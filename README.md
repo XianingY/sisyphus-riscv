@@ -1,6 +1,6 @@
 # Sisyphus
 
-Sisyphus is a SysY compiler project for the 2025 compiler contest track.
+Sisyphus is a SysY compiler project for the 2026 compiler contest track.
 
 ## Features
 
@@ -37,6 +37,10 @@ Sisyphus is a SysY compiler project for the 2025 compiler contest track.
 scripts/build.sh
 ```
 
+Contest evaluators may compile all `src/*.cpp` files directly instead of using
+CMake. In that mode the default target comes from
+`src/main/DefaultTarget.h`.
+
 Default target can be changed at configure time:
 
 ```bash
@@ -71,6 +75,19 @@ cmake --build build -j
 # Forced pure dialect path (no fallback)
 ./build/compiler tests/smoke/basic.sy -S -o basic.rv.forced.s -O1 --force-dialect-codegen
 ```
+
+## 2026 Dual-Track Submission
+
+Use the same GitLab repository with two branches:
+
+- RISC-V track: submit `https://gitlab.eduxiji.net/T2026104862010407/compiler2026-sisyphus.git master`.
+- ARM track: create an `arm` branch, set `SISYPHUS_DEFAULT_TARGET_ARM` to `1`
+  in `src/main/DefaultTarget.h`, then submit
+  `https://gitlab.eduxiji.net/T2026104862010407/compiler2026-sisyphus.git arm`.
+
+The evaluator command does not pass `--target`, so each submitted branch must
+have the correct default target. The compiler still accepts `--target=riscv`
+and `--target=arm` for local testing.
 
 ## Smoke Test
 

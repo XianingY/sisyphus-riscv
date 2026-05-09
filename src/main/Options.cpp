@@ -1,4 +1,5 @@
 #include "Options.h"
+#include "DefaultTarget.h"
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -248,11 +249,10 @@ Options sys::parseArgs(int argc, char **argv) {
   }
 
   if (!opts.rv && !opts.arm) {
-#ifdef DEFAULT_TARGET_ARM
-    opts.arm = true;
-#else
-    opts.rv = true;
-#endif
+    if (kDefaultTarget == DefaultTarget::Arm)
+      opts.arm = true;
+    else
+      opts.rv = true;
   }
 
   if (opts.emitIR)
