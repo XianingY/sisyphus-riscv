@@ -72,6 +72,29 @@ std::string FloatArrayAttr::toString() {
   return ss.str();
 }
 
+std::string ArgTypesAttr::toString() {
+  std::stringstream ss;
+  ss << "<arg_types = ";
+  for (size_t i = 0; i < types.size(); i++) {
+    if (i)
+      ss << ", ";
+    switch (types[i]) {
+    case Value::f32:
+      ss << "f32";
+      break;
+    case Value::i64:
+      ss << "i64";
+      break;
+    case Value::i32:
+    default:
+      ss << "i32";
+      break;
+    }
+  }
+  ss << ">";
+  return ss.str();
+}
+
 std::string CallerAttr::toString() {
   std::stringstream ss;
   if (!callers.size())

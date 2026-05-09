@@ -4,6 +4,49 @@
 using namespace sys::rv;
 using namespace sys;
 
+namespace {
+
+std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
+  int argcnt = funcOp->get<ArgCountAttr>()->count;
+  if (auto argTypes = funcOp->find<ArgTypesAttr>()) {
+    if ((int) argTypes->types.size() == argcnt)
+      return argTypes->types;
+  }
+
+  std::vector<Value::Type> types(argcnt, Value::i32);
+  for (auto getarg : funcOp->findAll<GetArgOp>()) {
+    int idx = V(getarg);
+    if (idx >= 0 && idx < argcnt)
+      types[idx] = getarg->getResultType();
+  }
+  return types;
+}
+
+int getStackArgIndex(const std::vector<Value::Type> &types, int index) {
+  int intCount = 0;
+  int fpCount = 0;
+  int stackCount = 0;
+
+  for (int i = 0; i <= index; i++) {
+    bool fp = types[i] == Value::f32;
+    int &regCount = fp ? fpCount : intCount;
+    if (regCount < 8) {
+      if (i == index)
+        return -1;
+      regCount++;
+      continue;
+    }
+
+    if (i == index)
+      return stackCount;
+    stackCount++;
+  }
+
+  return -1;
+}
+
+}
+
 #define CREATE_MV(fp, rd, rs) \
   if (!fp) \
     builder.create<MvOp>({ RDC(rd), RSC(rs) }); \
@@ -799,7 +842,7 @@ void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset) {
     return;
   }
 
-  Reg scratch = (dst == Reg::t6 ? Reg::t5 : Reg::t6);
+  Reg scratch = (dst == spillReg2 ? spillReg : spillReg2);
   materializeSpAddr(builder, scratch, offset);
   builder.create<sys::rv::LoadOp>(ty, {
     RDC(dst),
@@ -902,16 +945,15 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     return V(a) < V(b);
   });
   std::map<Op*, int> argOffsets;
-  int argOffset = 0;
+  auto argTypes = getArgTypes(cast<FuncOp>(funcOp));
 
   for (auto op : remainingGets) {
-    argOffsets[op] = argOffset;
-    argOffset += 8;
+    int stackIndex = getStackArgIndex(argTypes, V(op));
+    if (stackIndex >= 0)
+      argOffsets[op] = stackIndex * 8;
   }
 
   runRewriter(funcOp, [&](GetArgOp *op) {
-    assert(V(op) >= 8);
-
     // `sp + offset` is the base pointer.
     // We read past the base pointer (starting from 0):
     //    <arg 8> bp + 0

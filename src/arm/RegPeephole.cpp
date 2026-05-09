@@ -4,6 +4,48 @@
 using namespace sys::arm;
 using namespace sys;
 
+namespace {
+
+std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
+  int argcnt = funcOp->get<ArgCountAttr>()->count;
+  if (auto argTypes = funcOp->find<ArgTypesAttr>()) {
+    if ((int) argTypes->types.size() == argcnt)
+      return argTypes->types;
+  }
+
+  std::vector<Value::Type> types(argcnt, Value::i32);
+  for (auto getarg : funcOp->findAll<GetArgOp>()) {
+    int idx = V(getarg);
+    if (idx >= 0 && idx < argcnt)
+      types[idx] = getarg->getResultType();
+  }
+  return types;
+}
+
+int getStackArgIndex(const std::vector<Value::Type> &types, int index) {
+  int intCount = 0;
+  int fpCount = 0;
+  int stackCount = 0;
+
+  for (int i = 0; i <= index; i++) {
+    bool fp = types[i] == Value::f32;
+    int &regCount = fp ? fpCount : intCount;
+    if (regCount < 8) {
+      if (i == index)
+        return -1;
+      regCount++;
+      continue;
+    }
+
+    if (i == index)
+      return stackCount;
+    stackCount++;
+  }
+
+  return -1;
+}
+
+}
 
 #define REPLACE_BRANCH(T1, T2, ...) \
   REPLACE_BRANCH_IMPL(T1, T2, __VA_ARGS__); \
@@ -150,6 +192,66 @@ int RegAlloc::latePeephole(Op *funcOp) {
       converted++;
       builder.setBeforeOp(next);
       CREATE_MV(isFP(RD(next)), RD(next), RS(op));
+      next->erase();
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter(funcOp, [&](StrXOp *op) {
+    if (op == op->getParent()->getLastOp())
+      return false;
+    if (!op->has<RsAttr>() || !op->has<Rs2Attr>() || !op->has<IntAttr>())
+      return false;
+
+    auto next = op->nextOp();
+    if (isa<LdrXOp>(next) &&
+        next->has<RsAttr>() && next->has<RdAttr>() && next->has<IntAttr>() &&
+        RS(next) == RS2(op) && V(next) == V(op)) {
+      converted++;
+      builder.setBeforeOp(next);
+      CREATE_MV(false, RD(next), RS(op));
+      next->erase();
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter(funcOp, [&](StrFOp *op) {
+    if (op == op->getParent()->getLastOp())
+      return false;
+    if (!op->has<RsAttr>() || !op->has<Rs2Attr>() || !op->has<IntAttr>())
+      return false;
+
+    auto next = op->nextOp();
+    if (isa<LdrFOp>(next) &&
+        next->has<RsAttr>() && next->has<RdAttr>() && next->has<IntAttr>() &&
+        RS(next) == RS2(op) && V(next) == V(op)) {
+      converted++;
+      builder.setBeforeOp(next);
+      CREATE_MV(true, RD(next), RS(op));
+      next->erase();
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter(funcOp, [&](StrDOp *op) {
+    if (op == op->getParent()->getLastOp())
+      return false;
+    if (!op->has<RsAttr>() || !op->has<Rs2Attr>() || !op->has<IntAttr>())
+      return false;
+
+    auto next = op->nextOp();
+    if (isa<LdrDOp>(next) &&
+        next->has<RsAttr>() && next->has<RdAttr>() && next->has<IntAttr>() &&
+        RS(next) == RS2(op) && V(next) == V(op)) {
+      converted++;
+      builder.setBeforeOp(next);
+      CREATE_MV(true, RD(next), RS(op));
       next->erase();
       return true;
     }
@@ -645,6 +747,16 @@ int RegAlloc::latePeephole(Op *funcOp) {
       op->erase();
       return true;
     }
+    if (!op->atFront()) {
+      auto prev = op->prevOp();
+      if (isa<MovIOp>(prev) &&
+          prev->has<RdAttr>() && prev->has<IntAttr>() &&
+          RD(prev) == RD(op) && V(prev) == V(op)) {
+        converted++;
+        op->erase();
+        return true;
+      }
+    }
     return false;
   });
 
@@ -1051,16 +1163,15 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     return V(a) < V(b);
   });
   std::map<Op*, int> argOffsets;
-  int argOffset = 0;
+  auto argTypes = getArgTypes(cast<FuncOp>(funcOp));
 
   for (auto op : remainingGets) {
-    argOffsets[op] = argOffset;
-    argOffset += 8;
+    int stackIndex = getStackArgIndex(argTypes, V(op));
+    if (stackIndex >= 0)
+      argOffsets[op] = stackIndex * 8;
   }
 
   runRewriter(funcOp, [&](GetArgOp *op) {
-    assert(V(op) >= 8);
-
     // `sp + offset` is the base pointer.
     // We read past the base pointer (starting from 0):
     //    <arg 8> bp + 0

@@ -104,6 +104,15 @@ void DAE::run() {
 
     // Decrease argument count of the function.
     argcnt -= toRemove.size();
+    if (auto argTypes = func->find<ArgTypesAttr>()) {
+      std::vector<Value::Type> compact;
+      compact.reserve(argTypes->types.size());
+      for (size_t i = 0; i < argTypes->types.size(); i++) {
+        if (!toRemove.count((int) i))
+          compact.push_back(argTypes->types[i]);
+      }
+      argTypes->types = compact;
+    }
 
     // For all remaining getargs, decrease their count as well.
     getargs = func->findAll<GetArgOp>();

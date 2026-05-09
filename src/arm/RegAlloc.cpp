@@ -114,6 +114,51 @@ void emitStackLoad(Builder &builder, Reg dst, bool fp, int offset, Reg addrTmp) 
     builder.create<LdrXOp>({ RDC(dst), RSC(addrTmp), new IntAttr(0) });
 }
 
+std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
+  int argcnt = funcOp->get<ArgCountAttr>()->count;
+  if (auto argTypes = funcOp->find<ArgTypesAttr>()) {
+    if ((int) argTypes->types.size() == argcnt)
+      return argTypes->types;
+  }
+
+  std::vector<Value::Type> types(argcnt, Value::i32);
+  for (auto getarg : funcOp->findAll<GetArgOp>()) {
+    int idx = V(getarg);
+    if (idx >= 0 && idx < argcnt)
+      types[idx] = getarg->getResultType();
+  }
+  return types;
+}
+
+struct ArgPlacement {
+  bool fp;
+  int regIndex;
+  int stackIndex;
+};
+
+ArgPlacement getArgPlacement(const std::vector<Value::Type> &types, int index) {
+  int intCount = 0;
+  int fpCount = 0;
+  int stackCount = 0;
+
+  for (int i = 0; i <= index; i++) {
+    bool fp = types[i] == Value::f32;
+    int &regCount = fp ? fpCount : intCount;
+    if (regCount < 8) {
+      if (i == index)
+        return { fp, regCount, -1 };
+      regCount++;
+      continue;
+    }
+
+    if (i == index)
+      return { fp, -1, stackCount };
+    stackCount++;
+  }
+
+  return { false, -1, -1 };
+}
+
 }
 
 std::map<std::string, int> RegAlloc::stats() {
@@ -226,7 +271,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   builder.setToRegionStart(region);
   std::vector<Value> argHolders, fargHolders;
   auto argcnt = funcOp->get<ArgCountAttr>()->count;
-  for (int i = 0; i < std::min(argcnt, 8); i++) {
+  auto argTypes = getArgTypes(cast<FuncOp>(funcOp));
+  for (int i = 0; i < 8; i++) {
     auto placeholder = builder.create<PlaceHolderOp>();
     assignment[placeholder] = argRegs[i];
     argHolders.push_back(placeholder);
@@ -237,13 +283,22 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   }
 
   auto rawGets = funcOp->findAll<GetArgOp>();
+  for (auto it = rawGets.begin(); it != rawGets.end();) {
+    if ((*it)->getUses().empty()) {
+      (*it)->erase();
+      it = rawGets.erase(it);
+      continue;
+    }
+    ++it;
+  }
   // We might find some getArgs missing by DCE, so it's not necessarily consecutive.
   std::vector<Op*> getArgs;
   getArgs.resize(argcnt);
-  for (auto x : rawGets)
-    getArgs[V(x)] = x;
+  for (auto x : rawGets) {
+    if (V(x) >= 0 && V(x) < argcnt)
+      getArgs[V(x)] = x;
+  }
 
-  int fcnt = 0, cnt = 0;
   auto entry = region->getFirstBlock();
   for (size_t i = 0; i < getArgs.size(); i++) {
     // A missing argument.
@@ -252,21 +307,20 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
     Op *op = getArgs[i];
     auto ty = op->getResultType();
+    auto placement = getArgPlacement(argTypes, (int) i);
 
-    if (fpreg(ty) && fcnt < 8) {
+    if (fpreg(ty) && placement.regIndex >= 0) {
       op->moveToStart(entry);
       builder.setBeforeOp(op);
-      builder.create<PlaceHolderOp>({ fargHolders[fcnt] });
-      builder.replace<ReadRegOp>(op, Value::f32, { new RegAttr(fargRegs[fcnt]) });
-      fcnt++;
+      builder.create<PlaceHolderOp>({ fargHolders[placement.regIndex] });
+      builder.replace<ReadRegOp>(op, Value::f32, { new RegAttr(fargRegs[placement.regIndex]) });
       continue;
     }
-    if (!fpreg(ty) && cnt < 8) {
+    if (!fpreg(ty) && placement.regIndex >= 0) {
       op->moveToStart(entry);
       builder.setBeforeOp(op);
-      builder.create<PlaceHolderOp>({ argHolders[cnt] });
-      builder.replace<ReadRegOp>(op, Value::i64, { new RegAttr(argRegs[cnt]) });
-      cnt++;
+      builder.create<PlaceHolderOp>({ argHolders[placement.regIndex] });
+      builder.replace<ReadRegOp>(op, Value::i64, { new RegAttr(argRegs[placement.regIndex]) });
       continue;
     }
     // Spilled to stack; don't do anything.

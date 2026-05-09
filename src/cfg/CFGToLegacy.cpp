@@ -207,9 +207,15 @@ private:
   bool lowerFunction(const Func &cfgFunc) {
     builder.setToBlockEnd(topBlock);
 
+    std::vector<Value::Type> argTypes;
+    argTypes.reserve(cfgFunc.params.size());
+    for (const auto &param : cfgFunc.params)
+      argTypes.push_back(isArrayLike(param) ? Value::i64 : toValueType(param.type));
+
     auto *funcOp = builder.create<FuncOp>({
       new NameAttr(cfgFunc.name),
-      new ArgCountAttr((int) cfgFunc.params.size())
+      new ArgCountAttr((int) cfgFunc.params.size()),
+      new ArgTypesAttr(argTypes)
     });
 
     int bbCount = std::max(1, (int) cfgFunc.blocks.size());

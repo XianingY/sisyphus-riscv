@@ -134,6 +134,16 @@ public:
   ArgCountAttr *clone() override { return new ArgCountAttr(count); }
 };
 
+class ArgTypesAttr : public AttrImpl<ArgTypesAttr, __LINE__> {
+public:
+  std::vector<Value::Type> types;
+
+  ArgTypesAttr(const std::vector<Value::Type> &types): types(types) {}
+
+  std::string toString() override;
+  ArgTypesAttr *clone() override { return new ArgTypesAttr(types); }
+};
+
 class CallerAttr : public AttrImpl<CallerAttr, __LINE__> {
 public:
   // The functions in `callers` actually calls the function with this attribute.
