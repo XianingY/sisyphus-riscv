@@ -137,6 +137,14 @@ if [[ ! -x "${COMPILER_PATH}" ]]; then
   echo "error: compiler not found at ${COMPILER_PATH}"
   exit 1
 fi
+if [[ "${SISY_RUNTIME_IN_DOCKER:-0}" == "1" ]]; then
+  compiler_magic="$(od -An -tx1 -N4 "${COMPILER_PATH}" 2>/dev/null | tr -d ' \n' || true)"
+  if [[ "${compiler_magic}" != "7f454c46" ]]; then
+    echo "error: ${COMPILER_PATH} is not a Linux ELF executable inside Docker."
+    echo "hint: rebuild with: docker run --rm --user \"\$(id -u):\$(id -g)\" -v \"\$PWD:\$PWD\" -w \"\$PWD\" ${SISY_DOCKER_IMAGE} bash -lc 'scripts/build.sh'"
+    exit 1
+  fi
+fi
 if [[ ! -f "${RUNTIME_SYLIB_C}" ]]; then
   RUNTIME_SYLIB_C="${ROOT_DIR}/runtime/sylib.c"
 fi

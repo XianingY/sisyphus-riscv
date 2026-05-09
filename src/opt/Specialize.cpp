@@ -124,6 +124,8 @@ bool Specialize::specialize() {
         new NameAttr(pname),
         fn->get<ArgCountAttr>()
       });
+      if (auto argTypes = fn->find<ArgTypesAttr>())
+        copied->add<ArgTypesAttr>(argTypes->types);
       copied->appendRegion();
 
       copy(copied->getRegion(), fn->getRegion());

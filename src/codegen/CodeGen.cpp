@@ -362,9 +362,14 @@ void CodeGen::emit(ASTNode *node) {
 
   if (auto fn = dyn_cast<FnDeclNode>(node)) {
     auto fnTy = cast<FunctionType>(fn->type);
+    std::vector<Value::Type> argTypes;
+    argTypes.reserve(fnTy->params.size());
+    for (auto paramTy : fnTy->params)
+      argTypes.push_back(isa<FloatType>(paramTy) ? Value::f32 : Value::i32);
     auto funcOp = builder.create<FuncOp>({
       new NameAttr(fn->name),
-      new ArgCountAttr(fnTy->params.size())
+      new ArgCountAttr(fnTy->params.size()),
+      new ArgTypesAttr(argTypes)
     });
     auto bb = funcOp->createFirstBlock();
 
@@ -379,7 +384,7 @@ void CodeGen::emit(ASTNode *node) {
       // Get the value of the argument and create a temp variable for it.
       Value::Type ty = isa<FloatType>(argTy) ? Value::f32 : Value::i32;
       auto arg = builder.create<GetArgOp>(ty, { new IntAttr(i) });
-      // Preserve argument positional metadata for backend ABI lowering.
+      // Preserve argument reads so backend ABI lowering sees the full layout.
       arg->add<ImpureAttr>();
       if ((isa<ArrayType>(argTy) || isa<PointerType>(argTy)) && !funcOp->has<ImpureAttr>())
         funcOp->add<ImpureAttr>();
