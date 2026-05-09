@@ -12,6 +12,7 @@ std::map<std::string, int> AggressiveDCE::stats() {
 #define PRESERVED(Ty) || isa<Ty>(op)
 static bool preserved(Op *op) {
   return (isa<CallOp>(op) && op->has<ImpureAttr>())
+    PRESERVED(GetArgOp)
     PRESERVED(BranchOp)
     PRESERVED(GotoOp)
     PRESERVED(StoreOp)

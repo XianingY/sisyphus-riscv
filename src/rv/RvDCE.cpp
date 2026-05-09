@@ -11,6 +11,7 @@ std::map<std::string, int> RvDCE::stats() {
 
 bool RvDCE::isImpure(Op *op) {
   if (isa<SubSpOp>(op) || isa<JOp>(op) ||
+      isa<GetArgOp>(op) ||
       isa<BneOp>(op) || isa<BltOp>(op) ||
       isa<BgeOp>(op) || isa<BeqOp>(op) || isa<WriteRegOp>(op) ||
       isa<StoreOp>(op) || isa<RetOp>(op) ||

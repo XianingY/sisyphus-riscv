@@ -521,17 +521,11 @@ TransparentBlockNode *Parser::varDecl(bool global) {
     }
     // No initialization; all must be zero.
     if (!init && global) {
-      if (auto arrTy = dyn_cast<ArrayType>(ty)) {
-        int size = arrTy->getSize();
-        if (isa<FloatType>(base)) {
-          float *ptr = new float[size];
-          memset(ptr, 0, sizeof(float) * size);
-          init = new ConstArrayNode(ptr);
-        } else {
-          int *ptr = new int[size];
-          memset(ptr, 0, sizeof(int) * size);
-          init = new ConstArrayNode(ptr);
-        }
+      if (isa<ArrayType>(ty)) {
+        if (isa<FloatType>(base))
+          init = new ConstArrayNode((float*) nullptr);
+        else
+          init = new ConstArrayNode((int*) nullptr);
         init->type = ty;
       } else init = new IntNode(0);
     }

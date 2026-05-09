@@ -109,6 +109,21 @@ int RegAlloc::latePeephole(Op *funcOp) {
     return true;
   });
 
+  runRewriter(funcOp, [&](LiOp *op) {
+    auto prev = op->prevOp();
+    if (!prev || !isa<LiOp>(prev))
+      return false;
+    if (!prev->has<RdAttr>() || !prev->has<IntAttr>() ||
+        !op->has<RdAttr>() || !op->has<IntAttr>())
+      return false;
+    if (RD(prev) != RD(op) || V(prev) != V(op))
+      return false;
+
+    converted++;
+    op->erase();
+    return true;
+  });
+
   runRewriter(funcOp, [&](StoreOp *op) {
     if (op->atBack())
       return false;

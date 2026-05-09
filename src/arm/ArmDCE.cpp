@@ -13,6 +13,7 @@ std::map<std::string, int> ArmDCE::stats() {
 #define IMPURE(Ty) || isa<Ty>(op)
 bool ArmDCE::isImpure(Op *op) {
   return isa<AllocaOp>(op)
+    IMPURE(GetArgOp)
     IMPURE(StrFOp)
     IMPURE(StrWOp)
     IMPURE(StrXOp)

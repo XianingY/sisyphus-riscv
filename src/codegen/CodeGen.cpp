@@ -439,13 +439,8 @@ void CodeGen::emit(ASTNode *node) {
         value = isa<FloatType>(base)
           ? (void*) cast<ConstArrayNode>(vardecl->init)->vf
           : (void*) cast<ConstArrayNode>(vardecl->init)->vi;
-      else {
-        value = isa<FloatType>(base)
-          ? (void*) new float[size]
-          : (void*) new int[size];
-        // sizeof(int) == sizeof(float).
-        memset(value, 0, sizeof(int) * size);
-      }
+      else
+        value = nullptr;
       
       Value addr;
       if (isa<FloatType>(base)) {
