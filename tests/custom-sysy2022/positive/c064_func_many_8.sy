@@ -1,9 +1,0 @@
-int sum12(int a0,int a1,int a2,int a3,int a4,int a5,int a6,int a7,int a8,int a9,int a10,int a11) {
-  return a0+a1+a2+a3+a4+a5+a6+a7+a8+a9+a10+a11;
-}
-int main() {
-  int v = 11;
-  putint(sum12(v,v+1,v+2,v+3,v+4,v+5,v+6,v+7,v+8,v+9,v+10,v+11));
-  putch(10);
-  return 0;
-}

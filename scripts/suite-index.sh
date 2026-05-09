@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OFFICIAL_DIR="${ROOT_DIR}/tests/external/official"
+OFFICIAL_DIR="${SISY_OFFICIAL_SUITE_ROOT:-${ROOT_DIR}/test/official}"
 OUT_DIR="${ROOT_DIR}/tests/.out/suites"
 OUT_CSV="${OUT_DIR}/index.csv"
 
@@ -20,7 +20,11 @@ mkdir -p "${OUT_DIR}"
 printf 'suite,tier,kind,case_id,src,in,out,enabled\n' >"${OUT_CSV}"
 
 abs_path() {
-  realpath -m "$1"
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+print(pathlib.Path(sys.argv[1]).resolve())
+PY
 }
 
 emit_suite_cases() {

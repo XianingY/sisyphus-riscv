@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPILER="${ROOT_DIR}/build/compiler"
-CASE_ROOT="${ROOT_DIR}/tests/external/official/official-arm-perf"
+OFFICIAL_DIR="${SISY_OFFICIAL_SUITE_ROOT:-${ROOT_DIR}/test/official}"
+CASE_ROOT="${OFFICIAL_DIR}/official-arm-perf"
 OUT_DIR="${ROOT_DIR}/tests/.out/arm-o2-fft-regression"
 mkdir -p "${OUT_DIR}"
 

@@ -9,8 +9,8 @@ usage() {
 usage: $0 [all|riscv|arm] [all|O0|O1|O2]
 
 env:
-  CUSTOM_MANIFEST              default: tests/custom-sysy2022/manifest.csv
-  CUSTOM_SUITE_ROOT            default: tests/custom-sysy2022
+  CUSTOM_MANIFEST              default: test/custom-sysy2022/manifest.csv
+  CUSTOM_SUITE_ROOT            default: test/custom-sysy2022
   CUSTOM_RUNTIME_ROOT          default: tests/.out/custom-runtime
   CUSTOM_LABEL                 default: custom-sysy2022
   CUSTOM_CASE_FILTER           substring filter on case_id
@@ -28,8 +28,8 @@ if [[ "${TARGET_ARG}" == "-h" || "${TARGET_ARG}" == "--help" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MANIFEST="${CUSTOM_MANIFEST:-${ROOT_DIR}/tests/custom-sysy2022/manifest.csv}"
-SUITE_ROOT="${CUSTOM_SUITE_ROOT:-${ROOT_DIR}/tests/custom-sysy2022}"
+MANIFEST="${CUSTOM_MANIFEST:-${ROOT_DIR}/test/custom-sysy2022/manifest.csv}"
+SUITE_ROOT="${CUSTOM_SUITE_ROOT:-${ROOT_DIR}/test/custom-sysy2022}"
 OUT_ROOT="${CUSTOM_RUNTIME_ROOT:-${ROOT_DIR}/tests/.out/custom-runtime}"
 LABEL="${CUSTOM_LABEL:-custom-sysy2022}"
 COMPILER="${SISY_COMPILER_PATH:-${ROOT_DIR}/build/compiler}"

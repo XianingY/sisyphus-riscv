@@ -98,31 +98,12 @@ scripts/run_smoke.sh
 ## Regression
 
 ```bash
-# Compile-only regression
-scripts/regression.sh test/custom riscv O0
-scripts/regression.sh test/custom riscv O1
-scripts/regression.sh test/custom riscv O2
-scripts/regression.sh test/custom arm O0
-scripts/regression.sh test/custom arm O1
-scripts/regression.sh test/custom arm O2
+# Compile-only smoke regression
+scripts/regression.sh tests/smoke riscv O0
+scripts/regression.sh tests/smoke arm O0
 
-# Semantic compare (interpreter vs expected output)
-scripts/compare.sh test/custom riscv O1
-scripts/compare.sh test/custom arm O1
-scripts/compare.sh test/custom riscv O2
-scripts/compare.sh test/custom arm O2
-
-# Fast O0/O1 assembly-size proxy
-scripts/asm-delta.sh test/custom riscv
-
-# Matrix evaluation for O1 tuning candidates
-scripts/eval-o1-matrix.sh test/custom
-
-# Unified O1/O2 matrix evaluation (RISC-V proxy + ARM consistency checks)
-scripts/eval-profile-matrix.sh test/custom
-
-# Sync official ZIP suites and generate suite index
-scripts/suite-sync.sh --update --src-root /home/wslootie/github/cpe/compiler2025
+# Sync official ZIP suites into ignored local samples and generate suite index
+scripts/suite-sync.sh --update --src-root /Users/byzantium/github/compiler2025
 scripts/suite-index.sh
 
 # Runtime eval (Docker-first, QEMU user-mode)
@@ -169,6 +150,9 @@ Compare/validator environment variables:
 - Workflow details: `docs/QEMU.md`
 
 ## Public Suites
+
+Official suites are extracted under `test/official/` for local evaluation. This
+directory is ignored by Git and should not be uploaded to the contest GitLab.
 
 - `official-functional`: hard gate (`functional.zip`, SysY standard functional set)
 - `official-arm-perf`: soft perf gate (`ARM-性能.zip`)

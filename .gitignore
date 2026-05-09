@@ -5,7 +5,8 @@ tests/external
 .runtime-tools
 .runtime-reports
 bin
-test/official
+test/official/
+test/custom-sysy2022/
 test/temp
 test/fuzz
 test/cnf

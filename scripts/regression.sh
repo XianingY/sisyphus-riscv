@@ -8,10 +8,18 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPILER="${ROOT_DIR}/build/compiler"
-CASE_DIR="$(realpath -m "$1")"
+CASE_DIR="$(python3 - "$1" <<'PY'
+import pathlib
+import sys
+print(pathlib.Path(sys.argv[1]).resolve())
+PY
+)"
 TARGET="${2:-riscv}"
 OPT="${3:-O1}"
-EXTRA_ARGS=("${@:4}")
+EXTRA_ARGS=()
+if [[ $# -gt 3 ]]; then
+  EXTRA_ARGS=("${@:4}")
+fi
 if [[ -n "${SISY_COMPILER_EXTRA_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
   EXTRA_ARGS+=(${SISY_COMPILER_EXTRA_ARGS})
@@ -46,7 +54,11 @@ count=0
 while IFS= read -r -d '' f; do
   rel="${f#${CASE_DIR}/}"
   stem="$(safe_stem "${rel}")"
-  if ! "${COMPILER}" "${f}" -S -o "${OUT_DIR}/${stem}.s" "--target=${TARGET}" "-${OPT}" "${EXTRA_ARGS[@]}"; then
+  cmd=("${COMPILER}" "${f}" -S -o "${OUT_DIR}/${stem}.s" "--target=${TARGET}" "-${OPT}")
+  if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
+    cmd+=("${EXTRA_ARGS[@]}")
+  fi
+  if ! "${cmd[@]}"; then
     echo "[fail] ${rel}"
     exit 1
   fi
