@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_ROOT="${ROOT_DIR}/tests/custom-sysy2022"
+OUT_ROOT="${ROOT_DIR}/test/custom-sysy2022"
 MANIFEST="${OUT_ROOT}/manifest.csv"
 
 rm -rf "${OUT_ROOT}"
@@ -779,7 +779,7 @@ if [[ "${dup_custom}" -ne 0 ]]; then
   exit 1
 fi
 
-OFFICIAL_ROOT="${ROOT_DIR}/tests/external/official"
+OFFICIAL_ROOT="${SISY_OFFICIAL_SUITE_ROOT:-${ROOT_DIR}/test/official}"
 if [[ -d "${OFFICIAL_ROOT}" ]]; then
   declare -A official_exact
   declare -A official_canon

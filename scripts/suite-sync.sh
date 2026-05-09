@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTERNAL_DIR="${ROOT_DIR}/tests/external"
-OFFICIAL_DIR="${EXTERNAL_DIR}/official"
-LOCK_FILE="${EXTERNAL_DIR}/lock.json"
+OFFICIAL_DIR="${SISY_OFFICIAL_SUITE_ROOT:-${ROOT_DIR}/test/official}"
+LOCK_FILE="${OFFICIAL_DIR}/lock.json"
 TMP_META="$(mktemp)"
 TMP_ORPHAN="$(mktemp)"
 SRC_ROOT_DEFAULT="/home/wslootie/github/cpe/compiler2025"
@@ -71,12 +71,92 @@ for legacy in \
   fi
 done
 
-for required_tool in unzip sha256sum python3; do
+for required_tool in python3; do
   if ! command -v "${required_tool}" >/dev/null 2>&1; then
     echo "error: missing required tool '${required_tool}'"
     exit 1
   fi
 done
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${path}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${path}" | awk '{print $1}'
+  else
+    echo "error: missing sha256sum or shasum" >&2
+    exit 1
+  fi
+}
+
+file_size() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+print(os.path.getsize(sys.argv[1]))
+PY
+}
+
+file_mtime_utc() {
+  python3 - "$1" <<'PY'
+import datetime
+import os
+import sys
+mtime = os.path.getmtime(sys.argv[1])
+print(datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+PY
+}
+
+extract_zip() {
+  local zip_path="$1"
+  local dst_dir="$2"
+  python3 - "${zip_path}" "${dst_dir}" <<'PY'
+import pathlib
+import shutil
+import sys
+import zipfile
+
+zip_path = pathlib.Path(sys.argv[1])
+dst_dir = pathlib.Path(sys.argv[2])
+if dst_dir.exists():
+    shutil.rmtree(dst_dir)
+dst_dir.mkdir(parents=True, exist_ok=True)
+
+with zipfile.ZipFile(zip_path) as zf:
+    infos = zf.infolist()
+    parts = []
+    for info in infos:
+        name = info.filename.replace("\\", "/")
+        clean = [p for p in pathlib.PurePosixPath(name).parts if p not in ("", ".")]
+        if clean:
+            parts.append(clean)
+
+    strip_prefix = None
+    first_parts = {p[0] for p in parts}
+    if len(first_parts) == 1 and any(len(p) > 1 for p in parts):
+        strip_prefix = next(iter(first_parts))
+
+    for info in infos:
+        name = info.filename.replace("\\", "/")
+        clean = [p for p in pathlib.PurePosixPath(name).parts if p not in ("", ".")]
+        if not clean:
+            continue
+        if strip_prefix and clean[0] == strip_prefix:
+            clean = clean[1:]
+        if not clean:
+            continue
+        target = dst_dir.joinpath(*clean)
+        if not target.resolve().is_relative_to(dst_dir.resolve()):
+            raise RuntimeError(f"unsafe zip path: {info.filename}")
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, target.open("wb") as out:
+            shutil.copyfileobj(src, out)
+PY
+}
 
 append_meta() {
   local suite="$1"
@@ -95,9 +175,9 @@ append_meta() {
   fi
 
   local sha size mtime
-  sha="$(sha256sum "${zip_path}" | awk '{print $1}')"
-  size="$(stat -c '%s' "${zip_path}")"
-  mtime="$(date -u -d "@$(stat -c '%Y' "${zip_path}")" +"%Y-%m-%dT%H:%M:%SZ")"
+  sha="$(sha256_file "${zip_path}")"
+  size="$(file_size "${zip_path}")"
+  mtime="$(file_mtime_utc "${zip_path}")"
 
   local needs_extract=0
   if [[ "${UPDATE}" -eq 1 || ! -d "${dst_dir}" ]]; then
@@ -114,9 +194,7 @@ append_meta() {
 
   if [[ "${needs_extract}" -eq 1 ]]; then
     echo "[extract] ${suite} <= ${zip_name}"
-    rm -rf "${dst_dir}"
-    mkdir -p "${dst_dir}"
-    unzip -qq -o "${zip_path}" -d "${dst_dir}"
+    extract_zip "${zip_path}" "${dst_dir}"
     echo "${sha}" >"${stamp_file}"
   else
     echo "[keep] ${suite} (unchanged zip)"
@@ -130,9 +208,7 @@ append_meta() {
   if [[ "${sy_count}" != "${expected_sy}" || "${in_count}" != "${expected_in}" || "${out_count}" != "${expected_out}" ]]; then
     if [[ "${needs_extract}" -eq 0 ]]; then
       echo "[repair] re-extract ${suite} due to count mismatch"
-      rm -rf "${dst_dir}"
-      mkdir -p "${dst_dir}"
-      unzip -qq -o "${zip_path}" -d "${dst_dir}"
+      extract_zip "${zip_path}" "${dst_dir}"
       echo "${sha}" >"${stamp_file}"
       sy_count="$(find "${dst_dir}" -type f -name '*.sy' | wc -l | tr -d ' ')"
       in_count="$(find "${dst_dir}" -type f -name '*.in' | wc -l | tr -d ' ')"

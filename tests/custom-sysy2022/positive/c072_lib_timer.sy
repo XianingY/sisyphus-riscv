@@ -1,9 +1,0 @@
-int main() {
-  int x = 1;
-  starttime();
-  x = x + 6;
-  stoptime();
-  putint(x);
-  putch(10);
-  return 0;
-}

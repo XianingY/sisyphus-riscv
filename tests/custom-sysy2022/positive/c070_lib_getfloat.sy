@@ -1,7 +1,0 @@
-int main() {
-  float x = getfloat();
-  int y = x * 4.0;
-  putint(y);
-  putch(10);
-  return 0;
-}

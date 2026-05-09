@@ -1,5 +1,0 @@
-int n = 3;
-int a[n];
-int main() {
-  return 0;
-}
