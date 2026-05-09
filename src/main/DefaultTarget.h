@@ -12,7 +12,7 @@ enum class DefaultTarget {
 // directly and do not pass CMake definitions. Keep master on RISC-V; set this
 // to 1 on the ARM submission branch.
 #ifndef SISYPHUS_DEFAULT_TARGET_ARM
-#define SISYPHUS_DEFAULT_TARGET_ARM 0
+#define SISYPHUS_DEFAULT_TARGET_ARM 1
 #endif
 
 #if defined(DEFAULT_TARGET_ARM) || SISYPHUS_DEFAULT_TARGET_ARM
