@@ -409,9 +409,11 @@ private:
             if (elems == 0)
               elems = 1;
             if (arr->isFloat) {
-              info.floatArrayInit.assign(arr->vf, arr->vf + elems);
+              if (arr->vf)
+                info.floatArrayInit.assign(arr->vf, arr->vf + elems);
             } else {
-              info.intArrayInit.assign(arr->vi, arr->vi + elems);
+              if (arr->vi)
+                info.intArrayInit.assign(arr->vi, arr->vi + elems);
             }
           }
         }

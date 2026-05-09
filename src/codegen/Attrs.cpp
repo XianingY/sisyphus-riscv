@@ -23,6 +23,8 @@ std::string FromAttr::toString() {
 }
 
 IntArrayAttr::IntArrayAttr(int *vi, int size): vi(vi), size(size), allZero(true) {
+  if (!vi)
+    return;
   for (int i = 0; i < size; i++) {
     if (vi[i] != 0) {
       allZero = false;
@@ -32,6 +34,8 @@ IntArrayAttr::IntArrayAttr(int *vi, int size): vi(vi), size(size), allZero(true)
 }
 
 FloatArrayAttr::FloatArrayAttr(float *vf, int size): vf(vf), size(size), allZero(true) {
+  if (!vf)
+    return;
   for (int i = 0; i < size; i++) {
     if (vf[i] != 0) {
       allZero = false;

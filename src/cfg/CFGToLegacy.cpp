@@ -159,13 +159,16 @@ private:
 
       Value g;
       if (sym.elementType == hir::TypeKind::Float) {
-        auto *data = new float[elemCount];
-        std::fill(data, data + elemCount, 0.0f);
+        float *data = nullptr;
         if (!sym.floatArrayInit.empty()) {
+          data = new float[elemCount];
+          std::fill(data, data + elemCount, 0.0f);
           size_t n = std::min(elemCount, sym.floatArrayInit.size());
           for (size_t i = 0; i < n; i++)
             data[i] = sym.floatArrayInit[i];
         } else if (sym.hasFloatInit) {
+          data = new float[elemCount];
+          std::fill(data, data + elemCount, 0.0f);
           data[0] = (float) sym.floatInit;
         }
 
@@ -177,13 +180,16 @@ private:
         });
         g.defining->add<FPAttr>();
       } else {
-        auto *data = new int[elemCount];
-        std::fill(data, data + elemCount, 0);
+        int *data = nullptr;
         if (!sym.intArrayInit.empty()) {
+          data = new int[elemCount];
+          std::fill(data, data + elemCount, 0);
           size_t n = std::min(elemCount, sym.intArrayInit.size());
           for (size_t i = 0; i < n; i++)
             data[i] = sym.intArrayInit[i];
         } else if (sym.hasIntInit) {
+          data = new int[elemCount];
+          std::fill(data, data + elemCount, 0);
           data[0] = (int) sym.intInit;
         }
 
