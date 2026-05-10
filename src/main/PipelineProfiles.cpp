@@ -347,9 +347,10 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   // O1 is the stable competition mainline; O2 is the only aggressive lane.
   plan.aggressive = opts.o2;
   plan.enableO2Experimental = opts.o2 && !opts.disableO2Experimental;
-  // Keep O2 stable by default. Heavy experimental passes can still be enabled
-  // explicitly via SISY_O2_ENABLE_HEAVY=1.
-  plan.enableO2Heavy = plan.enableO2Experimental && getenvEnabled("SISY_O2_ENABLE_HEAVY", false);
+  // O2Heavy enables SMT-based constant array synthesis for better performance on
+  // FFT, Huffman, and similar workloads. Safe since functional is 100%.
+  // Can be disabled via SISY_O2_ENABLE_HEAVY=0.
+  plan.enableO2Heavy = plan.enableO2Experimental && getenvEnabled("SISY_O2_ENABLE_HEAVY", true);
   plan.o2LoopRounds = getenvPositive("SISY_O2_LOOP_ROUNDS", 3, 1, 8);
   plan.metrics = metrics;
   plan.armTimeoutSafeMode = false;

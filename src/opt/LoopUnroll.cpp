@@ -189,7 +189,8 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
 
   // Not every loop can be unrolled, even not all constant-bounded loops.
   // See 65_color.sy, where we are attempting to unroll a nested loop with a total of 18^5*7 = 13226976 iterations.
-  if (loopsize > 300)
+  // Relaxed limits for better performance on tight loops.
+  if (loopsize > 500)
     return false;
 
   auto phis = header->getPhis();
@@ -249,8 +250,9 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     return false;
 
   // Guardrail: keep duplicated loop body within a bounded growth budget.
+  // Relaxed for better performance on small tight loops.
   int estimatedGrowth = loopsize * (unroll - 1);
-  if (estimatedGrowth > 400)
+  if (estimatedGrowth > 800)
     return false;
 
   // Record the phi values at the beginning of `exit` that are taken from the latch.
