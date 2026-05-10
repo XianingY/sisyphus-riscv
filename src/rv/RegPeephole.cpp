@@ -1,10 +1,21 @@
 #include "RvPasses.h"
 #include "Regs.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace sys::rv;
 using namespace sys;
 
 namespace {
+
+bool envEnabled(const char *name, bool fallback = true) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
+    return false;
+  return true;
+}
 
 std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
   int argcnt = funcOp->get<ArgCountAttr>()->count;
@@ -188,6 +199,45 @@ int RegAlloc::latePeephole(Op *funcOp) {
 
     return false;
   });
+
+  if (envEnabled("SISY_RV_ENABLE_LOAD_LOAD_CSE", true)) {
+    for (auto bb : funcOp->getRegion()->getBlocks()) {
+      Op *op = bb->getFirstOp();
+      while (op) {
+        Op *next = op->atBack() ? nullptr : op->nextOp();
+        Op *after = (next && !next->atBack()) ? next->nextOp() : nullptr;
+
+        if (next && isa<LoadOp>(op) && isa<LoadOp>(next) &&
+            op->has<RdAttr>() && op->has<RsAttr>() && op->has<IntAttr>() &&
+            next->has<RdAttr>() && next->has<RsAttr>() && next->has<IntAttr>() &&
+            RS(op) == RS(next) && V(op) == V(next) && SIZE(op) == SIZE(next) &&
+            op->getResultType() == next->getResultType() &&
+            RD(op) != RS(next)) {
+          converted++;
+          builder.setBeforeOp(next);
+          CREATE_MV(isFP(RD(next)), RD(next), RD(op));
+          next->erase();
+          op = after;
+          continue;
+        }
+
+        if (next && isa<FldOp>(op) && isa<FldOp>(next) &&
+            op->has<RdAttr>() && op->has<RsAttr>() && op->has<IntAttr>() &&
+            next->has<RdAttr>() && next->has<RsAttr>() && next->has<IntAttr>() &&
+            RS(op) == RS(next) && V(op) == V(next) &&
+            RD(op) != RS(next)) {
+          converted++;
+          builder.setBeforeOp(next);
+          CREATE_MV(/*fp=*/true, RD(next), RD(op));
+          next->erase();
+          op = after;
+          continue;
+        }
+
+        op = next;
+      }
+    }
+  }
 
   runRewriter(funcOp, [&](FmvdxOp *op) {
     if (op->atBack())

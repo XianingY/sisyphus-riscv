@@ -91,6 +91,7 @@ public:
   void useCache(cache_2 cache) { this->cache = (int*) cache; cache_type = 2; }
   std::string out() { return outbuf.str(); }
   int exitcode() { return retcode & 0xff; }
+  int functionResult() const { return static_cast<int32_t>(retcode); }
   bool timedOut() const { return executionTimedOut; }
 };
 

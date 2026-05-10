@@ -147,6 +147,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
+      pm.addPass<sys::SemanticBitwise>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);

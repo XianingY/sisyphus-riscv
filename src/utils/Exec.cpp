@@ -27,13 +27,19 @@ Interpreter::Interpreter(ModuleOp *module, size_t explicitStepLimit) {
       
       if (auto intArr = op->find<IntArrayAttr>()) {
         int *vp = new int[size];
-        memcpy(vp, intArr->vi, size * 4);
+        if (intArr->vi)
+          memcpy(vp, intArr->vi, size * 4);
+        else
+          memset(vp, 0, size * 4);
         globalMap[name] = Value { .vi = (intptr_t) vp };
         addRange(globalRanges, (intptr_t) vp, (size_t) SIZE(op));
       }
       if (auto fpArr = op->find<FloatArrayAttr>()) {
         float *vfp = new float[size];
-        memcpy(vfp, fpArr->vf, size * 4);
+        if (fpArr->vf)
+          memcpy(vfp, fpArr->vf, size * 4);
+        else
+          memset(vfp, 0, size * 4);
         globalMap[name] = Value { .vi = (intptr_t) vfp };
         fpGlobals.insert(name);
         addRange(globalRanges, (intptr_t) vfp, (size_t) SIZE(op));
@@ -513,6 +519,9 @@ void Interpreter::run(std::istream &input) {
 }
 
 void Interpreter::runFunction(const std::string &func, const std::vector<int> &args) {
+  stepCount = 0;
+  executionTimedOut = false;
+  lastValidCached = false;
   std::vector<Value> values;
   values.reserve(args.size());
   for (auto x : args)

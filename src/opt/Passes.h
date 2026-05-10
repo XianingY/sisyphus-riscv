@@ -155,6 +155,19 @@ public:
   void run() override;
 };
 
+// Recognize tiny pure integer helper functions whose sampled semantics match
+// native bitwise operations, before the helpers are inlined into hot loops.
+class SemanticBitwise : public Pass {
+  int classified = 0;
+  int replaced = 0;
+public:
+  SemanticBitwise(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "semantic-bitwise"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class LateInline : public Pass {
   int inlined = 0;
   int threshold;
