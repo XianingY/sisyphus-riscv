@@ -358,7 +358,8 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   // FFT, Huffman, and similar workloads. Safe since functional is 100%.
   // Can be disabled via SISY_O2_ENABLE_HEAVY=0.
   plan.enableO2Heavy = plan.enableO2Experimental && getenvEnabled("SISY_O2_ENABLE_HEAVY", true);
-  plan.o2LoopRounds = getenvPositive("SISY_O2_LOOP_ROUNDS", 3, 1, 8);
+  // More loop rounds for O2 to catch optimization opportunities in tight loops.
+  plan.o2LoopRounds = getenvPositive("SISY_O2_LOOP_ROUNDS", 5, 1, 8);
   plan.metrics = metrics;
   plan.armTimeoutSafeMode = false;
   plan.armInstCombineRounds = -1;
