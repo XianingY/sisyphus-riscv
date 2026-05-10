@@ -1,9 +1,0 @@
-int main() {
-  if (1 <= 2) {
-    if (2 <= 1) {
-      return 1;
-    }
-    return 0;
-  }
-  return 1;
-}

@@ -167,6 +167,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+    pm.addPass<sys::PrivatizeReduction>();
     pm.addPass<sys::LICM>();
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
@@ -197,6 +198,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (enableO1LiteTail && !economyMode) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+      pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
       pm.addPass<sys::GVN>();
@@ -230,6 +232,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     int loopRounds = aggressive ? plan.o2LoopRounds : (economyMode ? 1 : 3);
     for (int i = 0; i < loopRounds; i++) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+      pm.addPass<sys::PrivatizeReduction>();
+      pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
       pm.addPass<sys::RemoveEmptyLoop>();
@@ -238,6 +242,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (aggressive) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+      pm.addPass<sys::PrivatizeReduction>();
+      pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
       pm.addPass<sys::GVN>();
@@ -246,6 +252,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
 
     if (aggressive) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+      pm.addPass<sys::PrivatizeReduction>();
+      pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
       pm.addPass<sys::GVN>();

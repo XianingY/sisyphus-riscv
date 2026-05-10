@@ -45,10 +45,10 @@ bool noAlias(Op *load, const std::vector<Op*> &stores) {
 }
 
 // Traces `op` up back, and determines if everything between `info` and `outer` are invariant.
-bool variant(Op *op, LoopInfo *info, LoopInfo *outer, int depth = 0) {
-  // Somehow hit a loop. Why?
-  if (depth >= 100)
-    return true;
+bool variant(Op *op, LoopInfo *info, LoopInfo *outer, std::set<Op*> &visited) {
+  if (visited.count(op))
+    return false; // Cycle assumes invariant unless proven otherwise
+  visited.insert(op);
 
   // These will be marked as variant, but they don't affect anything.
   if (isa<BranchOp>(op) || isa<GotoOp>(op) || isa<ReturnOp>(op) || isa<AllocaOp>(op))
@@ -60,9 +60,8 @@ bool variant(Op *op, LoopInfo *info, LoopInfo *outer, int depth = 0) {
   if (isa<PhiOp>(op)) {
     auto parent = op->getParent();
     // For header phis, the only concern would be preheader.
-    // Don't trap in an infinite loop.
     if (parent == info->header)
-      return variant(Op::getPhiFrom(op, info->preheader), info, outer);
+      return variant(Op::getPhiFrom(op, info->preheader), info, outer, visited);
   }
 
   for (auto operand : op->getOperands()) {
@@ -72,8 +71,8 @@ bool variant(Op *op, LoopInfo *info, LoopInfo *outer, int depth = 0) {
       continue;
     // We can't hoist out things that are between `outer` and `info`.
     if (parent->dominates(info->header) && parent != info->header)
-      return false;
-    if (variant(def, info, outer, depth + 1))
+      return true;
+    if (variant(def, info, outer, visited))
       return true;
   }
   return false;
@@ -226,7 +225,8 @@ bool LICM::hoistSubloop(LoopInfo *outer) {
     bool good = true;
     for (auto bb : loop->getBlocks()) {
       for (auto op : bb->getOps()) {
-        if (variant(op, loop, outer)) {
+        std::set<Op*> visited;
+        if (variant(op, loop, outer, visited)) {
           good = false;
           break;
         }
