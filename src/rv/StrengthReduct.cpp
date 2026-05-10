@@ -125,6 +125,52 @@ int StrengthReduct::runImpl() {
       return true;
     }
 
+    // Handle x * ((1<<n) - 1) where n >= 2.
+    // e.g., x*7 = (x<<3) - x, x*15 = (x<<4) - x, x*31 = (x<<5) - x
+    // These are NOT caught by bits==2 case because they have 3+ bits set.
+    for (int n = 2; n < 31; n++) {
+      int pow2n = 1 << n;
+      if (i == pow2n - 1) {
+        converted++;
+        builder.setBeforeOp(op);
+        Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(n) });
+        builder.replace<SubwOp>(op, { shifted, x });
+        return true;
+      }
+    }
+
+    // Handle x * ((1<<n) + 1) where n >= 1.
+    // e.g., x*9 = (x<<3) + x, x*17 = (x<<4) + x
+    for (int n = 1; n < 31; n++) {
+      int pow2n = 1 << n;
+      if (i == pow2n + 1) {
+        converted++;
+        builder.setBeforeOp(op);
+        Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(n) });
+        builder.replace<AddwOp>(op, { shifted, x });
+        return true;
+      }
+    }
+
+    // Handle x * ((1<<n) + (1<<m)) where n > m >= 1 and bits > 2.
+    // e.g., x*10 = (x<<3) + (x<<1), x*18 = (x<<4) + (x<<1)
+    int highest = 31 - __builtin_clz(i);
+    int secondHighest = highest - 1;
+    while (secondHighest >= 0 && ((i >> secondHighest) & 1) == 0) {
+      secondHighest--;
+    }
+    if (secondHighest >= 1) {
+      int remaining = i - (1 << highest) - (1 << secondHighest);
+      if (remaining == 0) {
+        converted++;
+        builder.setBeforeOp(op);
+        Value shiftedHigh = builder.create<SlliwOp>({ x }, { new IntAttr(highest) });
+        Value shiftedLow = builder.create<SlliwOp>({ x }, { new IntAttr(secondHighest) });
+        builder.replace<AddwOp>(op, { shiftedHigh, shiftedLow });
+        return true;
+      }
+    }
+
     // Similar to above, but for sub instead of add.
     for (int place = 0; place < 31; place++) {
       if (__builtin_popcount(i + (1 << place)) == 1) {
