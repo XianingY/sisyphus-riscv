@@ -236,11 +236,12 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     return false;
 
   // Fully unroll constant-bounded loops if it's small enough.
+  // Increased limit for better performance on tight inner loops in FFT/matmul.
   if (lower && upper && isa<IntOp>(lower) && isa<IntOp>(upper)) {
     int low = V(lower);
     int high = V(upper);
     int times = (high - low) / V(step);
-    if (times <= 1000 / loopsize)
+    if (times <= 2000 / loopsize)
       unroll = times;
   }
   // Not a constant loop.
