@@ -105,6 +105,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   const bool enableO2Experimental = plan.enableO2Experimental;
   const bool enableO1LiteTail = !aggressive;
   const bool armSafeStructured = opts.arm && !aggressive;
+  const bool enablePrivatizeReduction =
+    getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
   // "large" modules use an economy lane to cap compile-time, but "huge"
   // modules are safer with the full O1-style shrink pipeline before backend.
   // This avoids sending oversized IR to regalloc on cases like 84_long_array2.
@@ -167,7 +169,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    pm.addPass<sys::PrivatizeReduction>();
+    if (enablePrivatizeReduction)
+      pm.addPass<sys::PrivatizeReduction>();
     pm.addPass<sys::LICM>();
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
@@ -198,7 +201,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (enableO1LiteTail && !economyMode) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
       pm.addPass<sys::GVN>();
@@ -232,7 +236,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     int loopRounds = aggressive ? plan.o2LoopRounds : (economyMode ? 1 : 3);
     for (int i = 0; i < loopRounds; i++) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
@@ -242,7 +247,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (aggressive) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
@@ -252,7 +258,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
 
     if (aggressive) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();

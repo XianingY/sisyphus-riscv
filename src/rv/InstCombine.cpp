@@ -1,5 +1,7 @@
 #include "RvPasses.h"
 #include "RvDupPasses.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace sys::rv;
 using namespace sys;
@@ -19,8 +21,18 @@ bool inRange(int x) {
   return x >= -2048 && x <= 2047;
 }
 
+static bool getenvEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  if (std::strcmp(raw, "0") == 0 || std::strcmp(raw, "false") == 0)
+    return false;
+  return true;
+}
+
 void InstCombine::run() {
   Builder builder;
+  const bool enableLiZeroCombine = getenvEnabled("SISY_RV_ENABLE_LI_ZERO_COMBINE", false);
 
   runRewriter([&](AddOp *op) {
     auto x = op->getOperand(0).defining;
@@ -343,8 +355,10 @@ void InstCombine::run() {
   // Only run this after all int-related fold completes.
   // Rewrite `li a0, 0` into reading from `zero`.
   runRewriter([&](LiOp *op) {
+    if (!enableLiZeroCombine)
+      return false;
     if (V(op) == 0)
-      builder.replace<ReadRegOp>(op, Value::i32, { new RegAttr(Reg::zero)} );
+      builder.replace<ReadRegOp>(op, op->getResultType(), { new RegAttr(Reg::zero)} );
     
     return false;
   });
