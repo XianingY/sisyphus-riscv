@@ -149,11 +149,35 @@ int StrengthReduct::runImpl() {
       converted++;
       builder.setBeforeOp(op);
 
-      // and     w8, w0, #1
-      // cmp     w0, #0
-      // cneg    w0, w8, lt
+      // Clang output of x % 2:
+      //   and     w8, w0, #1
+      //   cmp     w0, #0
+      //   cneg    w0, w8, lt
       Value _and = builder.create<AndIOp>({ x }, { new IntAttr(1) });
       builder.replace<CnegLtZOp>(op, { x, _and });
+      return true;
+    }
+
+    if (__builtin_popcount(i) == 1) {
+      // For x % 2^n (power of 2), use bitwise AND which is much faster than division.
+      // Algorithm: result = x & (2^n - 1) for positive x
+      // For signed x, need to handle negative: (x + (x>>31)) & (2^n-1) - (x>>31)
+      // Simplified: (x + bias) & mask - bias where bias = x>>31 & (2^n-1)
+      converted++;
+      builder.setBeforeOp(op);
+
+      // x >> 31 (sign extension)
+      Value sra = builder.create<AsrWIOp>({ x }, { new IntAttr(31) });
+      // mask = 2^n - 1 = (1 << n) - 1 = i - 1
+      Value mask = builder.create<MovIOp>({ new IntAttr(i - 1) });
+      // bias = sign >> 31 & mask = sra & mask
+      Value bias = builder.create<AndIOp>({ sra, mask });
+      // x + bias
+      Value plus = builder.create<AddWOp>({ x, bias });
+      // (x + bias) & mask
+      Value masked = builder.create<AndIOp>({ plus, mask });
+      // result = masked - bias
+      builder.replace<SubWOp>(op, { masked, bias });
       return true;
     }
 
@@ -188,25 +212,33 @@ int StrengthReduct::runImpl() {
       converted++;
       builder.setBeforeOp(op);
 
-      // add     w8, w0, w0, lsr #31
-      // asr     w0, w8, #1
-      Value add = builder.create<AddWROp>({ x, x }, { new IntAttr(31) });
+      // See clang output: x / 2 should become
+      //   srliw   a1, a0, 31
+      //   add     a0, a0, a1
+      //   sraiw   a0, a0, 1
+      Value sra = builder.create<AsrWIOp>({ x }, { new IntAttr(31) });
+      Value add = builder.create<AddWOp>({ x, sra });
       builder.replace<AsrWIOp>(op, { add }, { new IntAttr(1) });
       return true;
     }
 
     if (__builtin_popcount(i) == 1) {
+      // For x / 2^n (power of 2), use shift with bias correction.
+      // Algorithm: (x + ((x >> 31) & (2^n - 1))) >> n
+      // This handles negative numbers correctly for truncation-toward-zero division.
+      int n = __builtin_ctz(i);
       converted++;
       builder.setBeforeOp(op);
 
-      // add     w8, w0, #(2^n - 1)
-      // cmp     w0, #0
-      // csel    w8, w8, w0, lt
-      // asr     w0, w8, #n
-      Value vi = builder.create<MovIOp>({ new IntAttr(i - 1) });
-      Value add = builder.create<AddWOp>({ x, vi });
-      Value csel = builder.create<CselLtZOp>({ x, add, x });
-      builder.replace<AsrWIOp>(op, { csel }, { new IntAttr(__builtin_ctz(i)) });
+      // mask = 2^n - 1
+      Value mask = builder.create<MovIOp>({ new IntAttr(i - 1) });
+      // sign = x >> 31 (sign extension)
+      Value sign = builder.create<AsrWIOp>({ x }, { new IntAttr(31) });
+      // bias = sign & mask
+      Value bias = builder.create<AndIOp>({ sign, mask });
+      // (x + bias) >> n
+      Value plus = builder.create<AddWOp>({ x, bias });
+      builder.replace<AsrWIOp>(op, { plus }, { new IntAttr(n) });
       return true;
     }
 
