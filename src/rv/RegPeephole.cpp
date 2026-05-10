@@ -832,12 +832,13 @@ void materializeSpAddr(Builder &builder, Reg tmp, int offset) {
 }
 
 void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset) {
+  int size = ty == Value::i64 ? 8 : 4;
   if (fitsImm12(offset)) {
     builder.create<sys::rv::LoadOp>(ty, {
       RDC(dst),
       RSC(Reg::sp),
       new IntAttr(offset),
-      new SizeAttr(8)
+      new SizeAttr(size)
     });
     return;
   }
@@ -848,7 +849,7 @@ void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset) {
     RDC(dst),
     RSC(scratch),
     new IntAttr(0),
-    new SizeAttr(8)
+    new SizeAttr(size)
   });
 }
 
@@ -961,8 +962,9 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     // ...
     assert(argOffsets.count(op));
     int myoffset = offset + argOffsets[op];
+    Value::Type loadTy = argTypes[V(op)];
     builder.setBeforeOp(op);
-    emitStackLoad(builder, RD(op), isFP(RD(op)) ? Value::f32 : Value::i64, myoffset);
+    emitStackLoad(builder, RD(op), loadTy, myoffset);
     auto created = op->prevOp();
     if (created)
       op->replaceAllUsesWith(created);

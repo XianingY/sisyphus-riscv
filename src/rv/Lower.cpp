@@ -352,7 +352,7 @@ void Lower::run() {
     std::vector<std::pair<Value, Reg>> fargRegWrites;
     std::vector<Value> argsNew;
     std::vector<Value> fargsNew;
-    std::vector<Value> spilled;
+    std::vector<std::pair<Value, int>> spilled;
     int cnt = 0;
     int fcnt = 0;
     for (size_t i = 0; i < args.size(); i++) {
@@ -368,7 +368,7 @@ void Lower::run() {
         cnt++;
         continue;
       }
-      spilled.push_back(arg);
+      spilled.push_back({ arg, ty == Value::i64 ? 8 : 4 });
     }
 
     // More registers must get spilled to stack.
@@ -381,7 +381,10 @@ void Lower::run() {
     
     for (int i = 0; i < spilled.size(); i++) {
       auto sp = builder.create<ReadRegOp>(Value::i32, { new RegAttr(Reg::sp) });
-      builder.create<StoreOp>({ spilled[i], sp }, { new SizeAttr(8), new IntAttr(i * 8) });
+      builder.create<StoreOp>({ spilled[i].first, sp }, {
+        new SizeAttr(spilled[i].second),
+        new IntAttr(i * 8)
+      });
     }
 
     argsNew.reserve(argRegWrites.size());

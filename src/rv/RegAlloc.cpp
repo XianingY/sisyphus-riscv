@@ -326,6 +326,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   std::unordered_map<Op*, int> spillOffset;
   int currentOffset = STACKOFF(funcOp);
+  if (currentOffset % 8 != 0)
+    currentOffset = currentOffset / 8 * 8 + 8;
   int highest = 0;
 
   if (!fastMode) {
