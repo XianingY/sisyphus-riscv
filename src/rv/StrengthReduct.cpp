@@ -106,7 +106,7 @@ int StrengthReduct::runImpl() {
     if (bits == 1) {
       converted++;
       builder.setBeforeOp(op);
-      builder.replace<SlliwOp>(op, { x }, { new IntAttr(__builtin_ctz(i)) });
+      builder.replace<SlliOp>(op, { x }, { new IntAttr(__builtin_ctz(i)) });
       return true;
     }
 
