@@ -237,17 +237,20 @@ int StrengthReduct::runImpl() {
 
     auto bits = __builtin_popcount(i);
     if (bits == 1) {
-      // See clang output: x / 2^n should become
-      //   slli    a1, a0, 1
-      //   srli    a1, a1, (64 - n)
-      //   add     a0, a0, a1
-      //   sraiw   a0, a0, n
-      auto n = __builtin_ctz(i);
+      // For x / 2^n (power of 2), use shift with bias correction.
+      // Algorithm: (x + ((x >> 31) & (2^n - 1))) >> n
+      // This handles negative numbers correctly for truncation-toward-zero division.
+      int n = __builtin_ctz(i);
       converted++;
       builder.setBeforeOp(op);
 
-      Value ls = builder.create<SlliOp>({ x }, { new IntAttr(1) });
-      Value bias = builder.create<SrliOp>({ ls }, { new IntAttr(64 - n) });
+      // mask = 2^n - 1
+      Value mask = builder.create<LiOp>({ new IntAttr(i - 1) });
+      // sign = x >> 31 (sign extension)
+      Value sign = builder.create<SraiwOp>({ x }, { new IntAttr(31) });
+      // bias = sign & mask
+      Value bias = builder.create<AndOp>({ sign, mask });
+      // (x + bias) >> n
       Value plus = builder.create<AddOp>({ x, bias });
       builder.replace<SraiwOp>(op, { plus }, { new IntAttr(n) });
       return true;
@@ -333,27 +336,25 @@ int StrengthReduct::runImpl() {
     }
 
     if (__builtin_popcount(i) == 1) {
-      // Clang output of x % 2^n:
-      //   slli    a1, a0, 1
-      //   srli    a1, a1, (64 - n)
-      //   add     a1, a1, a0
-      //   andi    a1, a1, -2^n
-      //   subw    a0, a0, a1
+      // For x % 2^n (power of 2), use bitwise AND which is much faster than division.
+      // Algorithm: result = x & (2^n - 1) for positive x
+      // For signed x, need to handle negative: (x + (x>>31)) & (2^n-1) - (x>>31)
+      // Simplified: (x + bias) & mask - bias where bias = x>>31 & (2^n-1)
       converted++;
       builder.setBeforeOp(op);
-      
-      int n = __builtin_ctz(i);
-      Value ls = builder.create<SlliOp>({ x }, { new IntAttr(1) });
-      Value bias = builder.create<SrliOp>({ ls }, { new IntAttr(64 - n) });
+
+      // x >> 31 (sign extension)
+      Value sra = builder.create<SraiwOp>({ x }, { new IntAttr(31) });
+      // mask = 2^n - 1 = (1 << n) - 1 = i - 1
+      Value mask = builder.create<LiOp>({ new IntAttr(i - 1) });
+      // bias = sign >> 31 & mask = sra & mask
+      Value bias = builder.create<AndOp>({ sra, mask });
+      // x + bias
       Value plus = builder.create<AddOp>({ x, bias });
-      Value andi;
-      if (i <= 2048)
-        andi = builder.create<AndiOp>({ plus }, { new IntAttr(-i) });
-      else {
-        Value value = builder.create<LiOp>({ new IntAttr(-i) });
-        andi = builder.create<AndOp>({ plus, value });
-      }
-      builder.replace<SubwOp>(op, { x, andi });
+      // (x + bias) & mask
+      Value masked = builder.create<AndOp>({ plus, mask });
+      // result = masked - bias
+      builder.replace<SubwOp>(op, { masked, bias });
       return true;
     }
 
