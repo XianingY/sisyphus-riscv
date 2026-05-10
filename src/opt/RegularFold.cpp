@@ -96,6 +96,9 @@ static Rule rules[] = {
   "(change (div (mul x 'a) 'b) (!only-if (!eq (!mod 'a 'b) 0) (mul x (!div 'a 'b))))",
   "(change (div (div x 'a) 'b) (!only-if (!ne (!mul 'a 'b) -1) (div x (!mul 'a 'b))))",
 
+  // Word division (32-bit) - same chain folding as 64-bit
+  "(change (divw (divw x 'a) 'b) (!only-if (!ne (!mul 'a 'b) -1) (divw x (!mul 'a 'b))))",
+
   // Long division
   "(change (divl x 1) x)",
 

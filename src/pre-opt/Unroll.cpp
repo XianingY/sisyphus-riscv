@@ -40,9 +40,11 @@ void Unroll::run() {
     if (opcount(region) >= 50)
       continue;
 
-    // Don't unroll loops with calls in it.
-    if (loop->findAll<CallOp>().size() > 0)
-      continue;
+    // Allow unrolling loops with calls - the call will be duplicated and later
+    // optimization passes can inline or eliminate the redundancy. This enables
+    // unrolling of loops that contain small helper functions.
+    // if (loop->findAll<CallOp>().size() > 0)
+    //   continue;
 
     // unroll() requires that step is 1.
     auto step = loop->DEF(2);
