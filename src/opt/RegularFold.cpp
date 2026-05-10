@@ -225,6 +225,23 @@ static Rule rules[] = {
   // And
   "(change (and x 0) 0)",
   "(change (and 'a 'b) (!and 'a 'b))",
+  "(change (and x x) x)",
+  "(change (and x -1) x)",
+  "(change (and -1 x) x)",
+
+  // Or
+  "(change (or x 0) x)",
+  "(change (or 0 x) x)",
+  "(change (or x x) x)",
+  "(change (or 'a 'b) (!or 'a 'b))",
+  "(change (or x -1) -1)",
+  "(change (or -1 x) -1)",
+
+  // Xor
+  "(change (xor x 0) x)",
+  "(change (xor 0 x) x)",
+  "(change (xor x x) 0)",
+  "(change (xor 'a 'b) (!xor 'a 'b))",
 
   // Select
   "(change (select 1 x y) x)",

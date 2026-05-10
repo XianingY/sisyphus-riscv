@@ -140,6 +140,23 @@ void InstCombine::run() {
     return false;
   });
 
+  runRewriter([&](SrlwOp *op) {
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      auto val = V(y);
+      if (!inRange(val))
+        return false;
+
+      combined++;
+      builder.replace<SrliwOp>(op, { x }, { new IntAttr(val) });
+      return true;
+    }
+
+    return false;
+  });
+
   runRewriter([&](SraOp *op) {
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -157,6 +174,23 @@ void InstCombine::run() {
     return false;
   });
 
+  runRewriter([&](SrlOp *op) {
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      auto val = V(y);
+      if (!inRange(val))
+        return false;
+
+      combined++;
+      builder.replace<SrliOp>(op, { x }, { new IntAttr(val) });
+      return true;
+    }
+
+    return false;
+  });
+
   runRewriter([&](SllOp *op) {
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -168,6 +202,42 @@ void InstCombine::run() {
 
       combined++;
       builder.replace<SlliOp>(op, { x }, { new IntAttr(val) });
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter([&](OrOp *op) {
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+    if (isa<LiOp>(x) && inRange(x)) {
+      combined++;
+      builder.replace<OriOp>(op, { y }, { x->get<IntAttr>() });
+      return true;
+    }
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      combined++;
+      builder.replace<OriOp>(op, { x }, { y->get<IntAttr>() });
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter([&](XorOp *op) {
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+    if (isa<LiOp>(x) && inRange(x)) {
+      combined++;
+      builder.replace<XoriOp>(op, { y }, { x->get<IntAttr>() });
+      return true;
+    }
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      combined++;
+      builder.replace<XoriOp>(op, { x }, { y->get<IntAttr>() });
       return true;
     }
 
@@ -224,6 +294,87 @@ void InstCombine::run() {
   });
 
   RvDCE(module).run();
+
+  runRewriter([&](SlliwOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SrliwOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SraiwOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SlliOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SrliOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SraiOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](AndiOp *op) {
+    if (V(op) == -1) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](OriOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](XoriOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
 
   runRewriter([&](AddiwOp *op) {
     if (V(op) == 0) {
