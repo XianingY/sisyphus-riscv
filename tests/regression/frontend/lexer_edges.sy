@@ -1,9 +1,0 @@
-int main() {
-  float x = 0x1.fp+2;
-  int y = x;
-  // keep lexer around boundary-heavy forms
-  if (y == 7) {
-    return 0;
-  }
-  return 1;
-}

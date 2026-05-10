@@ -232,6 +232,17 @@ public:
   void run() override;
 };
 
+class PrivatizeReduction : public Pass {
+  int privatized = 0;
+  void runImpl(LoopInfo *info);
+public:
+  PrivatizeReduction(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "privatize-reduction"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 }
 
 #endif
