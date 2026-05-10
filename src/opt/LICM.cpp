@@ -69,9 +69,10 @@ bool variant(Op *op, LoopInfo *info, LoopInfo *outer, std::set<Op*> &visited) {
     auto parent = def->getParent();
     if (parent->dominates(outer->header) && parent != outer->header)
       continue;
-    // We can't hoist out things that are between `outer` and `info`.
+    // Values defined between `outer` and `info` are part of the outer loop
+    // but outside the inner loop — skip them for subloop hoisting decisions.
     if (parent->dominates(info->header) && parent != info->header)
-      return true;
+      continue;
     if (variant(def, info, outer, visited))
       return true;
   }
