@@ -79,6 +79,20 @@ public:
   void run() override;
 };
 
+// Tail recursion elimination after structured control has been lowered to CFG.
+class LoweredTCO : public Pass {
+  int removed = 0;
+  int rejected = 0;
+
+  bool runImpl(FuncOp *func);
+public:
+  LoweredTCO(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "lowered-tco"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Remerge basic blocks.
 // It is always possible to ensure each region has one block (except allocas),
 // since before FlattenCFG there's no jumps.

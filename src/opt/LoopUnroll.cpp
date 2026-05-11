@@ -1,5 +1,7 @@
 #include "LoopPasses.h"
 #include "Passes.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace sys;
 
@@ -235,8 +237,11 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   if (!isa<IntOp>(step))
     return false;
 
-  // Helper to estimate upper bound for runtime-computed values
-  // Returns -1 if can't estimate, otherwise returns estimated upper bound
+  auto runtimeUnrollEnabled = []() {
+    auto env = std::getenv("SISY_ENABLE_RUNTIME_UNROLL");
+    return env && std::strcmp(env, "1") == 0;
+  };
+
   auto estimateUpperBound = [](Op* expr) -> int64_t {
     if (!expr)
       return -1;
@@ -285,7 +290,7 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     int times = (high - low) / V(step);
     if (times <= 2000 / loopsize)
       unroll = times;
-  } else {
+  } else if (runtimeUnrollEnabled()) {
     // Partial unrolling for runtime-bounded loops (e.g., fft inner loops)
     // Try to estimate the upper bound
     int64_t estUpper = estimateUpperBound(upper);

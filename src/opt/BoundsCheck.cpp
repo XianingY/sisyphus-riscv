@@ -1,231 +1,262 @@
 #include "LoopPasses.h"
-#include "Passes.h"
 
 using namespace sys;
 
-// BoundsCheck pass
-// Eliminates redundant bounds checks in stencil loops like conv2d.
-//
-// Pattern: if (i + offset >= 0 && i + offset < bound) { access array[i+offset] }
-//
-// For conv2d with pad=2:
-// - When r is in [pad, N-pad), the row check is always true
-// - When c is in [pad, N-pad), the col check is always true
-//
-// Strategy:
-// 1. Find stencil access patterns with constant offsets
-// 2. Determine safe region based on loop bounds
-// 3. Hoist or eliminate redundant checks
-
 std::map<std::string, int> BoundsCheck::stats() {
-    return {
-        {"checks-eliminated", eliminated},
-        {"checks-hoisted", hoisted}
-    };
+  return {
+    { "branches-eliminated", branchesEliminated },
+    { "bounds-proved", boundsProved },
+    { "bounds-rejected", boundsRejected },
+  };
 }
 
-// Extract the value from an Op, handling phi nodes
-Op* peelValue(Op* val) {
-    while (isa<PhiOp>(val) && val->getOperandCount() == 1) {
-        val = val->DEF();
-    }
-    return val;
+namespace {
+
+Op *peel(Op *op) {
+  while (op && isa<PhiOp>(op) && op->getOperandCount() == 1)
+    op = op->DEF();
+  return op;
 }
 
-// Check if an op is a known constant value
-bool tryGetIntValue(Op* op, int& result) {
-    op = peelValue(op);
-    if (auto intOp = dyn_cast<IntOp>(op)) {
-        result = V(intOp);
-        return true;
-    }
+struct Affine {
+  Op *base = nullptr;
+  int offset = 0;
+  bool valid = false;
+  bool constant = false;
+};
+
+struct IvInfo {
+  Op *iv = nullptr;
+  Op *start = nullptr;
+  Op *stop = nullptr;
+  Op *step = nullptr;
+};
+
+Affine affine(Op *op) {
+  op = peel(op);
+  if (!op)
+    return {};
+  if (auto *c = dyn_cast<IntOp>(op))
+    return { nullptr, V(c), true, true };
+  if (auto *add = dyn_cast<AddIOp>(op)) {
+    auto lhs = affine(add->DEF(0));
+    auto rhs = affine(add->DEF(1));
+    if (lhs.valid && rhs.constant)
+      return { lhs.base, lhs.offset + rhs.offset, true, lhs.constant };
+    if (rhs.valid && lhs.constant)
+      return { rhs.base, rhs.offset + lhs.offset, true, rhs.constant };
+    return {};
+  }
+  if (auto *sub = dyn_cast<SubIOp>(op)) {
+    auto lhs = affine(sub->DEF(0));
+    auto rhs = affine(sub->DEF(1));
+    if (lhs.valid && rhs.constant)
+      return { lhs.base, lhs.offset - rhs.offset, true, lhs.constant };
+    return {};
+  }
+  return { op, 0, true, false };
+}
+
+bool extractIndexOffset(Op *expr, Op *iv, int &offset) {
+  auto a = affine(expr);
+  if (!a.valid || a.constant || peel(a.base) != peel(iv))
     return false;
+  offset = a.offset;
+  return true;
 }
 
-// Find the loop variable and step from a phi at the loop header
-// Returns the induction variable op and step value
-Op* findLoopInductionVar(LoopInfo* loop, int& step) {
-    step = loop->getStep();
-    return loop->getInduction();
-}
-
-// Check if we can prove that (indVar + offset) is always within [0, bound)
-// given that indVar is in [loopStart, loopStop)
-bool canProveAlwaysInBounds(Op* indVar, int offset, Op* bound, LoopInfo* loop) {
-    // Get loop bounds
-    auto start = peelValue(loop->getStart());
-    auto stop = peelValue(loop->getStop());
-
-    int startVal, stopVal, boundVal;
-
-    // Need constant loop bounds for now
-    if (!tryGetIntValue(start, startVal) || !tryGetIntValue(stop, stopVal))
-        return false;
-
-    // Step must be positive
-    if (loop->getStep() <= 0)
-        return false;
-
-    // If offset is such that even at the minimum indVar, idx >= 0 is guaranteed
-    int minIdx = startVal + offset;
-    bool lowerSafe = (minIdx >= 0);
-
-    // For upper bound, we need startVal + offset < bound OR stopVal + offset <= bound
-    // But this depends on bound which might not be constant
-    // For now, just check if offset >= 0 and startVal >= 0
-    if (!lowerSafe)
-        return false;
-
-    // Check upper bound - if bound is constant
-    if (tryGetIntValue(bound, boundVal)) {
-        // Check if max possible index is < bound
-        int maxIdx = stopVal - 1 + offset;  // stop is exclusive, so last valid is stopVal - 1
-        return maxIdx < boundVal;
-    }
-
+bool isAddStep(Op *op, Op *iv, Op *&step) {
+  op = peel(op);
+  auto *add = dyn_cast<AddIOp>(op);
+  if (!add)
     return false;
+  if (peel(add->DEF(0)) == peel(iv)) {
+    step = add->DEF(1);
+    return true;
+  }
+  if (peel(add->DEF(1)) == peel(iv)) {
+    step = add->DEF(0);
+    return true;
+  }
+  return false;
 }
 
-// Look for: if (cond) { trueBody } else { falseBody }
-// where cond is a bounds check and trueBody has the actual access
-// Returns true if we can eliminate the check
-bool tryEliminateBoundsCheck(IfOp* ifOp, LoopInfo* loop, Op* indVar) {
-    auto cond = ifOp->getOperand(0).defining;
+Op *findStopFromTerm(Op *term, Op *iv) {
+  auto *branch = dyn_cast<BranchOp>(term);
+  if (!branch || !branch->getOperandCount())
+    return nullptr;
+  auto *cond = peel(branch->DEF());
+  auto *lt = dyn_cast<LtOp>(cond);
+  if (!lt)
+    return nullptr;
+  if (peel(lt->DEF(0)) == peel(iv))
+    return lt->DEF(1);
+  if (auto *add = dyn_cast<AddIOp>(peel(lt->DEF(0)))) {
+    if (peel(add->DEF(0)) == peel(iv) || peel(add->DEF(1)) == peel(iv))
+      return lt->DEF(1);
+  }
+  return nullptr;
+}
 
-    // Handle nested AndIOp: ((a >= 0 && a < N) && (b >= 0 && b < N))
-    // For now, just handle one level of AndIOp
-    Op* idx = nullptr;
-    Op* upper = nullptr;
+std::vector<IvInfo> collectIvs(LoopInfo *loop) {
+  std::vector<IvInfo> result;
+  if (!loop->preheader || loop->latches.size() != 1)
+    return result;
+  auto *latch = loop->getLatch();
 
-    // The condition is: idx >= 0 && idx < upper
-    // which is represented as AndIOp(LeOp(0, idx), LtOp(idx, upper))
-    if (!isa<AndIOp>(cond))
-        return false;
-
-    auto andOp = cast<AndIOp>(cond);
-    auto left = peelValue(andOp->DEF(0));
-    auto right = peelValue(andOp->DEF(1));
-
-    // Try to find LeOp(0, idx) on one side and LtOp(idx, upper) on the other
-    Op* foundIdx = nullptr;
-    bool foundLower = false, foundUpper = false;
-
-    // Check left side for lower bound check
-    if (auto le = dyn_cast<LeOp>(left)) {
-        auto le0 = peelValue(le->DEF(0));
-        auto leIdx = peelValue(le->DEF(1));
-        if (isa<IntOp>(le0) && V(le0) == 0) {
-            foundIdx = leIdx;
-            foundLower = true;
-        }
+  for (auto *phi : loop->header->getPhis()) {
+    if (phi->getOperandCount() != 2)
+      continue;
+    auto from0 = FROM(phi->getAttrs()[0]);
+    auto from1 = FROM(phi->getAttrs()[1]);
+    auto *def0 = phi->DEF(0);
+    auto *def1 = phi->DEF(1);
+    if (from0 == latch && from1 == loop->preheader) {
+      std::swap(from0, from1);
+      std::swap(def0, def1);
     }
+    if (from0 != loop->preheader || from1 != latch)
+      continue;
 
-    // Check right side for upper bound check
-    if (auto lt = dyn_cast<LtOp>(right)) {
-        if (foundIdx && peelValue(lt->DEF(0)) == foundIdx) {
-            upper = peelValue(lt->DEF(1));
-            foundUpper = true;
-        }
-    }
+    Op *step = nullptr;
+    if (!isAddStep(def1, phi, step) || !isa<IntOp>(step) || V(step) <= 0)
+      continue;
 
-    // Also check the swapped case
-    if (!foundUpper && !foundLower) {
-        if (auto lt = dyn_cast<LtOp>(left)) {
-            auto ltIdx = peelValue(lt->DEF(0));
-            auto ltUpper = peelValue(lt->DEF(1));
-            if (isa<IntOp>(ltUpper) && V(ltUpper) == 0) {
-                // This is idx < 0 which is wrong, skip
-            } else {
-                foundIdx = ltIdx;
-                upper = ltUpper;
-                foundUpper = true;
-            }
-        }
-        if (auto le = dyn_cast<LeOp>(right)) {
-            auto le0 = peelValue(le->DEF(0));
-            if (isa<IntOp>(le0) && V(le0) == 0) {
-                foundLower = true;
-            }
-        }
-    }
+    Op *stop = findStopFromTerm(loop->header->getLastOp(), phi);
+    if (!stop)
+      stop = findStopFromTerm(latch->getLastOp(), phi);
+    if (!stop)
+      continue;
 
-    if (!foundLower || !foundUpper || !foundIdx)
-        return false;
+    result.push_back({ phi, def0, stop, step });
+  }
+  return result;
+}
 
-    // Try to extract offset from foundIdx relative to indVar
-    int offset = -1;
-    if (foundIdx == indVar) {
-        offset = 0;
-    } else if (auto add = dyn_cast<AddIOp>(foundIdx)) {
-        if (peelValue(add->DEF(0)) == indVar && isa<IntOp>(add->DEF(1))) {
-            offset = V(add->DEF(1));
-        } else if (peelValue(add->DEF(1)) == indVar && isa<IntOp>(add->DEF(0))) {
-            offset = V(add->DEF(0));
-        }
-    } else if (auto sub = dyn_cast<SubIOp>(foundIdx)) {
-        if (peelValue(sub->DEF(0)) == indVar && isa<IntOp>(sub->DEF(1))) {
-            offset = -V(sub->DEF(1));
-        }
-    }
-
-    if (offset == -1)
-        return false;
-
-    // Now check if we can prove the condition is always true
-    if (canProveAlwaysInBounds(indVar, offset, upper, loop)) {
-        // We can eliminate the check - just execute the true branch
-        // For now, just mark as eliminated and remove the if
-        return true;
-    }
-
+bool proveLower(Op *idx, const IvInfo &iv) {
+  int offset = 0;
+  if (!extractIndexOffset(idx, iv.iv, offset))
     return false;
+
+  auto start = affine(iv.start);
+  if (!start.valid || !start.constant)
+    return false;
+  return start.offset + offset >= 0;
 }
 
-void BoundsCheck::runImpl(LoopInfo* loop) {
-    // Process subloops first
-    for (auto subloop : loop->subloops) {
-        runImpl(subloop);
+bool proveUpper(Op *idx, Op *bound, bool inclusive, const IvInfo &iv) {
+  int idxOffset = 0;
+  if (!extractIndexOffset(idx, iv.iv, idxOffset))
+    return false;
+
+  auto stop = affine(iv.stop);
+  auto upper = affine(bound);
+  if (!stop.valid || !upper.valid)
+    return false;
+
+  if (stop.constant && upper.constant) {
+    int maxIdx = stop.offset - 1 + idxOffset;
+    return inclusive ? maxIdx <= upper.offset : maxIdx < upper.offset;
+  }
+
+  if (stop.constant || upper.constant || peel(stop.base) != peel(upper.base))
+    return false;
+
+  // The loop is canonicalized as iv < stop for positive steps, so the last
+  // possible iv is <= stop - 1.  Compare offsets relative to the same base.
+  int maxIdxOffset = stop.offset - 1 + idxOffset;
+  return inclusive ? maxIdxOffset <= upper.offset : maxIdxOffset < upper.offset;
+}
+
+bool provePredicateTrue(Op *cond, const IvInfo &iv) {
+  cond = peel(cond);
+  if (!cond)
+    return false;
+  if (auto *c = dyn_cast<IntOp>(cond))
+    return V(c) != 0;
+  if (auto *andOp = dyn_cast<AndIOp>(cond))
+    return provePredicateTrue(andOp->DEF(0), iv) &&
+           provePredicateTrue(andOp->DEF(1), iv);
+  if (auto *lt = dyn_cast<LtOp>(cond))
+    return proveUpper(lt->DEF(0), lt->DEF(1), /*inclusive=*/ false, iv);
+  if (auto *le = dyn_cast<LeOp>(cond)) {
+    auto lhs = peel(le->DEF(0));
+    auto rhs = peel(le->DEF(1));
+    if (auto *c = dyn_cast<IntOp>(lhs); c && V(c) == 0)
+      return proveLower(rhs, iv);
+    return proveUpper(lhs, rhs, /*inclusive=*/ true, iv);
+  }
+  return false;
+}
+
+void removePhiIncoming(BasicBlock *bb, BasicBlock *from) {
+  if (!bb || !from)
+    return;
+  for (auto *phi : bb->getPhis()) {
+    for (int i = (int) phi->getAttrs().size() - 1; i >= 0; i--) {
+      if (FROM(phi->getAttrs()[i]) == from) {
+        phi->removeOperand(i);
+        phi->removeAttribute(i);
+      }
+    }
+  }
+}
+
+} // namespace
+
+void BoundsCheck::runImpl(LoopInfo *loop) {
+  for (auto *subloop : loop->subloops)
+    runImpl(subloop);
+
+  if (!loop->subloops.empty())
+    return;
+  auto ivs = collectIvs(loop);
+  if (ivs.empty())
+    return;
+
+  Builder builder;
+
+  for (auto *bb : loop->getBlocks()) {
+    auto *term = bb->getLastOp();
+    auto *branch = dyn_cast<BranchOp>(term);
+    if (!branch || !branch->has<TargetAttr>() || !branch->has<ElseAttr>())
+      continue;
+    if (!loop->contains(TARGET(branch)) || !loop->contains(ELSE(branch)))
+      continue;
+
+    bool proven = false;
+    for (const auto &iv : ivs) {
+      if (provePredicateTrue(branch->DEF(), iv)) {
+        proven = true;
+        break;
+      }
+    }
+    if (!proven) {
+      boundsRejected++;
+      continue;
     }
 
-    // Only process innermost loops
-    if (!loop->subloops.empty())
-        return;
-
-    // Get loop info
-    int stepVal;
-    auto indVar = findLoopInductionVar(loop, stepVal);
-    if (!indVar)
-        return;
-
-    // Look for bounds check patterns in the loop body
-    for (auto bb : loop->getBlocks()) {
-        for (auto op : bb->getOps()) {
-            if (!isa<IfOp>(op))
-                continue;
-
-            auto ifOp = cast<IfOp>(op);
-
-            // Try to eliminate this bounds check
-            if (tryEliminateBoundsCheck(ifOp, loop, indVar)) {
-                eliminated++;
-                // TODO: Actually replace the if with unconditional execution
-                // For now just count it
-            }
-        }
-    }
+    auto *trueTarget = TARGET(branch);
+    auto *falseTarget = ELSE(branch);
+    if (trueTarget != falseTarget)
+      removePhiIncoming(falseTarget, bb);
+    builder.replace<GotoOp>(branch, { new TargetAttr(trueTarget) });
+    boundsProved++;
+    branchesEliminated++;
+  }
 }
 
 void BoundsCheck::run() {
-    LoopAnalysis analysis(module);
-    analysis.run();
-    auto forests = analysis.getResult();
+  LoopAnalysis analysis(module);
+  analysis.run();
+  auto forests = analysis.getResult();
 
-    for (auto func : collectFuncs()) {
-        auto& forest = forests[func];
-
-        for (auto loop : forest.getLoops()) {
-            if (!loop->getParent())
-                runImpl(loop);
-        }
+  for (auto *func : collectFuncs()) {
+    auto &forest = forests[func];
+    for (auto *loop : forest.getLoops()) {
+      if (!loop->getParent())
+        runImpl(loop);
     }
+    func->getRegion()->updatePreds();
+  }
 }

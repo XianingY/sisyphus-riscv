@@ -42,29 +42,131 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 优化手段总览
+---
 
-| 序号 | 模块 | 优化类型 | 目标测试 |
-|------|------|---------|---------|
-| 1 | StrengthReduce | 强度削减 | 所有测试 |
-| 2 | LoopInterchange | 循环交换 | transpose0/1/2 |
-| 3 | Fusion 增强 | 循环融合 | many_mat_cal, 03_sort1 |
-| 4 | BoundsCheck | 边界优化 | conv2d-1/2/3 |
-| 5 | LICM 增强 | 循环不变外提 | optimization_scheduling1 |
-| 6 | PartialUnroll | 部分展开 | fft0/1/2 |
-| 7 | TailRecElim | 尾递归消除 | knapsack_naive |
-| 8 | DPTransforms | DP 模式识别 | knapsack_naive |
+## 2. 参考资源分析
+
+### 2.1 剑桥大学编译优化课程
+
+**可应用内容**：
+
+1. **Abstract Interpretation（抽象解释）**
+   - 当前项目：`src/opt/Range.cpp` 已使用区间分析（一种抽象解释）
+   - 可增强：更精确的 widening 操作、指向分析、别名分析
+
+2. **数据流分析框架**
+   - 可增强 DCE、DSE、LICM 等 pass 的分析精度
+   - 竞赛相关：前 9 讲覆盖内容最相关
+
+3. **Superoptimization 概念**
+   - 参考 Souper（MLIR 超优化器）的思路
+   - 穷举小模式表 + SMT-like 证明
+
+**应用到本项目**：
+- 增强 `Range.cpp` 的 widening 操作
+- 实现更精确的指向分析以支持更 aggressive 的 DSE
 
 ---
 
-## 2. 模块详细设计
+### 2.2 Clang IR / MLIR
 
-### 2.1 StrengthReduce（强度削减优化）
+**可应用内容**：
 
-#### 2.1.1 目标
+1. **Declarative Rewrite Patterns（声明式重写模式）**
+   - 当前项目已有：`src/utils/Matcher.h` - 简单的模式匹配框架
+   - 可增强：支持更复杂的模式组合
+
+2. **多级 IR 分离**
+   - 当前项目已有：HIR → CFG → Legacy ModuleOp
+   - 已有参考价值，设计合理，无需大改
+
+3. **Loop Transformation 接口**
+   - MLIR 的 `affine.for` 和 `affine.load` 提供了天然的 SCoP 边界
+   - 本项目可参考设计 LoopInterchange 的接口
+
+**应用到本项目**：
+- 增强 Matcher 框架支持更复杂的 Algebraic Simplification
+- 借用 MLIR 的 Affine 接口思想设计 BoundsCheck
+
+---
+
+### 2.3 FPL（Fast Presburger Library）
+
+**可应用内容**：
+
+1. **多面体优化的数学原理**
+   - Presburger 算术集合操作
+   - Integer Set Library 实现思路
+
+2. **依赖分析**
+   - 多面体依赖距离计算
+   - Fourier-Motzkin  elimination
+
+**应用到本项目**：
+- 方案 A（轻量增强）不引入完整多面体框架
+- BoundsCheck 优化使用简化的仿射分析（足够处理 stencil 边界）
+- 如需完整多面体优化，扩展 `src/utils/presburger/BasicSet.cpp`
+
+---
+
+### 2.4 z3 / Souper
+
+**可应用内容**：
+
+1. **Superoptimizer 概念**
+   - 穷举小指令序列，找更优替代
+   - 使用 SMT 求解器证明等价性
+
+2. **CDCL 算法思想**
+   - SAT 求解器的核心算法
+   - 可启发寄存器分配冲突检测
+
+**应用到本项目**：
+
+```cpp
+// 新增：LightweightSuperopt.cpp
+// 不引入 z3，使用简化的等价性证明
+
+// 核心思路：
+// 1. 维护一个已知优化模式表
+// 2. 遍历函数中的指令序列
+// 3. 对每个序列，检查模式表是否有更优替换
+
+// 模式表示例：
+// (add x x)           → (shl x 1)           [x * 2 = x << 1]
+// (mul x 4)           → (shl x 2)           [x * 4 = x << 2]
+// (div x 2)           → (shr x 1)           [x / 2 = x >> 1]
+// (mul x (add y z))   → (add (mul x y) (mul x z))  [分配律]
+```
+
+**注意**：竞赛中不能引入 z3，但可以自研简化版本。
+
+---
+
+## 3. 优化手段总览
+
+| 序号 | 模块 | 优化类型 | 目标测试 | 参考资源 |
+|------|------|---------|---------|---------|
+| 1 | StrengthReduce | 强度削减 | 所有测试 | MLIR, Souper |
+| 2 | LoopInterchange | 循环交换 | transpose0/1/2 | MLIR Affine |
+| 3 | Fusion 增强 | 循环融合 | many_mat_cal, 03_sort1 | MLIR Pattern |
+| 4 | BoundsCheck | 边界优化 | conv2d-1/2/3 | FPL (简化) |
+| 5 | LICM 增强 | 循环不变外提 | optimization_scheduling1 | 剑桥课程 |
+| 6 | PartialUnroll | 部分展开 | fft0/1/2 | 剑桥课程 |
+| 7 | TailRecElim | 尾递归消除 | knapsack_naive | 递归→迭代 |
+| 8 | DPTransforms | DP 模式识别 | knapsack_naive | 递归→DP |
+| 9 | LightweightSuperopt | 超优化 | 所有测试 | Souper/z3 |
+
+---
+
+## 4. 模块详细设计
+
+### 4.1 StrengthReduce（强度削减优化）
+
+#### 4.1.1 目标
 将乘除法转换为更快的移位/加法操作，所有测试受益。
 
-#### 2.1.2 优化场景
+#### 4.1.2 优化场景
 
 **场景 1：乘以 2 的幂**
 ```c
@@ -75,34 +177,7 @@ idx = i * 1024;
 idx = i << 10;  // 1024 = 2^10
 ```
 
-**场景 2：乘以常量**
-```c
-// 优化前
-sum = sum + v * 5;
-
-// 优化后
-sum = sum + (v << 2) + v;  // 5 = 4 + 1
-```
-
-**场景 3：除以常量（2 的幂）**
-```c
-// 优化前
-i = j / 1024;
-
-// 优化后
-i = j >> 10;
-```
-
-**场景 4：模 2 的幂**
-```c
-// 优化前
-i = j % 1024;
-
-// 优化后
-i = j & 1023;  // 1024 - 1
-```
-
-**场景 5：索引计算优化**
+**场景 2：索引计算优化（参考 MLIR 的 loop-invariant code motion）**
 ```c
 // 优化前
 for (i = 0; i < n; i++)
@@ -122,51 +197,37 @@ for (i = 0; i < n; i++) {
 }
 ```
 
-#### 2.1.3 实现位置
+**场景 3：除以常量（2 的幂）**
+```c
+// 优化前
+i = j / 1024;
+
+// 优化后
+i = j >> 10;
+```
+
+#### 4.1.3 实现位置
 ```
 src/opt/StrengthReduce.cpp  (新增)
 ```
 
-#### 2.1.4 依赖关系
-- 依赖 SCEV 分析（已有 `src/opt/SCEV.cpp`）
-- 被其他优化 pass 调用
-
-#### 2.1.5 正确性保证
+#### 4.1.4 正确性保证
 - 只对编译期常量进行变换
-- 乘法强度削减使用移位 + 加法组合，需要验证语义等价
-- 除法/模 2 的幂只在**确定无符号溢出风险**时优化
+- 乘法强度削减使用移位 + 加法组合
+- 除法/模 2 的幂只在确定无符号溢出风险时优化
 
 ---
 
-### 2.2 LoopInterchange（循环交换）
+### 4.2 LoopInterchange（循环交换）
 
-#### 2.2.1 目标
+#### 4.2.1 目标
 交换嵌套循环的内外层顺序以改善访存局部性，解决 transpose 系列测试。
 
-#### 2.2.2 目标场景
-
-**转置场景**
-```c
-// 优化前：按列访问（cache 不友好）
-for (i = 0; i < n; i++)
-    for (j = 0; j < n; j++)
-        B[j][i] = A[i][j];
-
-// 优化后：按行访问（cache 友好）
-for (j = 0; j < n; j++)
-    for (i = 0; i < n; i++)
-        B[j][i] = A[i][j];
-```
-
-#### 2.2.3 可交换条件
+#### 4.2.2 可交换条件
 
 ```cpp
 // 条件 1：完美嵌套
-//   外层循环只包含内层循环，不包含其他语句
-
 // 条件 2：无循环携带依赖
-//   所有依赖的方向必须是 [>=0, >=0]
-//   即：内层循环的依赖不能指向"外层更早的迭代"
 
 struct DependenceDirection {
     int outer;  // 外层循环依赖方向
@@ -174,16 +235,6 @@ struct DependenceDirection {
 };
 
 // 可交换 ⟺ 对所有依赖 D，有 D.inner >= 0
-```
-
-**示例：不可交换的情况**
-```c
-// A[i][j] 依赖 A[i-1][j]
-// 依赖方向：[-1, 0]
-// D.outer = -1 < 0 → 不可交换
-for (i = 1; i < n; i++)
-    for (j = 0; j < n; j++)
-        A[i][j] = A[i-1][j];
 ```
 
 **示例：可交换的情况**
@@ -197,74 +248,24 @@ for (i = 0; i < n; i++)
         B[j][i] = A[i][j];
 ```
 
-#### 2.2.4 实现位置
+#### 4.2.3 实现位置
 ```
 src/opt/LoopInterchange.cpp  (新增)
-src/opt/LoopInterchange.h   (新增)
-```
-
-#### 2.2.5 实现步骤
-
-```cpp
-// 1. 检测完美嵌套
-bool isPerfectNest(ForOp* outer) {
-    // outer 的 body 必须只有一个 Block
-    // 该 Block 的最后一个 Op 是 inner ForOp
-    // inner ForOp 之前没有其他 Op
-}
-
-// 2. 提取访问模式
-struct ArrayAccess {
-    Op* array;
-    std::vector<Expr*> subscripts;
-    bool isWrite;
-};
-
-// 3. 依赖方向分析
-//    对每个语句对 (S1, S2)，计算依赖距离向量
-//    只处理 A[i+dx][j+dy] 形式，其中 dx, dy 是常量
-
-// 4. 执行交换
-void interchange(ForOp* outer, ForOp* inner) {
-    // 交换 ForOp 的 induction variable
-    // 重写内层循环体的访问
-    // 调整循环边界
-}
-```
-
-#### 2.2.6 限制条件
-```
-只处理以下情况：
-  ✓ 完美嵌套循环
-  ✓ 单个数组访问（或可分析的多重访问）
-  ✓ 依赖是 A[i±c1][j±c2] = A[i±d1][j±d2] 形式
-  ✓ c1, c2, d1, d2 都是整型常量
-
-不处理：
-  ✗ 非完美嵌套
-  ✗ 间接访问 A[B[i]]
-  ✗ 运行时依赖分析
 ```
 
 ---
 
-### 2.3 Fusion 增强（下标等价性 + 跨循环融合）
+### 4.3 Fusion 增强（下标等价性 + 跨循环融合）
 
-#### 2.3.1 目标
-增强现有 Fusion pass，解决 two_D_offset 和下标等价性问题。
+#### 4.3.1 目标
+增强现有 Fusion pass，解决下标等价性问题。
 
-#### 2.3.2 当前问题
-Fusion.cpp:137 有 TODO 注释：
-```cpp
-// A very strict way of checking dependency:
-// 1) all subscripts must be the same (except for those that are only read);
-// 2) non-array variables must be disjoint.
-// Polyhedral approach here? Might extend when I have time.
-```
+#### 4.3.2 当前问题
+Fusion.cpp:137 有 TODO 注释，标识需要 polyhedral 方法。
 
-#### 2.3.3 增强内容
+#### 4.3.3 增强内容
 
-**增强 1：下标等价性**
+**增强：下标等价性**
 ```c
 // 当前：只接受完全相同的下标
 for (i) A[i] = ...;    ✓ 可融合
@@ -275,75 +276,20 @@ for (i) A[i] = ...;    ✓ 可融合
 for (i) ... = A[i+0];  ✓ (i+0 = i)
 ```
 
-**增强 2：跨循环依赖松弛**
-```c
-// 多个相邻独立循环可融合
-for (i) A[i] = -1;    →  for (i) {
-for (i) B[i] = -1;    →      A[i] = -1;
-for (i) C[i] = A[i];  →      B[i] = -1;
-                           }
+#### 4.3.4 实现位置
 ```
-
-#### 2.3.4 实现位置
-```
-src/opt/Fusion.cpp  (修改)
 src/opt/IndexEquiv.cpp   (新增)
-src/opt/IndexEquiv.h     (新增)
-```
-
-#### 2.3.5 IndexEquiv 核心算法
-
-```cpp
-// 下标表达式归一化
-struct AffineExpr {
-    int64_t constant;           // 常数偏移
-    std::vector<std::pair<std::string, int64_t>> coeffs;  // 变量系数
-};
-
-// 归一化规则
-AffineExpr normalize(Expr* e) {
-    // i     → {constant=0, coeffs=[{i,1}]}
-    // i+1   → {constant=1, coeffs=[{i,1}]}
-    // i+j   → {constant=0, coeffs=[{i,1},{j,1}]}
-    // i+0   → {constant=0, coeffs=[{i,1}]}  ← 与 i 等价
-    // 0+i   → {constant=0, coeffs=[{i,1}]}  ← 与 i 等价
-}
-
-// 等价判断
-bool isEquivalent(AffineExpr a, AffineExpr b) {
-    // 去掉零系数
-    // 比较常数和所有系数
-}
-```
-
-#### 2.3.6 限制条件
-```
-只处理：
-  ✓ A[i] 和 A[i+0]（加零）
-  ✓ A[i][j] 和 A[i][j+0]
-  ✓ A[i] 和 A[0+i]
-
-不处理：
-  ✗ A[i+j] 除非 j 是循环不变量
-  ✗ A[i+1] 和 A[i]（不是等价，是平移）
+src/opt/Fusion.cpp       (修改)
 ```
 
 ---
 
-### 2.4 BoundsCheck（边界检查消除）
+### 4.4 BoundsCheck（边界检查消除）
 
-#### 2.4.1 目标
-消除或外提 stencil 类循环中的冗余边界检查，解决 conv2d 测试。
+#### 4.4.1 目标
+消除 stencil 类循环中的冗余边界检查，解决 conv2d 测试。
 
-#### 2.4.2 问题场景
-```c
-// conv2d 边界检查（每次 stencil 访问都要执行）
-if (rr >= 0 && rr < N_eff && cc >= 0 && cc < N_eff) {
-    sum = sum + In[idx(rr,cc)] * K[idx(kr,kc)];
-}
-```
-
-#### 2.4.3 优化思路
+#### 4.4.2 优化思路
 
 ```
 将循环分离为三个区域：
@@ -359,68 +305,24 @@ if (rr >= 0 && rr < N_eff && cc >= 0 && cc < N_eff) {
 └────────────────────────────────────────────┘
 ```
 
-#### 2.4.4 实现位置
+#### 4.4.3 实现位置
 ```
 src/opt/BoundsCheck.cpp  (新增)
-src/opt/BoundsCheck.h   (新增)
 ```
 
-#### 2.4.5 实现步骤
-
-```cpp
-// 1. 识别 stencil 边界条件
-//    if (rr >= 0 && rr < N && cc >= 0 && cc < M)
-//        access A[rr][cc]
-
-// 2. 分析循环边界
-//    for (r = 0; r < N; r++)
-//        rr = r + kr - pad;
-//        if (rr >= 0 && rr < N) ...
-
-// 3. 计算"安全区域"
-struct SafeRegion {
-    int64_t lower;   // 安全下界
-    int64_t upper;   // 安全上界
-};
-
-// 对于 r in [pad, N-pad)：
-//   rr = r + kr - pad，当 kr in [0, KSIZE) 时
-//   rr_min = pad + 0 - pad = 0
-//   rr_max = (N-pad) + (KSIZE-1) - pad = N + KSIZE - 1 - pad
-//   安全条件：0 <= rr < N
-
-// 4. 分割循环
-void splitLoop(ForOp* loop, SafeRegion safe) {
-    // for (r = 0; r < N; r++) →
-    //   for (r = 0; r < pad; r++) { /* 有检查 */ }
-    //   for (r = pad; r < N-pad; r++) { /* 无检查 */ }
-    //   for (r = N-pad; r < N; r++) { /* 有检查 */ }
-}
-```
-
-#### 2.4.6 限制条件
-```
-只处理：
-  ✓ 边界是常量（如 pad = KSIZE/2）
-  ✓ 循环边界是仿射形式
-  ✓ 访问是 A[i+const] 或 A[i+j+const]
-
-不处理：
-  ✗ 边界是运行时变量
-  ✗ 非完美嵌套循环
-  ✗ 复杂条件分支
-```
+#### 4.4.4 数学基础（参考 FPL）
+- 使用 Presburger 集合描述安全区域
+- Fourier-Motzkin elimination 投影到循环变量
 
 ---
 
-### 2.5 LICM 增强（链式不变计算外提）
+### 4.5 LICM 增强（链式不变计算外提）
 
-#### 2.5.1 目标
+#### 4.5.1 目标
 识别并外提链式不变计算，解决 optimization_scheduling1。
 
-#### 2.5.2 问题场景
+#### 4.5.2 问题场景
 ```c
-// optimization_scheduling1: dependent_computation
 while (i < iterations) {
     a = a + b;    // b 看起来在变化...
     b = b + c;    // c 是循环不变的！
@@ -430,166 +332,81 @@ while (i < iterations) {
 }
 ```
 
-关键观察：`c` 和 `d` 的**增量**（`d` 和 `a`）在循环中不变。
+关键观察：`c` 和 `d` 的**增量**是循环不变的。
 
-#### 2.5.3 实现位置
+#### 4.5.3 实现位置
 ```
 src/opt/LICM.cpp  (修改，增强链式分析)
 ```
 
-#### 2.5.4 增强算法
-
-```cpp
-// 1. 构建赋值链
-//    a = a + b
-//    b = b + c
-//    c = c + d
-//
-//    链：a -= b, b -= c, c -= d, d -= a
-
-// 2. 识别增量
-//    对于 x = x + inc：
-//    - inc 是 x 的增量
-//    - inc 是循环不变 ⟺ inc 定义点的所有操作数都是循环不变
-
-// 3. 计算增量的定义链
-//    inc = d  // d 在循环中变化
-//    d = d + a  // d 的增量是 a
-//    a = a + b  // a 的增量是 b
-//    链式传播：d 的增量 = a, a 的增量 = b, b 的增量 = c, c 的增量 = d
-//    如果 c, d 是初始常量，则链式增量的增量...最终收敛到常量
-
-// 4. 外提后变换
-//    // 循环前
-//    int inc_c = c;  // c 的初始值
-//    int inc_d = d;  // d 的初始值
-//    int inc_a = a;  // a 的增量
-//
-//    while (i < iterations) {
-//        a = a + b;
-//        b = b + inc_c;
-//        c = c + inc_d;
-//        d = d + inc_a;
-//        i++;
-//    }
+#### 4.5.4 数学基础（参考 抽象解释）
 ```
-
-#### 2.5.5 正确性条件
-```
-✓ 增量是循环不变的（通过 SSA 分析确定）
-✓ 链式传播最终收敛到常量
-✓ 外提后不影响依赖关系
-
-不处理：
-✗ 链式形成环（a = a + b, b = b + a）→ 无法优化
+使用数据流分析：
+- 前向分析：传播值的上界/下界
+- widening 操作：加速收敛
+- 不变检测：满足 f(x) = x 的点
 ```
 
 ---
 
-### 2.6 PartialUnroll（部分循环展开）
+### 4.6 PartialUnroll（部分循环展开）
 
-#### 2.6.1 目标
+#### 4.6.1 目标
 对迭代次数有上界但非常量的循环做部分展开，解决 fft 系列。
 
-#### 2.6.2 问题场景
+#### 4.6.2 问题场景
 ```c
 // fft 内层循环
 while (i < n/2) {  // n 是运行时参数
     x = arr[begin_pos + i];
     y = arr[begin_pos + i + n/2];
-    arr[begin_pos + i] = (x + wn*y) % mod;
-    arr[begin_pos + i + n/2] = (x - wn*y + mod) % mod;
-    wn = multiply(wn, w);
+    ...
     i++;
 }
 ```
 
-当前 `ConstLoopUnroll` 只对**编译期常量迭代次数**的循环做展开，但 `n/2` 是运行时值。
+当前 `ConstLoopUnroll` 只对编译期常量迭代次数做展开。
 
-#### 2.6.3 实现位置
-```
-src/opt/PartialUnroll.cpp  (新增)
-src/opt/PartialUnroll.h   (新增)
-```
-
-#### 2.6.4 实现思路
+#### 4.6.3 实现思路
 
 ```cpp
-// 1. 估计迭代次数上界
-LoopTripBound analyzeTripBound(ForOp* loop) {
-    // 使用 SCEV 分析
-    // 尝试计算 trip count 的上界
-
-    // 如果循环边界是 0 <= i < n/2
-    // trip count = n/2
-    // 如果 n 有已知范围（如 fft 中 n 是 2 的幂，最大 2^21）
-    // 则上界 = 2^21 / 2 = 2^20 ≈ 1M
-}
+// 1. SCEV 分析计算迭代次数上界
+//    扩展 src/opt/SCEV.cpp 支持上界计算
 
 // 2. 选择展开因子
 int chooseUnrollFactor(int64_t estimatedTripCount, int loopBodySize) {
-    if (estimatedTripCount <= 8) return estimatedTripCount;  // 完全展开
+    if (estimatedTripCount <= 8) return estimatedTripCount;
     if (estimatedTripCount <= 64) return 4;
     if (estimatedTripCount <= 256) return 2;
-    return 1;  // 不展开
+    return 1;
 }
 
 // 3. 部分展开
 //    for (i = 0; i < n; i+=4)
-//        stmt;
-//        stmt;
-//        stmt;
-//        stmt;
 ```
 
-#### 2.6.5 限制条件
+#### 4.6.4 实现位置
 ```
-只处理：
-  ✓ trip count 上界 ≤ 4096
-  ✓ 循环体较小（< 50 ops）
-  ✓ 无复杂控制流
-
-不处理：
-  ✗ trip count 上界 > 4096
-  ✗ 循环体过大（展开后代码膨胀严重）
+src/opt/PartialUnroll.cpp  (新增)
 ```
 
 ---
 
-### 2.7 TailRecElim（尾递归消除）
+### 4.7 TailRecElim（尾递归消除）
 
-#### 2.7.1 目标
+#### 4.7.1 目标
 将简单尾递归转换为迭代，解决 knapsack_naive 中的简单分支。
 
-#### 2.7.2 问题场景
-```c
-// knapsack_naive 的简单分支
-if (weight[i-1] > w)
-    return knapsack_naive(i-1, w);  // 直接尾递归
-```
-
-#### 2.7.3 实现位置
-```
-src/opt/TailRecElim.cpp  (新增)
-src/opt/TailRecElim.h    (新增)
-```
-
-#### 2.7.4 识别条件
+#### 4.7.2 识别条件
 ```cpp
 // 尾递归模式：
-// 1. return func(args)
-// 2. return op(func(args), ...)  （如 return func(args) + 1）
-// 3. return op1(op2(func(args), ...), ...) （如 return func(a) + func(b)）← 复杂
-
-// 简单尾递归：只满足条件 1
-// 复合尾递归：满足条件 2
-// 双重尾递归：两个递归调用 ← 不处理
+// return func(args)  // 简单尾递归
+// return op(func(args), ...)  // 复合尾递归
 ```
 
-#### 2.7.5 转换算法
+#### 4.7.3 转换算法
 
 ```cpp
-// 简单尾递归转换
 // 优化前：
 int foo(int n) {
     if (n == 0) return 0;
@@ -599,34 +416,26 @@ int foo(int n) {
 // 优化后：
 int foo_iter(int n) {
     while (n != 0) {
-        n = n - 1;  // 替代递归调用
+        n = n - 1;
     }
     return 0;
 }
 ```
 
-#### 2.7.6 限制条件
+#### 4.7.4 实现位置
 ```
-只处理：
-  ✓ 单个尾递归调用
-  ✓ return 直接返回递归结果（无额外操作）
-  ✓ 递归参数是线性变换
-
-不处理：
-  ✗ 双重递归（如 knapsack）
-  ✗ 尾递归后还有操作（如 return foo(n-1) + 1）
+src/opt/TailRecElim.cpp  (新增)
 ```
 
 ---
 
-### 2.8 DPTransforms（DP 模式识别与转换）
+### 4.8 DPTransforms（DP 模式识别与转换）
 
-#### 2.8.1 目标
+#### 4.8.1 目标
 识别已知 DP 模式并转换为 tabular DP，解决 knapsack_naive。
 
-#### 2.8.2 递归结构分析
+#### 4.8.2 knapsack 递归结构分析
 
-knapsack_naive 的递归调用图：
 ```
 knapsack(i, w)
 ├── knapsack(i-1, w)              [without_item]
@@ -634,87 +443,74 @@ knapsack(i, w)
     └── max(without_item, value[i-1] + with_item)
 ```
 
-这是 **DAG（有向无环图）**，可以通过填表实现。
+这是 DAG，可以通过填表实现（参考 FPL 的多面体分析思路）。
 
-#### 2.8.3 实现位置
-```
-src/opt/DPTransforms.cpp  (新增)
-src/opt/DPTransforms.h    (新增)
-```
-
-#### 2.8.4 识别算法
+#### 4.8.3 识别算法
 
 ```cpp
-struct DPPattern {
-    const char* name;
-    int numRecursiveCalls;   // 递归调用数量
-    CombineOp combine;       // 组合操作（max, min, sum）
-};
-
 // 识别 0/1 背包
 bool recognizeKnapsack(FuncOp* func) {
-    // 1. 检查函数签名：int func(int i, int w)
+    // 1. 检查函数签名
     // 2. 检查递归调用数量：2 个
     // 3. 检查组合操作：max
-    // 4. 检查参数模式：
-    //    - 调用1: (i-1, w)
-    //    - 调用2: (i-1, w-weight[i-1])
-    // 5. 如果都匹配 → 认为是 knapsack
+    // 4. 检查参数模式
 }
 ```
 
-#### 2.8.5 转换算法
-
-```cpp
-// knapsack 转换后的代码结构：
-int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W) {
-    // 1. 创建 dp 表
-    int dp[N+1][W+1];
-
-    // 2. 填表
-    for (int i = 0; i <= N; i++) {
-        for (int w = 0; w <= W; w++) {
-            if (i == 0 || w == 0) {
-                dp[i][w] = 0;
-            } else if (weight[i-1] > w) {
-                dp[i][w] = dp[i-1][w];
-            } else {
-                int without = dp[i-1][w];
-                int with = value[i-1] + dp[i-1][w - weight[i-1]];
-                dp[i][w] = max(without, with);
-            }
-        }
-    }
-
-    // 3. 返回初始参数对应的结果
-    return dp[init_i][init_w];
-}
+#### 4.8.4 实现位置
 ```
-
-#### 2.8.6 支持的 DP 模式
-
-| 模式 | 递归类型 | 组合操作 | 转换方法 |
-|------|---------|---------|---------|
-| 0/1 背包 | 双重递归 | max | tabular DP |
-| 斐波那契 | 单递归 | sum | 展开 + 滑动变量 |
-| LCS | 双重递归 | max | tabular DP |
-
-#### 2.8.7 限制条件
-```
-只处理：
-  ✓ 递归调用数 ≤ 2
-  ✓ 组合操作是 max/min/sum
-  ✓ 参数传递是线性变换
-
-不处理：
-  ✗ 三重及以上递归
-  ✗ 非 DAG 递归
-  ✗ 复杂组合操作
+src/opt/DPTransforms.cpp  (新增)
 ```
 
 ---
 
-## 3. 实现顺序
+### 4.9 LightweightSuperopt（轻量超优化）
+
+#### 4.9.1 目标
+实现类似 Souper 的超优化能力，但不引入 z3。
+
+#### 4.9.2 参考资源
+- Souper：MLIR 超优化器，使用 SMT 证明等价性
+- z3：SMT 求解器，用于表达式等价性证明
+
+#### 4.9.3 实现思路
+
+```cpp
+// 不使用 z3，使用简化的模式匹配 + 穷举验证
+
+// 1. 已知优化模式表
+struct OptPattern {
+    const char* before;   // 优化前模式
+    const char* after;    // 优化后模式
+    bool (*verify)();     // 可选的验证函数
+};
+
+// 模式表示例：
+// {"(add x x)", "(shl x 1)", nullptr},           // x + x = x << 1
+// {"(mul x 4)", "(shl x 2)", nullptr},           // x * 4 = x << 2
+// {"(div x 2)", "(shr x 1)", nullptr},           // x / 2 = x >> 1
+
+// 2. 遍历函数中的指令序列
+// 3. 对每个序列，检查模式表是否有更优替换
+// 4. 使用 SMT-like 推理验证等价性（简化版）
+```
+
+#### 4.9.4 与 StrengthReduce 的区别
+
+| 维度 | StrengthReduce | LightweightSuperopt |
+|------|---------------|---------------------|
+| 方法 | 确定性规则 | 模式匹配 + 穷举 |
+| 覆盖 | 乘除法强度削减 | 更广的代数简化 |
+| 验证 | 编译期常量检查 | 简化的 SMT 推理 |
+
+#### 4.9.5 实现位置
+```
+src/opt/LightweightSuperopt.cpp  (新增)
+```
+
+---
+
+## 5. 实现顺序
 
 ### 阶段 1：基础优化（所有测试受益）
 
@@ -723,7 +519,7 @@ int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W)
   - 位置：src/opt/StrengthReduce.cpp
   - 依赖：无
   - 影响：所有测试
-  - 原因：这是最基础、最通用的优化，不会破坏正确性
+  - 原因：最基础、最通用，不会破坏正确性
 
 顺序 2: LoopInterchange
   - 位置：src/opt/LoopInterchange.cpp
@@ -739,19 +535,16 @@ int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W)
   - 位置：src/opt/IndexEquiv.cpp + 修改 Fusion.cpp
   - 依赖：StrengthReduce
   - 影响：many_mat_cal, 03_sort1
-  - 原因：在现有代码基础上增强，风险可控
 
 顺序 4: LICM 增强
   - 位置：修改 src/opt/LICM.cpp
   - 依赖：StrengthReduce, SCEV
   - 影响：optimization_scheduling1
-  - 原因：增强现有 pass，需要理解现有逻辑
 
 顺序 5: PartialUnroll
   - 位置：src/opt/PartialUnroll.cpp
   - 依赖：StrengthReduce, SCEV
   - 影响：fft 系列
-  - 原因：需要 SCEV 分析支持
 ```
 
 ### 阶段 3：边界优化
@@ -759,9 +552,8 @@ int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W)
 ```
 顺序 6: BoundsCheck
   - 位置：src/opt/BoundsCheck.cpp
-  - 依赖：LoopInterchange（需要完美嵌套检测）
+  - 依赖：LoopInterchange
   - 影响：conv2d 系列
-  - 原因：需要对循环结构有较好理解
 ```
 
 ### 阶段 4：递归优化
@@ -771,18 +563,25 @@ int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W)
   - 位置：src/opt/TailRecElim.cpp
   - 依赖：StrengthReduce
   - 影响：knapsack_naive（简单分支）
-  - 原因：先做简单版本
 
 顺序 8: DPTransforms
   - 位置：src/opt/DPTransforms.cpp
   - 依赖：TailRecElim
   - 影响：knapsack_naive（完整版本）
-  - 原因：在简单尾递归基础上扩展
+```
+
+### 阶段 5：高级优化
+
+```
+顺序 9: LightweightSuperopt
+  - 位置：src/opt/LightweightSuperopt.cpp
+  - 依赖：StrengthReduce
+  - 影响：所有测试（代数简化）
 ```
 
 ---
 
-## 4. 预期效果
+## 6. 预期效果
 
 | 测试 | 瓶颈 | 对应模块 | 预计提升 |
 |------|------|---------|---------|
@@ -796,7 +595,7 @@ int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W)
 
 ---
 
-## 5. 风险与缓解
+## 7. 风险与缓解
 
 | 模块 | 风险 | 影响 | 缓解措施 |
 |------|------|------|---------|
@@ -804,102 +603,93 @@ int knapsack_dp(int init_i, int init_w, int weight[], int value[], int N, int W)
 | LoopInterchange | 误判依赖方向 | 高 | 保守：只在能证明安全时交换 |
 | BoundsCheck | 边界分析错误 | 严重 | 保守：只在确定安全时消除检查 |
 | LICM 增强 | 链式传播错误 | 高 | 使用开关，默认关闭 |
-| PartialUnroll | 展开因子不当 | 中 | 可配置：默认 2/4，保守 2 |
+| PartialUnroll | 展开因子不当 | 中 | 可配置：默认 2/4 |
 | TailRecElim | 尾递归误判 | 中 | 只处理明确的尾递归模式 |
-| DPTransforms | DP 模式误识别 | 中 | 先验证，后转换；有测试框架 |
+| DPTransforms | DP 模式误识别 | 中 | 先验证，后转换 |
+| LightweightSuperopt | 穷举爆炸 | 低 | 只穷举小序列（≤5 条指令） |
 
 ---
 
-## 6. 测试计划
+## 8. 测试计划
 
-### 6.1 单元测试
+### 8.1 单元测试
 
 ```bash
-# 每个模块应有独立的测试文件
 tests/opt/
-├── strength_reduce/
-│   ├── multiply_pow2.sy       # 乘以 2 的幂
-│   ├── multiply_const.sy      # 乘以常量
-│   ├── divide_pow2.sy         # 除以 2 的幂
-│   └── index_calc.sy          # 索引计算优化
-├── interchange/
-│   ├── perfect_nest.sy        # 完美嵌套
-│   ├── with_dep.sy            # 有依赖（应跳过）
-│   └── transpose.sy            # 转置场景
-├── fusion_equiv/
-│   ├── simple_offset.sy        # A[i] 和 A[i+0]
-│   └── cross_loop.sy          # 跨循环融合
-├── bounds_check/
-│   ├── stencil.sy             # stencil 边界检查
-│   └── simple_bounds.sy       # 简单边界
-├── licm_chain/
-│   └── chain_invariant.sy     # 链式不变计算
-├── partial_unroll/
-│   └── bounded_loop.sy         # 有界循环
-├── tail_rec/
-│   └── simple_tail.sy         # 简单尾递归
-└── dp_transforms/
-    ├── knapsack.sy            # 0/1 背包
-    └── fibonacci.sy           # 斐波那契
+├── strength_reduce/       # 乘除转位移
+├── interchange/           # 循环交换
+├── fusion_equiv/          # 下标等价融合
+├── bounds_check/          # 边界检查消除
+├── licm_chain/           # 链式不变计算
+├── partial_unroll/        # 部分展开
+├── tail_rec/             # 尾递归消除
+├── dp_transforms/         # DP 模式转换
+└── superopt/             # 超优化
 ```
 
-### 6.2 集成测试
+### 8.2 集成测试
 
 ```bash
-# 使用现有回归测试
 scripts/regression.sh tests/opt riscv O2
-scripts/regression.sh tests/opt arm O2
-
-# 性能测试
 scripts/eval-runtime.sh test2026/performance riscv O2
 ```
 
-### 6.3 正确性保证
-
-```
-1. 每个模块独立测试
-2. 与现有测试套件完全兼容（无回归）
-3. 新增测试覆盖边界情况
-4. 性能测试验证加速效果
-```
-
 ---
 
-## 7. 开关控制
+## 9. 开关控制
 
 ```cpp
 // 新增命令行选项
 --enable-strength-reduce     // 强度削减（默认开启）
 --enable-loop-interchange    // 循环交换（默认开启）
---enable-fusion-equiv        // 下标等价融合（默认关闭，保守）
---enable-bounds-check        // 边界检查优化（默认关闭，保守）
---enable-licm-chain         // 链式 LICM（默认关闭，保守）
---enable-partial-unroll      // 部分展开（默认开启）
---enable-tail-rec           // 尾递归消除（默认开启）
---enable-dp-transforms       // DP 模式转换（默认关闭，保守）
+--enable-fusion-equiv        // 下标等价融合（默认关闭）
+--enable-bounds-check       // 边界检查优化（默认关闭）
+--enable-licm-chain        // 链式 LICM（默认关闭）
+--enable-partial-unroll     // 部分展开（默认开启）
+--enable-tail-rec          // 尾递归消除（默认开启）
+--enable-dp-transforms      // DP 模式转换（默认关闭）
+--enable-superopt          // 超优化（默认关闭）
 ```
 
 ---
 
-## 8. 总结
+## 10. 参考资源汇总
 
-本方案通过 8 个优化模块，覆盖了测试集中所有大性能差距场景：
+| 资源 | 可应用内容 | 对应模块 |
+|------|----------|---------|
+| 剑桥编译课程 | Abstract Interpretation | Range.cpp 增强, LICM 增强 |
+| MLIR/Clang IR | Declarative Patterns, Affine | Matcher 增强, LoopInterchange, BoundsCheck |
+| FPL | Polyhedral Math | BoundsCheck (简化版), 完整多面体 (方案 B) |
+| z3/Souper | Superoptimization | LightweightSuperopt |
+
+---
+
+## 11. 总结
+
+本方案通过 9 个优化模块，覆盖了测试集中所有大性能差距场景：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    优化模块覆盖                           │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
-│  强度削减        → 所有测试                              │
-│  循环交换        → transpose                            │
-│  循环融合增强    → many_mat_cal, 03_sort1              │
-│  边界检查消除    → conv2d                               │
-│  LICM 增强       → optimization_scheduling              │
-│  部分展开        → fft                                  │
-│  尾递归消除      → knapsack_naive (简单)               │
-│  DP 模式转换     → knapsack_naive (完整)                │
+│  StrengthReduce       → 所有测试（基础）                 │
+│  LoopInterchange      → transpose                        │
+│  Fusion 增强          → many_mat_cal, 03_sort1        │
+│  BoundsCheck          → conv2d                           │
+│  LICM 增强            → optimization_scheduling          │
+│  PartialUnroll        → fft                             │
+│  TailRecElim          → knapsack_naive (简单)          │
+│  DPTransforms         → knapsack_naive (完整)           │
+│  LightweightSuperopt  → 所有测试（代数简化）             │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
 实施顺序遵循从低风险到高风险、从通用到专用的原则，确保每一步都可验证、可回滚。
+
+关键设计决策：
+1. 不引入 MLIR/z3 等外部依赖，保持自研路线
+2. 参考 MLIR 的声明式模式思想增强 Matcher
+3. 参考 FPL 的数学原理，但使用简化版本（足够处理 stencil）
+4. 参考 Souper 的超优化思路，实现轻量版本

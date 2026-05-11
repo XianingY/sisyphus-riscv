@@ -89,6 +89,8 @@ void appendCoreO0(sys::PassManager &pm) {
   pm.addPass<sys::RaiseToFor>();
   pm.addPass<sys::DCE>(/*elimBlocks=*/ false);
   pm.addPass<sys::Lower>();
+  if (getenvEnabled("SISY_ENABLE_LOWERED_TCO", true))
+    pm.addPass<sys::LoweredTCO>();
 
   pm.addPass<sys::FlattenCFG>();
   pm.addPass<sys::Mem2Reg>();
@@ -114,7 +116,13 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
 
   pm.addPass<sys::MoveAlloca>();
 
+  auto appendLoweredTCO = [&]() {
+    if (getenvEnabled("SISY_ENABLE_LOWERED_TCO", true))
+      pm.addPass<sys::LoweredTCO>();
+  };
+
   auto appendLoweredTail = [&]() {
+    appendLoweredTCO();
     if (economyMode) {
       pm.addPass<sys::FlattenCFG>();
       pm.addPass<sys::Mem2Reg>();
@@ -177,6 +185,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
     pm.addPass<sys::SCEV>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", true)) {
+      pm.addPass<sys::BoundsCheck>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::AggressiveDCE>();
     if (opts.arm && opts.enableExperimental)
       pm.addPass<sys::Vectorize>();

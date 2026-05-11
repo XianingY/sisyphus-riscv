@@ -523,33 +523,26 @@ int RegAlloc::latePeephole(Op *funcOp) {
         return true;
       }
 
-      // mv rd, rs -> mulw/addw/subw rd, rd, rd (when the op uses rd as both operands)
-      // Pattern: mv t0, a0; mulw a0, t0, t0  ->  mulw a0, a0, a0
-      // After mv: rd = rs, so mulw rd, rs, rs becomes mulw rd, rd, rd
-      if (isa<MulwOp>(next) || isa<AddwOp>(next) || isa<SubwOp>(next)) {
+      // Propagate a single-use move into the following arithmetic op.
+      // This must substitute the move source, not the arithmetic destination:
+      //   mv t0, a0; addw a1, t0, t0  ->  addw a1, a0, a0
+      // Replacing with RD(next) corrupts cases where RD(next) is unrelated.
+      if ((isa<MulwOp>(next) || isa<AddwOp>(next) || isa<SubwOp>(next)) &&
+          op->getUses().size() == 1 &&
+          *op->getUses().begin() == next) {
         Reg mvSrc = RS(op);
         Reg mvDst = RD(op);
 
-        if (RS(next) == RS2(next)) {
-          if (RS(next) == mvDst || RS(next) == mvSrc) {
-            RS(next) = RD(next);
-            RS2(next) = RD(next);
-            converted++;
-            op->erase();
-            return true;
-          }
+        bool changed = false;
+        if (RS(next) == mvDst) {
+          RS(next) = mvSrc;
+          changed = true;
         }
-
-        if (RD(next) == RS(next) && RS2(next) == mvDst) {
-          RS(next) = RD(next);
-          RS2(next) = RD(next);
-          converted++;
-          op->erase();
-          return true;
+        if (RS2(next) == mvDst) {
+          RS2(next) = mvSrc;
+          changed = true;
         }
-        if (RD(next) == RS2(next) && RS(next) == mvDst) {
-          RS(next) = RD(next);
-          RS2(next) = RD(next);
+        if (changed) {
           converted++;
           op->erase();
           return true;

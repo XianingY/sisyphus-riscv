@@ -102,6 +102,13 @@ int StrengthReduct::runImpl() {
     }
 
     auto bits = __builtin_popcount(i);
+    auto hasShiftSubForm = [&]() {
+      for (int place = 0; place < 31; place++) {
+        if (__builtin_popcount(i + (1 << place)) == 1)
+          return true;
+      }
+      return false;
+    };
 
     if (bits == 1) {
       converted++;
@@ -126,13 +133,13 @@ int StrengthReduct::runImpl() {
     }
 
     // General decomposition for constants with 3+ bits.
-    // Handle x * c where c = sum of (1 << bit[i]) for multiple bits.
-    // e.g., x * 105 = x * (64 + 32 + 8 + 1) = ((x << 6) + (x << 5) + (x << 3) + x)
-    if (bits >= 3 && bits <= 16) {
+    // Keep this as a plain modulo-2^32 shift/add chain.  The previous
+    // pairwise regrouping could discard the already accumulated partial
+    // sum for constants such as 13, changing the value.
+    if (bits >= 3 && bits <= 16 && !hasShiftSubForm()) {
       converted++;
       builder.setBeforeOp(op);
 
-      // Find all bit positions
       std::vector<int> bitPositions;
       int temp = i;
       while (temp > 0) {
@@ -141,31 +148,20 @@ int StrengthReduct::runImpl() {
         temp &= ~(1 << bit);
       }
 
-      // Sort in descending order for optimal shift-add chain
-      std::sort(bitPositions.rbegin(), bitPositions.rend());
-
-      // Build the shift-add chain iteratively
-      Value result = builder.create<SlliwOp>({ x }, { new IntAttr(bitPositions[0]) });
+      Value result;
+      if (bitPositions[0] == 0)
+        result = x;
+      else
+        result = builder.create<SlliwOp>({ x }, { new IntAttr(bitPositions[0]) });
 
       for (size_t j = 1; j < bitPositions.size(); j++) {
         int bit = bitPositions[j];
-        int prevBit = bitPositions[j - 1];
-
-        // Check if we can combine: (x << prev) + (x << bit) = ((x << (prev - bit)) + x) << bit
-        // when prev > bit and prev - bit == bit (i.e., prev == 2 * bit)
-        if (prevBit == 2 * bit) {
-          // (x << prev) + (x << bit) = ((x << bit) + x) << bit
-          Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(bit) });
-          Value added = builder.create<AddwOp>({ shifted, x });
-          result = builder.create<SlliwOp>({ added }, { new IntAttr(bit) });
-        } else {
-          // Simple case: add x << bit
-          Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(bit) });
-          result = builder.create<AddwOp>({ result, shifted });
-        }
+        Value term = bit == 0
+          ? x
+          : builder.create<SlliwOp>({ x }, { new IntAttr(bit) });
+        result = builder.create<AddwOp>({ result, term });
       }
 
-      // result now holds the complete sum, replace the mul
       op->replaceAllUsesWith(result.defining);
       op->erase();
       return true;

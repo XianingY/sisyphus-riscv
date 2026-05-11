@@ -261,8 +261,9 @@ public:
 };
 
 class BoundsCheck : public Pass {
-  int eliminated = 0;
-  int hoisted = 0;
+  int branchesEliminated = 0;
+  int boundsProved = 0;
+  int boundsRejected = 0;
 
   void runImpl(LoopInfo *info);
 public:
