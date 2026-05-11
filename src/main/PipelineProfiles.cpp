@@ -414,10 +414,21 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   const bool hitHugeOps = plan.metrics.moduleOpCount >= hugeOpThreshold;
   const bool hitHugeScore = score >= hugeScoreThreshold;
   const bool highParamPressure = plan.metrics.maxGetArgArity > 8 || plan.metrics.getArgCount >= 256;
-  // O2-only downshift for super-complex IR; O1 remains stable baseline.
-  plan.largeModuleMode = plan.aggressive && largeModeEnabled &&
-                         (hitOps || hitBlocks || hitEdges || hitPhis || hitCalls || hitDepth || hitScore);
-  plan.hugeModuleMode = plan.largeModuleMode && hugeModeEnabled && (hitHugeOps || hitHugeScore);
+  // O1 also needs a conservative lane for very branch/call-heavy functional
+  // programs. These stress late CFG and backend allocation without helping
+  // dense-kernel performance, so keep the optimized O1 path for normal modules
+  // and route only high-complexity IR through the economy tail.
+  const bool o1StableLargeMode = !plan.aggressive && opts.rv &&
+                                 getenvEnabled("SISY_O1_STABLE_LARGE_MODE", true) &&
+                                 !highParamPressure &&
+                                 (hitBlocks || hitCalls || hitScore);
+  plan.largeModuleMode = (plan.aggressive && largeModeEnabled &&
+                         (hitOps || hitBlocks || hitEdges || hitPhis || hitCalls || hitDepth || hitScore))
+                         || o1StableLargeMode;
+  if (o1StableLargeMode)
+    plan.coreProfile = CoreProfile::O0;
+  plan.hugeModuleMode = plan.aggressive && plan.largeModuleMode && hugeModeEnabled &&
+                        (hitHugeOps || hitHugeScore);
   plan.backendFastMode = plan.hugeModuleMode;
   plan.useArmBackend = opts.arm;
   plan.useRvBackend = opts.rv;
