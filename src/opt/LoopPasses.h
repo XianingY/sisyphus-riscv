@@ -252,6 +252,25 @@ public:
   void run() override;
 };
 
+class RepeatInvariantReduction : public Pass {
+  int visited = 0;
+  int reduced = 0;
+  int rejected = 0;
+  int badShape = 0;
+  int badCfg = 0;
+  int noShape = 0;
+  int impureBody = 0;
+  int badInductionUse = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  RepeatInvariantReduction(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "repeat-invariant-reduction"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class Vectorize : public Pass {
   std::unordered_map<Op*, Op*> base;
   

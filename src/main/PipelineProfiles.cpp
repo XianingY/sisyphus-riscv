@@ -161,6 +161,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
+      pm.addPass<sys::RuntimeMemoize>();
 
     pm.addPass<sys::Mem2Reg>();
     pm.addPass<sys::ArrayStrideAnalysis>();
@@ -179,6 +181,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
+      pm.addPass<sys::RepeatInvariantReduction>();
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
       pm.addPass<sys::LoopInterchange>();

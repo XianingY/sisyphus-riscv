@@ -168,6 +168,23 @@ public:
   void run() override;
 };
 
+// Adds a bounded runtime memo table for small pure self-recursive integer
+// functions. The cache is guarded by an epoch that is bumped at non-recursive
+// call sites, so recursive calls within one top-level invocation can share
+// results without reusing stale values after global inputs are refreshed.
+class RuntimeMemoize : public Pass {
+  int memoized = 0;
+  int entryChecks = 0;
+  int callEpochBumps = 0;
+
+public:
+  RuntimeMemoize(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "runtime-memoize"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class LateInline : public Pass {
   int inlined = 0;
   int threshold;
