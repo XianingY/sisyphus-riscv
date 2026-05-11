@@ -235,6 +235,48 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   if (!isa<IntOp>(step))
     return false;
 
+  // Helper to estimate upper bound for runtime-computed values
+  // Returns -1 if can't estimate, otherwise returns estimated upper bound
+  auto estimateUpperBound = [](Op* expr) -> int64_t {
+    if (!expr)
+      return -1;
+    // If it's a constant, return directly
+    if (isa<IntOp>(expr))
+      return V(expr);
+    // If it's a GetArgOp (function argument), use conservative bound
+    if (isa<GetArgOp>(expr)) {
+      // For fft, the size argument is typically <= 8192 (2^23)
+      // Conservative: assume 8192
+      return 8192;
+    }
+    // If it's a division by constant, try to estimate the operand
+    if (auto div = dyn_cast<DivIOp>(expr)) {
+      auto rhs = div->DEF(1);
+      if (isa<IntOp>(rhs)) {
+        int divisor = V(rhs);
+        if (divisor > 0) {
+          auto lhs = div->DEF(0);
+          // Recursively estimate the numerator
+          if (isa<GetArgOp>(lhs)) {
+            // For fft, the size argument is typically <= 8192
+            // Conservative estimate: assume <= 8192, so n/2 <= 4096
+            return 4096 / divisor;
+          }
+          // Check if lhs is a load from the function argument alloca
+          if (auto load = dyn_cast<LoadOp>(lhs)) {
+            auto src = load->DEF(0);
+            // If the source is an alloca for a function argument, use conservative bound
+            if (isa<AllocaOp>(src)) {
+              return 4096 / divisor;
+            }
+          }
+        }
+      }
+    }
+    // For other expressions, we can't estimate
+    return -1;
+  };
+
   // Fully unroll constant-bounded loops if it's small enough.
   // Increased limit for better performance on tight inner loops in FFT/matmul.
   if (lower && upper && isa<IntOp>(lower) && isa<IntOp>(upper)) {
@@ -243,8 +285,38 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     int times = (high - low) / V(step);
     if (times <= 2000 / loopsize)
       unroll = times;
+  } else {
+    // Partial unrolling for runtime-bounded loops (e.g., fft inner loops)
+    // Try to estimate the upper bound
+    int64_t estUpper = estimateUpperBound(upper);
+    if (estUpper > 0 && loopsize > 0) {
+      // Partial unrolling based on estimated trip count
+      // Choose unroll factor based on loop size and estimated trip count
+      int64_t estTimes = estUpper / V(step);
+
+      // Calculate potential benefit: unrolling reduces loop overhead
+      // and can expose ILP. Be more aggressive for small loops.
+      if (loopsize <= 20) {
+        // Very small tight loop - can unroll more
+        if (estTimes <= 64)
+          unroll = 8;
+        else if (estTimes <= 256)
+          unroll = 4;
+        else
+          unroll = 2;  // Large trip count but tight loop
+      } else if (loopsize <= 50) {
+        // Small loop
+        if (estTimes <= 32)
+          unroll = 4;
+        else if (estTimes <= 256)
+          unroll = 2;
+        else
+          unroll = 2;  // Conservative: even large loops benefit from 2x unroll
+      }
+      // Larger loops: don't partially unroll
+    }
   }
-  // Not a constant loop.
+  // Not a constant loop and couldn't estimate.
   if (unroll == -1)
     return false;
   if (unroll <= 1)
@@ -261,7 +333,7 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   // It can be from something that passes through all the loop, for example.
   auto exitphis = exit->getPhis();
   exitlatch.clear();
-  for (auto phi : exitphis) 
+  for (auto phi : exitphis)
     exitlatch[phi] = Op::getPhiFrom(phi, latch);
 
   // We construct a side-loop with checks in it. The code is roughly the same.

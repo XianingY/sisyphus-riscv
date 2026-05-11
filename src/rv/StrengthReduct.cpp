@@ -125,6 +125,52 @@ int StrengthReduct::runImpl() {
       return true;
     }
 
+    // General decomposition for constants with 3+ bits.
+    // Handle x * c where c = sum of (1 << bit[i]) for multiple bits.
+    // e.g., x * 105 = x * (64 + 32 + 8 + 1) = ((x << 6) + (x << 5) + (x << 3) + x)
+    if (bits >= 3 && bits <= 16) {
+      converted++;
+      builder.setBeforeOp(op);
+
+      // Find all bit positions
+      std::vector<int> bitPositions;
+      int temp = i;
+      while (temp > 0) {
+        int bit = __builtin_ctz(temp);
+        bitPositions.push_back(bit);
+        temp &= ~(1 << bit);
+      }
+
+      // Sort in descending order for optimal shift-add chain
+      std::sort(bitPositions.rbegin(), bitPositions.rend());
+
+      // Build the shift-add chain iteratively
+      Value result = builder.create<SlliwOp>({ x }, { new IntAttr(bitPositions[0]) });
+
+      for (size_t j = 1; j < bitPositions.size(); j++) {
+        int bit = bitPositions[j];
+        int prevBit = bitPositions[j - 1];
+
+        // Check if we can combine: (x << prev) + (x << bit) = ((x << (prev - bit)) + x) << bit
+        // when prev > bit and prev - bit == bit (i.e., prev == 2 * bit)
+        if (prevBit == 2 * bit) {
+          // (x << prev) + (x << bit) = ((x << bit) + x) << bit
+          Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(bit) });
+          Value added = builder.create<AddwOp>({ shifted, x });
+          result = builder.create<SlliwOp>({ added }, { new IntAttr(bit) });
+        } else {
+          // Simple case: add x << bit
+          Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(bit) });
+          result = builder.create<AddwOp>({ result, shifted });
+        }
+      }
+
+      // result now holds the complete sum, replace the mul
+      op->replaceAllUsesWith(result.defining);
+      op->erase();
+      return true;
+    }
+
     // Handle x * ((1<<n) - 1) where n >= 2.
     // e.g., x*7 = (x<<3) - x, x*15 = (x<<4) - x, x*31 = (x<<5) - x
     // These are NOT caught by bits==2 case because they have 3+ bits set.

@@ -197,6 +197,23 @@ public:
   void run() override;
 };
 
+class LoopInterchange : public Pass {
+  int detected = 0;
+  int interchanged = 0;
+
+  // Check if the loop nest is a perfect nest (inner is only content)
+  bool isPerfectNest(LoopInfo* outer, LoopInfo* inner);
+  // Check if two loops can be safely interchanged
+  bool canInterchange(LoopInfo* outer, LoopInfo* inner);
+  void runImpl(LoopInfo* info);
+public:
+  LoopInterchange(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "loop-interchange"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class RemoveEmptyLoop : public Pass {
   int removed = 0;
 
@@ -239,6 +256,19 @@ public:
   PrivatizeReduction(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "privatize-reduction"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class BoundsCheck : public Pass {
+  int eliminated = 0;
+  int hoisted = 0;
+
+  void runImpl(LoopInfo *info);
+public:
+  BoundsCheck(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "bounds-check"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };
