@@ -179,9 +179,17 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+    // LoopInterchange after canonicalize+rotate, before LICM/unroll.
+    if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
+      pm.addPass<sys::LoopInterchange>();
     if (enablePrivatizeReduction)
       pm.addPass<sys::PrivatizeReduction>();
+    // Early Unswitch before first LICM is useful for invariant branches at O1.
+    if (getenvEnabled("SISY_ENABLE_O1_UNSWITCH", true))
+      pm.addPass<sys::Unswitch>();
     pm.addPass<sys::LICM>();
+    if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
+      pm.addPass<sys::ScalarReplace>();
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
     pm.addPass<sys::SCEV>();
@@ -320,8 +328,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::TidyMemory>();
     if (aggressive) {
       pm.addPass<sys::Fusion>();
-      pm.addPass<sys::Unswitch>();
     }
+    // Repeat Unswitch after simplification to expose later loop cleanup.
+    if (getenvEnabled("SISY_ENABLE_O1_UNSWITCH", true))
+      pm.addPass<sys::Unswitch>();
     pm.addPass<sys::DCE>(/*elimBlocks=*/ false);
     pm.addPass<sys::ColumnMajor>();
     if (!opts.arm)

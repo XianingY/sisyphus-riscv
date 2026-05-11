@@ -4,6 +4,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -16,7 +17,9 @@ enum class BitwiseKind {
   And,
   Or,
   Xor,
-  Not
+  Not,
+  Shl,
+  Shr
 };
 
 struct Candidate {
@@ -142,7 +145,41 @@ bool matchesBinary(ModuleOp *module, const std::string &name, BitwiseKind kind) 
   return true;
 }
 
-Candidate classify(ModuleOp *module, FuncOp *func) {
+bool matchesShift(ModuleOp *module, const std::string &name, BitwiseKind kind) {
+  // Recognize if-else cascades that implement shift via division/multiplication
+  // by powers of two. For non-negative x, x/2^n == x >> n and x*2^n == x << n.
+  // We sample n in [0,8] (the typical range for these cascades) and x from a
+  // set of non-negative integers.
+  static const std::vector<int> xSamples = {
+    0, 1, 2, 3, 5, 7, 15, 31, 63, 127, 255, 256,
+    1023, 1024, 4095, 65535, 0x12345678, 0x2aaaaaaa, 0x3fffffff, 0x55555555
+  };
+
+  for (int x : xSamples) {
+    for (int n = 0; n <= 8; n++) {
+      bool ok = true;
+      int32_t got = runSample(module, name, { x, n }, ok);
+      if (!ok)
+        return false;
+      int32_t expect = 0;
+      switch (kind) {
+      case BitwiseKind::Shl:
+        expect = x << n;
+        break;
+      case BitwiseKind::Shr:
+        expect = x >> n;
+        break;
+      default:
+        return false;
+      }
+      if (got != expect)
+        return false;
+    }
+  }
+  return true;
+}
+
+Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled) {
   Candidate result;
   if (hasUnsupportedSideEffect(func))
     return result;
@@ -175,6 +212,13 @@ Candidate classify(ModuleOp *module, FuncOp *func) {
   for (auto kind : { BitwiseKind::And, BitwiseKind::Or, BitwiseKind::Xor })
     if (matchesBinary(module, name, kind))
       return { kind, argc };
+
+  // Check shift patterns (if-else cascades implementing x>>n or x<<n).
+  if (shiftEnabled) {
+    for (auto kind : { BitwiseKind::Shr, BitwiseKind::Shl })
+      if (matchesShift(module, name, kind))
+        return { kind, argc };
+  }
   return result;
 }
 
@@ -190,6 +234,10 @@ Op *buildReplacement(Builder &builder, CallOp *call, BitwiseKind kind) {
     auto minusOne = builder.create<IntOp>({ new IntAttr(-1) });
     return builder.create<SubIOp>({ minusOne, call->getOperand(0) });
   }
+  case BitwiseKind::Shl:
+    return builder.create<LShiftOp>({ call->getOperand(0), call->getOperand(1) });
+  case BitwiseKind::Shr:
+    return builder.create<RShiftOp>({ call->getOperand(0), call->getOperand(1) });
   default:
     return nullptr;
   }
@@ -207,11 +255,15 @@ std::map<std::string, int> SemanticBitwise::stats() {
 void SemanticBitwise::run() {
   CallGraph(module).run();
 
+  // Shift recognition can be independently disabled while keeping bitwise ops.
+  const char *shiftEnv = std::getenv("SISY_ENABLE_SEMANTIC_SHIFT");
+  bool shiftEnabled = !shiftEnv || !shiftEnv[0] || shiftEnv[0] != '0';
+
   std::map<std::string, Candidate> candidates;
   for (auto func : collectFuncs()) {
     if (isExtern(NAME(func)))
       continue;
-    auto candidate = classify(module, func);
+    auto candidate = classify(module, func, shiftEnabled);
     if (candidate.kind == BitwiseKind::None)
       continue;
     candidates[NAME(func)] = candidate;

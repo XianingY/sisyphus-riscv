@@ -1,7 +1,42 @@
 #include "Passes.h"
 #include "../utils/Matcher.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+
 using namespace sys;
+
+// Try to resolve an Op to a compile-time integer constant.
+// Handles two cases:
+//   1. The Op is an IntOp (literal constant).
+//   2. The Op is a LoadOp whose address is a GetGlobalOp pointing to a
+//      scalar (size == 1) integer global with a known initializer.
+//      This covers patterns like `const int base = 16;` which the frontend
+//      emits as a global variable rather than inlining the constant.
+static std::optional<int> tryGetConstantValue(
+    Op *op, const std::map<std::string, GlobalOp*> &gMap) {
+  if (isa<IntOp>(op))
+    return V(op);
+
+  // Pattern: load(getglobal(<name>))
+  if (isa<LoadOp>(op)) {
+    auto addr = op->DEF(0);
+    if (!isa<GetGlobalOp>(addr))
+      return std::nullopt;
+    auto name = NAME(addr);
+    auto it = gMap.find(name);
+    if (it == gMap.end())
+      return std::nullopt;
+    auto glob = it->second;
+    auto iarr = glob->get<IntArrayAttr>();
+    if (!iarr || iarr->size != 1)
+      return std::nullopt;
+    return iarr->vi[0];
+  }
+
+  return std::nullopt;
+}
 
 #define INT(op) isa<IntOp>(op)
 
@@ -332,6 +367,15 @@ int RegularFold::runImpl(Region *region) {
 void RegularFold::run() {
   auto funcs = collectFuncs();
   int folded;
+
+  bool enableIrDivStrength = true;
+  if (const char *env = std::getenv("SISY_ENABLE_IR_DIV_STRENGTH"))
+    enableIrDivStrength = env[0] && std::strcmp(env, "0") != 0;
+
+  // Build a map of global name → GlobalOp for constant-global detection.
+  // We use this to resolve loads from scalar const globals (e.g. `const int base = 16`).
+  auto gMap = getGlobalMap();
+
   do {
     folded = 0;
     for (auto func : funcs) {
@@ -390,6 +434,84 @@ void RegularFold::run() {
       }
       return false;
     });
+
+    // Signed integer division by a compile-time power-of-2 constant:
+    //   x / 2^n  →  (x + ((x >> 31) & (2^n - 1))) >> n
+    // This is the standard "round toward zero" transformation for signed division.
+    // The non-negative case (x >= 0) is handled more precisely by RangeAwareFold;
+    // this rule covers the general signed case.
+    if (enableIrDivStrength) {
+      runRewriter([&](DivIOp *op) {
+        auto x = op->DEF(0);
+        auto y = op->DEF(1);
+
+        // Divisor must be a compile-time integer constant (or a load from a
+        // scalar const global, e.g. `const int base = 16`).
+        auto maybeDiv = tryGetConstantValue(y, gMap);
+        if (!maybeDiv)
+          return false;
+
+        int divisor = *maybeDiv;
+        // Must be a positive power of 2 greater than 1.
+        if (divisor <= 1 || __builtin_popcount((unsigned)divisor) != 1)
+          return false;
+
+        int n = __builtin_ctz((unsigned)divisor);  // log2(divisor)
+        int mask = divisor - 1;                    // 2^n - 1
+
+        // Generate: sign = x >> 31  (arithmetic, propagates sign bit)
+        //           bias = sign & mask
+        //           result = (x + bias) >> n
+        builder.setBeforeOp(op);
+        auto c31  = builder.create<IntOp>({ new IntAttr(31) });
+        auto sign = builder.create<RShiftOp>({ x, c31 });
+        auto cmask = builder.create<IntOp>({ new IntAttr(mask) });
+        auto bias = builder.create<AndIOp>({ sign, cmask });
+        auto xbias = builder.create<AddIOp>({ x, bias });
+        auto cn   = builder.create<IntOp>({ new IntAttr(n) });
+        builder.replace<RShiftOp>(op, { xbias, cn });
+
+        folded++;
+        return false;
+      });
+
+      // Signed integer remainder by a compile-time power-of-2 constant,
+      // when Range analysis confirms x >= 0:
+      //   x % 2^n  →  x & (2^n - 1)
+      // This is only valid for non-negative x: for negative x, C semantics give
+      // a negative remainder, but bitwise AND always gives a non-negative result.
+      runRewriter([&](ModIOp *op) {
+        auto x = op->DEF(0);
+        auto y = op->DEF(1);
+
+        // Divisor must be a compile-time integer constant (or a load from a
+        // scalar const global, e.g. `const int base = 16`).
+        auto maybeMod = tryGetConstantValue(y, gMap);
+        if (!maybeMod)
+          return false;
+
+        int divisor = *maybeMod;
+        // Must be a positive power of 2.
+        if (divisor <= 0 || __builtin_popcount((unsigned)divisor) != 1)
+          return false;
+
+        // Range analysis must confirm x >= 0 (lower bound >= 0).
+        if (!x->has<RangeAttr>())
+          return false;
+        auto [low, high] = RANGE(x);
+        if (low < 0)
+          return false;
+
+        int mask = divisor - 1;  // 2^n - 1
+
+        builder.setBeforeOp(op);
+        auto cmask = builder.create<IntOp>({ new IntAttr(mask) });
+        builder.replace<AndIOp>(op, { x, cmask });
+
+        folded++;
+        return false;
+      });
+    }
 
     foldedTotal += folded;
   } while (folded);

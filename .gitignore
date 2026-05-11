@@ -1,6 +1,8 @@
 build
 build-*
+build_*
 .DS_Store
+.kiro/
 output/
 tests/.out
 tests/external

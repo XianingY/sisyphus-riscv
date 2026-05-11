@@ -343,8 +343,7 @@ Interpreter::Value Interpreter::applyExtern(const std::string &name, const std::
   }
   if (name == "getarray") {
     int n; inbuf >> n;
-    // See 03_sort1.in. They provided data that exceed range of int.
-    // They're too irresponsible.
+    // Some public inputs contain unsigned values outside signed int range.
     unsigned *ptr = (unsigned*) callArgs[0].vi;
     for (int i = 0; i < n; i++)
       inbuf >> ptr[i];

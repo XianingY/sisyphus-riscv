@@ -121,6 +121,7 @@ class ConstLoopUnroll : public Pass {
   std::map<Op*, Op*> phiMap;
   std::map<Op*, Op*> exitlatch;
   int unrolled = 0;
+  int factorUnrolled = 0;
 
   // Returns true if changed.
   bool runImpl(LoopInfo *info);
@@ -128,6 +129,14 @@ class ConstLoopUnroll : public Pass {
   // Starts insertion after `bb`, and duplicate `info` a total of `unroll` times.
   // This only unrolls constant loops.
   BasicBlock *copyLoop(LoopInfo *info, BasicBlock *bb, int unroll);
+  // Attempt factor unroll for non-constant trip-count loops.
+  // When `loop` has a runtime trip-count and a small, side-effect-free body,
+  // clone the loop body as a remainder loop and convert the original loop
+  // into a "main loop" that iterates in steps of (factor * original_step).
+  // The cloned loop handles the tail iterations (trip % factor).
+  //
+  // Returns true if the transformation was applied.
+  bool tryFactorUnroll(LoopInfo *loop, int factor);
 public:
   ConstLoopUnroll(ModuleOp *module): Pass(module) {}
 
@@ -210,6 +219,23 @@ public:
   LoopInterchange(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "loop-interchange"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+// Promotes loop-invariant load/store patterns to scalar registers.
+// For loops where the same address is repeatedly loaded, computed on, and stored,
+// this pass hoists the load to the preheader, replaces in-loop accesses with a phi,
+// and sinks the store to the exit block.
+class ScalarReplace : public Pass {
+  int detected = 0;
+  int promoted = 0;
+
+  void runImpl(LoopInfo *info);
+public:
+  ScalarReplace(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "scalar-replace"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };
