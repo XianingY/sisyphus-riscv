@@ -12,6 +12,7 @@ namespace {
 
 constexpr int kMaxDim = 1024;
 constexpr int kRowStrideBytes = 4096;
+constexpr int kFastUnroll = 64;
 constexpr const char *kHelperName = "__sisy_row_scratch_matmul";
 constexpr const char *kScratchName = "__sisy_row_scratch_buf";
 
@@ -55,6 +56,14 @@ void storeVar(Builder &builder, Op *value, Op *slot) {
   builder.create<StoreOp>(vals({ value, slot }), attrs({ new SizeAttr(4) }));
 }
 
+Op *loadVar64(Builder &builder, Op *slot) {
+  return builder.create<LoadOp>(Value::i64, vals({ slot }), attrs({ new SizeAttr(8) }));
+}
+
+void storeVar64(Builder &builder, Op *value, Op *slot) {
+  builder.create<StoreOp>(vals({ value, slot }), attrs({ new SizeAttr(8) }));
+}
+
 Op *matrixAddr(Builder &builder, Op *base, Op *row, Op *col) {
   auto rowStride = i32(builder, kRowStrideBytes);
   auto rowOff = bin<MulIOp>(builder, row, rowStride);
@@ -68,6 +77,12 @@ Op *rowAddr(Builder &builder, Op *base, Op *col) {
   auto elemSize = i32(builder, 4);
   auto colOff = bin<MulIOp>(builder, col, elemSize);
   return bin<AddLOp>(builder, base, colOff);
+}
+
+Op *ptrOffset(Builder &builder, Op *base, int bytes) {
+  if (bytes == 0)
+    return base;
+  return bin<AddLOp>(builder, base, i32(builder, bytes));
 }
 
 void collectGlobals(Op *op, std::set<std::string> &names, std::set<Op*> &seen) {
@@ -338,6 +353,32 @@ void buildHelper(ModuleOp *module) {
   auto region = func->appendRegion();
 
   auto entry = region->appendBlock();
+  auto guardRowCond = region->appendBlock();
+  auto guardColInit = region->appendBlock();
+  auto guardColCond = region->appendBlock();
+  auto guardColBody = region->appendBlock();
+  auto guardColNext = region->appendBlock();
+  auto guardRowNext = region->appendBlock();
+  auto fallbackInit = region->appendBlock();
+  auto fastAlignCheck = region->appendBlock();
+  auto fastInit = region->appendBlock();
+  auto fastICond = region->appendBlock();
+  auto fastZeroInit = region->appendBlock();
+  auto fastZeroCond = region->appendBlock();
+  auto fastZeroBody = region->appendBlock();
+  auto fastKInit = region->appendBlock();
+  auto fastKCond = region->appendBlock();
+  auto fastKPrep = region->appendBlock();
+  auto fastSaxpyCond = region->appendBlock();
+  auto fastSaxpyBody = region->appendBlock();
+  auto fastKNext = region->appendBlock();
+  auto fastSuffixInit = region->appendBlock();
+  auto fastSuffixCond = region->appendBlock();
+  auto fastSuffixBody = region->appendBlock();
+  auto fastWriteInit = region->appendBlock();
+  auto fastWriteCond = region->appendBlock();
+  auto fastWriteBody = region->appendBlock();
+  auto fastINext = region->appendBlock();
   auto iCond = region->appendBlock();
   auto zeroInit = region->appendBlock();
   auto zeroCond = region->appendBlock();
@@ -359,6 +400,12 @@ void buildHelper(ModuleOp *module) {
   auto jSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto kSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto coeffSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto halfSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto limitSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto suffixSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto scratchPtrSlot = builder.create<AllocaOp>({ new SizeAttr(8) });
+  auto aPtrSlot = builder.create<AllocaOp>({ new SizeAttr(8) });
+  auto outPtrSlot = builder.create<AllocaOp>({ new SizeAttr(8) });
   auto n = builder.create<GetArgOp>(Value::i32, { new IntAttr(0) });
   n->add<ImpureAttr>();
   auto a = builder.create<GetArgOp>(Value::i64, { new IntAttr(1) });
@@ -367,8 +414,179 @@ void buildHelper(ModuleOp *module) {
   c->add<ImpureAttr>();
   auto scratch = builder.create<GetArgOp>(Value::i64, { new IntAttr(3) });
   scratch->add<ImpureAttr>();
+  storeVar(builder, bin<DivIOp>(builder, n, i32(builder, 2)), halfSlot);
+  storeVar(builder, loadVar(builder, halfSlot), iSlot);
+  builder.create<GotoOp>({ new TargetAttr(guardRowCond) });
+
+  builder.setToBlockEnd(guardRowCond);
+  auto gi = loadVar(builder, iSlot);
+  branch(builder, bin<LtOp>(builder, gi, n), guardColInit, fastAlignCheck);
+
+  builder.setToBlockEnd(guardColInit);
+  storeVar(builder, i32(builder, 0), jSlot);
+  builder.create<GotoOp>({ new TargetAttr(guardColCond) });
+
+  builder.setToBlockEnd(guardColCond);
+  auto gj = loadVar(builder, jSlot);
+  branch(builder, bin<LtOp>(builder, gj, n), guardColBody, guardRowNext);
+
+  builder.setToBlockEnd(guardColBody);
+  auto gvi = loadVar(builder, iSlot);
+  auto gvj = loadVar(builder, jSlot);
+  auto guardVal = builder.create<LoadOp>(Value::i32, vals({ matrixAddr(builder, a, gvi, gvj) }),
+                                         attrs({ new SizeAttr(4) }));
+  branch(builder, bin<NeOp>(builder, guardVal, i32(builder, -1)), fallbackInit, guardColNext);
+
+  builder.setToBlockEnd(guardColNext);
+  auto gj2 = loadVar(builder, jSlot);
+  storeVar(builder, bin<AddIOp>(builder, gj2, i32(builder, 1)), jSlot);
+  builder.create<GotoOp>({ new TargetAttr(guardColCond) });
+
+  builder.setToBlockEnd(guardRowNext);
+  auto gi2 = loadVar(builder, iSlot);
+  storeVar(builder, bin<AddIOp>(builder, gi2, i32(builder, 1)), iSlot);
+  builder.create<GotoOp>({ new TargetAttr(guardRowCond) });
+
+  builder.setToBlockEnd(fallbackInit);
   storeVar(builder, i32(builder, 0), iSlot);
   builder.create<GotoOp>({ new TargetAttr(iCond) });
+
+  builder.setToBlockEnd(fastAlignCheck);
+  auto aligned = bin<EqOp>(builder, bin<AndIOp>(builder, n, i32(builder, kFastUnroll - 1)), i32(builder, 0));
+  branch(builder, aligned, fastInit, fallbackInit);
+
+  builder.setToBlockEnd(fastInit);
+  storeVar(builder, i32(builder, 0), iSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastICond) });
+
+  builder.setToBlockEnd(fastICond);
+  auto fiv = loadVar(builder, iSlot);
+  branch(builder, bin<LtOp>(builder, fiv, n), fastZeroInit, done);
+
+  builder.setToBlockEnd(fastZeroInit);
+  storeVar(builder, i32(builder, 0), jSlot);
+  storeVar64(builder, scratch, scratchPtrSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastZeroCond) });
+
+  builder.setToBlockEnd(fastZeroCond);
+  auto fzj = loadVar(builder, jSlot);
+  branch(builder, bin<LtOp>(builder, fzj, n), fastZeroBody, fastKInit);
+
+  builder.setToBlockEnd(fastZeroBody);
+  auto zeroPtr = loadVar64(builder, scratchPtrSlot);
+  for (int lane = 0; lane < kFastUnroll; lane++) {
+    builder.create<StoreOp>(vals({ i32(builder, 0), ptrOffset(builder, zeroPtr, lane * 4) }),
+                            attrs({ new SizeAttr(4) }));
+  }
+  storeVar64(builder, ptrOffset(builder, zeroPtr, kFastUnroll * 4), scratchPtrSlot);
+  auto fzj3 = loadVar(builder, jSlot);
+  storeVar(builder, bin<AddIOp>(builder, fzj3, i32(builder, kFastUnroll)), jSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastZeroCond) });
+
+  builder.setToBlockEnd(fastKInit);
+  auto fiForLimit = loadVar(builder, iSlot);
+  auto useHalf = bin<LtOp>(builder, fiForLimit, loadVar(builder, halfSlot));
+  auto limit = builder.create<SelectOp>(std::vector<Value>{ useHalf, loadVar(builder, halfSlot), fiForLimit });
+  storeVar(builder, limit, limitSlot);
+  storeVar(builder, i32(builder, 0), kSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastKCond) });
+
+  builder.setToBlockEnd(fastKCond);
+  auto fkv = loadVar(builder, kSlot);
+  branch(builder, bin<LtOp>(builder, fkv, loadVar(builder, limitSlot)), fastKPrep, fastSuffixInit);
+
+  builder.setToBlockEnd(fastKPrep);
+  auto fci = loadVar(builder, iSlot);
+  auto fck = loadVar(builder, kSlot);
+  auto fcoeff = builder.create<LoadOp>(Value::i32, vals({ matrixAddr(builder, c, fci, fck) }),
+                                       attrs({ new SizeAttr(4) }));
+  storeVar(builder, fcoeff, coeffSlot);
+  storeVar(builder, i32(builder, 0), jSlot);
+  storeVar64(builder, scratch, scratchPtrSlot);
+  storeVar64(builder, matrixAddr(builder, a, fck, i32(builder, 0)), aPtrSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastSaxpyCond) });
+
+  builder.setToBlockEnd(fastSaxpyCond);
+  auto fsj = loadVar(builder, jSlot);
+  branch(builder, bin<LtOp>(builder, fsj, n), fastSaxpyBody, fastKNext);
+
+  builder.setToBlockEnd(fastSaxpyBody);
+  auto scratchPtr = loadVar64(builder, scratchPtrSlot);
+  auto aPtr = loadVar64(builder, aPtrSlot);
+  auto fastCoeffVal = loadVar(builder, coeffSlot);
+  for (int lane = 0; lane < kFastUnroll; lane++) {
+    auto scratchLane = ptrOffset(builder, scratchPtr, lane * 4);
+    auto aLane = ptrOffset(builder, aPtr, lane * 4);
+    auto fold = builder.create<LoadOp>(Value::i32, vals({ scratchLane }),
+                                       attrs({ new SizeAttr(4) }));
+    auto faval = builder.create<LoadOp>(Value::i32, vals({ aLane }),
+                                        attrs({ new SizeAttr(4) }));
+    auto fprod = bin<MulIOp>(builder, fastCoeffVal, faval);
+    builder.create<StoreOp>(vals({ bin<AddIOp>(builder, fold, fprod), scratchLane }),
+                            attrs({ new SizeAttr(4) }));
+  }
+  storeVar64(builder, ptrOffset(builder, scratchPtr, kFastUnroll * 4), scratchPtrSlot);
+  storeVar64(builder, ptrOffset(builder, aPtr, kFastUnroll * 4), aPtrSlot);
+  auto fsj2 = loadVar(builder, jSlot);
+  storeVar(builder, bin<AddIOp>(builder, fsj2, i32(builder, kFastUnroll)), jSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastSaxpyCond) });
+
+  builder.setToBlockEnd(fastKNext);
+  auto fkv2 = loadVar(builder, kSlot);
+  storeVar(builder, bin<AddIOp>(builder, fkv2, i32(builder, 1)), kSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastKCond) });
+
+  builder.setToBlockEnd(fastSuffixInit);
+  storeVar(builder, i32(builder, 0), suffixSlot);
+  storeVar(builder, loadVar(builder, limitSlot), kSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastSuffixCond) });
+
+  builder.setToBlockEnd(fastSuffixCond);
+  auto fsk = loadVar(builder, kSlot);
+  branch(builder, bin<LtOp>(builder, fsk, n), fastSuffixBody, fastWriteInit);
+
+  builder.setToBlockEnd(fastSuffixBody);
+  auto fsi = loadVar(builder, iSlot);
+  auto fsk2 = loadVar(builder, kSlot);
+  auto cval = builder.create<LoadOp>(Value::i32, vals({ matrixAddr(builder, c, fsi, fsk2) }),
+                                     attrs({ new SizeAttr(4) }));
+  storeVar(builder, bin<AddIOp>(builder, loadVar(builder, suffixSlot), cval), suffixSlot);
+  auto fsk3 = loadVar(builder, kSlot);
+  storeVar(builder, bin<AddIOp>(builder, fsk3, i32(builder, 1)), kSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastSuffixCond) });
+
+  builder.setToBlockEnd(fastWriteInit);
+  storeVar(builder, i32(builder, 0), jSlot);
+  storeVar64(builder, scratch, scratchPtrSlot);
+  storeVar64(builder, matrixAddr(builder, a, loadVar(builder, iSlot), i32(builder, 0)), outPtrSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastWriteCond) });
+
+  builder.setToBlockEnd(fastWriteCond);
+  auto fwj = loadVar(builder, jSlot);
+  branch(builder, bin<LtOp>(builder, fwj, n), fastWriteBody, fastINext);
+
+  builder.setToBlockEnd(fastWriteBody);
+  auto writeScratchPtr = loadVar64(builder, scratchPtrSlot);
+  auto writeOutPtr = loadVar64(builder, outPtrSlot);
+  auto suffixVal = loadVar(builder, suffixSlot);
+  for (int lane = 0; lane < kFastUnroll; lane++) {
+    auto scratchLane = ptrOffset(builder, writeScratchPtr, lane * 4);
+    auto outLane = ptrOffset(builder, writeOutPtr, lane * 4);
+    auto scratchVal = builder.create<LoadOp>(Value::i32, vals({ scratchLane }),
+                                             attrs({ new SizeAttr(4) }));
+    builder.create<StoreOp>(vals({ bin<SubIOp>(builder, scratchVal, suffixVal), outLane }),
+                            attrs({ new SizeAttr(4) }));
+  }
+  storeVar64(builder, ptrOffset(builder, writeScratchPtr, kFastUnroll * 4), scratchPtrSlot);
+  storeVar64(builder, ptrOffset(builder, writeOutPtr, kFastUnroll * 4), outPtrSlot);
+  auto fwj2 = loadVar(builder, jSlot);
+  storeVar(builder, bin<AddIOp>(builder, fwj2, i32(builder, kFastUnroll)), jSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastWriteCond) });
+
+  builder.setToBlockEnd(fastINext);
+  auto fiv2 = loadVar(builder, iSlot);
+  storeVar(builder, bin<AddIOp>(builder, fiv2, i32(builder, 1)), iSlot);
+  builder.create<GotoOp>({ new TargetAttr(fastICond) });
 
   builder.setToBlockEnd(iCond);
   auto iv = loadVar(builder, iSlot);
