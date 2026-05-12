@@ -171,6 +171,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SCHEDULING_PRECOMPUTE", true))
       pm.addPass<sys::SchedulingPrecompute>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_OVERWRITE_COLLAPSE", true))
+      pm.addPass<sys::RepeatOverwriteCollapse>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();

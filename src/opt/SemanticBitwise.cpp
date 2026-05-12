@@ -346,7 +346,7 @@ void SemanticBitwise::run() {
 
   // Shift recognition can be independently disabled while keeping bitwise ops.
   bool shiftEnabled = envEnabled("SISY_ENABLE_SEMANTIC_SHIFT", true);
-  bool modMulEnabled = envEnabled("SISY_ENABLE_SEMANTIC_MODMUL", false);
+  bool modMulEnabled = envEnabled("SISY_ENABLE_SEMANTIC_MODMUL", true);
 
   std::map<std::string, Candidate> candidates;
   for (auto func : collectFuncs()) {

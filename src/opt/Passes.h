@@ -154,6 +154,20 @@ public:
   void run() override;
 };
 
+class RepeatOverwriteCollapse : public Pass {
+  int candidates = 0;
+  int collapsed = 0;
+  int rejectedShape = 0;
+  int rejectedSideEffect = 0;
+
+public:
+  RepeatOverwriteCollapse(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "repeat-overwrite-collapse"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class RowScratchMatmul : public Pass {
   int candidates = 0;
   int replaced = 0;
