@@ -21,7 +21,9 @@ enum class BitwiseKind {
   Shl,
   Shr,
   Nibble,
-  ModMul
+  ModMul,
+  Max,
+  Min
 };
 
 struct Candidate {
@@ -140,6 +142,32 @@ bool matchesBinary(ModuleOp *module, const std::string &name, BitwiseKind kind) 
       default:
         return false;
       }
+      if (got != expect)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool matchesMinMax(ModuleOp *module, const std::string &name, BitwiseKind kind) {
+  static const std::vector<int> samples = {
+    0, 1, -1, 2, -2, 7, -7, 1024, -1024,
+    0x12345678, -0x1234567, INT_MIN, INT_MAX
+  };
+
+  for (int a : samples) {
+    for (int b : samples) {
+      bool ok = true;
+      int32_t got = runSample(module, name, { a, b }, ok);
+      if (!ok)
+        return false;
+      int32_t expect = 0;
+      if (kind == BitwiseKind::Max)
+        expect = a < b ? b : a;
+      else if (kind == BitwiseKind::Min)
+        expect = a < b ? a : b;
+      else
+        return false;
       if (got != expect)
         return false;
     }
@@ -277,6 +305,12 @@ Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled, bool modMu
   if (hasUnsupportedSideEffect(func))
     return result;
 
+  if (envEnabled("SISY_ENABLE_SEMANTIC_MINMAX", true)) {
+    for (auto kind : { BitwiseKind::Max, BitwiseKind::Min })
+      if (matchesMinMax(module, name, kind))
+        return { kind, argc };
+  }
+
   for (auto kind : { BitwiseKind::And, BitwiseKind::Or, BitwiseKind::Xor })
     if (matchesBinary(module, name, kind))
       return { kind, argc };
@@ -326,6 +360,14 @@ Op *buildReplacement(Builder &builder, CallOp *call, BitwiseKind kind) {
     auto product = builder.create<MulLOp>({ call->getOperand(0), call->getOperand(1) });
     auto mod = builder.create<IntOp>({ new IntAttr(998244353) });
     return builder.create<ModLOp>({ product, mod });
+  }
+  case BitwiseKind::Max: {
+    auto less = builder.create<LtOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<SelectOp>(std::vector<Value>{ less, call->DEF(1), call->DEF(0) });
+  }
+  case BitwiseKind::Min: {
+    auto less = builder.create<LtOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<SelectOp>(std::vector<Value>{ less, call->DEF(0), call->DEF(1) });
   }
   default:
     return nullptr;

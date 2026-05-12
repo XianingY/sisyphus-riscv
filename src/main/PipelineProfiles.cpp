@@ -259,6 +259,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DSE>();
       pm.addPass<sys::DLE>();
     }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", false)) {
+      pm.addPass<sys::ParityIfConversion>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::Select>();
     if ((aggressive || enableO1LiteTail) && !economyMode) {
       pm.addPass<sys::Range>();

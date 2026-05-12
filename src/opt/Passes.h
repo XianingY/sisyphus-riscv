@@ -260,6 +260,20 @@ public:
   void run() override;
 };
 
+// Convert short parity-controlled accumulator branches into SelectOp. This is
+// deliberately narrower than the generic Select pass because it may hoist
+// loads out of the taken block.
+class ParityIfConversion : public Pass {
+  int converted = 0;
+  int rejected = 0;
+public:
+  ParityIfConversion(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "parity-if-conversion"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Recognize lowered bit-buffer readers after SemanticBitwise has normalized
 // hand-written bitwise helpers, then specialize constant-width calls in-place.
 class SemanticBitBuffer : public Pass {
