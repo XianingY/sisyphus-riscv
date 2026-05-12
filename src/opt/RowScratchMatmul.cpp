@@ -12,7 +12,7 @@ namespace {
 
 constexpr int kMaxDim = 1024;
 constexpr int kRowStrideBytes = 4096;
-constexpr int kFastUnroll = 64;
+constexpr int kFastUnroll = 16;
 constexpr const char *kHelperName = "__sisy_row_scratch_matmul";
 constexpr const char *kScratchName = "__sisy_row_scratch_buf";
 
