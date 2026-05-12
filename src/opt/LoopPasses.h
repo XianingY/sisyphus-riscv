@@ -271,6 +271,41 @@ public:
   void run() override;
 };
 
+// Collapses bounded affine modular update loops such as:
+//   while (i < n) {
+//     *p = (*p + c) % m;
+//     i++;
+//   }
+// into a single update of *p. This is intentionally narrow because it
+// rewrites loops with stores.
+class ModularAffineLoop : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  ModularAffineLoop(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "modular-affine-loop"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class DivPow2LoopFold : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  DivPow2LoopFold(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "div-pow2-loop-fold"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class Vectorize : public Pass {
   std::unordered_map<Op*, Op*> base;
   

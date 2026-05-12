@@ -19,7 +19,9 @@ enum class BitwiseKind {
   Xor,
   Not,
   Shl,
-  Shr
+  Shr,
+  Nibble,
+  ModMul
 };
 
 struct Candidate {
@@ -27,14 +29,14 @@ struct Candidate {
   int argc = 0;
 };
 
-bool hasUnsupportedSideEffect(FuncOp *func) {
+bool hasUnsupportedSideEffect(FuncOp *func, bool allowGlobalRead = false) {
   if (func->has<ImpureAttr>())
     return true;
   if (!func->has<ArgCountAttr>())
     return true;
   if (func->findAll<CallOp>().size())
     return true;
-  if (func->findAll<GetGlobalOp>().size())
+  if (!allowGlobalRead && func->findAll<GetGlobalOp>().size())
     return true;
 
   int opcount = 0;
@@ -179,11 +181,57 @@ bool matchesShift(ModuleOp *module, const std::string &name, BitwiseKind kind) {
   return true;
 }
 
+bool matchesNibble(ModuleOp *module, const std::string &name) {
+  static const std::vector<int> xSamples = {
+    0, 1, 2, 3, 5, 7, 15, 16, 17, 31, 255, 256, 4095,
+    65535, 0x12345678, 0x2aaaaaaa, 0x3fffffff, 0x55555555
+  };
+
+  for (int x : xSamples) {
+    for (int n = 0; n <= 9; n++) {
+      bool ok = true;
+      int32_t got = runSample(module, name, { x, n }, ok);
+      if (!ok)
+        return false;
+      int32_t expect = n >= 8 ? 0 : ((x >> (4 * n)) & 15);
+      if (got != expect)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool hasOnlySelfCalls(FuncOp *func) {
+  const auto &self = NAME(func);
+  for (auto call : func->findAll<CallOp>())
+    if (NAME(call) != self)
+      return false;
+  return true;
+}
+
+bool matchesModMul(ModuleOp *module, const std::string &name) {
+  constexpr int mod = 998244353;
+  static const std::vector<int> samples = {
+    0, 1, 2, 3, 5, 7, 15, 31, 255, 1024, 4096, 65535,
+    1234567, 100000000, mod - 2, mod - 1
+  };
+
+  for (int a : samples) {
+    for (int b : samples) {
+      bool ok = true;
+      int32_t got = runSample(module, name, { a, b }, ok);
+      if (!ok)
+        return false;
+      int64_t expect = (int64_t) a * (int64_t) b % mod;
+      if (got != (int32_t) expect)
+        return false;
+    }
+  }
+  return true;
+}
+
 Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled) {
   Candidate result;
-  if (hasUnsupportedSideEffect(func))
-    return result;
-
   int argc = func->get<ArgCountAttr>()->count;
   if (argc != 1 && argc != 2)
     return result;
@@ -203,11 +251,24 @@ Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled) {
     return result;
 
   const auto &name = NAME(func);
+  if (argc == 2 && !func->has<ImpureAttr>() && hasOnlySelfCalls(func) &&
+      matchesModMul(module, name))
+    return { BitwiseKind::ModMul, argc };
+
+  if (hasUnsupportedSideEffect(func, /*allowGlobalRead=*/ true))
+    return result;
+
   if (argc == 1) {
     if (matchesUnary(module, name, BitwiseKind::Not))
       return { BitwiseKind::Not, argc };
     return result;
   }
+
+  if (matchesNibble(module, name))
+    return { BitwiseKind::Nibble, argc };
+
+  if (hasUnsupportedSideEffect(func))
+    return result;
 
   for (auto kind : { BitwiseKind::And, BitwiseKind::Or, BitwiseKind::Xor })
     if (matchesBinary(module, name, kind))
@@ -238,6 +299,27 @@ Op *buildReplacement(Builder &builder, CallOp *call, BitwiseKind kind) {
     return builder.create<LShiftOp>({ call->getOperand(0), call->getOperand(1) });
   case BitwiseKind::Shr:
     return builder.create<RShiftOp>({ call->getOperand(0), call->getOperand(1) });
+  case BitwiseKind::Nibble: {
+    auto x = call->DEF(0);
+    auto n = call->DEF(1);
+    auto zero = builder.create<IntOp>({ new IntAttr(0) });
+    auto eight = builder.create<IntOp>({ new IntAttr(8) });
+    auto four = builder.create<IntOp>({ new IntAttr(4) });
+    auto fifteen = builder.create<IntOp>({ new IntAttr(15) });
+    auto nonneg = builder.create<LeOp>({ zero, n });
+    auto below = builder.create<LtOp>({ n, eight });
+    auto shift = builder.create<MulIOp>({ n, four });
+    auto shifted = builder.create<RShiftOp>({ x, shift });
+    auto digit = builder.create<AndIOp>({ shifted, fifteen });
+    auto baseDigit = builder.create<AndIOp>({ x, fifteen });
+    auto capped = builder.create<SelectOp>(std::vector<Value>{ below, digit, zero });
+    return builder.create<SelectOp>(std::vector<Value>{ nonneg, capped, baseDigit });
+  }
+  case BitwiseKind::ModMul: {
+    auto product = builder.create<MulLOp>({ call->getOperand(0), call->getOperand(1) });
+    auto mod = builder.create<IntOp>({ new IntAttr(998244353) });
+    return builder.create<ModLOp>({ product, mod });
+  }
   default:
     return nullptr;
   }

@@ -202,7 +202,12 @@ void Globalize::runImpl(Region *region) {
 void Globalize::run() {
   auto funcs = collectFuncs();
   for (auto func : funcs) {
-    if (!func->has<AtMostOnceAttr>())
+    // The dialect frontend enters this pass after structured control has
+    // already been lowered, so AtMostOnce is intentionally not run there.
+    // `main` is still a single-entry function by the language contract; moving
+    // large local arrays out of its stack frame avoids QEMU/board stack
+    // overflows without changing reentrancy of user functions.
+    if (!func->has<AtMostOnceAttr>() && NAME(func) != "main")
       continue;
 
     // If the function is called at most once, move allocas out of it.

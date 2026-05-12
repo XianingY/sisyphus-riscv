@@ -145,6 +145,29 @@ struct InlineShape {
   int selfCalls = 0;
 };
 
+bool exprReferencesGlobal(Op *op, std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return false;
+  seen.insert(op);
+  if (isa<GetGlobalOp>(op))
+    return true;
+  for (auto operand : op->getOperands())
+    if (exprReferencesGlobal(operand.defining, seen))
+      return true;
+  return false;
+}
+
+bool writesGlobalMemory(FuncOp *func) {
+  for (auto store : func->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    std::set<Op*> seen;
+    if (exprReferencesGlobal(store->DEF(1), seen))
+      return true;
+  }
+  return false;
+}
+
 InlineShape analyzeInlineShape(FuncOp *func) {
   InlineShape shape;
   const auto &self = NAME(func);
@@ -200,6 +223,8 @@ void Inline::run() {
     }
 
     FuncOp *func = fnMap[fname];
+    if (writesGlobalMemory(func))
+      return false;
 
     // Don't inline overly large functions.
     auto fnRegion = func->getRegion();

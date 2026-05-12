@@ -101,6 +101,33 @@ public:
   void run() override;
 };
 
+class ConstArgSpecialize : public Pass {
+  int cloned = 0;
+  int retargeted = 0;
+  int skippedBudget = 0;
+
+public:
+  ConstArgSpecialize(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "const-arg-specialize"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class BooleanMatrixRecurrenceFastPath : public Pass {
+  int candidates = 0;
+  int fastpaths = 0;
+  int rejectedAlias = 0;
+  int rejectedShape = 0;
+
+public:
+  BooleanMatrixRecurrenceFastPath(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "bool-matrix-recurrence"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Globalizes local arrays.
 class Globalize : public Pass {
   void runImpl(Region *region);

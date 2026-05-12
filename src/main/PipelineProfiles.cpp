@@ -155,6 +155,13 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+      pm.addPass<sys::ConstArgSpecialize>();
+      pm.addPass<sys::GVN>();
+      pm.addPass<sys::DCE>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_RECURRENCE_SUFFIX", true))
+      pm.addPass<sys::BooleanMatrixRecurrenceFastPath>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
       pm.addPass<sys::SemanticBitwise>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
@@ -167,6 +174,15 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::Mem2Reg>();
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+      pm.addPass<sys::ConstArgSpecialize>();
+      pm.addPass<sys::DCE>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DIV_POW2_LOOP_FOLD", false)) {
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+      pm.addPass<sys::DivPow2LoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::RegularFold>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::DAE>();
@@ -181,6 +197,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
+      pm.addPass<sys::ModularAffineLoop>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
