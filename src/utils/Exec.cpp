@@ -209,8 +209,26 @@ void Interpreter::exec(Op *op) {
   EXEC_BINARY(AddIOp, +);
   EXEC_BINARY(SubIOp, -);
   EXEC_BINARY(MulIOp, *);
-  EXEC_BINARY(DivIOp, /);
-  EXEC_BINARY(ModIOp, %);
+  case DivIOp::id: {
+    auto rhs = (int32_t) eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (int32_t) ((int32_t) eval(op->DEF(0)) / rhs));
+    break;
+  }
+  case ModIOp::id: {
+    auto rhs = (int32_t) eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (int32_t) ((int32_t) eval(op->DEF(0)) % rhs));
+    break;
+  }
   EXEC_BINARY(EqOp, ==);
   EXEC_BINARY(NeOp, !=);
   EXEC_BINARY(LtOp, <);
@@ -223,8 +241,26 @@ void Interpreter::exec(Op *op) {
   EXEC_BINARY_L(AddLOp, +);
   EXEC_BINARY_L(SubLOp, -);
   EXEC_BINARY_L(MulLOp, *);
-  EXEC_BINARY_L(DivLOp, /);
-  EXEC_BINARY_L(ModLOp, %);
+  case DivLOp::id: {
+    auto rhs = eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (eval(op->DEF(0)) / rhs));
+    break;
+  }
+  case ModLOp::id: {
+    auto rhs = eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (eval(op->DEF(0)) % rhs));
+    break;
+  }
   EXEC_BINARY_L(LShiftLOp, <<);
   EXEC_BINARY_L(RShiftLOp, >>);
 

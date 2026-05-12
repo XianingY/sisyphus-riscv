@@ -1,5 +1,7 @@
 #include "RvPasses.h"
 #include "../opt/LoopPasses.h"
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 
 using namespace sys;
@@ -40,6 +42,15 @@ Multiplier chooseMultiplier(int d) {
 
 namespace {
 
+bool envEnabled(const char *name, bool fallback) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
+    return false;
+  return true;
+}
+
 void hoistLi(LoopInfo *loop) {
   for (auto subloop : loop->subloops)
     hoistLi(subloop);
@@ -63,6 +74,8 @@ int StrengthReduct::runImpl() {
   Builder builder;
 
   int converted = 0;
+  const bool enableMulwDecompose =
+    envEnabled("SISY_RV_ENABLE_MULW_DECOMPOSE", false);
   
   // ===================
   // Rewrite MulOp.
@@ -136,7 +149,7 @@ int StrengthReduct::runImpl() {
     // Keep this as a plain modulo-2^32 shift/add chain.  The previous
     // pairwise regrouping could discard the already accumulated partial
     // sum for constants such as 13, changing the value.
-    if (bits >= 3 && bits <= 16 && !hasShiftSubForm()) {
+    if (enableMulwDecompose && bits >= 3 && bits <= 16 && !hasShiftSubForm()) {
       converted++;
       builder.setBeforeOp(op);
 

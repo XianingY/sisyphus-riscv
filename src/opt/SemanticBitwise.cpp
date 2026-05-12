@@ -230,7 +230,14 @@ bool matchesModMul(ModuleOp *module, const std::string &name) {
   return true;
 }
 
-Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled) {
+bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return raw[0] != '0';
+}
+
+Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled, bool modMulEnabled) {
   Candidate result;
   int argc = func->get<ArgCountAttr>()->count;
   if (argc != 1 && argc != 2)
@@ -251,7 +258,7 @@ Candidate classify(ModuleOp *module, FuncOp *func, bool shiftEnabled) {
     return result;
 
   const auto &name = NAME(func);
-  if (argc == 2 && !func->has<ImpureAttr>() && hasOnlySelfCalls(func) &&
+  if (modMulEnabled && argc == 2 && !func->has<ImpureAttr>() && hasOnlySelfCalls(func) &&
       matchesModMul(module, name))
     return { BitwiseKind::ModMul, argc };
 
@@ -338,14 +345,14 @@ void SemanticBitwise::run() {
   CallGraph(module).run();
 
   // Shift recognition can be independently disabled while keeping bitwise ops.
-  const char *shiftEnv = std::getenv("SISY_ENABLE_SEMANTIC_SHIFT");
-  bool shiftEnabled = !shiftEnv || !shiftEnv[0] || shiftEnv[0] != '0';
+  bool shiftEnabled = envEnabled("SISY_ENABLE_SEMANTIC_SHIFT", true);
+  bool modMulEnabled = envEnabled("SISY_ENABLE_SEMANTIC_MODMUL", false);
 
   std::map<std::string, Candidate> candidates;
   for (auto func : collectFuncs()) {
     if (isExtern(NAME(func)))
       continue;
-    auto candidate = classify(module, func, shiftEnabled);
+    auto candidate = classify(module, func, shiftEnabled, modMulEnabled);
     if (candidate.kind == BitwiseKind::None)
       continue;
     candidates[NAME(func)] = candidate;

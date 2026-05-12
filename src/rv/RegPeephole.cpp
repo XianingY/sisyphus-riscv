@@ -527,7 +527,8 @@ int RegAlloc::latePeephole(Op *funcOp) {
       // This must substitute the move source, not the arithmetic destination:
       //   mv t0, a0; addw a1, t0, t0  ->  addw a1, a0, a0
       // Replacing with RD(next) corrupts cases where RD(next) is unrelated.
-      if ((isa<MulwOp>(next) || isa<AddwOp>(next) || isa<SubwOp>(next)) &&
+      if (envEnabled("SISY_RV_ENABLE_MOVE_ARITH_PEEPHOLE", false) &&
+          (isa<MulwOp>(next) || isa<AddwOp>(next) || isa<SubwOp>(next)) &&
           op->getUses().size() == 1 &&
           *op->getUses().begin() == next) {
         Reg mvSrc = RS(op);
