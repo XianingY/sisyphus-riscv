@@ -21,6 +21,14 @@ bool inRange(int x) {
   return x >= -2048 && x <= 2047;
 }
 
+bool inShamt32(int x) {
+  return x >= 0 && x < 32;
+}
+
+bool inShamt64(int x) {
+  return x >= 0 && x < 64;
+}
+
 static bool getenvEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
   if (!raw || !raw[0])
@@ -107,12 +115,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SllwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt32(val))
         return false;
 
       combined++;
@@ -124,12 +134,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrawOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt32(val))
         return false;
 
       combined++;
@@ -141,12 +153,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrlwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt32(val))
         return false;
 
       combined++;
@@ -158,12 +172,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SraOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt64(val))
         return false;
 
       combined++;
@@ -175,12 +191,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrlOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt64(val))
         return false;
 
       combined++;
@@ -192,12 +210,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SllOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt64(val))
         return false;
 
       combined++;
@@ -209,6 +229,8 @@ void InstCombine::run() {
   });
 
   runRewriter([&](OrOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_LOGIC_IMM_COMBINE", true))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
     if (isa<LiOp>(x) && inRange(x)) {
@@ -227,6 +249,8 @@ void InstCombine::run() {
   });
 
   runRewriter([&](XorOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_LOGIC_IMM_COMBINE", true))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
     if (isa<LiOp>(x) && inRange(x)) {
@@ -296,29 +320,21 @@ void InstCombine::run() {
   RvDCE(module).run();
 
   runRewriter([&](SlliwOp *op) {
-    if (V(op) == 0) {
-      op->replaceAllUsesWith(op->getOperand().defining);
-      op->erase();
-      return true;
-    }
+    (void) op;
+    // `slliw rd, rs, 0` is not a pure move on RV64: it sign-extends the
+    // low 32 bits. Keep it so i32 values stay ABI-canonicalized.
     return false;
   });
 
   runRewriter([&](SrliwOp *op) {
-    if (V(op) == 0) {
-      op->replaceAllUsesWith(op->getOperand().defining);
-      op->erase();
-      return true;
-    }
+    (void) op;
+    // `srliw` also truncates to 32 bits before producing the result.
     return false;
   });
 
   runRewriter([&](SraiwOp *op) {
-    if (V(op) == 0) {
-      op->replaceAllUsesWith(op->getOperand().defining);
-      op->erase();
-      return true;
-    }
+    (void) op;
+    // `sraiw rd, rs, 0` is the standard 32-bit sign-extension idiom.
     return false;
   });
 

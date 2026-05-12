@@ -164,6 +164,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::BooleanMatrixRecurrenceFastPath>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
       pm.addPass<sys::SemanticBitwise>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_BITBUFFER_SPECIALIZE", true))
+      pm.addPass<sys::SemanticBitBuffer>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);

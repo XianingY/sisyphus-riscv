@@ -195,6 +195,23 @@ public:
   void run() override;
 };
 
+// Recognize lowered bit-buffer readers after SemanticBitwise has normalized
+// hand-written bitwise helpers, then specialize constant-width calls in-place.
+class SemanticBitBuffer : public Pass {
+  int candidates = 0;
+  int specialized = 0;
+  int repeatFolded = 0;
+  int rejectedShape = 0;
+  int rejectedNonConstCall = 0;
+
+public:
+  SemanticBitBuffer(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "semantic-bitbuffer"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Adds a bounded runtime memo table for small pure self-recursive integer
 // functions. The cache is guarded by an epoch that is bumped at non-recursive
 // call sites, so recursive calls within one top-level invocation can share
