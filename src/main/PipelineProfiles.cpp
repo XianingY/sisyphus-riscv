@@ -209,6 +209,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::ModularAffineLoop>();
       pm.addPass<sys::SimplifyCFG>();
     }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", true)) {
+      pm.addPass<sys::RotlRepeatLoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true)) {

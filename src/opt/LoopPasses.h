@@ -306,6 +306,20 @@ public:
   void run() override;
 };
 
+class RotlRepeatLoopFold : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+
+  bool runImpl(FuncOp *func, LoopInfo *info);
+public:
+  RotlRepeatLoopFold(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "rotl-repeat-loop-fold"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class Vectorize : public Pass {
   std::unordered_map<Op*, Op*> base;
   
