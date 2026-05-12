@@ -162,6 +162,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_RECURRENCE_SUFFIX", true))
       pm.addPass<sys::BooleanMatrixRecurrenceFastPath>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_ROW_SUM_RECURRENCE", true))
+      pm.addPass<sys::MatrixRowSumRecurrence>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
       pm.addPass<sys::SemanticBitwise>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_BITBUFFER_SPECIALIZE", true))

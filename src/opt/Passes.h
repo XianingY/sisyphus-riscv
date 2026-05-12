@@ -128,6 +128,19 @@ public:
   void run() override;
 };
 
+class MatrixRowSumRecurrence : public Pass {
+  int candidates = 0;
+  int replaced = 0;
+  int rejectedShape = 0;
+
+public:
+  MatrixRowSumRecurrence(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "matrix-row-sum-recurrence"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class RowScratchMatmul : public Pass {
   int candidates = 0;
   int replaced = 0;
