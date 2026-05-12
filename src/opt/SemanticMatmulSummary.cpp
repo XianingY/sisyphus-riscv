@@ -13,6 +13,7 @@ namespace {
 
 constexpr int kDim = 1000;
 constexpr int kStrideBytes = kDim * 4;
+constexpr int kTileK = 32;  // k-dimension tile size for cache locality
 constexpr const char *kHelperName = "__sisy_semantic_matmul_summary";
 constexpr const char *kScratchName = "__sisy_semantic_matmul_row";
 
@@ -141,11 +142,17 @@ void buildHelper(ModuleOp *module) {
   });
   auto region = func->appendRegion();
 
+  // Block layout:
+  // entry → iCond → zeroInit → zeroCond/zeroBody → kkInit
+  //   → kkCond → kInit → kCond → kPrep → even/odd j loops → kNext → kkNext
+  //   → minInit → minCond/minBody → iNext → done
   auto entry = region->appendBlock();
   auto iCond = region->appendBlock();
   auto zeroInit = region->appendBlock();
   auto zeroCond = region->appendBlock();
   auto zeroBody = region->appendBlock();
+  auto kkInit = region->appendBlock();
+  auto kkCond = region->appendBlock();
   auto kInit = region->appendBlock();
   auto kCond = region->appendBlock();
   auto kPrep = region->appendBlock();
@@ -156,6 +163,7 @@ void buildHelper(ModuleOp *module) {
   auto oddAdd = region->appendBlock();
   auto oddSkip = region->appendBlock();
   auto kNext = region->appendBlock();
+  auto kkNext = region->appendBlock();
   auto minInit = region->appendBlock();
   auto minCond = region->appendBlock();
   auto minBody = region->appendBlock();
@@ -170,6 +178,8 @@ void buildHelper(ModuleOp *module) {
   auto iSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto jSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto kSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto kkSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto kEndSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto sumSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto minSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto aikSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
@@ -186,7 +196,7 @@ void buildHelper(ModuleOp *module) {
   builder.create<GotoOp>({ new TargetAttr(zeroCond) });
 
   builder.setToBlockEnd(zeroCond);
-  branch(builder, bin<LtOp>(builder, loadVar(builder, jSlot), i32(builder, kDim)), zeroBody, kInit);
+  branch(builder, bin<LtOp>(builder, loadVar(builder, jSlot), i32(builder, kDim)), zeroBody, kkInit);
 
   builder.setToBlockEnd(zeroBody);
   builder.create<StoreOp>(vals({ i32(builder, 0), addr1d(builder, scratch, loadVar(builder, jSlot)) }),
@@ -194,25 +204,44 @@ void buildHelper(ModuleOp *module) {
   storeVar(builder, bin<AddIOp>(builder, loadVar(builder, jSlot), i32(builder, 1)), jSlot);
   builder.create<GotoOp>({ new TargetAttr(zeroCond) });
 
+  // Outer tile loop: kk iterates in steps of kTileK
+  builder.setToBlockEnd(kkInit);
+  storeVar(builder, i32(builder, 0), kkSlot);
+  builder.create<GotoOp>({ new TargetAttr(kkCond) });
+
+  builder.setToBlockEnd(kkCond);
+  branch(builder, bin<LtOp>(builder, loadVar(builder, kkSlot), i32(builder, kDim)), kInit, minInit);
+
+  // Inner k loop: k from kk to min(kk + kTileK, kDim)
   builder.setToBlockEnd(kInit);
-  storeVar(builder, i32(builder, 0), kSlot);
-  builder.create<GotoOp>({ new TargetAttr(kCond) });
+  {
+    auto kk = loadVar(builder, kkSlot);
+    storeVar(builder, kk, kSlot);
+    // kEnd = min(kk + kTileK, kDim)
+    auto kkPlusTile = bin<AddIOp>(builder, kk, i32(builder, kTileK));
+    auto cmp = bin<LtOp>(builder, kkPlusTile, i32(builder, kDim));
+    auto kEnd = builder.create<SelectOp>(std::vector<Value>{ cmp, kkPlusTile, i32(builder, kDim) });
+    storeVar(builder, kEnd, kEndSlot);
+    builder.create<GotoOp>({ new TargetAttr(kCond) });
+  }
 
   builder.setToBlockEnd(kCond);
-  branch(builder, bin<LtOp>(builder, loadVar(builder, kSlot), i32(builder, kDim)), kPrep, minInit);
+  branch(builder, bin<LtOp>(builder, loadVar(builder, kSlot), loadVar(builder, kEndSlot)), kPrep, kkNext);
 
   builder.setToBlockEnd(kPrep);
-  auto i0 = loadVar(builder, iSlot);
-  auto k0 = loadVar(builder, kSlot);
-  auto aik = builder.create<LoadOp>(Value::i32, vals({ addr2d(builder, aBase, i0, k0) }),
-                                    attrs({ new SizeAttr(4) }));
-  auto coeff = builder.create<LoadOp>(Value::i32, vals({ addr2d(builder, aBase, k0, i0) }),
+  {
+    auto i0 = loadVar(builder, iSlot);
+    auto k0 = loadVar(builder, kSlot);
+    auto aik = builder.create<LoadOp>(Value::i32, vals({ addr2d(builder, aBase, i0, k0) }),
                                       attrs({ new SizeAttr(4) }));
-  storeVar(builder, aik, aikSlot);
-  storeVar(builder, coeff, coeffSlot);
-  storeVar(builder, i32(builder, 0), jSlot);
-  auto even = bin<EqOp>(builder, bin<AndIOp>(builder, aik, i32(builder, 1)), i32(builder, 0));
-  branch(builder, even, evenJCond, oddJCond);
+    auto coeff = builder.create<LoadOp>(Value::i32, vals({ addr2d(builder, aBase, k0, i0) }),
+                                        attrs({ new SizeAttr(4) }));
+    storeVar(builder, aik, aikSlot);
+    storeVar(builder, coeff, coeffSlot);
+    storeVar(builder, i32(builder, 0), jSlot);
+    auto even = bin<EqOp>(builder, bin<AndIOp>(builder, aik, i32(builder, 1)), i32(builder, 0));
+    branch(builder, even, evenJCond, oddJCond);
+  }
 
   builder.setToBlockEnd(evenJCond);
   branch(builder, bin<LtOp>(builder, loadVar(builder, jSlot), i32(builder, kDim)), evenJBody, kNext);
@@ -263,6 +292,11 @@ void buildHelper(ModuleOp *module) {
   builder.setToBlockEnd(kNext);
   storeVar(builder, bin<AddIOp>(builder, loadVar(builder, kSlot), i32(builder, 1)), kSlot);
   builder.create<GotoOp>({ new TargetAttr(kCond) });
+
+  // Advance outer tile loop
+  builder.setToBlockEnd(kkNext);
+  storeVar(builder, bin<AddIOp>(builder, loadVar(builder, kkSlot), i32(builder, kTileK)), kkSlot);
+  builder.create<GotoOp>({ new TargetAttr(kkCond) });
 
   builder.setToBlockEnd(minInit);
   storeVar(builder, i32(builder, 2147483647), minSlot);
