@@ -224,6 +224,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // Early Unswitch before first LICM is useful for invariant branches at O1.
     if (getenvEnabled("SISY_ENABLE_O1_UNSWITCH", true))
       pm.addPass<sys::Unswitch>();
+    pm.addPass<sys::Alias>();
     pm.addPass<sys::LICM>();
     if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
       pm.addPass<sys::ScalarReplace>();

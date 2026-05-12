@@ -44,6 +44,43 @@ bool noAlias(Op *load, const std::vector<Op*> &stores) {
   return true;
 }
 
+// Trace through AddLOp/MulIOp/etc to find the base GetGlobalOp.
+Op *traceGlobalBase(Op *addr) {
+  // Follow the pointer chain: AddLOp's first operand is typically the base.
+  while (addr) {
+    if (isa<GetGlobalOp>(addr))
+      return addr;
+    if (isa<AddLOp>(addr)) {
+      addr = addr->DEF(0);
+      continue;
+    }
+    // PhiOp with single operand — follow through.
+    if (isa<PhiOp>(addr) && addr->getOperandCount() == 1) {
+      addr = addr->DEF(0);
+      continue;
+    }
+    break;
+  }
+  return nullptr;
+}
+
+// Enhanced no-alias check: if the load address traces to a different global
+// base than ALL store addresses, they can never alias.
+bool noAliasGlobalBase(Op *load, const std::vector<Op*> &stores) {
+  auto loadBase = traceGlobalBase(load->DEF());
+  if (!loadBase)
+    return false;
+
+  for (auto store : stores) {
+    auto storeBase = traceGlobalBase(store);
+    if (!storeBase)
+      return false;
+    if (NAME(loadBase) == NAME(storeBase))
+      return false;
+  }
+  return true;
+}
+
 // Traces `op` up back, and determines if everything between `info` and `outer` are invariant.
 bool variant(Op *op, LoopInfo *info, LoopInfo *outer, std::set<Op*> &visited) {
   if (visited.count(op))
@@ -92,7 +129,8 @@ void LICM::hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
     if (op->has<VariantAttr>())
       continue;
 
-    if (pinned(op) || isa<PhiOp>(op) || (isa<LoadOp>(op) && (!noAlias(op, stores) || impure))
+    if (pinned(op) || isa<PhiOp>(op)
+        || (isa<LoadOp>(op) && (impure || (!noAlias(op, stores) && !noAliasGlobalBase(op, stores))))
         // When a store only writes a loop-invariant value to loop-invariant address,
         // and it doesn't follow any load, then it's safe to hoist it out.
         || (isa<StoreOp>(op) && (!hoistable || impure || op->DEF(0)->has<VariantAttr>() || op->DEF(1)->has<VariantAttr>())))
@@ -129,7 +167,8 @@ void LICM::markVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
     if (op->has<VariantAttr>())
       continue;
 
-    if (pinned(op) || (isa<LoadOp>(op) && (!noAlias(op, stores) || impure))
+    if (pinned(op)
+        || (isa<LoadOp>(op) && (impure || (!noAlias(op, stores) && !noAliasGlobalBase(op, stores))))
         || (isa<StoreOp>(op) && (!hoistable || impure || op->DEF(0)->has<VariantAttr>() || op->DEF(1)->has<VariantAttr>())))
       op->add<VariantAttr>();
     else for (auto operand : op->getOperands()) {
@@ -148,16 +187,10 @@ void LICM::markVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
 }
 
 bool LICM::updateStores(LoopInfo *info) {
-  // Check rotated loops.
+  // Check that the loop has a preheader (required for hoisting).
   auto preheader = info->preheader;
   if (!preheader)
     return false;
-
-  for (auto latch : info->latches) {
-    auto term = latch->getLastOp();
-    if (!isa<BranchOp>(term))
-      return false;
-  }
 
   // Record all stores in the loop.
   stores.clear();
