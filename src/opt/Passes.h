@@ -248,6 +248,18 @@ public:
   void run() override;
 };
 
+class SemanticTranspose : public Pass {
+  int candidates = 0;
+  int callsRewritten = 0;
+  int rejectedShape = 0;
+public:
+  SemanticTranspose(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "semantic-transpose"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Recognize lowered bit-buffer readers after SemanticBitwise has normalized
 // hand-written bitwise helpers, then specialize constant-width calls in-place.
 class SemanticBitBuffer : public Pass {
