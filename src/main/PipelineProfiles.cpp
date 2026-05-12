@@ -155,7 +155,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::GVN>();
       pm.addPass<sys::DCE>();
@@ -194,7 +194,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::Mem2Reg>();
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::DCE>();
     }
