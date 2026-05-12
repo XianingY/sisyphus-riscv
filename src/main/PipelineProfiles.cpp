@@ -169,6 +169,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_BITBUFFER_SPECIALIZE", true))
       pm.addPass<sys::SemanticBitBuffer>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SCHEDULING_PRECOMPUTE", true))
+      pm.addPass<sys::SchedulingPrecompute>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();
