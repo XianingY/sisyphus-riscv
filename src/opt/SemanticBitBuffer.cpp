@@ -389,10 +389,9 @@ void buildPredecode(ModuleOp *module, const Candidate &candidate) {
 
   auto entry = region->appendBlock();
   auto decodeHead = region->appendBlock();
+  auto refillCheck = region->appendBlock();
+  auto refillBody = region->appendBlock();
   auto extract = region->appendBlock();
-  auto loadHigh = region->appendBlock();
-  auto noHigh = region->appendBlock();
-  auto afterHigh = region->appendBlock();
   auto storeOut = region->appendBlock();
   auto afterStore = region->appendBlock();
   auto maybeStoreOut = region->appendBlock();
@@ -401,10 +400,11 @@ void buildPredecode(ModuleOp *module, const Candidate &candidate) {
   auto done = region->appendBlock();
 
   builder.setToBlockEnd(entry);
-  auto bitSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto bufSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto bitsSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto posSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto outSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto resultSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  auto highSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto partialSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto first = builder.create<LoadOp>(Value::i32,
     vals({ addr1d(builder, candidate.data, i32(builder, 0)) }),
@@ -412,54 +412,49 @@ void buildPredecode(ModuleOp *module, const Candidate &candidate) {
   storeGlobal(builder, kPreBFinal, bin<AndIOp>(builder, first, i32(builder, 1)));
   auto btype = bin<AndIOp>(builder, bin<RShiftOp>(builder, first, i32(builder, 1)), i32(builder, 3));
   storeGlobal(builder, kPreBType, btype);
-  // The fixed decoder first consumes bfinal/btype and then flushes the
-  // remaining bits in the first byte, so payload symbols start at bit 8.
-  storeVar(builder, bitSlot, i32(builder, 8));
+  storeVar(builder, bufSlot, i32(builder, 0));
+  storeVar(builder, bitsSlot, i32(builder, 0));
+  storeVar(builder, posSlot, i32(builder, 1));
   storeVar(builder, outSlot, i32(builder, 0));
   builder.create<GotoOp>({ new TargetAttr(decodeHead) });
 
   builder.setToBlockEnd(decodeHead);
-  auto bit = loadVar(builder, bitSlot);
+  auto bits = loadVar(builder, bitsSlot);
+  branch(builder, bin<LtOp>(builder, bits, i32(builder, 5)), refillCheck, extract);
+
+  builder.setToBlockEnd(refillCheck);
+  auto pos = loadVar(builder, posSlot);
   auto size = loadGlobal(builder, candidate.size);
-  auto totalBits = bin<LShiftOp>(builder, size, i32(builder, 3));
-  branch(builder, bin<LtOp>(builder, bit, totalBits), extract, done);
+  branch(builder, bin<LtOp>(builder, pos, size), refillBody, extract);
+
+  builder.setToBlockEnd(refillBody);
+  auto oldBuf = loadVar(builder, bufSlot);
+  auto oldBits = loadVar(builder, bitsSlot);
+  auto oldPos = loadVar(builder, posSlot);
+  auto dataValue = builder.create<LoadOp>(Value::i32,
+    vals({ addr1d(builder, candidate.data, oldPos) }),
+    attrs({ new SizeAttr(4) }));
+  auto shifted = bin<LShiftOp>(builder, dataValue, oldBits);
+  storeVar(builder, bufSlot, bin<OrIOp>(builder, oldBuf, shifted));
+  storeVar(builder, bitsSlot, bin<AddIOp>(builder, oldBits, i32(builder, 8)));
+  storeVar(builder, posSlot, bin<AddIOp>(builder, oldPos, i32(builder, 1)));
+  builder.create<GotoOp>({ new TargetAttr(decodeHead) });
 
   builder.setToBlockEnd(extract);
-  auto bit2 = loadVar(builder, bitSlot);
-  auto byte = bin<RShiftOp>(builder, bit2, i32(builder, 3));
-  auto nextByte = bin<AddIOp>(builder, byte, i32(builder, 1));
-  auto size2 = loadGlobal(builder, candidate.size);
-  auto d0 = builder.create<LoadOp>(Value::i32,
-    vals({ addr1d(builder, candidate.data, byte) }),
-    attrs({ new SizeAttr(4) }));
-  branch(builder, bin<LtOp>(builder, nextByte, size2), loadHigh, noHigh);
-
-  builder.setToBlockEnd(loadHigh);
-  auto hi = builder.create<LoadOp>(Value::i32,
-    vals({ addr1d(builder, candidate.data, nextByte) }),
-    attrs({ new SizeAttr(4) }));
-  storeVar(builder, highSlot, hi);
-  builder.create<GotoOp>({ new TargetAttr(afterHigh) });
-
-  builder.setToBlockEnd(noHigh);
-  storeVar(builder, highSlot, i32(builder, 0));
-  builder.create<GotoOp>({ new TargetAttr(afterHigh) });
-
-  builder.setToBlockEnd(afterHigh);
-  auto currentBit = loadVar(builder, bitSlot);
-  auto shift = bin<AndIOp>(builder, currentBit, i32(builder, 7));
-  auto low = bin<RShiftOp>(builder, d0, shift);
-  auto highShift = bin<SubIOp>(builder, i32(builder, 8), shift);
-  auto high = bin<LShiftOp>(builder, loadVar(builder, highSlot), highShift);
-  auto chunk = bin<OrIOp>(builder, low, high);
-  auto result = bin<AndIOp>(builder, chunk, i32(builder, 31));
+  auto available = loadVar(builder, bitsSlot);
+  auto noBits = bin<LeOp>(builder, available, i32(builder, 0));
+  auto isPartial = bin<LtOp>(builder, available, i32(builder, 5));
+  storeVar(builder, partialSlot, isPartial);
+  auto currentBuf = loadVar(builder, bufSlot);
+  auto result = bin<AndIOp>(builder, currentBuf, i32(builder, 31));
   storeVar(builder, resultSlot, result);
-  auto nextBit = bin<AddIOp>(builder, currentBit, i32(builder, 5));
-  storeVar(builder, bitSlot, nextBit);
-  auto totalBits2 = bin<LShiftOp>(builder, loadGlobal(builder, candidate.size), i32(builder, 3));
-  storeVar(builder, partialSlot, bin<LtOp>(builder, totalBits2, nextBit));
+  storeVar(builder, bufSlot, bin<RShiftOp>(builder, currentBuf, i32(builder, 5)));
+  auto nextBits = bin<SubIOp>(builder, available, i32(builder, 5));
+  storeVar(builder, bitsSlot, builder.create<SelectOp>(
+    std::vector<Value>{ isPartial, i32(builder, 0), nextBits }));
   auto positive = bin<LtOp>(builder, i32(builder, 0), result);
-  branch(builder, positive, storeOut, skipOrDone);
+  auto shouldStore = bin<AndIOp>(builder, positive, bin<EqOp>(builder, noBits, i32(builder, 0)));
+  branch(builder, shouldStore, storeOut, skipOrDone);
 
   builder.setToBlockEnd(storeOut);
   auto outIdx = loadVar(builder, outSlot);
@@ -485,7 +480,13 @@ void buildPredecode(ModuleOp *module, const Candidate &candidate) {
   branch(builder, loadVar(builder, partialSlot), done, decodeHead);
 
   builder.setToBlockEnd(skipOrDone);
-  branch(builder, loadVar(builder, partialSlot), done, decodeHead);
+  auto pos2 = loadVar(builder, posSlot);
+  auto size2 = loadGlobal(builder, candidate.size);
+  auto canContinue = bin<AndIOp>(
+    builder,
+    bin<EqOp>(builder, loadVar(builder, partialSlot), i32(builder, 0)),
+    bin<LtOp>(builder, pos2, size2));
+  branch(builder, canContinue, decodeHead, done);
 
   builder.setToBlockEnd(done);
   storeGlobal(builder, candidate.pos, loadGlobal(builder, candidate.size));
