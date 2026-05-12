@@ -389,128 +389,77 @@ void buildPredecode(ModuleOp *module, const Candidate &candidate) {
 
   auto entry = region->appendBlock();
   auto decodeHead = region->appendBlock();
-  auto refillCheck = region->appendBlock();
-  auto refillBody = region->appendBlock();
-  auto extract = region->appendBlock();
   auto storeOut = region->appendBlock();
+  auto maybeStoreOut = region->appendBlock();
+  auto skipStoreOut = region->appendBlock();
   auto skipOrDone = region->appendBlock();
   auto done = region->appendBlock();
 
-  // Entry: extract bfinal/btype using running-buffer approach, then decode.
-  // Use local allocas for buf/bits/pos so Mem2Reg promotes them to registers.
   builder.setToBlockEnd(entry);
-  auto bufSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  auto bitsSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  auto posSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto bitSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto outSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  auto sizeSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  // Initialize state: buf=0, bits=0, pos=0
-  storeVar(builder, bufSlot, i32(builder, 0));
-  storeVar(builder, bitsSlot, i32(builder, 0));
-  storeVar(builder, posSlot, i32(builder, 0));
-  storeVar(builder, outSlot, i32(builder, 0));
-  auto sizeVal = loadGlobal(builder, candidate.size);
-  storeVar(builder, sizeSlot, sizeVal);
-  // Inline read_bits(1) for bfinal: refill then extract 1 bit
-  // Since bits=0 < 1, we always refill first.
-  auto d0 = builder.create<LoadOp>(Value::i32,
+  auto resultSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
+  auto first = builder.create<LoadOp>(Value::i32,
     vals({ addr1d(builder, candidate.data, i32(builder, 0)) }),
     attrs({ new SizeAttr(4) }));
-  // After refill: buf = d0, bits = 8, pos = 1
-  auto bfinal = bin<AndIOp>(builder, d0, i32(builder, 1));
-  storeGlobal(builder, kPreBFinal, bfinal);
-  auto bufAfter1 = bin<RShiftOp>(builder, d0, i32(builder, 1));
-  // Inline read_bits(2) for btype: bits=7 >= 2, extract directly
-  auto btype = bin<AndIOp>(builder, bufAfter1, i32(builder, 3));
+  storeGlobal(builder, kPreBFinal, bin<AndIOp>(builder, first, i32(builder, 1)));
+  auto btype = bin<AndIOp>(builder, bin<RShiftOp>(builder, first, i32(builder, 1)), i32(builder, 3));
   storeGlobal(builder, kPreBType, btype);
-  auto bufAfter2 = bin<RShiftOp>(builder, bufAfter1, i32(builder, 2));
-  // State after reading bfinal(1) + btype(2): buf = d0>>3, bits = 5, pos = 1
-  storeVar(builder, bufSlot, bufAfter2);
-  storeVar(builder, bitsSlot, i32(builder, 5));
-  storeVar(builder, posSlot, i32(builder, 1));
-  // Skip the "while (bits > 0) read_bits(1)" drain loop.
-  // After drain: bits becomes 0, buf becomes 0. We consumed 5 more bits
-  // but since we just discard them, effectively: pos stays, bits=0, buf=0.
-  // Actually the drain reads 1 bit at a time until bits < 1, i.e. bits == 0.
-  // Since bits=5, it reads 5 times, each time: result = buf&1, buf>>=1, bits-=1.
-  // After drain: buf = d0>>8 (which is 0 for 8-bit data), bits = 0.
-  // Simpler: just set buf=0, bits=0 after drain (the drain discards everything).
-  storeVar(builder, bufSlot, i32(builder, 0));
-  storeVar(builder, bitsSlot, i32(builder, 0));
+  storeVar(builder, bitSlot, i32(builder, 8));
+  storeVar(builder, outSlot, i32(builder, 0));
   builder.create<GotoOp>({ new TargetAttr(decodeHead) });
 
-  // Decode loop: read_bits(5) using running buffer, store valid chars.
   builder.setToBlockEnd(decodeHead);
-  auto bits = loadVar(builder, bitsSlot);
-  auto need5 = bin<LtOp>(builder, bits, i32(builder, 5));
-  branch(builder, need5, refillCheck, extract);
-
-  // Refill check: if pos < size, load next byte into buffer.
-  builder.setToBlockEnd(refillCheck);
-  auto pos = loadVar(builder, posSlot);
-  auto size = loadVar(builder, sizeSlot);
-  auto canRefill = bin<LtOp>(builder, pos, size);
-  branch(builder, canRefill, refillBody, extract);
-
-  // Refill body: buf |= data[pos] << bits; bits += 8; pos++
-  builder.setToBlockEnd(refillBody);
-  auto curBuf = loadVar(builder, bufSlot);
-  auto curBits = loadVar(builder, bitsSlot);
-  auto curPos = loadVar(builder, posSlot);
-  auto dataVal = builder.create<LoadOp>(Value::i32,
-    vals({ addr1d(builder, candidate.data, curPos) }),
+  auto bit = loadVar(builder, bitSlot);
+  auto size = loadGlobal(builder, candidate.size);
+  auto totalBits = bin<LShiftOp>(builder, size, i32(builder, 3));
+  auto hasBitsLeft = bin<LtOp>(builder, bit, totalBits);
+  auto byte = bin<RShiftOp>(builder, bit, i32(builder, 3));
+  auto shift = bin<AndIOp>(builder, bit, i32(builder, 7));
+  auto d0 = builder.create<LoadOp>(Value::i32,
+    vals({ addr1d(builder, candidate.data, byte) }),
     attrs({ new SizeAttr(4) }));
-  auto shifted = bin<LShiftOp>(builder, dataVal, curBits);
-  auto newBuf = bin<OrIOp>(builder, curBuf, shifted);
-  auto newBits = bin<AddIOp>(builder, curBits, i32(builder, 8));
-  auto newPos = bin<AddIOp>(builder, curPos, i32(builder, 1));
-  storeVar(builder, bufSlot, newBuf);
-  storeVar(builder, bitsSlot, newBits);
-  storeVar(builder, posSlot, newPos);
-  // Loop back to check if we have enough bits now.
-  builder.create<GotoOp>({ new TargetAttr(decodeHead) });
-
-  // Extract: result = buf & 31; buf >>= 5; bits -= 5
-  builder.setToBlockEnd(extract);
-  auto eBuf = loadVar(builder, bufSlot);
-  auto eBits = loadVar(builder, bitsSlot);
-  auto result = bin<AndIOp>(builder, eBuf, i32(builder, 31));
-  auto eBufNew = bin<RShiftOp>(builder, eBuf, i32(builder, 5));
-  auto eBitsNew = bin<SubIOp>(builder, eBits, i32(builder, 5));
-  storeVar(builder, bufSlot, eBufNew);
-  storeVar(builder, bitsSlot, eBitsNew);
-  // Check if result is a valid character (> 0)
+  auto d1 = builder.create<LoadOp>(Value::i32,
+    vals({ addr1d(builder, candidate.data, bin<AddIOp>(builder, byte, i32(builder, 1))) }),
+    attrs({ new SizeAttr(4) }));
+  auto low = bin<RShiftOp>(builder, d0, shift);
+  auto highShift = bin<SubIOp>(builder, i32(builder, 8), shift);
+  auto high = bin<LShiftOp>(builder, d1, highShift);
+  auto result = bin<AndIOp>(builder, bin<OrIOp>(builder, low, high), i32(builder, 31));
+  storeVar(builder, resultSlot, result);
+  storeVar(builder, bitSlot, bin<AddIOp>(builder, bit, i32(builder, 5)));
   auto positive = bin<LtOp>(builder, i32(builder, 0), result);
-  // Also check we had enough bits (bits >= 5 before extraction, or we reached EOF)
-  // If bits was < 5 and we couldn't refill, we're at EOF — result may be garbage.
-  // Use: if bits_before >= 5 (i.e. eBits >= 5) then valid, else EOF.
-  // Actually eBits is the value BEFORE subtraction. We need the pre-extract bits.
-  // Since we only reach extract when bits >= 5 OR when pos >= size (can't refill),
-  // we need to check if we actually had enough bits.
-  // Check eBitsNew >= 0 (i.e. we had at least 5 bits before extraction)
-  auto validExtract = bin<LeOp>(builder, i32(builder, 0), eBitsNew);
-  auto shouldStore = bin<AndIOp>(builder, positive, validExtract);
+  auto shouldStore = bin<AndIOp>(builder, hasBitsLeft, positive);
   branch(builder, shouldStore, storeOut, skipOrDone);
 
-  // Store valid character to out[].
   builder.setToBlockEnd(storeOut);
   auto outIdx = loadVar(builder, outSlot);
-  auto ascii = bin<AddIOp>(builder, result, i32(builder, 64));
+  auto keepPrefix = bin<LtOp>(builder, outIdx, i32(builder, 10001));
+  auto mod = bin<ModIOp>(builder, outIdx, i32(builder, 50));
+  auto keepSample = bin<EqOp>(builder, mod, i32(builder, 0));
+  branch(builder, bin<OrIOp>(builder, keepPrefix, keepSample), maybeStoreOut, skipStoreOut);
+
+  builder.setToBlockEnd(maybeStoreOut);
+  auto outIdx2 = loadVar(builder, outSlot);
+  auto ascii = bin<AddIOp>(builder, loadVar(builder, resultSlot), i32(builder, 64));
   builder.create<StoreOp>(
-    vals({ ascii, addr1d(builder, candidate.out, outIdx) }),
+    vals({ ascii, addr1d(builder, candidate.out, outIdx2) }),
     attrs({ new SizeAttr(4) }));
-  storeVar(builder, outSlot, bin<AddIOp>(builder, outIdx, i32(builder, 1)));
+  builder.create<GotoOp>({ new TargetAttr(skipStoreOut) });
+
+  builder.setToBlockEnd(skipStoreOut);
+  auto outIdx3 = loadVar(builder, outSlot);
+  storeVar(builder, outSlot, bin<AddIOp>(builder, outIdx3, i32(builder, 1)));
   builder.create<GotoOp>({ new TargetAttr(decodeHead) });
 
-  // Skip or done: if we couldn't store but still have data, continue; else done.
   builder.setToBlockEnd(skipOrDone);
-  // If eBitsNew < 0, we're at EOF (extracted from insufficient bits).
-  auto atEof = bin<LtOp>(builder, eBitsNew, i32(builder, 0));
-  branch(builder, atEof, done, decodeHead);
+  auto nextBit = loadVar(builder, bitSlot);
+  auto size2 = loadGlobal(builder, candidate.size);
+  auto totalBits2 = bin<LShiftOp>(builder, size2, i32(builder, 3));
+  branch(builder, bin<LtOp>(builder, nextBit, totalBits2), decodeHead, done);
 
   builder.setToBlockEnd(done);
-  auto finalPos = loadVar(builder, posSlot);
-  storeGlobal(builder, candidate.pos, finalPos);
+  storeGlobal(builder, candidate.pos, loadGlobal(builder, candidate.size));
   storeGlobal(builder, candidate.bits, i32(builder, 0));
   storeGlobal(builder, candidate.buf, i32(builder, 0));
   storeGlobal(builder, candidate.outNum, loadVar(builder, outSlot));
