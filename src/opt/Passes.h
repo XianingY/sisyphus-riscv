@@ -141,6 +141,18 @@ public:
   void run() override;
 };
 
+class SemanticMatmulSummary : public Pass {
+  int candidates = 0;
+  int replaced = 0;
+  int rejectedShape = 0;
+public:
+  SemanticMatmulSummary(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "semantic-matmul-summary"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class SchedulingPrecompute : public Pass {
   int candidates = 0;
   int replaced = 0;
