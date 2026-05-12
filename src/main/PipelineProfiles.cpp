@@ -182,6 +182,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::Globalize>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
       pm.addPass<sys::RuntimeMemoize>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DEAD_GLOBAL_STORE", true)) {
+      pm.addPass<sys::DeadGlobalStore>();
+      pm.addPass<sys::DCE>();
+    }
 
     pm.addPass<sys::Mem2Reg>();
     pm.addPass<sys::ArrayStrideAnalysis>();

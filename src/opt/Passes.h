@@ -153,6 +153,17 @@ public:
   void run() override;
 };
 
+class DeadGlobalStore : public Pass {
+  int removed = 0;
+  int deadGlobals = 0;
+public:
+  DeadGlobalStore(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "dead-global-store"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class SchedulingPrecompute : public Pass {
   int candidates = 0;
   int replaced = 0;
