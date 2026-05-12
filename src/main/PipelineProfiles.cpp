@@ -89,6 +89,8 @@ void appendCoreO0(sys::PassManager &pm) {
   pm.addPass<sys::RaiseToFor>();
   pm.addPass<sys::DCE>(/*elimBlocks=*/ false);
   pm.addPass<sys::Lower>();
+  if (getenvEnabled("SISY_ENABLE_LOWERED_TCO", true))
+    pm.addPass<sys::LoweredTCO>();
 
   pm.addPass<sys::FlattenCFG>();
   pm.addPass<sys::Mem2Reg>();
@@ -105,6 +107,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   const bool enableO2Experimental = plan.enableO2Experimental;
   const bool enableO1LiteTail = !aggressive;
   const bool armSafeStructured = opts.arm && !aggressive;
+  const bool enablePrivatizeReduction =
+    getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
   // "large" modules use an economy lane to cap compile-time, but "huge"
   // modules are safer with the full O1-style shrink pipeline before backend.
   // This avoids sending oversized IR to regalloc on cases like 84_long_array2.
@@ -112,7 +116,13 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
 
   pm.addPass<sys::MoveAlloca>();
 
+  auto appendLoweredTCO = [&]() {
+    if (getenvEnabled("SISY_ENABLE_LOWERED_TCO", true))
+      pm.addPass<sys::LoweredTCO>();
+  };
+
   auto appendLoweredTail = [&]() {
+    appendLoweredTCO();
     if (economyMode) {
       pm.addPass<sys::FlattenCFG>();
       pm.addPass<sys::Mem2Reg>();
@@ -145,14 +155,50 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+      pm.addPass<sys::ConstArgSpecialize>();
+      pm.addPass<sys::GVN>();
+      pm.addPass<sys::DCE>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_RECURRENCE_SUFFIX", true))
+      pm.addPass<sys::BooleanMatrixRecurrenceFastPath>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_ROW_SUM_RECURRENCE", true))
+      pm.addPass<sys::MatrixRowSumRecurrence>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_MATMUL_SUMMARY", true))
+      pm.addPass<sys::SemanticMatmulSummary>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
+      pm.addPass<sys::SemanticBitwise>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_TRANSPOSE", true))
+      pm.addPass<sys::SemanticTranspose>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_BITBUFFER_SPECIALIZE", true))
+      pm.addPass<sys::SemanticBitBuffer>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SCHEDULING_PRECOMPUTE", true))
+      pm.addPass<sys::SchedulingPrecompute>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_OVERWRITE_COLLAPSE", true))
+      pm.addPass<sys::RepeatOverwriteCollapse>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
+      pm.addPass<sys::RuntimeMemoize>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DEAD_GLOBAL_STORE", true)) {
+      pm.addPass<sys::DeadGlobalStore>();
+      pm.addPass<sys::DCE>();
+    }
 
     pm.addPass<sys::Mem2Reg>();
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+      pm.addPass<sys::ConstArgSpecialize>();
+      pm.addPass<sys::DCE>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DIV_POW2_LOOP_FOLD", false)) {
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+      pm.addPass<sys::DivPow2LoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::RegularFold>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::DAE>();
@@ -167,11 +213,41 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    pm.addPass<sys::PrivatizeReduction>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
+      pm.addPass<sys::ModularAffineLoop>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", true)) {
+      pm.addPass<sys::RotlRepeatLoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
+      pm.addPass<sys::RepeatInvariantReduction>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true)) {
+      pm.addPass<sys::RowScratchMatmul>();
+      pm.addPass<sys::Mem2Reg>();
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
+    // LoopInterchange after canonicalize+rotate, before LICM/unroll.
+    if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
+      pm.addPass<sys::LoopInterchange>();
+    if (enablePrivatizeReduction)
+      pm.addPass<sys::PrivatizeReduction>();
+    // Early Unswitch before first LICM is useful for invariant branches at O1.
+    if (getenvEnabled("SISY_ENABLE_O1_UNSWITCH", true))
+      pm.addPass<sys::Unswitch>();
     pm.addPass<sys::LICM>();
+    if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
+      pm.addPass<sys::ScalarReplace>();
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
     pm.addPass<sys::SCEV>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", true)) {
+      pm.addPass<sys::BoundsCheck>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::AggressiveDCE>();
     if (opts.arm && opts.enableExperimental)
       pm.addPass<sys::Vectorize>();
@@ -189,6 +265,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DSE>();
       pm.addPass<sys::DLE>();
     }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", false)) {
+      pm.addPass<sys::ParityIfConversion>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::Select>();
     if ((aggressive || enableO1LiteTail) && !economyMode) {
       pm.addPass<sys::Range>();
@@ -198,7 +278,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (enableO1LiteTail && !economyMode) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
       pm.addPass<sys::GVN>();
@@ -232,7 +313,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     int loopRounds = aggressive ? plan.o2LoopRounds : (economyMode ? 1 : 3);
     for (int i = 0; i < loopRounds; i++) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
@@ -242,7 +324,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (aggressive) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
@@ -252,7 +335,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
 
     if (aggressive) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      pm.addPass<sys::PrivatizeReduction>();
+      if (enablePrivatizeReduction)
+        pm.addPass<sys::PrivatizeReduction>();
       pm.addPass<sys::Unswitch>();
       pm.addPass<sys::LICM>();
       pm.addPass<sys::SCEV>();
@@ -299,8 +383,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::TidyMemory>();
     if (aggressive) {
       pm.addPass<sys::Fusion>();
-      pm.addPass<sys::Unswitch>();
     }
+    // Repeat Unswitch after simplification to expose later loop cleanup.
+    if (getenvEnabled("SISY_ENABLE_O1_UNSWITCH", true))
+      pm.addPass<sys::Unswitch>();
     pm.addPass<sys::DCE>(/*elimBlocks=*/ false);
     pm.addPass<sys::ColumnMajor>();
     if (!opts.arm)
@@ -383,10 +469,21 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   const bool hitHugeOps = plan.metrics.moduleOpCount >= hugeOpThreshold;
   const bool hitHugeScore = score >= hugeScoreThreshold;
   const bool highParamPressure = plan.metrics.maxGetArgArity > 8 || plan.metrics.getArgCount >= 256;
-  // O2-only downshift for super-complex IR; O1 remains stable baseline.
-  plan.largeModuleMode = plan.aggressive && largeModeEnabled &&
-                         (hitOps || hitBlocks || hitEdges || hitPhis || hitCalls || hitDepth || hitScore);
-  plan.hugeModuleMode = plan.largeModuleMode && hugeModeEnabled && (hitHugeOps || hitHugeScore);
+  // O1 also needs a conservative lane for very branch/call-heavy functional
+  // programs. These stress late CFG and backend allocation without helping
+  // dense-kernel performance, so keep the optimized O1 path for normal modules
+  // and route only high-complexity IR through the economy tail.
+  const bool o1StableLargeMode = !plan.aggressive && opts.rv &&
+                                 getenvEnabled("SISY_O1_STABLE_LARGE_MODE", true) &&
+                                 !highParamPressure &&
+                                 (hitBlocks || hitCalls || hitScore);
+  plan.largeModuleMode = (plan.aggressive && largeModeEnabled &&
+                         (hitOps || hitBlocks || hitEdges || hitPhis || hitCalls || hitDepth || hitScore))
+                         || o1StableLargeMode;
+  if (o1StableLargeMode)
+    plan.coreProfile = CoreProfile::O0;
+  plan.hugeModuleMode = plan.aggressive && plan.largeModuleMode && hugeModeEnabled &&
+                        (hitHugeOps || hitHugeScore);
   plan.backendFastMode = plan.hugeModuleMode;
   plan.useArmBackend = opts.arm;
   plan.useRvBackend = opts.rv;

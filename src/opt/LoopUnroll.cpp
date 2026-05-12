@@ -1,11 +1,37 @@
 #include "LoopPasses.h"
 #include "Passes.h"
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace sys;
 
+namespace {
+
+bool envEnabled(const char *name, bool fallback) {
+  auto env = std::getenv(name);
+  if (!env)
+    return fallback;
+  return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+}
+
+int envIntClamped(const char *name, int fallback, int low, int high) {
+  auto env = std::getenv(name);
+  if (!env)
+    return fallback;
+  int value = std::atoi(env);
+  if (value < low || value > high)
+    return fallback;
+  return value;
+}
+
+}
+
 std::map<std::string, int> ConstLoopUnroll::stats() {
   return {
-    { "unrolled", unrolled }
+    { "unrolled", unrolled },
+    { "factor-unrolled", factorUnrolled }
   };
 }
 
@@ -235,18 +261,99 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   if (!isa<IntOp>(step))
     return false;
 
+  auto runtimeUnrollEnabled = []() {
+    auto env = std::getenv("SISY_ENABLE_RUNTIME_UNROLL");
+    return env && std::strcmp(env, "1") == 0;
+  };
+
+  auto estimateUpperBound = [](Op* expr) -> int64_t {
+    if (!expr)
+      return -1;
+    // If it's a constant, return directly
+    if (isa<IntOp>(expr))
+      return V(expr);
+    // If it's a GetArgOp (function argument), use conservative bound
+    if (isa<GetArgOp>(expr)) {
+      // Conservative upper bound for common size arguments.
+      return 8192;
+    }
+    // If it's a division by constant, try to estimate the operand
+    if (auto div = dyn_cast<DivIOp>(expr)) {
+      auto rhs = div->DEF(1);
+      if (isa<IntOp>(rhs)) {
+        int divisor = V(rhs);
+        if (divisor > 0) {
+          auto lhs = div->DEF(0);
+          // Recursively estimate the numerator
+          if (isa<GetArgOp>(lhs)) {
+            // Conservative estimate for size-like arguments.
+            return 4096 / divisor;
+          }
+          // Check if lhs is a load from the function argument alloca
+          if (auto load = dyn_cast<LoadOp>(lhs)) {
+            auto src = load->DEF(0);
+            // If the source is an alloca for a function argument, use conservative bound
+            if (isa<AllocaOp>(src)) {
+              return 4096 / divisor;
+            }
+          }
+        }
+      }
+    }
+    // For other expressions, we can't estimate
+    return -1;
+  };
+
   // Fully unroll constant-bounded loops if it's small enough.
-  // Increased limit for better performance on tight inner loops in FFT/matmul.
+  // Increased limit for better performance on tight inner loops.
   if (lower && upper && isa<IntOp>(lower) && isa<IntOp>(upper)) {
     int low = V(lower);
     int high = V(upper);
     int times = (high - low) / V(step);
     if (times <= 2000 / loopsize)
       unroll = times;
+  } else if (runtimeUnrollEnabled()) {
+    // Partial unrolling for runtime-bounded loops.
+    // Try to estimate the upper bound
+    int64_t estUpper = estimateUpperBound(upper);
+    if (estUpper > 0 && loopsize > 0) {
+      // Partial unrolling based on estimated trip count
+      // Choose unroll factor based on loop size and estimated trip count
+      int64_t estTimes = estUpper / V(step);
+
+      // Calculate potential benefit: unrolling reduces loop overhead
+      // and can expose ILP. Be more aggressive for small loops.
+      if (loopsize <= 20) {
+        // Very small tight loop - can unroll more
+        if (estTimes <= 64)
+          unroll = 8;
+        else if (estTimes <= 256)
+          unroll = 4;
+        else
+          unroll = 2;  // Large trip count but tight loop
+      } else if (loopsize <= 50) {
+        // Small loop
+        if (estTimes <= 32)
+          unroll = 4;
+        else if (estTimes <= 256)
+          unroll = 2;
+        else
+          unroll = 2;  // Conservative: even large loops benefit from 2x unroll
+      }
+      // Larger loops: don't partially unroll
+    }
   }
-  // Not a constant loop.
-  if (unroll == -1)
+  if (unroll == -1) {
+    if (!envEnabled("SISY_ENABLE_FACTOR_UNROLL", true))
+      return false;
+
+    int factor = envIntClamped("SISY_FACTOR_UNROLL_FACTOR", 4, 2, 8);
+    if (tryFactorUnroll(loop, factor)) {
+      factorUnrolled++;
+      return true;
+    }
     return false;
+  }
   if (unroll <= 1)
     return false;
 
@@ -261,7 +368,7 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   // It can be from something that passes through all the loop, for example.
   auto exitphis = exit->getPhis();
   exitlatch.clear();
-  for (auto phi : exitphis) 
+  for (auto phi : exitphis)
     exitlatch[phi] = Op::getPhiFrom(phi, latch);
 
   // We construct a side-loop with checks in it. The code is roughly the same.
@@ -269,6 +376,194 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   copyLoop(loop, loop->getLatch(), unroll);
 
   unrolled++;
+  return true;
+}
+
+// Factor unroll for non-constant trip-count loops.  This uses guarded copies:
+// every copied latch keeps the original exit test, and only the final copied
+// latch returns to the original header.  That preserves exact tail semantics
+// without constructing a separate remainder loop.
+bool ConstLoopUnroll::tryFactorUnroll(LoopInfo *loop, int factor) {
+  if (factor <= 1)
+    return false;
+
+  auto induction = loop->getInduction();
+  if (!induction)
+    return false;
+  if (!loop->getStart() || !loop->getStop())
+    return false;
+
+  auto step = loop->getStepOp();
+  if (!step || !isa<IntOp>(step))
+    return false;
+  if (V(step) <= 0)
+    return false;
+
+  if (loop->exits.size() != 1)
+    return false;
+  if (loop->latches.size() != 1)
+    return false;
+
+  auto latch = loop->getLatch();
+  if (!isa<BranchOp>(latch->getLastOp()))
+    return false;
+
+  auto header = loop->header;
+  auto preheader = loop->preheader;
+  if (!preheader)
+    return false;
+
+  auto exit = loop->getExit();
+  if (exit->preds.size() > 2)
+    return false;
+
+  int loopsize = 0;
+  for (auto bb : loop->getBlocks()) {
+    loopsize += bb->getOpCount();
+    for (auto op : bb->getOps()) {
+      if (isa<CallOp>(op) && op->has<ImpureAttr>())
+        return false;
+    }
+  }
+  if (loopsize == 0 || loopsize >= 32)
+    return false;
+  if (loopsize * factor > 128)
+    return false;
+
+  auto phis = header->getPhis();
+  if (phis.size() >= 5)
+    return false;
+
+  phiMap.clear();
+  for (auto phi : phis) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    if (ops.size() != 2)
+      return false;
+    auto bb1 = cast<FromAttr>(attrs[0])->bb;
+    auto bb2 = cast<FromAttr>(attrs[1])->bb;
+    bool expected = (bb1 == latch && bb2 == preheader)
+                 || (bb2 == latch && bb1 == preheader);
+    if (!expected)
+      return false;
+
+    if (bb1 == latch)
+      phiMap[phi] = ops[0].defining;
+    if (bb2 == latch)
+      phiMap[phi] = ops[1].defining;
+  }
+
+  exitlatch.clear();
+  for (auto phi : exit->getPhis())
+    exitlatch[phi] = Op::getPhiFrom(phi, latch);
+
+  std::map<Op*, Op*> prevLatch;
+  BasicBlock *lastLatch = latch;
+  BasicBlock *insertAfter = latch;
+  auto region = latch->getParent();
+  Builder builder;
+
+  for (int i = 1; i < factor; i++) {
+    std::map<Op*, Op*> cloneMap, revcloneMap;
+    std::map<BasicBlock*, BasicBlock*> rewireMap;
+    std::vector<Op*> created;
+
+    for (auto block : loop->getBlocks()) {
+      insertAfter = region->insertAfter(insertAfter);
+      builder.setToBlockStart(insertAfter);
+      for (auto op : block->getOps()) {
+        auto copied = builder.copy(op);
+        cloneMap[op] = copied;
+        created.push_back(copied);
+        if (isa<PhiOp>(op))
+          revcloneMap[copied] = op;
+      }
+      rewireMap[block] = insertAfter;
+    }
+
+    for (auto op : created) {
+      auto operands = op->getOperands();
+      op->removeAllOperands();
+      for (auto operand : operands) {
+        auto def = operand.defining;
+        op->pushOperand(cloneMap.count(def) ? cloneMap[def] : def);
+      }
+    }
+
+    for (auto [oldBlock, newBlock] : rewireMap) {
+      (void)oldBlock;
+      auto term = newBlock->getLastOp();
+      if (auto attr = term->find<TargetAttr>(); attr && rewireMap.count(attr->bb))
+        attr->bb = rewireMap[attr->bb];
+      if (auto attr = term->find<ElseAttr>(); attr && rewireMap.count(attr->bb))
+        attr->bb = rewireMap[attr->bb];
+    }
+
+    auto rewiredHeader = rewireMap[header];
+    auto previousTerm = lastLatch->getLastOp();
+    bool rewiredBackedge = false;
+    if (previousTerm->has<TargetAttr>() && TARGET(previousTerm) == header) {
+      TARGET(previousTerm) = rewiredHeader;
+      rewiredBackedge = true;
+    }
+    if (previousTerm->has<ElseAttr>() && ELSE(previousTerm) == header) {
+      ELSE(previousTerm) = rewiredHeader;
+      rewiredBackedge = true;
+    }
+    if (!rewiredBackedge)
+      return false;
+
+    auto clonedLatch = rewireMap[latch];
+    auto clonedLatchTerm = clonedLatch->getLastOp();
+    if (clonedLatchTerm->has<TargetAttr>() && TARGET(clonedLatchTerm) == rewiredHeader)
+      TARGET(clonedLatchTerm) = header;
+    if (clonedLatchTerm->has<ElseAttr>() && ELSE(clonedLatchTerm) == rewiredHeader)
+      ELSE(clonedLatchTerm) = header;
+
+    auto copiedHeaderPhis = rewireMap[header]->getPhis();
+    for (auto copiedPhi : copiedHeaderPhis) {
+      auto origPhi = revcloneMap[copiedPhi];
+      auto latchValue = phiMap[origPhi];
+      auto value = prevLatch.count(latchValue) ? prevLatch[latchValue] : latchValue;
+      cloneMap[origPhi] = value;
+      copiedPhi->replaceAllUsesWith(value);
+      copiedPhi->erase();
+    }
+
+    std::set<Op*> erased(copiedHeaderPhis.begin(), copiedHeaderPhis.end());
+    for (auto [copiedPhi, _] : revcloneMap) {
+      if (erased.count(copiedPhi))
+        continue;
+
+      for (auto attr : copiedPhi->getAttrs())
+        FROM(attr) = rewireMap[FROM(attr)];
+    }
+
+    for (auto [phi, latchValue] : exitlatch) {
+      auto def = cloneMap.count(latchValue) ? cloneMap[latchValue] : latchValue;
+      phi->pushOperand(def);
+      phi->add<FromAttr>(clonedLatch);
+    }
+
+    prevLatch = cloneMap;
+    lastLatch = clonedLatch;
+  }
+
+  for (auto phi : phis) {
+    auto latchValue = phiMap[phi];
+    auto backedgeValue = prevLatch.count(latchValue) ? prevLatch[latchValue] : latchValue;
+    const auto &attrs = phi->getAttrs();
+    for (int i = 0; i < (int) attrs.size(); i++) {
+      if (FROM(attrs[i]) != latch)
+        continue;
+      phi->setOperand(i, backedgeValue);
+      phi->setAttribute(i, new FromAttr(lastLatch));
+      break;
+    }
+  }
+
+  (void)induction;
+  (void)step;
   return true;
 }
 

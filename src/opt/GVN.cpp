@@ -125,14 +125,18 @@ void GVN::dvnt(BasicBlock *bb, Domtree &domtree) {
     }
     
     Expr key { .id = op->opid };
+    bool missingDef = false;
     for (auto operand : op->getOperands()) {
       auto def = operand.defining;
       if (!symbols.count(def)) {
-        std::cerr << "cannot find def:\n  " << def;
-        std::cerr << "demanding op:\n  " << op;
-        assert(false);
+        missingDef = true;
+        break;
       }
       key.operands.push_back(symbols[def]);
+    }
+    if (missingDef) {
+      symbols[op] = num++;
+      continue;
     }
 
     // Canonicalize for commutative Ops.

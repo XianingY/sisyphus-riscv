@@ -27,13 +27,19 @@ Interpreter::Interpreter(ModuleOp *module, size_t explicitStepLimit) {
       
       if (auto intArr = op->find<IntArrayAttr>()) {
         int *vp = new int[size];
-        memcpy(vp, intArr->vi, size * 4);
+        if (intArr->vi)
+          memcpy(vp, intArr->vi, size * 4);
+        else
+          memset(vp, 0, size * 4);
         globalMap[name] = Value { .vi = (intptr_t) vp };
         addRange(globalRanges, (intptr_t) vp, (size_t) SIZE(op));
       }
       if (auto fpArr = op->find<FloatArrayAttr>()) {
         float *vfp = new float[size];
-        memcpy(vfp, fpArr->vf, size * 4);
+        if (fpArr->vf)
+          memcpy(vfp, fpArr->vf, size * 4);
+        else
+          memset(vfp, 0, size * 4);
         globalMap[name] = Value { .vi = (intptr_t) vfp };
         fpGlobals.insert(name);
         addRange(globalRanges, (intptr_t) vfp, (size_t) SIZE(op));
@@ -203,8 +209,26 @@ void Interpreter::exec(Op *op) {
   EXEC_BINARY(AddIOp, +);
   EXEC_BINARY(SubIOp, -);
   EXEC_BINARY(MulIOp, *);
-  EXEC_BINARY(DivIOp, /);
-  EXEC_BINARY(ModIOp, %);
+  case DivIOp::id: {
+    auto rhs = (int32_t) eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (int32_t) ((int32_t) eval(op->DEF(0)) / rhs));
+    break;
+  }
+  case ModIOp::id: {
+    auto rhs = (int32_t) eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (int32_t) ((int32_t) eval(op->DEF(0)) % rhs));
+    break;
+  }
   EXEC_BINARY(EqOp, ==);
   EXEC_BINARY(NeOp, !=);
   EXEC_BINARY(LtOp, <);
@@ -217,8 +241,26 @@ void Interpreter::exec(Op *op) {
   EXEC_BINARY_L(AddLOp, +);
   EXEC_BINARY_L(SubLOp, -);
   EXEC_BINARY_L(MulLOp, *);
-  EXEC_BINARY_L(DivLOp, /);
-  EXEC_BINARY_L(ModLOp, %);
+  case DivLOp::id: {
+    auto rhs = eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (eval(op->DEF(0)) / rhs));
+    break;
+  }
+  case ModLOp::id: {
+    auto rhs = eval(op->DEF(1));
+    if (rhs == 0) {
+      executionTimedOut = true;
+      store(op, (intptr_t) 0);
+      break;
+    }
+    store(op, (intptr_t) (eval(op->DEF(0)) % rhs));
+    break;
+  }
   EXEC_BINARY_L(LShiftLOp, <<);
   EXEC_BINARY_L(RShiftLOp, >>);
 
@@ -337,8 +379,7 @@ Interpreter::Value Interpreter::applyExtern(const std::string &name, const std::
   }
   if (name == "getarray") {
     int n; inbuf >> n;
-    // See 03_sort1.in. They provided data that exceed range of int.
-    // They're too irresponsible.
+    // Some public inputs contain unsigned values outside signed int range.
     unsigned *ptr = (unsigned*) callArgs[0].vi;
     for (int i = 0; i < n; i++)
       inbuf >> ptr[i];
@@ -513,6 +554,9 @@ void Interpreter::run(std::istream &input) {
 }
 
 void Interpreter::runFunction(const std::string &func, const std::vector<int> &args) {
+  stepCount = 0;
+  executionTimedOut = false;
+  lastValidCached = false;
   std::vector<Value> values;
   values.reserve(args.size());
   for (auto x : args)

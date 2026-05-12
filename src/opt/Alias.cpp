@@ -157,7 +157,7 @@ void Alias::runImpl(Region *region) {
 
 // This has better precision after Mem2Reg, because less `int**` is possible.
 // Before Mem2Reg, we can store the address of an array in an alloca. 
-// (Though it won't be fully eliminated after the pass; see 66_exgcd.sy)
+// Some nested address patterns are still not fully eliminated after this pass.
 // Moreover, it's more useful when all unnecessary alloca's have been removed.
 //
 // In addition, remember to update the information after Globalize and Localize.

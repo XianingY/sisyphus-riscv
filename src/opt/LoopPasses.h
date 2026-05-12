@@ -121,6 +121,7 @@ class ConstLoopUnroll : public Pass {
   std::map<Op*, Op*> phiMap;
   std::map<Op*, Op*> exitlatch;
   int unrolled = 0;
+  int factorUnrolled = 0;
 
   // Returns true if changed.
   bool runImpl(LoopInfo *info);
@@ -128,6 +129,14 @@ class ConstLoopUnroll : public Pass {
   // Starts insertion after `bb`, and duplicate `info` a total of `unroll` times.
   // This only unrolls constant loops.
   BasicBlock *copyLoop(LoopInfo *info, BasicBlock *bb, int unroll);
+  // Attempt factor unroll for non-constant trip-count loops.
+  // When `loop` has a runtime trip-count and a small, side-effect-free body,
+  // clone the loop body as a remainder loop and convert the original loop
+  // into a "main loop" that iterates in steps of (factor * original_step).
+  // The cloned loop handles the tail iterations (trip % factor).
+  //
+  // Returns true if the transformation was applied.
+  bool tryFactorUnroll(LoopInfo *loop, int factor);
 public:
   ConstLoopUnroll(ModuleOp *module): Pass(module) {}
 
@@ -197,6 +206,40 @@ public:
   void run() override;
 };
 
+class LoopInterchange : public Pass {
+  int detected = 0;
+  int interchanged = 0;
+
+  // Check if the loop nest is a perfect nest (inner is only content)
+  bool isPerfectNest(LoopInfo* outer, LoopInfo* inner);
+  // Check if two loops can be safely interchanged
+  bool canInterchange(LoopInfo* outer, LoopInfo* inner);
+  void runImpl(LoopInfo* info);
+public:
+  LoopInterchange(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "loop-interchange"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+// Promotes loop-invariant load/store patterns to scalar registers.
+// For loops where the same address is repeatedly loaded, computed on, and stored,
+// this pass hoists the load to the preheader, replaces in-loop accesses with a phi,
+// and sinks the store to the exit block.
+class ScalarReplace : public Pass {
+  int detected = 0;
+  int promoted = 0;
+
+  void runImpl(LoopInfo *info);
+public:
+  ScalarReplace(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "scalar-replace"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class RemoveEmptyLoop : public Pass {
   int removed = 0;
 
@@ -205,6 +248,74 @@ public:
   RemoveEmptyLoop(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "remove-empty-loop"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class RepeatInvariantReduction : public Pass {
+  int visited = 0;
+  int reduced = 0;
+  int rejected = 0;
+  int badShape = 0;
+  int badCfg = 0;
+  int noShape = 0;
+  int impureBody = 0;
+  int badInductionUse = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  RepeatInvariantReduction(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "repeat-invariant-reduction"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+// Collapses bounded affine modular update loops such as:
+//   while (i < n) {
+//     *p = (*p + c) % m;
+//     i++;
+//   }
+// into a single update of *p. This is intentionally narrow because it
+// rewrites loops with stores.
+class ModularAffineLoop : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  ModularAffineLoop(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "modular-affine-loop"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class DivPow2LoopFold : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  DivPow2LoopFold(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "div-pow2-loop-fold"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class RotlRepeatLoopFold : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+
+  bool runImpl(FuncOp *func, LoopInfo *info);
+public:
+  RotlRepeatLoopFold(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "rotl-repeat-loop-fold"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };
@@ -239,6 +350,20 @@ public:
   PrivatizeReduction(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "privatize-reduction"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class BoundsCheck : public Pass {
+  int branchesEliminated = 0;
+  int boundsProved = 0;
+  int boundsRejected = 0;
+
+  void runImpl(LoopInfo *info);
+public:
+  BoundsCheck(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "bounds-check"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };

@@ -1,5 +1,7 @@
 #include "RvPasses.h"
 #include "RvDupPasses.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace sys::rv;
 using namespace sys;
@@ -19,8 +21,26 @@ bool inRange(int x) {
   return x >= -2048 && x <= 2047;
 }
 
+bool inShamt32(int x) {
+  return x >= 0 && x < 32;
+}
+
+bool inShamt64(int x) {
+  return x >= 0 && x < 64;
+}
+
+static bool getenvEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  if (std::strcmp(raw, "0") == 0 || std::strcmp(raw, "false") == 0)
+    return false;
+  return true;
+}
+
 void InstCombine::run() {
   Builder builder;
+  const bool enableLiZeroCombine = getenvEnabled("SISY_RV_ENABLE_LI_ZERO_COMBINE", false);
 
   runRewriter([&](AddOp *op) {
     auto x = op->getOperand(0).defining;
@@ -95,12 +115,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SllwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt32(val))
         return false;
 
       combined++;
@@ -112,12 +134,14 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrawOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt32(val))
         return false;
 
       combined++;
@@ -128,13 +152,34 @@ void InstCombine::run() {
     return false;
   });
 
-  runRewriter([&](SraOp *op) {
+  runRewriter([&](SrlwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt32(val))
+        return false;
+
+      combined++;
+      builder.replace<SrliwOp>(op, { x }, { new IntAttr(val) });
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter([&](SraOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      auto val = V(y);
+      if (!inShamt64(val))
         return false;
 
       combined++;
@@ -145,17 +190,78 @@ void InstCombine::run() {
     return false;
   });
 
-  runRewriter([&](SllOp *op) {
+  runRewriter([&](SrlOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
 
     if (isa<LiOp>(y) && inRange(y)) {
       auto val = V(y);
-      if (!inRange(val))
+      if (!inShamt64(val))
+        return false;
+
+      combined++;
+      builder.replace<SrliOp>(op, { x }, { new IntAttr(val) });
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter([&](SllOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+      return false;
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      auto val = V(y);
+      if (!inShamt64(val))
         return false;
 
       combined++;
       builder.replace<SlliOp>(op, { x }, { new IntAttr(val) });
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter([&](OrOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_LOGIC_IMM_COMBINE", true))
+      return false;
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+    if (isa<LiOp>(x) && inRange(x)) {
+      combined++;
+      builder.replace<OriOp>(op, { y }, { x->get<IntAttr>() });
+      return true;
+    }
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      combined++;
+      builder.replace<OriOp>(op, { x }, { y->get<IntAttr>() });
+      return true;
+    }
+
+    return false;
+  });
+
+  runRewriter([&](XorOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_LOGIC_IMM_COMBINE", true))
+      return false;
+    auto x = op->getOperand(0).defining;
+    auto y = op->getOperand(1).defining;
+    if (isa<LiOp>(x) && inRange(x)) {
+      combined++;
+      builder.replace<XoriOp>(op, { y }, { x->get<IntAttr>() });
+      return true;
+    }
+
+    if (isa<LiOp>(y) && inRange(y)) {
+      combined++;
+      builder.replace<XoriOp>(op, { x }, { y->get<IntAttr>() });
       return true;
     }
 
@@ -212,6 +318,79 @@ void InstCombine::run() {
   });
 
   RvDCE(module).run();
+
+  runRewriter([&](SlliwOp *op) {
+    (void) op;
+    // `slliw rd, rs, 0` is not a pure move on RV64: it sign-extends the
+    // low 32 bits. Keep it so i32 values stay ABI-canonicalized.
+    return false;
+  });
+
+  runRewriter([&](SrliwOp *op) {
+    (void) op;
+    // `srliw` also truncates to 32 bits before producing the result.
+    return false;
+  });
+
+  runRewriter([&](SraiwOp *op) {
+    (void) op;
+    // `sraiw rd, rs, 0` is the standard 32-bit sign-extension idiom.
+    return false;
+  });
+
+  runRewriter([&](SlliOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SrliOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](SraiOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](AndiOp *op) {
+    if (V(op) == -1) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](OriOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
+
+  runRewriter([&](XoriOp *op) {
+    if (V(op) == 0) {
+      op->replaceAllUsesWith(op->getOperand().defining);
+      op->erase();
+      return true;
+    }
+    return false;
+  });
 
   runRewriter([&](AddiwOp *op) {
     if (V(op) == 0) {
@@ -343,8 +522,10 @@ void InstCombine::run() {
   // Only run this after all int-related fold completes.
   // Rewrite `li a0, 0` into reading from `zero`.
   runRewriter([&](LiOp *op) {
+    if (!enableLiZeroCombine)
+      return false;
     if (V(op) == 0)
-      builder.replace<ReadRegOp>(op, Value::i32, { new RegAttr(Reg::zero)} );
+      builder.replace<ReadRegOp>(op, op->getResultType(), { new RegAttr(Reg::zero)} );
     
     return false;
   });

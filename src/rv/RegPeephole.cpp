@@ -1,10 +1,21 @@
 #include "RvPasses.h"
 #include "Regs.h"
+#include <cstdlib>
+#include <cstring>
 
 using namespace sys::rv;
 using namespace sys;
 
 namespace {
+
+bool envEnabled(const char *name, bool fallback = true) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
+    return false;
+  return true;
+}
 
 std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
   int argcnt = funcOp->get<ArgCountAttr>()->count;
@@ -188,6 +199,45 @@ int RegAlloc::latePeephole(Op *funcOp) {
 
     return false;
   });
+
+  if (envEnabled("SISY_RV_ENABLE_LOAD_LOAD_CSE", true)) {
+    for (auto bb : funcOp->getRegion()->getBlocks()) {
+      Op *op = bb->getFirstOp();
+      while (op) {
+        Op *next = op->atBack() ? nullptr : op->nextOp();
+        Op *after = (next && !next->atBack()) ? next->nextOp() : nullptr;
+
+        if (next && isa<LoadOp>(op) && isa<LoadOp>(next) &&
+            op->has<RdAttr>() && op->has<RsAttr>() && op->has<IntAttr>() &&
+            next->has<RdAttr>() && next->has<RsAttr>() && next->has<IntAttr>() &&
+            RS(op) == RS(next) && V(op) == V(next) && SIZE(op) == SIZE(next) &&
+            op->getResultType() == next->getResultType() &&
+            RD(op) != RS(next)) {
+          converted++;
+          builder.setBeforeOp(next);
+          CREATE_MV(isFP(RD(next)), RD(next), RD(op));
+          next->erase();
+          op = after;
+          continue;
+        }
+
+        if (next && isa<FldOp>(op) && isa<FldOp>(next) &&
+            op->has<RdAttr>() && op->has<RsAttr>() && op->has<IntAttr>() &&
+            next->has<RdAttr>() && next->has<RsAttr>() && next->has<IntAttr>() &&
+            RS(op) == RS(next) && V(op) == V(next) &&
+            RD(op) != RS(next)) {
+          converted++;
+          builder.setBeforeOp(next);
+          CREATE_MV(/*fp=*/true, RD(next), RD(op));
+          next->erase();
+          op = after;
+          continue;
+        }
+
+        op = next;
+      }
+    }
+  }
 
   runRewriter(funcOp, [&](FmvdxOp *op) {
     if (op->atBack())
@@ -471,6 +521,33 @@ int RegAlloc::latePeephole(Op *funcOp) {
         converted++;
         op->erase();
         return true;
+      }
+
+      // Propagate a single-use move into the following arithmetic op.
+      // This must substitute the move source, not the arithmetic destination:
+      //   mv t0, a0; addw a1, t0, t0  ->  addw a1, a0, a0
+      // Replacing with RD(next) corrupts cases where RD(next) is unrelated.
+      if (envEnabled("SISY_RV_ENABLE_MOVE_ARITH_PEEPHOLE", false) &&
+          (isa<MulwOp>(next) || isa<AddwOp>(next) || isa<SubwOp>(next)) &&
+          op->getUses().size() == 1 &&
+          *op->getUses().begin() == next) {
+        Reg mvSrc = RS(op);
+        Reg mvDst = RD(op);
+
+        bool changed = false;
+        if (RS(next) == mvDst) {
+          RS(next) = mvSrc;
+          changed = true;
+        }
+        if (RS2(next) == mvDst) {
+          RS2(next) = mvSrc;
+          changed = true;
+        }
+        if (changed) {
+          converted++;
+          op->erase();
+          return true;
+        }
       }
     }
     return false;
@@ -832,12 +909,13 @@ void materializeSpAddr(Builder &builder, Reg tmp, int offset) {
 }
 
 void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset) {
+  int size = ty == Value::i64 ? 8 : 4;
   if (fitsImm12(offset)) {
     builder.create<sys::rv::LoadOp>(ty, {
       RDC(dst),
       RSC(Reg::sp),
       new IntAttr(offset),
-      new SizeAttr(8)
+      new SizeAttr(size)
     });
     return;
   }
@@ -848,7 +926,7 @@ void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset) {
     RDC(dst),
     RSC(scratch),
     new IntAttr(0),
-    new SizeAttr(8)
+    new SizeAttr(size)
   });
 }
 
@@ -961,8 +1039,9 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     // ...
     assert(argOffsets.count(op));
     int myoffset = offset + argOffsets[op];
+    Value::Type loadTy = argTypes[V(op)];
     builder.setBeforeOp(op);
-    emitStackLoad(builder, RD(op), isFP(RD(op)) ? Value::f32 : Value::i64, myoffset);
+    emitStackLoad(builder, RD(op), loadTy, myoffset);
     auto created = op->prevOp();
     if (created)
       op->replaceAllUsesWith(created);

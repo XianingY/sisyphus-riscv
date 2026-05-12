@@ -1,5 +1,7 @@
 #include "RvPasses.h"
 #include "../opt/LoopPasses.h"
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 
 using namespace sys;
@@ -40,6 +42,15 @@ Multiplier chooseMultiplier(int d) {
 
 namespace {
 
+bool envEnabled(const char *name, bool fallback) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
+    return false;
+  return true;
+}
+
 void hoistLi(LoopInfo *loop) {
   for (auto subloop : loop->subloops)
     hoistLi(subloop);
@@ -63,6 +74,8 @@ int StrengthReduct::runImpl() {
   Builder builder;
 
   int converted = 0;
+  const bool enableMulwDecompose =
+    envEnabled("SISY_RV_ENABLE_MULW_DECOMPOSE", false);
   
   // ===================
   // Rewrite MulOp.
@@ -102,11 +115,18 @@ int StrengthReduct::runImpl() {
     }
 
     auto bits = __builtin_popcount(i);
+    auto hasShiftSubForm = [&]() {
+      for (int place = 0; place < 31; place++) {
+        if (__builtin_popcount(i + (1 << place)) == 1)
+          return true;
+      }
+      return false;
+    };
 
     if (bits == 1) {
       converted++;
       builder.setBeforeOp(op);
-      builder.replace<SlliOp>(op, { x }, { new IntAttr(__builtin_ctz(i)) });
+      builder.replace<SlliwOp>(op, { x }, { new IntAttr(__builtin_ctz(i)) });
       return true;
     }
 
@@ -123,6 +143,87 @@ int StrengthReduct::runImpl() {
       auto upperBits = builder.create<SlliwOp>({ x }, { new IntAttr(__builtin_ctz(i - (1 << firstPlace))) });
       builder.replace<AddwOp>(op, { lowerBits, upperBits });
       return true;
+    }
+
+    // General decomposition for constants with 3+ bits.
+    // Keep this as a plain modulo-2^32 shift/add chain.  The previous
+    // pairwise regrouping could discard the already accumulated partial
+    // sum for constants such as 13, changing the value.
+    if (enableMulwDecompose && bits >= 3 && bits <= 16 && !hasShiftSubForm()) {
+      converted++;
+      builder.setBeforeOp(op);
+
+      std::vector<int> bitPositions;
+      int temp = i;
+      while (temp > 0) {
+        int bit = __builtin_ctz(temp);
+        bitPositions.push_back(bit);
+        temp &= ~(1 << bit);
+      }
+
+      Value result;
+      if (bitPositions[0] == 0)
+        result = x;
+      else
+        result = builder.create<SlliwOp>({ x }, { new IntAttr(bitPositions[0]) });
+
+      for (size_t j = 1; j < bitPositions.size(); j++) {
+        int bit = bitPositions[j];
+        Value term = bit == 0
+          ? x
+          : builder.create<SlliwOp>({ x }, { new IntAttr(bit) });
+        result = builder.create<AddwOp>({ result, term });
+      }
+
+      op->replaceAllUsesWith(result.defining);
+      op->erase();
+      return true;
+    }
+
+    // Handle x * ((1<<n) - 1) where n >= 2.
+    // e.g., x*7 = (x<<3) - x, x*15 = (x<<4) - x, x*31 = (x<<5) - x
+    // These are NOT caught by bits==2 case because they have 3+ bits set.
+    for (int n = 2; n < 31; n++) {
+      int pow2n = 1 << n;
+      if (i == pow2n - 1) {
+        converted++;
+        builder.setBeforeOp(op);
+        Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(n) });
+        builder.replace<SubwOp>(op, { shifted, x });
+        return true;
+      }
+    }
+
+    // Handle x * ((1<<n) + 1) where n >= 1.
+    // e.g., x*9 = (x<<3) + x, x*17 = (x<<4) + x
+    for (int n = 1; n < 31; n++) {
+      int pow2n = 1 << n;
+      if (i == pow2n + 1) {
+        converted++;
+        builder.setBeforeOp(op);
+        Value shifted = builder.create<SlliwOp>({ x }, { new IntAttr(n) });
+        builder.replace<AddwOp>(op, { shifted, x });
+        return true;
+      }
+    }
+
+    // Handle x * ((1<<n) + (1<<m)) where n > m >= 1 and bits > 2.
+    // e.g., x*10 = (x<<3) + (x<<1), x*18 = (x<<4) + (x<<1)
+    int highest = 31 - __builtin_clz(i);
+    int secondHighest = highest - 1;
+    while (secondHighest >= 0 && ((i >> secondHighest) & 1) == 0) {
+      secondHighest--;
+    }
+    if (secondHighest >= 1) {
+      int remaining = i - (1 << highest) - (1 << secondHighest);
+      if (remaining == 0) {
+        converted++;
+        builder.setBeforeOp(op);
+        Value shiftedHigh = builder.create<SlliwOp>({ x }, { new IntAttr(highest) });
+        Value shiftedLow = builder.create<SlliwOp>({ x }, { new IntAttr(secondHighest) });
+        builder.replace<AddwOp>(op, { shiftedHigh, shiftedLow });
+        return true;
+      }
     }
 
     // Similar to above, but for sub instead of add.
@@ -191,20 +292,17 @@ int StrengthReduct::runImpl() {
 
     auto bits = __builtin_popcount(i);
     if (bits == 1) {
-      // For x / 2^n (power of 2), use shift with bias correction.
-      // Algorithm: (x + ((x >> 31) & (2^n - 1))) >> n
-      // This handles negative numbers correctly for truncation-toward-zero division.
-      int n = __builtin_ctz(i);
+      // See clang output: x / 2^n should become
+      //   slli    a1, a0, 1
+      //   srli    a1, a1, (64 - n)
+      //   add     a0, a0, a1
+      //   sraiw   a0, a0, n
+      auto n = __builtin_ctz(i);
       converted++;
       builder.setBeforeOp(op);
 
-      // mask = 2^n - 1
-      Value mask = builder.create<LiOp>({ new IntAttr(i - 1) });
-      // sign = x >> 31 (sign extension)
-      Value sign = builder.create<SraiwOp>({ x }, { new IntAttr(31) });
-      // bias = sign & mask
-      Value bias = builder.create<AndOp>({ sign, mask });
-      // (x + bias) >> n
+      Value ls = builder.create<SlliOp>({ x }, { new IntAttr(1) });
+      Value bias = builder.create<SrliOp>({ ls }, { new IntAttr(64 - n) });
       Value plus = builder.create<AddOp>({ x, bias });
       builder.replace<SraiwOp>(op, { plus }, { new IntAttr(n) });
       return true;
@@ -290,25 +388,27 @@ int StrengthReduct::runImpl() {
     }
 
     if (__builtin_popcount(i) == 1) {
-      // For x % 2^n (power of 2), use bitwise AND which is much faster than division.
-      // Algorithm: result = x & (2^n - 1) for positive x
-      // For signed x, need to handle negative: (x + (x>>31)) & (2^n-1) - (x>>31)
-      // Simplified: (x + bias) & mask - bias where bias = x>>31 & (2^n-1)
+      // Clang output of x % 2^n:
+      //   slli    a1, a0, 1
+      //   srli    a1, a1, (64 - n)
+      //   add     a1, a1, a0
+      //   andi    a1, a1, -2^n
+      //   subw    a0, a0, a1
       converted++;
       builder.setBeforeOp(op);
 
-      // x >> 31 (sign extension)
-      Value sra = builder.create<SraiwOp>({ x }, { new IntAttr(31) });
-      // mask = 2^n - 1 = (1 << n) - 1 = i - 1
-      Value mask = builder.create<LiOp>({ new IntAttr(i - 1) });
-      // bias = sign >> 31 & mask = sra & mask
-      Value bias = builder.create<AndOp>({ sra, mask });
-      // x + bias
+      int n = __builtin_ctz(i);
+      Value ls = builder.create<SlliOp>({ x }, { new IntAttr(1) });
+      Value bias = builder.create<SrliOp>({ ls }, { new IntAttr(64 - n) });
       Value plus = builder.create<AddOp>({ x, bias });
-      // (x + bias) & mask
-      Value masked = builder.create<AndOp>({ plus, mask });
-      // result = masked - bias
-      builder.replace<SubwOp>(op, { masked, bias });
+      Value andi;
+      if (i <= 2048)
+        andi = builder.create<AndiOp>({ plus }, { new IntAttr(-i) });
+      else {
+        Value value = builder.create<LiOp>({ new IntAttr(-i) });
+        andi = builder.create<AndOp>({ plus, value });
+      }
+      builder.replace<SubwOp>(op, { x, andi });
       return true;
     }
 
