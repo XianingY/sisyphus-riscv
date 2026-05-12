@@ -227,6 +227,8 @@ class SemanticBitBuffer : public Pass {
   int candidates = 0;
   int specialized = 0;
   int repeatFolded = 0;
+  int decodeFastpaths = 0;
+  int predecodedDrivers = 0;
   int rejectedShape = 0;
   int rejectedNonConstCall = 0;
 
