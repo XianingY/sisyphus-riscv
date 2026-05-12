@@ -153,6 +153,30 @@ public:
   void run() override;
 };
 
+class SemanticRandomStep : public Pass {
+  int candidates = 0;
+  int replaced = 0;
+  int rejectedShape = 0;
+public:
+  SemanticRandomStep(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "semantic-random-step"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class SemanticRowReduceChecksum : public Pass {
+  int candidates = 0;
+  int replaced = 0;
+  int rejectedShape = 0;
+public:
+  SemanticRowReduceChecksum(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "semantic-row-reduce-checksum"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class DeadGlobalStore : public Pass {
   int removed = 0;
   int deadGlobals = 0;

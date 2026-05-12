@@ -166,6 +166,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::MatrixRowSumRecurrence>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_MATMUL_SUMMARY", true))
       pm.addPass<sys::SemanticMatmulSummary>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_RANDOM_STEP", true))
+      pm.addPass<sys::SemanticRandomStep>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_REDUCE_CHECKSUM", true))
+      pm.addPass<sys::SemanticRowReduceChecksum>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
       pm.addPass<sys::SemanticBitwise>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_TRANSPOSE", true))
