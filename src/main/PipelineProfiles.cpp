@@ -122,6 +122,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   };
 
   auto appendLoweredTail = [&]() {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
+      pm.addPass<sys::RuntimeMemoize>();
     appendLoweredTCO();
     if (economyMode) {
       pm.addPass<sys::FlattenCFG>();
@@ -155,6 +157,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+      pm.addPass<sys::FunctionEquivalence>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::GVN>();
@@ -164,8 +168,6 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
-      pm.addPass<sys::RuntimeMemoize>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DEAD_GLOBAL_STORE", true)) {
       pm.addPass<sys::DeadGlobalStore>();
       pm.addPass<sys::DCE>();

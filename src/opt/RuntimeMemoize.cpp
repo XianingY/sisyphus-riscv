@@ -91,14 +91,25 @@ std::vector<Op*> orderedArgs(FuncOp *func, int argCount) {
   return args;
 }
 
-bool eligible(FuncOp *func) {
+enum class RejectReason {
+  None,
+  Impure,
+  ArgShape,
+  Types,
+  Calls,
+  Stores,
+  Ops,
+  Return
+};
+
+RejectReason eligible(FuncOp *func) {
   if (func->has<ImpureAttr>() || !func->has<ArgCountAttr>() || !func->has<ArgTypesAttr>())
-    return false;
+    return RejectReason::Impure;
   if (func->get<ArgCountAttr>()->count != 2)
-    return false;
+    return RejectReason::ArgShape;
   for (auto ty : func->get<ArgTypesAttr>()->types)
     if (ty != Value::i32)
-      return false;
+      return RejectReason::Types;
 
   int opCount = 0;
   int selfCalls = 0;
@@ -108,27 +119,27 @@ bool eligible(FuncOp *func) {
       opCount++;
       if (auto call = dyn_cast<CallOp>(op)) {
         if (NAME(call) != self)
-          return false;
+          return RejectReason::Calls;
         selfCalls++;
       }
       if (isa<CloneOp>(op) || isa<JoinOp>(op) || isa<WakeOp>(op))
-        return false;
+        return RejectReason::Calls;
     }
   }
   if (selfCalls == 0 || opCount > 260)
-    return false;
+    return RejectReason::Ops;
   if (!hasOnlySelfCalls(func) || storesToGlobal(func))
-    return false;
+    return storesToGlobal(func) ? RejectReason::Stores : RejectReason::Calls;
 
   bool hasI32Return = false;
   for (auto ret : func->findAll<ReturnOp>()) {
     if (ret->getOperandCount() == 0)
-      return false;
+      return RejectReason::Return;
     if (ret->DEF()->getResultType() != Value::i32)
-      return false;
+      return RejectReason::Return;
     hasI32Return = true;
   }
-  return hasI32Return;
+  return hasI32Return ? RejectReason::None : RejectReason::Return;
 }
 
 GlobalOp *createIntGlobal(ModuleOp *module, const std::string &name, int elements,
@@ -186,18 +197,31 @@ void addEntryCheck(FuncOp *func, const std::string &key0Name, const std::string 
   auto region = func->getRegion();
   auto entry = region->getFirstBlock();
   auto term = entry->getLastOp();
-  if (!isa<GotoOp>(term))
+  BasicBlock *original = nullptr;
+  bool replaceTerm = false;
+  if (term && isa<GotoOp>(term)) {
+    original = TARGET(term);
+    replaceTerm = true;
+  } else {
+    original = entry->nextBlock();
+  }
+  if (!original)
     return;
-  auto original = TARGET(term);
 
   auto checkSeen = region->insertAfter(entry);
   auto checkKeys = region->insertAfter(checkSeen);
   auto hitBlock = region->insertAfter(checkKeys);
 
   Builder builder;
-  builder.setBeforeOp(term);
+  if (replaceTerm)
+    builder.setBeforeOp(term);
+  else
+    builder.setToBlockEnd(entry);
   Value index = cacheIndex(builder, args[0], args[1], mask);
-  builder.replace<GotoOp>(term, { new TargetAttr(checkSeen) });
+  if (replaceTerm)
+    builder.replace<GotoOp>(term, { new TargetAttr(checkSeen) });
+  else
+    builder.create<GotoOp>({ new TargetAttr(checkSeen) });
 
   builder.setToBlockEnd(checkSeen);
   auto seenAddr = indexedAddress(builder, seenName, index);
@@ -273,14 +297,22 @@ void addReturnStores(FuncOp *func, const std::string &key0Name, const std::strin
 
 std::map<std::string, int> RuntimeMemoize::stats() {
   return {
+    { "candidates", candidates },
     { "memoized-functions", memoized },
     { "entry-checks", entryChecks },
     { "call-epoch-bumps", callEpochBumps },
+    { "rejected-impure", rejectedImpure },
+    { "rejected-arg-shape", rejectedArgShape },
+    { "rejected-types", rejectedTypes },
+    { "rejected-calls", rejectedCalls },
+    { "rejected-stores", rejectedStores },
+    { "rejected-ops", rejectedOps },
+    { "rejected-return", rejectedReturn },
   };
 }
 
 void RuntimeMemoize::run() {
-  if (!envEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", false))
+  if (!envEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
     return;
 
   int capacity = roundPow2(envInt("SISY_AUTO_MEMOIZE_CAPACITY", kDefaultCapacity));
@@ -290,8 +322,33 @@ void RuntimeMemoize::run() {
   auto funcs = collectFuncs();
   std::set<FuncOp*> candidates;
   for (auto func : funcs) {
-    if (eligible(func))
+    switch (eligible(func)) {
+    case RejectReason::None:
       candidates.insert(func);
+      this->candidates++;
+      break;
+    case RejectReason::Impure:
+      rejectedImpure++;
+      break;
+    case RejectReason::ArgShape:
+      rejectedArgShape++;
+      break;
+    case RejectReason::Types:
+      rejectedTypes++;
+      break;
+    case RejectReason::Calls:
+      rejectedCalls++;
+      break;
+    case RejectReason::Stores:
+      rejectedStores++;
+      break;
+    case RejectReason::Ops:
+      rejectedOps++;
+      break;
+    case RejectReason::Return:
+      rejectedReturn++;
+      break;
+    }
   }
   if (candidates.empty())
     return;

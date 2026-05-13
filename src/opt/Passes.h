@@ -126,9 +126,17 @@ public:
 };
 
 class RuntimeMemoize : public Pass {
+  int candidates = 0;
   int memoized = 0;
   int entryChecks = 0;
   int callEpochBumps = 0;
+  int rejectedImpure = 0;
+  int rejectedArgShape = 0;
+  int rejectedTypes = 0;
+  int rejectedCalls = 0;
+  int rejectedStores = 0;
+  int rejectedOps = 0;
+  int rejectedReturn = 0;
 
 public:
   RuntimeMemoize(ModuleOp *module): Pass(module) {}
@@ -188,6 +196,17 @@ public:
   RegularFold(ModuleOp *module): Pass(module) {}
     
   std::string name() override { return "regular-fold"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class FunctionEquivalence : public Pass {
+  int classified = 0;
+  int replaced = 0;
+public:
+  FunctionEquivalence(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "function-equivalence"; };
   std::map<std::string, int> stats() override;
   void run() override;
 };
