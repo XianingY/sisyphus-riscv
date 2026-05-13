@@ -38,6 +38,21 @@ static std::optional<int> tryGetConstantValue(
   return std::nullopt;
 }
 
+static bool hasDirectStoreToScalarGlobal(
+    const std::string &name,
+    ModuleOp *module) {
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    auto addr = store->DEF(1);
+    if (!addr || !isa<GetGlobalOp>(addr))
+      continue;
+    if (NAME(addr) == name)
+      return true;
+  }
+  return false;
+}
+
 #define INT(op) isa<IntOp>(op)
 
 static Rule rules[] = {
@@ -385,6 +400,29 @@ void RegularFold::run() {
 
     // Also, run some extra folds.
     Builder builder;
+
+    runRewriter([&](LoadOp *op) {
+      if (op->getResultType() != Value::i32 || op->getOperandCount() != 1)
+        return false;
+      auto addr = op->DEF(0);
+      if (!addr || !isa<GetGlobalOp>(addr))
+        return false;
+
+      auto name = NAME(addr);
+      auto it = gMap.find(name);
+      if (it == gMap.end())
+        return false;
+      auto glob = it->second;
+      auto iarr = glob->get<IntArrayAttr>();
+      if (!iarr || iarr->size != 1)
+        return false;
+      if (hasDirectStoreToScalarGlobal(name, module))
+        return false;
+
+      folded++;
+      builder.replace<IntOp>(op, { new IntAttr(iarr->vi[0]) });
+      return true;
+    });
 
     runRewriter([&](BranchOp *op) {
       auto cond = op->DEF();
