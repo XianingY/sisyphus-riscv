@@ -125,6 +125,19 @@ public:
   void run() override;
 };
 
+class RuntimeMemoize : public Pass {
+  int memoized = 0;
+  int entryChecks = 0;
+  int callEpochBumps = 0;
+
+public:
+  RuntimeMemoize(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "runtime-memoize"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Globalizes local arrays.
 class Globalize : public Pass {
   void runImpl(Region *region);
