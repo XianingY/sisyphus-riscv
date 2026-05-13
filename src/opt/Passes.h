@@ -203,8 +203,10 @@ public:
 class FunctionEquivalence : public Pass {
   int classified = 0;
   int replaced = 0;
+  bool allowModMul;
 public:
-  FunctionEquivalence(ModuleOp *module): Pass(module) {}
+  FunctionEquivalence(ModuleOp *module, bool allowModMul = true):
+    Pass(module), allowModMul(allowModMul) {}
 
   std::string name() override { return "function-equivalence"; };
   std::map<std::string, int> stats() override;
