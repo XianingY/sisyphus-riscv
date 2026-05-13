@@ -114,69 +114,6 @@ public:
   void run() override;
 };
 
-class BooleanMatrixRecurrenceFastPath : public Pass {
-  int candidates = 0;
-  int fastpaths = 0;
-  int rejectedAlias = 0;
-  int rejectedShape = 0;
-
-public:
-  BooleanMatrixRecurrenceFastPath(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "bool-matrix-recurrence"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class MatrixRowSumRecurrence : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-
-public:
-  MatrixRowSumRecurrence(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "matrix-row-sum-recurrence"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class SemanticMatmulSummary : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-public:
-  SemanticMatmulSummary(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-matmul-summary"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class SemanticRandomStep : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-public:
-  SemanticRandomStep(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-random-step"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class SemanticRowReduceChecksum : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-public:
-  SemanticRowReduceChecksum(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-row-reduce-checksum"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
 class DeadGlobalStore : public Pass {
   int removed = 0;
   int deadGlobals = 0;
@@ -184,46 +121,6 @@ public:
   DeadGlobalStore(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "dead-global-store"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class SchedulingPrecompute : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-
-public:
-  SchedulingPrecompute(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "scheduling-precompute"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class RepeatOverwriteCollapse : public Pass {
-  int candidates = 0;
-  int collapsed = 0;
-  int rejectedShape = 0;
-  int rejectedSideEffect = 0;
-
-public:
-  RepeatOverwriteCollapse(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "repeat-overwrite-collapse"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class RowScratchMatmul : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-
-public:
-  RowScratchMatmul(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "row-scratch-matmul"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };
@@ -282,31 +179,6 @@ public:
   void run() override;
 };
 
-// Recognize tiny pure integer helper functions whose sampled semantics match
-// native bitwise operations, before the helpers are inlined into hot loops.
-class SemanticBitwise : public Pass {
-  int classified = 0;
-  int replaced = 0;
-public:
-  SemanticBitwise(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-bitwise"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class SemanticTranspose : public Pass {
-  int candidates = 0;
-  int callsRewritten = 0;
-  int rejectedShape = 0;
-public:
-  SemanticTranspose(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-transpose"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
 // Convert short parity-controlled accumulator branches into SelectOp. This is
 // deliberately narrower than the generic Select pass because it may hoist
 // loads out of the taken block.
@@ -317,42 +189,6 @@ public:
   ParityIfConversion(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "parity-if-conversion"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-// Recognize lowered bit-buffer readers after SemanticBitwise has normalized
-// hand-written bitwise helpers, then specialize constant-width calls in-place.
-class SemanticBitBuffer : public Pass {
-  int candidates = 0;
-  int specialized = 0;
-  int repeatFolded = 0;
-  int decodeFastpaths = 0;
-  int predecodedDrivers = 0;
-  int rejectedShape = 0;
-  int rejectedNonConstCall = 0;
-
-public:
-  SemanticBitBuffer(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-bitbuffer"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-// Adds a bounded runtime memo table for small pure self-recursive integer
-// functions. The cache is guarded by an epoch that is bumped at non-recursive
-// call sites, so recursive calls within one top-level invocation can share
-// results without reusing stale values after global inputs are refreshed.
-class RuntimeMemoize : public Pass {
-  int memoized = 0;
-  int entryChecks = 0;
-  int callEpochBumps = 0;
-
-public:
-  RuntimeMemoize(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "runtime-memoize"; };
   std::map<std::string, int> stats() override;
   void run() override;
 };

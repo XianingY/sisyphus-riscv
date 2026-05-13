@@ -160,32 +160,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::GVN>();
       pm.addPass<sys::DCE>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_RECURRENCE_SUFFIX", true))
-      pm.addPass<sys::BooleanMatrixRecurrenceFastPath>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_ROW_SUM_RECURRENCE", true))
-      pm.addPass<sys::MatrixRowSumRecurrence>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_MATMUL_SUMMARY", true))
-      pm.addPass<sys::SemanticMatmulSummary>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_RANDOM_STEP", true))
-      pm.addPass<sys::SemanticRandomStep>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_REDUCE_CHECKSUM", true))
-      pm.addPass<sys::SemanticRowReduceChecksum>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
-      pm.addPass<sys::SemanticBitwise>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_TRANSPOSE", true))
-      pm.addPass<sys::SemanticTranspose>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_BITBUFFER_SPECIALIZE", true))
-      pm.addPass<sys::SemanticBitBuffer>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SCHEDULING_PRECOMPUTE", true))
-      pm.addPass<sys::SchedulingPrecompute>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_OVERWRITE_COLLAPSE", true))
-      pm.addPass<sys::RepeatOverwriteCollapse>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
-      pm.addPass<sys::RuntimeMemoize>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DEAD_GLOBAL_STORE", true)) {
       pm.addPass<sys::DeadGlobalStore>();
       pm.addPass<sys::DCE>();
@@ -227,13 +205,6 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true)) {
-      pm.addPass<sys::RowScratchMatmul>();
-      pm.addPass<sys::Mem2Reg>();
-      pm.addPass<sys::RegularFold>();
-      pm.addPass<sys::DCE>();
-      pm.addPass<sys::SimplifyCFG>();
-    }
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
       pm.addPass<sys::LoopInterchange>();
