@@ -196,7 +196,7 @@ Value cacheIndex(Builder &builder, Value arg0, Value arg1, int mask) {
   auto maskOp = builder.create<IntOp>({ new IntAttr(mask) });
   auto h0 = builder.create<MulIOp>({ arg0, c0 });
   auto h1 = builder.create<MulIOp>({ arg1, c1 });
-  auto mix = builder.create<XorIOp>({ h0, h1 });
+  auto mix = builder.create<XorIOp>(std::vector<Value>{ h0, h1 });
   return builder.create<AndIOp>({ mix, maskOp });
 }
 

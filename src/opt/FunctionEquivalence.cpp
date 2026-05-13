@@ -406,9 +406,9 @@ Op *buildReplacement(Builder &builder, CallOp *call, const Candidate &candidate)
   case EqKind::ModMul: {
     auto lhs = call->DEF(0);
     auto rhs = call->DEF(1);
-    auto product = builder.create<MulLOp>({ lhs, rhs });
+    auto product = builder.create<MulLOp>(std::vector<Value>{ lhs, rhs });
     auto mod = builder.create<IntOp>({ new IntAttr(candidate.param) });
-    return builder.create<ModLOp>({ product, mod });
+    return builder.create<ModLOp>(std::vector<Value>{ product, mod });
   }
   case EqKind::Max: {
     auto less = builder.create<LtOp>({ call->getOperand(0), call->getOperand(1) });
