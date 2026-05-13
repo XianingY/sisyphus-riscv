@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 using namespace sys;
@@ -21,6 +22,7 @@ enum class EqKind {
   Shl,
   Shr,
   Nibble,
+  ModMul,
   Max,
   Min
 };
@@ -28,6 +30,7 @@ enum class EqKind {
 struct Candidate {
   EqKind kind = EqKind::None;
   int argc = 0;
+  int param = 0;
 };
 
 bool envEnabled(const char *name, bool fallback) {
@@ -208,6 +211,111 @@ bool matchesNibble(ModuleOp *module, const std::string &name) {
   return true;
 }
 
+bool exprReferencesGlobalName(Op *op, const std::string &name, std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return false;
+  seen.insert(op);
+  if (auto get = dyn_cast<GetGlobalOp>(op))
+    return NAME(get) == name;
+  for (auto operand : op->getOperands())
+    if (exprReferencesGlobalName(operand.defining, name, seen))
+      return true;
+  return false;
+}
+
+bool storesToGlobalName(ModuleOp *module, const std::string &name) {
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    std::set<Op*> seen;
+    if (exprReferencesGlobalName(store->DEF(1), name, seen))
+      return true;
+  }
+  return false;
+}
+
+std::optional<int> immutableScalarGlobalValue(ModuleOp *module, const std::string &name) {
+  GlobalOp *target = nullptr;
+  for (auto glob : module->findAll<GlobalOp>()) {
+    auto global = cast<GlobalOp>(glob);
+    if (!global->has<NameAttr>() || NAME(global) != name)
+      continue;
+    target = global;
+    break;
+  }
+  if (!target || !target->has<DimensionAttr>() || DIM(target).size() != 1 || DIM(target)[0] != 1)
+    return std::nullopt;
+  auto init = target->find<IntArrayAttr>();
+  if (!init || init->size < 1)
+    return std::nullopt;
+  if (storesToGlobalName(module, name))
+    return std::nullopt;
+  return init->vi[0];
+}
+
+std::optional<int> referencedImmutableModulus(ModuleOp *module, FuncOp *func) {
+  std::set<std::string> names;
+  for (auto get : func->findAll<GetGlobalOp>())
+    names.insert(NAME(get));
+  std::optional<int> mod;
+  for (const auto &name : names) {
+    auto value = immutableScalarGlobalValue(module, name);
+    if (!value || *value <= 1)
+      continue;
+    if (mod && *mod != *value)
+      return std::nullopt;
+    mod = *value;
+  }
+  return mod;
+}
+
+bool hasOnlySelfCalls(FuncOp *func) {
+  const auto &self = NAME(func);
+  int calls = 0;
+  for (auto call : func->findAll<CallOp>()) {
+    calls++;
+    if (NAME(call) != self)
+      return false;
+  }
+  return calls > 0;
+}
+
+bool matchesModMul(ModuleOp *module, const std::string &name, int mod) {
+  std::vector<int> samples = {
+    0, 1, 2, 3, 5, 7, 15, 31, 63, 127, 255, 256,
+    1023, 1024, 4095, 65535
+  };
+  if (mod > 2) {
+    samples.push_back(mod - 2);
+    samples.push_back(mod - 1);
+  }
+
+  for (int a : samples) {
+    for (int b : samples) {
+      bool ok = true;
+      int32_t got = runSample(module, name, { a, b }, ok);
+      if (!ok)
+        return false;
+      int32_t expect = (int32_t) (((int64_t) a * (int64_t) b) % mod);
+      if (got != expect)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool provenNonNegative(Op *op) {
+  if (!op)
+    return false;
+  if (isa<IntOp>(op))
+    return V(op) >= 0;
+  if (!op->has<RangeAttr>())
+    return false;
+  auto [low, high] = RANGE(op);
+  (void) high;
+  return low >= 0;
+}
+
 Candidate classify(ModuleOp *module, FuncOp *func) {
   Candidate result;
   int argc = func->get<ArgCountAttr>()->count;
@@ -229,6 +337,12 @@ Candidate classify(ModuleOp *module, FuncOp *func) {
     return result;
 
   const auto &name = NAME(func);
+  if (argc == 2 && hasOnlySelfCalls(func)) {
+    auto mod = referencedImmutableModulus(module, func);
+    if (mod && matchesModMul(module, name, *mod))
+      return { EqKind::ModMul, argc, *mod };
+  }
+
   if (hasUnsupportedSideEffect(func, /*allowGlobalRead=*/ true))
     return result;
 
@@ -256,7 +370,8 @@ Candidate classify(ModuleOp *module, FuncOp *func) {
   return result;
 }
 
-Op *buildReplacement(Builder &builder, CallOp *call, EqKind kind) {
+Op *buildReplacement(Builder &builder, CallOp *call, const Candidate &candidate) {
+  auto kind = candidate.kind;
   switch (kind) {
   case EqKind::And:
     return builder.create<AndIOp>({ call->getOperand(0), call->getOperand(1) });
@@ -287,6 +402,13 @@ Op *buildReplacement(Builder &builder, CallOp *call, EqKind kind) {
     auto baseDigit = builder.create<AndIOp>({ x, fifteen });
     auto capped = builder.create<SelectOp>(std::vector<Value>{ below, digit, zero });
     return builder.create<SelectOp>(std::vector<Value>{ nonneg, capped, baseDigit });
+  }
+  case EqKind::ModMul: {
+    auto lhs = call->DEF(0);
+    auto rhs = call->DEF(1);
+    auto product = builder.create<MulLOp>({ lhs, rhs });
+    auto mod = builder.create<IntOp>({ new IntAttr(candidate.param) });
+    return builder.create<ModLOp>({ product, mod });
   }
   case EqKind::Max: {
     auto less = builder.create<LtOp>({ call->getOperand(0), call->getOperand(1) });
@@ -339,9 +461,12 @@ void FunctionEquivalence::run() {
       return false;
     if (call->getOperandCount() != it->second.argc)
       return false;
+    if (it->second.kind == EqKind::ModMul &&
+        (!provenNonNegative(call->DEF(0)) || !provenNonNegative(call->DEF(1))))
+      return false;
 
     builder.setBeforeOp(call);
-    Op *replacement = buildReplacement(builder, call, it->second.kind);
+    Op *replacement = buildReplacement(builder, call, it->second);
     if (!replacement)
       return false;
     call->replaceAllUsesWith(replacement);

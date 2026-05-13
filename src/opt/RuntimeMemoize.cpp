@@ -67,6 +67,29 @@ bool storesToGlobal(FuncOp *func) {
   return false;
 }
 
+bool readsOnlyImmutableScalarGlobals(FuncOp *func, ModuleOp *module) {
+  auto gets = func->findAll<GetGlobalOp>();
+  if (gets.empty())
+    return false;
+
+  std::map<std::string, GlobalOp*> globals;
+  for (auto glob : module->findAll<GlobalOp>())
+    if (glob->has<NameAttr>())
+      globals[NAME(glob)] = cast<GlobalOp>(glob);
+
+  for (auto get : gets) {
+    auto it = globals.find(NAME(get));
+    if (it == globals.end())
+      return false;
+    auto global = it->second;
+    if (!global->has<DimensionAttr>() || DIM(global).size() != 1 || DIM(global)[0] != 1)
+      return false;
+    if (!global->find<IntArrayAttr>())
+      return false;
+  }
+  return true;
+}
+
 bool hasOnlySelfCalls(FuncOp *func) {
   const auto &self = NAME(func);
   for (auto call : func->findAll<CallOp>())
@@ -322,6 +345,10 @@ void RuntimeMemoize::run() {
   auto funcs = collectFuncs();
   std::set<FuncOp*> candidates;
   for (auto func : funcs) {
+    if (readsOnlyImmutableScalarGlobals(func, module)) {
+      rejectedCalls++;
+      continue;
+    }
     switch (eligible(func)) {
     case RejectReason::None:
       candidates.insert(func);

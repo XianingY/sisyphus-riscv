@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -14,6 +15,7 @@ namespace {
 
 constexpr int kDefaultBudget = 64;
 constexpr int kDefaultMaxOps = 2000;
+constexpr int kDefaultRecursiveMaxConst = 1 << 30;
 
 bool envEnabled(const char *name, bool fallback) {
   auto env = std::getenv(name);
@@ -27,6 +29,14 @@ int envInt(const char *name, int fallback) {
   if (!env)
     return fallback;
   return std::atoi(env);
+}
+
+bool isRecursiveFunc(FuncOp *func) {
+  if (!func || !func->has<CallerAttr>())
+    return false;
+  const auto &name = NAME(func);
+  const auto &callers = CALLER(func);
+  return std::find(callers.begin(), callers.end(), name) != callers.end();
 }
 
 bool isSpecializedName(const std::string &name) {
@@ -81,6 +91,72 @@ int opCount(FuncOp *func) {
     for ([[maybe_unused]] auto op : bb->getOps())
       count++;
   return count;
+}
+
+int recursiveArgScore(FuncOp *func, int index) {
+  int score = 0;
+  for (auto getarg : func->findAll<GetArgOp>()) {
+    if (V(getarg) != index)
+      continue;
+    for (auto use : getarg->getUses()) {
+      if (isa<DivIOp>(use) || isa<ModIOp>(use) || isa<EqOp>(use) ||
+          isa<NeOp>(use) || isa<LtOp>(use) || isa<LeOp>(use))
+        score += 8;
+      else if ((isa<AddIOp>(use) || isa<SubIOp>(use)) &&
+               ((use->DEF(0) == getarg && isa<IntOp>(use->DEF(1))) ||
+                (use->DEF(1) == getarg && isa<IntOp>(use->DEF(0)))))
+        score += 4;
+      else if (isa<CallOp>(use))
+        score += 2;
+      else
+        score += 1;
+    }
+  }
+  return score;
+}
+
+std::optional<int> tryGetConstantValue(
+    Op *op,
+    const std::map<std::string, GlobalOp*> &gMap,
+    std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return std::nullopt;
+  seen.insert(op);
+
+  if (isa<IntOp>(op))
+    return V(op);
+
+  if (isa<LoadOp>(op)) {
+    auto addr = op->DEF(0);
+    if (!addr || !isa<GetGlobalOp>(addr))
+      return std::nullopt;
+    auto it = gMap.find(NAME(addr));
+    if (it == gMap.end())
+      return std::nullopt;
+    auto iarr = it->second->find<IntArrayAttr>();
+    if (!iarr || iarr->size != 1)
+      return std::nullopt;
+    return iarr->vi[0];
+  }
+
+  if (op->getOperandCount() != 2)
+    return std::nullopt;
+  auto lhs = tryGetConstantValue(op->DEF(0), gMap, seen);
+  auto rhs = tryGetConstantValue(op->DEF(1), gMap, seen);
+  if (!lhs || !rhs)
+    return std::nullopt;
+
+  if (isa<AddIOp>(op))
+    return *lhs + *rhs;
+  if (isa<SubIOp>(op))
+    return *lhs - *rhs;
+  if (isa<MulIOp>(op))
+    return *lhs * *rhs;
+  if (isa<DivIOp>(op) && *rhs != 0)
+    return *lhs / *rhs;
+  if (isa<ModIOp>(op) && *rhs != 0)
+    return *lhs % *rhs;
+  return std::nullopt;
 }
 
 void copyRegion(Region *dst, Region *src) {
@@ -157,9 +233,14 @@ void ConstArgSpecialize::run() {
   if (!envEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true))
     return;
 
+  CallGraph(module).run();
+
   const int budget = envInt("SISY_CONST_ARG_SPECIALIZE_BUDGET", kDefaultBudget);
   const int maxOps = envInt("SISY_CONST_ARG_SPECIALIZE_MAX_OPS", kDefaultMaxOps);
+  const int recursiveMaxConst =
+    envInt("SISY_CONST_ARG_SPECIALIZE_RECURSIVE_MAX_CONST", kDefaultRecursiveMaxConst);
   std::set<std::string> produced;
+  auto gMap = getGlobalMap();
 
   for (int round = 0; round < budget; round++) {
     while (foldTinyIntConstants(module));
@@ -177,16 +258,36 @@ void ConstArgSpecialize::run() {
         continue;
       if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
         continue;
+      bool recursive = isRecursiveFunc(func);
 
       int argIndex = -1;
       int argValue = 0;
-      for (int i = 0; i < call->getOperandCount(); i++) {
+      int bestScore = -1;
+      int start = recursive ? 0 : 0;
+      int end = call->getOperandCount();
+      int step = 1;
+      for (int i = start; i != end; i += step) {
         auto def = call->DEF(i);
-        if (!def || !isa<IntOp>(def))
+        if (!def)
           continue;
-        int value = V(def);
-        if (value < -1 || value > 16)
+        std::set<Op*> seen;
+        auto maybeValue = tryGetConstantValue(def, gMap, seen);
+        if (!maybeValue)
           continue;
+        int value = *maybeValue;
+        if (recursive) {
+          if (value < 0 || value > recursiveMaxConst)
+            continue;
+          int score = recursiveArgScore(func, i);
+          if (score < bestScore)
+            continue;
+          if (score == bestScore && argIndex >= i)
+            continue;
+          bestScore = score;
+        } else {
+          if (value < -1 || value > 16)
+            continue;
+        }
         argIndex = i;
         argValue = value;
         break;
