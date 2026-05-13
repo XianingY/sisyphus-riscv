@@ -86,9 +86,7 @@ void doInline(Op *call, Region *fnRegion) {
       clone->removeAllOperands();
       for (auto operand : operands) {
         auto def = operand.defining;
-        if (!cloneMap.count(def)) op->dump(std::cerr), def->dump(std::cerr);
-        assert(cloneMap.count(def));
-        clone->pushOperand(cloneMap[def]);
+        clone->pushOperand(cloneMap.count(def) ? cloneMap[def]->getResult() : operand);
       }
     }
   }

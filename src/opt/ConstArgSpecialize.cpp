@@ -330,6 +330,8 @@ void ConstArgSpecialize::run() {
       break;
 
     while (foldTinyIntConstants(module));
+    RegularFold(module).run();
+    SimplifyCFG(module).run();
     GVN(module).run();
     DCE(module).run();
   }

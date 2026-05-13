@@ -33,6 +33,17 @@ struct Candidate {
   int param = 0;
 };
 
+std::string modMulHelperName(const std::string &name) {
+  return "__fe_modmul_" + name;
+}
+
+bool hasFunctionNamed(ModuleOp *module, const std::string &name) {
+  for (auto func : module->findAll<FuncOp>())
+    if (NAME(func) == name)
+      return true;
+  return false;
+}
+
 bool envEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
   if (!raw || !raw[0])
@@ -316,7 +327,46 @@ bool provenNonNegative(Op *op) {
   return low >= 0;
 }
 
-Candidate classify(ModuleOp *module, FuncOp *func) {
+void ensureGuardedModMulHelper(ModuleOp *module, const std::string &originalName, int mod) {
+  auto helperName = modMulHelperName(originalName);
+  if (hasFunctionNamed(module, helperName))
+    return;
+
+  Builder builder;
+  builder.setToRegionStart(module->getRegion());
+  auto func = builder.create<FuncOp>({
+    new NameAttr(helperName),
+    new ArgCountAttr(2),
+    new ArgTypesAttr({ Value::i32, Value::i32 })
+  });
+  auto region = func->appendRegion();
+  auto entry = region->appendBlock();
+  auto slow = region->appendBlock();
+  auto fast = region->appendBlock();
+
+  builder.setToBlockEnd(entry);
+  auto lhs = builder.create<GetArgOp>(Value::i32, { new IntAttr(0) });
+  auto rhs = builder.create<GetArgOp>(Value::i32, { new IntAttr(1) });
+  auto zero = builder.create<IntOp>({ new IntAttr(0) });
+  auto lhsNeg = builder.create<LtOp>({ lhs, zero });
+  auto rhsNeg = builder.create<LtOp>({ rhs, zero });
+  auto anyNeg = builder.create<OrIOp>({ lhsNeg, rhsNeg });
+  builder.create<BranchOp>(std::vector<Value>{ anyNeg },
+                           { new TargetAttr(slow), new ElseAttr(fast) });
+
+  builder.setToBlockEnd(slow);
+  auto fallback = builder.create<CallOp>(Value::i32, std::vector<Value>{ lhs, rhs },
+                                         { new NameAttr(originalName) });
+  builder.create<ReturnOp>({ fallback });
+
+  builder.setToBlockEnd(fast);
+  auto product = builder.create<MulLOp>(std::vector<Value>{ lhs, rhs });
+  auto modOp = builder.create<IntOp>({ new IntAttr(mod) });
+  auto reduced = builder.create<ModLOp>(std::vector<Value>{ product, modOp });
+  builder.create<ReturnOp>({ reduced });
+}
+
+Candidate classify(ModuleOp *module, FuncOp *func, bool allowModMul) {
   Candidate result;
   int argc = func->get<ArgCountAttr>()->count;
   if (argc != 1 && argc != 2)
@@ -337,7 +387,7 @@ Candidate classify(ModuleOp *module, FuncOp *func) {
     return result;
 
   const auto &name = NAME(func);
-  if (argc == 2 && hasOnlySelfCalls(func)) {
+  if (allowModMul && argc == 2 && hasOnlySelfCalls(func)) {
     auto mod = referencedImmutableModulus(module, func);
     if (mod && matchesModMul(module, name, *mod))
       return { EqKind::ModMul, argc, *mod };
@@ -442,7 +492,7 @@ void FunctionEquivalence::run() {
   for (auto func : collectFuncs()) {
     if (isExtern(NAME(func)))
       continue;
-    auto candidate = classify(module, func);
+    auto candidate = classify(module, func, allowModMul);
     if (candidate.kind == EqKind::None)
       continue;
     candidates[NAME(func)] = candidate;
@@ -461,11 +511,15 @@ void FunctionEquivalence::run() {
       return false;
     if (call->getOperandCount() != it->second.argc)
       return false;
-    if (it->second.kind == EqKind::ModMul &&
-        (!provenNonNegative(call->DEF(0)) || !provenNonNegative(call->DEF(1))))
-      return false;
 
     builder.setBeforeOp(call);
+    if (it->second.kind == EqKind::ModMul &&
+        (!provenNonNegative(call->DEF(0)) || !provenNonNegative(call->DEF(1)))) {
+      ensureGuardedModMulHelper(module, NAME(call), it->second.param);
+      NAME(call) = modMulHelperName(NAME(call));
+      replaced++;
+      return false;
+    }
     Op *replacement = buildReplacement(builder, call, it->second);
     if (!replacement)
       return false;

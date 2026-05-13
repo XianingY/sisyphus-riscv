@@ -158,7 +158,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
-      pm.addPass<sys::FunctionEquivalence>();
+      pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::GVN>();
@@ -254,7 +254,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::EqClass>();
       pm.addPass<sys::RangeAwareFold>();
       if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
-        pm.addPass<sys::FunctionEquivalence>();
+        pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ true);
       pm.addPass<sys::Splice>();
     }
     if (enableO1LiteTail && !economyMode) {
