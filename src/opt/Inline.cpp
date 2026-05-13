@@ -166,6 +166,29 @@ bool writesGlobalMemory(FuncOp *func) {
   return false;
 }
 
+bool readsOnlyImmutableScalarGlobals(FuncOp *func) {
+  auto gets = func->findAll<GetGlobalOp>();
+  if (gets.empty())
+    return true;
+
+  std::map<std::string, GlobalOp*> gMap;
+  auto module = func->getParentOp<ModuleOp>();
+  for (auto op : module->getRegion()->getFirstBlock()->getOps())
+    if (auto glob = dyn_cast<GlobalOp>(op); glob && glob->has<NameAttr>())
+      gMap[NAME(glob)] = glob;
+  for (auto get : gets) {
+    auto it = gMap.find(NAME(get));
+    if (it == gMap.end())
+      return false;
+    auto global = it->second;
+    if (!global->has<DimensionAttr>() || DIM(global).size() != 1 || DIM(global)[0] != 1)
+      return false;
+    if (!global->find<IntArrayAttr>())
+      return false;
+  }
+  return true;
+}
+
 InlineShape analyzeInlineShape(FuncOp *func) {
   InlineShape shape;
   const auto &self = NAME(func);
@@ -183,15 +206,17 @@ InlineShape analyzeInlineShape(FuncOp *func) {
 }
 
 bool canInlineRecursive(FuncOp *func) {
-  if (!envEnabled("SISY_ENABLE_RECURSIVE_INLINE", false))
+  if (!envEnabled("SISY_ENABLE_RECURSIVE_INLINE", true))
     return false;
   if (!func->has<ArgCountAttr>())
     return false;
   if (func->get<ArgCountAttr>()->count >= 8)
     return false;
+  if (func->has<ImpureAttr>() || writesGlobalMemory(func) || !readsOnlyImmutableScalarGlobals(func))
+    return false;
 
   auto shape = analyzeInlineShape(func);
-  if (shape.opcount >= 100)
+  if (shape.opcount >= 48)
     return false;
   if (shape.selfCalls == 0 || shape.selfCalls > 2)
     return false;

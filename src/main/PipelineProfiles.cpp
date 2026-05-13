@@ -254,7 +254,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::EqClass>();
       pm.addPass<sys::RangeAwareFold>();
       if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
-        pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ true);
+        pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
       pm.addPass<sys::Splice>();
     }
     if (enableO1LiteTail && !economyMode) {

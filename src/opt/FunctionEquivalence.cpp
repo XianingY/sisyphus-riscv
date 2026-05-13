@@ -264,20 +264,22 @@ std::optional<int> immutableScalarGlobalValue(ModuleOp *module, const std::strin
   return init->vi[0];
 }
 
-std::optional<int> referencedImmutableModulus(ModuleOp *module, FuncOp *func) {
+std::vector<int> modulusCandidates(ModuleOp *module, FuncOp *func) {
+  std::set<int> values;
   std::set<std::string> names;
   for (auto get : func->findAll<GetGlobalOp>())
     names.insert(NAME(get));
-  std::optional<int> mod;
   for (const auto &name : names) {
     auto value = immutableScalarGlobalValue(module, name);
-    if (!value || *value <= 1)
-      continue;
-    if (mod && *mod != *value)
-      return std::nullopt;
-    mod = *value;
+    if (value && *value > 1)
+      values.insert(*value);
   }
-  return mod;
+  for (auto op : func->findAll<IntOp>()) {
+    int value = V(op);
+    if (value > 1)
+      values.insert(value);
+  }
+  return std::vector<int>(values.begin(), values.end());
 }
 
 bool hasOnlySelfCalls(FuncOp *func) {
@@ -339,6 +341,7 @@ void ensureGuardedModMulHelper(ModuleOp *module, const std::string &originalName
     new ArgCountAttr(2),
     new ArgTypesAttr({ Value::i32, Value::i32 })
   });
+  func->add<ImpureAttr>();
   auto region = func->appendRegion();
   auto entry = region->appendBlock();
   auto slow = region->appendBlock();
@@ -388,9 +391,10 @@ Candidate classify(ModuleOp *module, FuncOp *func, bool allowModMul) {
 
   const auto &name = NAME(func);
   if (allowModMul && argc == 2 && hasOnlySelfCalls(func)) {
-    auto mod = referencedImmutableModulus(module, func);
-    if (mod && matchesModMul(module, name, *mod))
-      return { EqKind::ModMul, argc, *mod };
+    for (int mod : modulusCandidates(module, func)) {
+      if (matchesModMul(module, name, mod))
+        return { EqKind::ModMul, argc, mod };
+    }
   }
 
   if (hasUnsupportedSideEffect(func, /*allowGlobalRead=*/ true))
