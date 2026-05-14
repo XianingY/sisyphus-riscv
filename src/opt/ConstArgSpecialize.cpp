@@ -13,8 +13,8 @@ using namespace sys;
 
 namespace {
 
-constexpr int kDefaultBudget = 128;
-constexpr int kDefaultMaxOps = 3000;
+constexpr int kDefaultBudget = 64;
+constexpr int kDefaultMaxOps = 2000;
 constexpr int kDefaultRecursiveMaxConst = 1 << 30;
 
 bool envEnabled(const char *name, bool fallback) {
@@ -331,8 +331,7 @@ void ConstArgSpecialize::run() {
         }
         argIndex = i;
         argValue = value;
-        if (!recursive)
-          break;
+        break;
       }
       if (argIndex < 0)
         continue;
