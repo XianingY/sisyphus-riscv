@@ -135,6 +135,35 @@ std::optional<int> immutableScalarGlobalValue(
   return iarr->vi[0];
 }
 
+bool mayStoreToGlobal(const std::string &name, Op *addr) {
+  if (!addr)
+    return false;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr) == name;
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown)
+    return false;
+  for (auto &[base, _] : alias->location) {
+    if (base && isa<GlobalOp>(base) && NAME(base) == name)
+      return true;
+  }
+  return false;
+}
+
+std::optional<std::string> zeroOffsetGlobalName(Op *addr) {
+  if (!addr)
+    return std::nullopt;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr);
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown || alias->location.size() != 1)
+    return std::nullopt;
+  auto &[base, offsets] = *alias->location.begin();
+  if (!base || !isa<GlobalOp>(base) || offsets.size() != 1 || offsets[0] != 0)
+    return std::nullopt;
+  return NAME(base);
+}
+
 std::optional<int> tryGetConstantValue(
     Op *op,
     const std::map<std::string, GlobalOp*> &gMap,
@@ -148,10 +177,10 @@ std::optional<int> tryGetConstantValue(
     return V(op);
 
   if (isa<LoadOp>(op)) {
-    auto addr = op->DEF(0);
-    if (!addr || !isa<GetGlobalOp>(addr))
+    auto name = zeroOffsetGlobalName(op->DEF(0));
+    if (!name)
       return std::nullopt;
-    return immutableScalarGlobalValue(NAME(addr), gMap, mutableGlobals);
+    return immutableScalarGlobalValue(*name, gMap, mutableGlobals);
   }
 
   if (op->getOperandCount() != 2)
@@ -261,9 +290,11 @@ void ConstArgSpecialize::run() {
     if (store->getOperandCount() < 2)
       continue;
     auto addr = store->DEF(1);
-    if (!addr || !isa<GetGlobalOp>(addr))
+    if (!addr)
       continue;
-    mutableGlobals.insert(NAME(addr));
+    for (auto &[name, _] : gMap)
+      if (mayStoreToGlobal(name, addr))
+        mutableGlobals.insert(name);
   }
 
   for (int round = 0; round < budget; round++) {

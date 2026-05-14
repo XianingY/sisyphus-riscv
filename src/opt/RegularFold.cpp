@@ -14,17 +14,23 @@ using namespace sys;
 //      scalar (size == 1) integer global with a known initializer.
 //      This covers patterns like `const int base = 16;` which the frontend
 //      emits as a global variable rather than inlining the constant.
-static bool hasDirectStoreToScalarGlobal(
+static bool hasStoreToScalarGlobal(
     const std::string &name,
     ModuleOp *module) {
   for (auto store : module->findAll<StoreOp>()) {
     if (store->getOperandCount() < 2)
       continue;
     auto addr = store->DEF(1);
-    if (!addr || !isa<GetGlobalOp>(addr))
+    if (!addr)
       continue;
-    if (NAME(addr) == name)
+    if (isa<GetGlobalOp>(addr) && NAME(addr) == name)
       return true;
+    auto alias = addr->find<AliasAttr>();
+    if (!alias || alias->unknown)
+      continue;
+    for (auto &[base, _] : alias->location)
+      if (base && isa<GlobalOp>(base) && NAME(base) == name)
+        return true;
   }
   return false;
 }
@@ -40,11 +46,25 @@ static std::optional<int> immutableScalarGlobalValue(
   auto iarr = glob->get<IntArrayAttr>();
   if (!iarr || iarr->size != 1)
     return std::nullopt;
-  if (hasDirectStoreToScalarGlobal(name, module))
+  if (hasStoreToScalarGlobal(name, module))
     return std::nullopt;
   if (!iarr->vi)
     return 0;
   return iarr->vi[0];
+}
+
+static std::optional<std::string> zeroOffsetGlobalName(Op *addr) {
+  if (!addr)
+    return std::nullopt;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr);
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown || alias->location.size() != 1)
+    return std::nullopt;
+  auto &[base, offsets] = *alias->location.begin();
+  if (!base || !isa<GlobalOp>(base) || offsets.size() != 1 || offsets[0] != 0)
+    return std::nullopt;
+  return NAME(base);
 }
 
 static std::optional<int> tryGetConstantValue(
@@ -52,13 +72,12 @@ static std::optional<int> tryGetConstantValue(
   if (isa<IntOp>(op))
     return V(op);
 
-  // Pattern: load(getglobal(<name>))
+  // Pattern: load(getglobal(<name>)) or an equivalent zero-offset alias.
   if (isa<LoadOp>(op)) {
-    auto addr = op->DEF(0);
-    if (!isa<GetGlobalOp>(addr))
+    auto name = zeroOffsetGlobalName(op->DEF(0));
+    if (!name)
       return std::nullopt;
-    auto name = NAME(addr);
-    return immutableScalarGlobalValue(name, gMap, module);
+    return immutableScalarGlobalValue(*name, gMap, module);
   }
 
   return std::nullopt;
