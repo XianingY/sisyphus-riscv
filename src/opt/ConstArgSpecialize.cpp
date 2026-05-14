@@ -115,9 +115,30 @@ int recursiveArgScore(FuncOp *func, int index) {
   return score;
 }
 
+std::optional<int> immutableScalarGlobalValue(
+    const std::string &name,
+    const std::map<std::string, GlobalOp*> &gMap,
+    const std::set<std::string> &mutableGlobals) {
+  if (mutableGlobals.count(name))
+    return std::nullopt;
+  auto it = gMap.find(name);
+  if (it == gMap.end())
+    return std::nullopt;
+  auto global = it->second;
+  if (!global->has<DimensionAttr>() || DIM(global).size() != 1 || DIM(global)[0] != 1)
+    return std::nullopt;
+  auto iarr = global->find<IntArrayAttr>();
+  if (!iarr || iarr->size != 1)
+    return std::nullopt;
+  if (!iarr->vi)
+    return 0;
+  return iarr->vi[0];
+}
+
 std::optional<int> tryGetConstantValue(
     Op *op,
     const std::map<std::string, GlobalOp*> &gMap,
+    const std::set<std::string> &mutableGlobals,
     std::set<Op*> &seen) {
   if (!op || seen.count(op))
     return std::nullopt;
@@ -130,19 +151,13 @@ std::optional<int> tryGetConstantValue(
     auto addr = op->DEF(0);
     if (!addr || !isa<GetGlobalOp>(addr))
       return std::nullopt;
-    auto it = gMap.find(NAME(addr));
-    if (it == gMap.end())
-      return std::nullopt;
-    auto iarr = it->second->find<IntArrayAttr>();
-    if (!iarr || iarr->size != 1)
-      return std::nullopt;
-    return iarr->vi[0];
+    return immutableScalarGlobalValue(NAME(addr), gMap, mutableGlobals);
   }
 
   if (op->getOperandCount() != 2)
     return std::nullopt;
-  auto lhs = tryGetConstantValue(op->DEF(0), gMap, seen);
-  auto rhs = tryGetConstantValue(op->DEF(1), gMap, seen);
+  auto lhs = tryGetConstantValue(op->DEF(0), gMap, mutableGlobals, seen);
+  auto rhs = tryGetConstantValue(op->DEF(1), gMap, mutableGlobals, seen);
   if (!lhs || !rhs)
     return std::nullopt;
 
@@ -241,6 +256,15 @@ void ConstArgSpecialize::run() {
     envInt("SISY_CONST_ARG_SPECIALIZE_RECURSIVE_MAX_CONST", kDefaultRecursiveMaxConst);
   std::set<std::string> produced;
   auto gMap = getGlobalMap();
+  std::set<std::string> mutableGlobals;
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    auto addr = store->DEF(1);
+    if (!addr || !isa<GetGlobalOp>(addr))
+      continue;
+    mutableGlobals.insert(NAME(addr));
+  }
 
   for (int round = 0; round < budget; round++) {
     while (foldTinyIntConstants(module));
@@ -271,7 +295,7 @@ void ConstArgSpecialize::run() {
         if (!def)
           continue;
         std::set<Op*> seen;
-        auto maybeValue = tryGetConstantValue(def, gMap, seen);
+        auto maybeValue = tryGetConstantValue(def, gMap, mutableGlobals, seen);
         if (!maybeValue)
           continue;
         int value = *maybeValue;

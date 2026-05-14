@@ -14,30 +14,6 @@ using namespace sys;
 //      scalar (size == 1) integer global with a known initializer.
 //      This covers patterns like `const int base = 16;` which the frontend
 //      emits as a global variable rather than inlining the constant.
-static std::optional<int> tryGetConstantValue(
-    Op *op, const std::map<std::string, GlobalOp*> &gMap) {
-  if (isa<IntOp>(op))
-    return V(op);
-
-  // Pattern: load(getglobal(<name>))
-  if (isa<LoadOp>(op)) {
-    auto addr = op->DEF(0);
-    if (!isa<GetGlobalOp>(addr))
-      return std::nullopt;
-    auto name = NAME(addr);
-    auto it = gMap.find(name);
-    if (it == gMap.end())
-      return std::nullopt;
-    auto glob = it->second;
-    auto iarr = glob->get<IntArrayAttr>();
-    if (!iarr || iarr->size != 1)
-      return std::nullopt;
-    return iarr->vi[0];
-  }
-
-  return std::nullopt;
-}
-
 static bool hasDirectStoreToScalarGlobal(
     const std::string &name,
     ModuleOp *module) {
@@ -51,6 +27,41 @@ static bool hasDirectStoreToScalarGlobal(
       return true;
   }
   return false;
+}
+
+static std::optional<int> immutableScalarGlobalValue(
+    const std::string &name,
+    const std::map<std::string, GlobalOp*> &gMap,
+    ModuleOp *module) {
+  auto it = gMap.find(name);
+  if (it == gMap.end())
+    return std::nullopt;
+  auto glob = it->second;
+  auto iarr = glob->get<IntArrayAttr>();
+  if (!iarr || iarr->size != 1)
+    return std::nullopt;
+  if (hasDirectStoreToScalarGlobal(name, module))
+    return std::nullopt;
+  if (!iarr->vi)
+    return 0;
+  return iarr->vi[0];
+}
+
+static std::optional<int> tryGetConstantValue(
+    Op *op, const std::map<std::string, GlobalOp*> &gMap, ModuleOp *module) {
+  if (isa<IntOp>(op))
+    return V(op);
+
+  // Pattern: load(getglobal(<name>))
+  if (isa<LoadOp>(op)) {
+    auto addr = op->DEF(0);
+    if (!isa<GetGlobalOp>(addr))
+      return std::nullopt;
+    auto name = NAME(addr);
+    return immutableScalarGlobalValue(name, gMap, module);
+  }
+
+  return std::nullopt;
 }
 
 #define INT(op) isa<IntOp>(op)
@@ -409,18 +420,12 @@ void RegularFold::run() {
         return false;
 
       auto name = NAME(addr);
-      auto it = gMap.find(name);
-      if (it == gMap.end())
-        return false;
-      auto glob = it->second;
-      auto iarr = glob->get<IntArrayAttr>();
-      if (!iarr || iarr->size != 1)
-        return false;
-      if (hasDirectStoreToScalarGlobal(name, module))
+      auto value = immutableScalarGlobalValue(name, gMap, module);
+      if (!value)
         return false;
 
       folded++;
-      builder.replace<IntOp>(op, { new IntAttr(iarr->vi[0]) });
+      builder.replace<IntOp>(op, { new IntAttr(*value) });
       return true;
     });
 
@@ -485,7 +490,7 @@ void RegularFold::run() {
 
         // Divisor must be a compile-time integer constant (or a load from a
         // scalar const global, e.g. `const int base = 16`).
-        auto maybeDiv = tryGetConstantValue(y, gMap);
+        auto maybeDiv = tryGetConstantValue(y, gMap, module);
         if (!maybeDiv)
           return false;
 
@@ -524,7 +529,7 @@ void RegularFold::run() {
 
         // Divisor must be a compile-time integer constant (or a load from a
         // scalar const global, e.g. `const int base = 16`).
-        auto maybeMod = tryGetConstantValue(y, gMap);
+        auto maybeMod = tryGetConstantValue(y, gMap, module);
         if (!maybeMod)
           return false;
 

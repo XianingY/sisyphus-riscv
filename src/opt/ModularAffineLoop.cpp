@@ -260,6 +260,23 @@ bool ModularAffineLoop::runImpl(LoopInfo *loop) {
   builder.create<StoreOp>({ foldedValue, update.addr }, { new SizeAttr(4) });
   builder.replace<GotoOp>(preterm, { new TargetAttr(exit) });
 
+  // The original 2-block loop is now unreachable. Leaving it in place keeps a
+  // self-contained dead SCC in the region, which later CFG-sensitive passes can
+  // still walk and trip over. Remove it eagerly instead of relying on later DCE.
+  auto detachBlock = [](BasicBlock *bb) {
+    auto ops = bb->getOps();
+    for (auto op : ops)
+      op->removeAllOperands();
+  };
+  detachBlock(loop->header);
+  detachBlock(body);
+  body->preds.clear();
+  body->succs.clear();
+  loop->header->preds.clear();
+  loop->header->succs.clear();
+  body->forceErase();
+  loop->header->forceErase();
+
   folded++;
   return true;
 }
