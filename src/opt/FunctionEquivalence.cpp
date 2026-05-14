@@ -37,6 +37,19 @@ std::string modMulHelperName(const std::string &name) {
   return "__fe_modmul_" + name;
 }
 
+std::string guardedBitwiseHelperName(const std::string &name, EqKind kind) {
+  switch (kind) {
+  case EqKind::And:
+    return "__fe_guard_and_" + name;
+  case EqKind::Or:
+    return "__fe_guard_or_" + name;
+  case EqKind::Xor:
+    return "__fe_guard_xor_" + name;
+  default:
+    return "__fe_guard_" + name;
+  }
+}
+
 bool hasFunctionNamed(ModuleOp *module, const std::string &name) {
   for (auto func : module->findAll<FuncOp>())
     if (NAME(func) == name)
@@ -182,46 +195,6 @@ bool matchesMinMax(ModuleOp *module, const std::string &name, EqKind kind) {
   return true;
 }
 
-bool matchesShift(ModuleOp *module, const std::string &name, EqKind kind) {
-  static const std::vector<int> xSamples = {
-    0, 1, 2, 3, 5, 7, 15, 31, 63, 127, 255, 256,
-    1023, 1024, 4095, 65535, 0x12345678, 0x2aaaaaaa, 0x3fffffff, 0x55555555
-  };
-
-  for (int x : xSamples) {
-    for (int n = 0; n <= 8; n++) {
-      bool ok = true;
-      int32_t got = runSample(module, name, { x, n }, ok);
-      if (!ok)
-        return false;
-      int32_t expect = kind == EqKind::Shl ? (x << n) : (x >> n);
-      if (got != expect)
-        return false;
-    }
-  }
-  return true;
-}
-
-bool matchesNibble(ModuleOp *module, const std::string &name) {
-  static const std::vector<int> xSamples = {
-    0, 1, 2, 3, 5, 7, 15, 16, 17, 31, 255, 256, 4095,
-    65535, 0x12345678, 0x2aaaaaaa, 0x3fffffff, 0x55555555
-  };
-
-  for (int x : xSamples) {
-    for (int n = 0; n <= 9; n++) {
-      bool ok = true;
-      int32_t got = runSample(module, name, { x, n }, ok);
-      if (!ok)
-        return false;
-      int32_t expect = n >= 8 ? 0 : ((x >> (4 * n)) & 15);
-      if (got != expect)
-        return false;
-    }
-  }
-  return true;
-}
-
 bool exprReferencesGlobalName(Op *op, const std::string &name, std::set<Op*> &seen) {
   if (!op || seen.count(op))
     return false;
@@ -352,6 +325,62 @@ bool provenNonNegative(Op *op) {
   return low >= 0;
 }
 
+Op *buildBinaryBitwise(Builder &builder, EqKind kind, Value lhs, Value rhs) {
+  switch (kind) {
+  case EqKind::And:
+    return builder.create<AndIOp>(std::vector<Value>{ lhs, rhs });
+  case EqKind::Or:
+    return builder.create<OrIOp>(std::vector<Value>{ lhs, rhs });
+  case EqKind::Xor:
+    return builder.create<XorIOp>(std::vector<Value>{ lhs, rhs });
+  default:
+    return nullptr;
+  }
+}
+
+bool needsNonNegativeGuard(EqKind kind) {
+  return kind == EqKind::And || kind == EqKind::Or || kind == EqKind::Xor;
+}
+
+void ensureGuardedBitwiseHelper(ModuleOp *module, const std::string &originalName, EqKind kind) {
+  auto helperName = guardedBitwiseHelperName(originalName, kind);
+  if (hasFunctionNamed(module, helperName))
+    return;
+
+  Builder builder;
+  builder.setToRegionStart(module->getRegion());
+  auto func = builder.create<FuncOp>({
+    new NameAttr(helperName),
+    new ArgCountAttr(2),
+    new ArgTypesAttr({ Value::i32, Value::i32 })
+  });
+  func->add<ImpureAttr>();
+  auto region = func->appendRegion();
+  auto entry = region->appendBlock();
+  auto slow = region->appendBlock();
+  auto fast = region->appendBlock();
+
+  builder.setToBlockEnd(entry);
+  auto lhs = builder.create<GetArgOp>(Value::i32, { new IntAttr(0) });
+  auto rhs = builder.create<GetArgOp>(Value::i32, { new IntAttr(1) });
+  auto zero = builder.create<IntOp>({ new IntAttr(0) });
+  auto lhsNeg = builder.create<LtOp>(std::vector<Value>{ lhs, zero });
+  auto rhsNeg = builder.create<LtOp>(std::vector<Value>{ rhs, zero });
+  auto anyNeg = builder.create<OrIOp>(std::vector<Value>{ lhsNeg, rhsNeg });
+  builder.create<BranchOp>(std::vector<Value>{ anyNeg },
+                           { new TargetAttr(slow), new ElseAttr(fast) });
+
+  builder.setToBlockEnd(slow);
+  auto fallback = builder.create<CallOp>(Value::i32, std::vector<Value>{ lhs, rhs },
+                                         { new NameAttr(originalName) });
+  builder.create<ReturnOp>(std::vector<Value>{ fallback });
+
+  builder.setToBlockEnd(fast);
+  auto value = buildBinaryBitwise(builder, kind, lhs, rhs);
+  assert(value && "guarded bitwise helper requires binary bitwise kind");
+  builder.create<ReturnOp>(std::vector<Value>{ value });
+}
+
 void ensureGuardedModMulHelper(ModuleOp *module, const std::string &originalName, int mod) {
   auto helperName = modMulHelperName(originalName);
   if (hasFunctionNamed(module, helperName))
@@ -429,9 +458,6 @@ Candidate classify(ModuleOp *module, FuncOp *func, bool allowModMul) {
     return result;
   }
 
-  if (matchesNibble(module, name))
-    return { EqKind::Nibble, argc };
-
   if (hasUnsupportedSideEffect(func))
     return result;
 
@@ -440,9 +466,6 @@ Candidate classify(ModuleOp *module, FuncOp *func, bool allowModMul) {
       return { kind, argc };
   for (auto kind : { EqKind::And, EqKind::Or, EqKind::Xor })
     if (matchesBinary(module, name, kind))
-      return { kind, argc };
-  for (auto kind : { EqKind::Shr, EqKind::Shl })
-    if (matchesShift(module, name, kind))
       return { kind, argc };
   return result;
 }
@@ -539,11 +562,19 @@ void FunctionEquivalence::run() {
     if (call->getOperandCount() != it->second.argc)
       return false;
 
+    const auto originalName = NAME(call);
     builder.setBeforeOp(call);
+    if (needsNonNegativeGuard(it->second.kind) &&
+        (!provenNonNegative(call->DEF(0)) || !provenNonNegative(call->DEF(1)))) {
+      ensureGuardedBitwiseHelper(module, originalName, it->second.kind);
+      NAME(call) = guardedBitwiseHelperName(originalName, it->second.kind);
+      replaced++;
+      return false;
+    }
     if (it->second.kind == EqKind::ModMul &&
         (!provenNonNegative(call->DEF(0)) || !provenNonNegative(call->DEF(1)))) {
-      ensureGuardedModMulHelper(module, NAME(call), it->second.param);
-      NAME(call) = modMulHelperName(NAME(call));
+      ensureGuardedModMulHelper(module, originalName, it->second.param);
+      NAME(call) = modMulHelperName(originalName);
       replaced++;
       return false;
     }
