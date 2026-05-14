@@ -13,8 +13,8 @@ using namespace sys;
 
 namespace {
 
-constexpr int kDefaultBudget = 64;
-constexpr int kDefaultMaxOps = 2000;
+constexpr int kDefaultBudget = 128;
+constexpr int kDefaultMaxOps = 3000;
 constexpr int kDefaultRecursiveMaxConst = 1 << 30;
 
 bool envEnabled(const char *name, bool fallback) {
@@ -37,26 +37,6 @@ bool isRecursiveFunc(FuncOp *func) {
   const auto &name = NAME(func);
   const auto &callers = CALLER(func);
   return std::find(callers.begin(), callers.end(), name) != callers.end();
-}
-
-bool hasOnlyI32Args(FuncOp *func) {
-  if (auto argTypes = func->find<ArgTypesAttr>()) {
-    for (auto ty : argTypes->types)
-      if (ty != Value::i32)
-        return false;
-  }
-  for (auto getarg : func->findAll<GetArgOp>())
-    if (getarg->getResultType() != Value::i32)
-      return false;
-  return true;
-}
-
-bool safeToSpecialize(FuncOp *func) {
-  if (!func || !hasOnlyI32Args(func))
-    return false;
-  if (func->has<ImpureAttr>())
-    return false;
-  return true;
 }
 
 bool isSpecializedName(const std::string &name) {
@@ -315,18 +295,16 @@ void ConstArgSpecialize::run() {
         continue;
 
       auto func = fmap[callee];
-      if (!func->has<ArgCountAttr>() || opCount(func) > maxOps || !safeToSpecialize(func))
+      if (!func->has<ArgCountAttr>() || opCount(func) > maxOps)
         continue;
       if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
         continue;
       bool recursive = isRecursiveFunc(func);
-      if (!recursive)
-        continue;
 
       int argIndex = -1;
       int argValue = 0;
       int bestScore = -1;
-      int start = 0;
+      int start = recursive ? 0 : 0;
       int end = call->getOperandCount();
       int step = 1;
       for (int i = start; i != end; i += step) {
@@ -347,10 +325,14 @@ void ConstArgSpecialize::run() {
           if (score == bestScore && argIndex >= i)
             continue;
           bestScore = score;
+        } else {
+          if (value < -1 || value > 16)
+            continue;
         }
         argIndex = i;
         argValue = value;
-        break;
+        if (!recursive)
+          break;
       }
       if (argIndex < 0)
         continue;
