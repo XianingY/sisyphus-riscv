@@ -351,22 +351,22 @@ void ensureGuardedModMulHelper(ModuleOp *module, const std::string &originalName
   auto lhs = builder.create<GetArgOp>(Value::i32, { new IntAttr(0) });
   auto rhs = builder.create<GetArgOp>(Value::i32, { new IntAttr(1) });
   auto zero = builder.create<IntOp>({ new IntAttr(0) });
-  auto lhsNeg = builder.create<LtOp>({ lhs, zero });
-  auto rhsNeg = builder.create<LtOp>({ rhs, zero });
-  auto anyNeg = builder.create<OrIOp>({ lhsNeg, rhsNeg });
+  auto lhsNeg = builder.create<LtOp>(std::vector<Value>{ lhs, zero });
+  auto rhsNeg = builder.create<LtOp>(std::vector<Value>{ rhs, zero });
+  auto anyNeg = builder.create<OrIOp>(std::vector<Value>{ lhsNeg, rhsNeg });
   builder.create<BranchOp>(std::vector<Value>{ anyNeg },
                            { new TargetAttr(slow), new ElseAttr(fast) });
 
   builder.setToBlockEnd(slow);
   auto fallback = builder.create<CallOp>(Value::i32, std::vector<Value>{ lhs, rhs },
                                          { new NameAttr(originalName) });
-  builder.create<ReturnOp>({ fallback });
+  builder.create<ReturnOp>(std::vector<Value>{ fallback });
 
   builder.setToBlockEnd(fast);
   auto product = builder.create<MulLOp>(std::vector<Value>{ lhs, rhs });
   auto modOp = builder.create<IntOp>({ new IntAttr(mod) });
   auto reduced = builder.create<ModLOp>(std::vector<Value>{ product, modOp });
-  builder.create<ReturnOp>({ reduced });
+  builder.create<ReturnOp>(std::vector<Value>{ reduced });
 }
 
 Candidate classify(ModuleOp *module, FuncOp *func, bool allowModMul) {
@@ -428,19 +428,19 @@ Op *buildReplacement(Builder &builder, CallOp *call, const Candidate &candidate)
   auto kind = candidate.kind;
   switch (kind) {
   case EqKind::And:
-    return builder.create<AndIOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<AndIOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
   case EqKind::Or:
-    return builder.create<OrIOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<OrIOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
   case EqKind::Xor:
-    return builder.create<XorIOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<XorIOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
   case EqKind::Not: {
     auto minusOne = builder.create<IntOp>({ new IntAttr(-1) });
-    return builder.create<SubIOp>({ minusOne, call->getOperand(0) });
+    return builder.create<SubIOp>(std::vector<Value>{ minusOne, call->getOperand(0) });
   }
   case EqKind::Shl:
-    return builder.create<LShiftOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<LShiftOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
   case EqKind::Shr:
-    return builder.create<RShiftOp>({ call->getOperand(0), call->getOperand(1) });
+    return builder.create<RShiftOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
   case EqKind::Nibble: {
     auto x = call->DEF(0);
     auto n = call->DEF(1);
@@ -448,12 +448,12 @@ Op *buildReplacement(Builder &builder, CallOp *call, const Candidate &candidate)
     auto eight = builder.create<IntOp>({ new IntAttr(8) });
     auto four = builder.create<IntOp>({ new IntAttr(4) });
     auto fifteen = builder.create<IntOp>({ new IntAttr(15) });
-    auto nonneg = builder.create<LeOp>({ zero, n });
-    auto below = builder.create<LtOp>({ n, eight });
-    auto shift = builder.create<MulIOp>({ n, four });
-    auto shifted = builder.create<RShiftOp>({ x, shift });
-    auto digit = builder.create<AndIOp>({ shifted, fifteen });
-    auto baseDigit = builder.create<AndIOp>({ x, fifteen });
+    auto nonneg = builder.create<LeOp>(std::vector<Value>{ zero, n });
+    auto below = builder.create<LtOp>(std::vector<Value>{ n, eight });
+    auto shift = builder.create<MulIOp>(std::vector<Value>{ n, four });
+    auto shifted = builder.create<RShiftOp>(std::vector<Value>{ x, shift });
+    auto digit = builder.create<AndIOp>(std::vector<Value>{ shifted, fifteen });
+    auto baseDigit = builder.create<AndIOp>(std::vector<Value>{ x, fifteen });
     auto capped = builder.create<SelectOp>(std::vector<Value>{ below, digit, zero });
     return builder.create<SelectOp>(std::vector<Value>{ nonneg, capped, baseDigit });
   }
@@ -465,11 +465,11 @@ Op *buildReplacement(Builder &builder, CallOp *call, const Candidate &candidate)
     return builder.create<ModLOp>(std::vector<Value>{ product, mod });
   }
   case EqKind::Max: {
-    auto less = builder.create<LtOp>({ call->getOperand(0), call->getOperand(1) });
+    auto less = builder.create<LtOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
     return builder.create<SelectOp>(std::vector<Value>{ less, call->DEF(1), call->DEF(0) });
   }
   case EqKind::Min: {
-    auto less = builder.create<LtOp>({ call->getOperand(0), call->getOperand(1) });
+    auto less = builder.create<LtOp>(std::vector<Value>{ call->getOperand(0), call->getOperand(1) });
     return builder.create<SelectOp>(std::vector<Value>{ less, call->DEF(0), call->DEF(1) });
   }
   default:

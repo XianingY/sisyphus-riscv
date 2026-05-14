@@ -186,18 +186,18 @@ GlobalOp *createIntGlobal(ModuleOp *module, const std::string &name, int element
 Value indexedAddress(Builder &builder, const std::string &globalName, Value index) {
   auto base = builder.create<GetGlobalOp>({ new NameAttr(globalName) });
   auto four = builder.create<IntOp>({ new IntAttr(4) });
-  auto offset = builder.create<MulIOp>({ index, four });
-  return builder.create<AddLOp>({ base, offset });
+  auto offset = builder.create<MulIOp>(std::vector<Value>{ index, four });
+  return builder.create<AddLOp>(std::vector<Value>{ base, offset });
 }
 
 Value cacheIndex(Builder &builder, Value arg0, Value arg1, int mask) {
   auto c0 = builder.create<IntOp>({ new IntAttr(1103515245) });
   auto c1 = builder.create<IntOp>({ new IntAttr(-1640531535) });
   auto maskOp = builder.create<IntOp>({ new IntAttr(mask) });
-  auto h0 = builder.create<MulIOp>({ arg0, c0 });
-  auto h1 = builder.create<MulIOp>({ arg1, c1 });
+  auto h0 = builder.create<MulIOp>(std::vector<Value>{ arg0, c0 });
+  auto h1 = builder.create<MulIOp>(std::vector<Value>{ arg1, c1 });
   auto mix = builder.create<XorIOp>(std::vector<Value>{ h0, h1 });
-  return builder.create<AndIOp>({ mix, maskOp });
+  return builder.create<AndIOp>(std::vector<Value>{ mix, maskOp });
 }
 
 void bumpEpochBefore(CallOp *call, const std::string &epochName, int &count) {
@@ -206,8 +206,8 @@ void bumpEpochBefore(CallOp *call, const std::string &epochName, int &count) {
   auto ep = builder.create<GetGlobalOp>({ new NameAttr(epochName) });
   auto old = builder.create<LoadOp>(Value::i32, { ep }, { new SizeAttr(4) });
   auto one = builder.create<IntOp>({ new IntAttr(1) });
-  auto next = builder.create<AddIOp>({ old, one });
-  builder.create<StoreOp>({ next, ep }, { new SizeAttr(4) });
+  auto next = builder.create<AddIOp>(std::vector<Value>{ old, one });
+  builder.create<StoreOp>(std::vector<Value>{ next, ep }, { new SizeAttr(4) });
   count++;
 }
 
@@ -269,7 +269,7 @@ void addEntryCheck(FuncOp *func, const std::string &key0Name, const std::string 
   builder.setToBlockEnd(hitBlock);
   auto valueAddr = indexedAddress(builder, valueName, index);
   auto cached = builder.create<LoadOp>(Value::i32, { valueAddr }, { new SizeAttr(4) });
-  builder.create<ReturnOp>({ cached });
+  builder.create<ReturnOp>(std::vector<Value>{ cached });
   entryChecks++;
 }
 
@@ -307,10 +307,10 @@ void addReturnStores(FuncOp *func, const std::string &key0Name, const std::strin
     auto seenAddr = indexedAddress(builder, seenName, index);
     auto ep = builder.create<GetGlobalOp>({ new NameAttr(epochName) });
     auto epoch = builder.create<LoadOp>(Value::i32, { ep }, { new SizeAttr(4) });
-    builder.create<StoreOp>({ args[0], key0Addr }, { new SizeAttr(4) });
-    builder.create<StoreOp>({ args[1], key1Addr }, { new SizeAttr(4) });
-    builder.create<StoreOp>({ retValue, valueAddr }, { new SizeAttr(4) });
-    builder.create<StoreOp>({ epoch, seenAddr }, { new SizeAttr(4) });
+    builder.create<StoreOp>(std::vector<Value>{ args[0], key0Addr }, { new SizeAttr(4) });
+    builder.create<StoreOp>(std::vector<Value>{ args[1], key1Addr }, { new SizeAttr(4) });
+    builder.create<StoreOp>(std::vector<Value>{ retValue, valueAddr }, { new SizeAttr(4) });
+    builder.create<StoreOp>(std::vector<Value>{ epoch, seenAddr }, { new SizeAttr(4) });
     builder.create<GotoOp>({ new TargetAttr(finalBlock) });
     storesAdded++;
   }
