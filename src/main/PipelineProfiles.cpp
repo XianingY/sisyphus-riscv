@@ -122,7 +122,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   };
 
   auto appendLoweredTail = [&]() {
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", false))
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
       pm.addPass<sys::RuntimeMemoize>();
     appendLoweredTCO();
     if (economyMode) {
@@ -199,20 +199,20 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_TRIANGULAR_LOOP_NARROWING", false))
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_TRIANGULAR_LOOP_NARROWING", true))
       pm.addPass<sys::TriangularLoopNarrowing>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ADDRESS_RECURRENCE", false))
       pm.addPass<sys::AddressRecurrence>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true))
       pm.addPass<sys::RowScratchMatmul>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
       pm.addPass<sys::ModularAffineLoop>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", true)) {
       pm.addPass<sys::RotlRepeatLoopFold>();
       pm.addPass<sys::SimplifyCFG>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", false))
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))

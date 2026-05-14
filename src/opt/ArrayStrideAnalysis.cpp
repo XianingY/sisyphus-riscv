@@ -1,6 +1,5 @@
 #include "Analysis.h"
 
-#include <cstdint>
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -9,30 +8,26 @@ using namespace sys;
 
 namespace {
 
-int32_t wrapI32(int64_t v) {
-  return (int32_t) (uint32_t) v;
-}
-
-int32_t addI32(int32_t lhs, int32_t rhs) {
-  return wrapI32((int64_t) lhs + (int64_t) rhs);
-}
-
-int32_t mulI32(int32_t lhs, int32_t rhs) {
-  return wrapI32((int64_t) lhs * (int64_t) rhs);
+int clampToInt(long long v) {
+  if (v > INT_MAX)
+    return INT_MAX;
+  if (v < INT_MIN)
+    return INT_MIN;
+  return (int) v;
 }
 
 struct LinearExpr {
-  int32_t constant = 0;
-  std::map<Op*, int32_t> terms;
+  long long constant = 0;
+  std::map<Op*, long long> terms;
   bool valid = true;
 };
 
-void mergeLinear(LinearExpr &dst, const LinearExpr &src, int32_t scale = 1) {
+void mergeLinear(LinearExpr &dst, const LinearExpr &src, long long scale = 1) {
   if (!dst.valid || !src.valid)
     return;
-  dst.constant = addI32(dst.constant, mulI32(src.constant, scale));
+  dst.constant += src.constant * scale;
   for (auto [op, coeff] : src.terms)
-    dst.terms[op] = addI32(dst.terms[op], mulI32(coeff, scale));
+    dst.terms[op] += coeff * scale;
 }
 
 bool collectLinearOffset(Op *op, LinearExpr &out, std::unordered_set<Op*> &visiting) {
@@ -48,7 +43,7 @@ bool collectLinearOffset(Op *op, LinearExpr &out, std::unordered_set<Op*> &visit
   }
 
   if (isa<IntOp>(op)) {
-    out.constant = addI32(out.constant, (int32_t) V(op));
+    out.constant += V(op);
     return true;
   }
 
@@ -76,7 +71,7 @@ bool collectLinearOffset(Op *op, LinearExpr &out, std::unordered_set<Op*> &visit
   } else if (isa<MulIOp>(op)) {
     Op *lhs = op->DEF(0), *rhs = op->DEF(1);
     if (isa<IntOp>(lhs) || isa<IntOp>(rhs)) {
-      int32_t factor = (int32_t) (isa<IntOp>(lhs) ? V(lhs) : V(rhs));
+      int factor = isa<IntOp>(lhs) ? V(lhs) : V(rhs);
       Op *other = isa<IntOp>(lhs) ? rhs : lhs;
       LinearExpr x;
       ok &= collectLinearOffset(other, x, visiting);
@@ -159,13 +154,13 @@ Op *buildOffsetValue(Builder &builder, const LinearExpr &expr) {
       continue;
     Op *scaled = term;
     if (coeff != 1) {
-      auto c = builder.create<IntOp>({ new IntAttr(coeff) });
+      auto c = builder.create<IntOp>({ new IntAttr(clampToInt(coeff)) });
       scaled = builder.create<MulIOp>({ term, c });
     }
     append(scaled);
   }
   if (expr.constant != 0) {
-    auto c = builder.create<IntOp>({ new IntAttr(expr.constant) });
+    auto c = builder.create<IntOp>({ new IntAttr(clampToInt(expr.constant)) });
     append(c);
   }
   if (!acc)
