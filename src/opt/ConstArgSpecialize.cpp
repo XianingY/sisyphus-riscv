@@ -135,21 +135,6 @@ std::optional<int> immutableScalarGlobalValue(
   return iarr->vi[0];
 }
 
-bool mayStoreToGlobal(const std::string &name, Op *addr) {
-  if (!addr)
-    return false;
-  if (isa<GetGlobalOp>(addr))
-    return NAME(addr) == name;
-  auto alias = addr->find<AliasAttr>();
-  if (!alias || alias->unknown)
-    return false;
-  for (auto &[base, _] : alias->location) {
-    if (base && isa<GlobalOp>(base) && NAME(base) == name)
-      return true;
-  }
-  return false;
-}
-
 std::optional<int> tryGetConstantValue(
     Op *op,
     const std::map<std::string, GlobalOp*> &gMap,
@@ -276,11 +261,9 @@ void ConstArgSpecialize::run() {
     if (store->getOperandCount() < 2)
       continue;
     auto addr = store->DEF(1);
-    if (!addr)
+    if (!addr || !isa<GetGlobalOp>(addr))
       continue;
-    for (auto &[name, _] : gMap)
-      if (mayStoreToGlobal(name, addr))
-        mutableGlobals.insert(name);
+    mutableGlobals.insert(NAME(addr));
   }
 
   for (int round = 0; round < budget; round++) {

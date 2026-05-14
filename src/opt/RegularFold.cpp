@@ -14,23 +14,17 @@ using namespace sys;
 //      scalar (size == 1) integer global with a known initializer.
 //      This covers patterns like `const int base = 16;` which the frontend
 //      emits as a global variable rather than inlining the constant.
-static bool hasStoreToScalarGlobal(
+static bool hasDirectStoreToScalarGlobal(
     const std::string &name,
     ModuleOp *module) {
   for (auto store : module->findAll<StoreOp>()) {
     if (store->getOperandCount() < 2)
       continue;
     auto addr = store->DEF(1);
-    if (!addr)
+    if (!addr || !isa<GetGlobalOp>(addr))
       continue;
-    if (isa<GetGlobalOp>(addr) && NAME(addr) == name)
+    if (NAME(addr) == name)
       return true;
-    auto alias = addr->find<AliasAttr>();
-    if (!alias || alias->unknown)
-      continue;
-    for (auto &[base, _] : alias->location)
-      if (base && isa<GlobalOp>(base) && NAME(base) == name)
-        return true;
   }
   return false;
 }
@@ -46,7 +40,7 @@ static std::optional<int> immutableScalarGlobalValue(
   auto iarr = glob->get<IntArrayAttr>();
   if (!iarr || iarr->size != 1)
     return std::nullopt;
-  if (hasStoreToScalarGlobal(name, module))
+  if (hasDirectStoreToScalarGlobal(name, module))
     return std::nullopt;
   if (!iarr->vi)
     return 0;
