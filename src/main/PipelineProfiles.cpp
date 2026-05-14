@@ -122,7 +122,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   };
 
   auto appendLoweredTail = [&]() {
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", false))
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
       pm.addPass<sys::RuntimeMemoize>();
     appendLoweredTCO();
     if (economyMode) {
