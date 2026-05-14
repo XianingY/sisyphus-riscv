@@ -199,8 +199,6 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true))
-      pm.addPass<sys::RowScratchMatmul>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
       pm.addPass<sys::ModularAffineLoop>();
     }

@@ -146,18 +146,6 @@ public:
   void run() override;
 };
 
-class RowScratchMatmul : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-public:
-  RowScratchMatmul(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "row-scratch-matmul"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
 // Globalizes local arrays.
 class Globalize : public Pass {
   void runImpl(Region *region);
