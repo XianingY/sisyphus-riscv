@@ -368,6 +368,32 @@ public:
   void run() override;
 };
 
+class TriangularLoopNarrowing : public Pass {
+  int narrowedLower = 0;
+  int rejected = 0;
+
+  void runImpl(LoopInfo *info);
+public:
+  TriangularLoopNarrowing(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "triangular-loop-narrowing"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class AddressRecurrence : public Pass {
+  int phiAddresses = 0;
+  int rewrittenAddresses = 0;
+
+  void runImpl(LoopInfo *info);
+public:
+  AddressRecurrence(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "address-recurrence"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 }
 
 #endif

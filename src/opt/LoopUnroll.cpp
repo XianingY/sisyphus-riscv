@@ -425,9 +425,9 @@ bool ConstLoopUnroll::tryFactorUnroll(LoopInfo *loop, int factor) {
         return false;
     }
   }
-  if (loopsize == 0 || loopsize >= 32)
+  if (loopsize == 0 || loopsize >= 48)
     return false;
-  if (loopsize * factor > 128)
+  if (loopsize * factor > 192)
     return false;
 
   auto phis = header->getPhis();

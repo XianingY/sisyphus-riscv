@@ -264,8 +264,36 @@ std::optional<int> immutableScalarGlobalValue(ModuleOp *module, const std::strin
   return init->vi[0];
 }
 
+std::optional<int> positiveIntValue(ModuleOp *module, Op *op) {
+  if (!op)
+    return std::nullopt;
+  if (auto *i = dyn_cast<IntOp>(op)) {
+    if (V(i) > 1)
+      return V(i);
+    return std::nullopt;
+  }
+  if (auto *load = dyn_cast<LoadOp>(op)) {
+    auto *addr = load->DEF(0);
+    if (!addr || !isa<GetGlobalOp>(addr))
+      return std::nullopt;
+    auto value = immutableScalarGlobalValue(module, NAME(addr));
+    if (value && *value > 1)
+      return value;
+  }
+  return std::nullopt;
+}
+
 std::vector<int> modulusCandidates(ModuleOp *module, FuncOp *func) {
   std::set<int> values;
+  for (auto mod : func->findAll<ModIOp>())
+    if (auto value = positiveIntValue(module, mod->DEF(1)); value)
+      values.insert(*value);
+  for (auto mod : func->findAll<ModLOp>())
+    if (auto value = positiveIntValue(module, mod->DEF(1)); value)
+      values.insert(*value);
+  if (!values.empty())
+    return std::vector<int>(values.begin(), values.end());
+
   std::set<std::string> names;
   for (auto get : func->findAll<GetGlobalOp>())
     names.insert(NAME(get));
@@ -273,11 +301,6 @@ std::vector<int> modulusCandidates(ModuleOp *module, FuncOp *func) {
     auto value = immutableScalarGlobalValue(module, name);
     if (value && *value > 1)
       values.insert(*value);
-  }
-  for (auto op : func->findAll<IntOp>()) {
-    int value = V(op);
-    if (value > 1)
-      values.insert(value);
   }
   return std::vector<int>(values.begin(), values.end());
 }
