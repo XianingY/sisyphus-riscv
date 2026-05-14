@@ -59,26 +59,6 @@ bool safeToSpecialize(FuncOp *func) {
   return true;
 }
 
-bool isPureScalarRecursiveHelper(FuncOp *func) {
-  if (!safeToSpecialize(func) || !isRecursiveFunc(func))
-    return false;
-
-  const auto &self = NAME(func);
-  for (auto bb : func->getRegion()->getBlocks()) {
-    for (auto op : bb->getOps()) {
-      if (isa<LoadOp>(op) || isa<StoreOp>(op) || isa<GetGlobalOp>(op) ||
-          isa<AllocaOp>(op) || isa<CloneOp>(op) || isa<JoinOp>(op) ||
-          isa<WakeOp>(op))
-        return false;
-      if (auto call = dyn_cast<CallOp>(op)) {
-        if (NAME(call) != self || call->has<ImpureAttr>())
-          return false;
-      }
-    }
-  }
-  return true;
-}
-
 bool isSpecializedName(const std::string &name) {
   return name.rfind("__carg_", 0) == 0;
 }
@@ -335,10 +315,12 @@ void ConstArgSpecialize::run() {
         continue;
 
       auto func = fmap[callee];
-      if (!func->has<ArgCountAttr>() || opCount(func) > maxOps ||
-          !isPureScalarRecursiveHelper(func))
+      if (!func->has<ArgCountAttr>() || opCount(func) > maxOps || !safeToSpecialize(func))
         continue;
       if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
+        continue;
+      bool recursive = isRecursiveFunc(func);
+      if (!recursive)
         continue;
 
       int argIndex = -1;
@@ -356,14 +338,16 @@ void ConstArgSpecialize::run() {
         if (!maybeValue)
           continue;
         int value = *maybeValue;
-        if (value < 0 || value > recursiveMaxConst)
-          continue;
-        int score = recursiveArgScore(func, i);
-        if (score < bestScore)
-          continue;
-        if (score == bestScore && argIndex >= i)
-          continue;
-        bestScore = score;
+        if (recursive) {
+          if (value < 0 || value > recursiveMaxConst)
+            continue;
+          int score = recursiveArgScore(func, i);
+          if (score < bestScore)
+            continue;
+          if (score == bestScore && argIndex >= i)
+            continue;
+          bestScore = score;
+        }
         argIndex = i;
         argValue = value;
         break;
