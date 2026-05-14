@@ -13,12 +13,20 @@ std::map<std::string, int> LoweredTCO::stats() {
 
 namespace {
 
-bool isI32OnlyArgs(FuncOp *func) {
+bool isSupportedArgType(Value::Type ty) {
+  return ty == Value::i32 || ty == Value::i64;
+}
+
+int valueSize(Value::Type ty) {
+  return ty == Value::i64 ? 8 : 4;
+}
+
+bool hasSupportedArgs(FuncOp *func) {
   auto *types = func->find<ArgTypesAttr>();
   if (!types)
     return false;
   for (auto ty : types->types) {
-    if (ty != Value::i32)
+    if (!isSupportedArgType(ty))
       return false;
   }
   return true;
@@ -43,12 +51,16 @@ bool findReturnSlot(FuncOp *func, BasicBlock *&exitBlock, Op *&retSlot) {
   return false;
 }
 
-bool collectArgSlots(FuncOp *func, std::vector<Op*> &slots,
+bool collectArgSlots(FuncOp *func, std::vector<Op*> &slots, std::vector<int> &slotSizes,
                      std::vector<Op*> &getargs, std::vector<Op*> &stores) {
   int argc = func->get<ArgCountAttr>()->count;
   slots.assign(argc, nullptr);
+  slotSizes.assign(argc, 0);
   getargs.assign(argc, nullptr);
   stores.assign(argc, nullptr);
+  auto *types = func->find<ArgTypesAttr>();
+  if (!types || (int) types->types.size() != argc)
+    return false;
 
   for (auto *getarg : func->findAll<GetArgOp>()) {
     if (!getarg->has<IntAttr>())
@@ -56,14 +68,18 @@ bool collectArgSlots(FuncOp *func, std::vector<Op*> &slots,
     int index = V(getarg);
     if (index < 0 || index >= argc)
       return false;
-    if (getarg->getResultType() != Value::i32)
+    if (getarg->getResultType() != types->types[index])
       return false;
+    int size = valueSize(types->types[index]);
 
     Op *initStore = nullptr;
     Op *slot = nullptr;
     for (auto *use : getarg->getUses()) {
       auto *store = dyn_cast<StoreOp>(use);
       if (!store || store->getOperandCount() != 2 || store->DEF(0) != getarg)
+        return false;
+      auto *sizeAttr = store->find<SizeAttr>();
+      if (!sizeAttr || sizeAttr->value != (size_t) size)
         return false;
       if (initStore)
         return false;
@@ -76,10 +92,11 @@ bool collectArgSlots(FuncOp *func, std::vector<Op*> &slots,
     getargs[index] = getarg;
     stores[index] = initStore;
     slots[index] = slot;
+    slotSizes[index] = size;
   }
 
   for (int i = 0; i < argc; i++) {
-    if (!slots[i] || !getargs[i] || !stores[i])
+    if (!slots[i] || !slotSizes[i] || !getargs[i] || !stores[i])
       return false;
   }
   return true;
@@ -100,6 +117,90 @@ bool isTailSelfCall(FuncOp *func, Op *retSlot, BasicBlock *exitBlock, Op *call) 
     return false;
 
   return true;
+}
+
+bool findVoidExitBlock(FuncOp *func, BasicBlock *&exitBlock) {
+  exitBlock = nullptr;
+  for (auto *bb : func->getRegion()->getBlocks()) {
+    if (bb->getOpCount() != 1)
+      continue;
+    auto *ret = dyn_cast<ReturnOp>(bb->getLastOp());
+    if (!ret || ret->getOperandCount() != 0)
+      continue;
+    if (exitBlock)
+      return false;
+    exitBlock = bb;
+  }
+  return exitBlock != nullptr;
+}
+
+bool reachesVoidExit(BasicBlock *bb, BasicBlock *exitBlock) {
+  for (int depth = 0; bb && depth < 8; depth++) {
+    if (bb == exitBlock)
+      return true;
+    if (bb->getOpCount() != 1)
+      return false;
+    auto *go = dyn_cast<GotoOp>(bb->getLastOp());
+    if (!go)
+      return false;
+    bb = TARGET(go);
+  }
+  return false;
+}
+
+bool isVoidTailSelfCall(FuncOp *func, BasicBlock *exitBlock, Op *call) {
+  if (!isa<CallOp>(call) || NAME(call) != NAME(func))
+    return false;
+  if (!call->getUses().empty())
+    return false;
+
+  auto *go = dyn_cast<GotoOp>(call->nextOp());
+  if (!go || go != call->getParent()->getLastOp())
+    return false;
+
+  return reachesVoidExit(TARGET(go), exitBlock);
+}
+
+bool isLoadFromSlot(Op *value, Op *slot) {
+  auto *load = dyn_cast<LoadOp>(value);
+  return load && load->getOperandCount() == 1 && load->DEF(0) == slot;
+}
+
+BasicBlock *makeExplicitBodyEntry(FuncOp *func, const std::vector<Op*> &stores) {
+  if (stores.empty())
+    return nullptr;
+
+  BasicBlock *initBlock = stores[0]->getParent();
+  for (auto *store : stores) {
+    if (store->getParent() != initBlock)
+      return nullptr;
+  }
+
+  Op *lastInit = nullptr;
+  for (auto *op : initBlock->getOps()) {
+    for (auto *store : stores) {
+      if (op == store)
+        lastInit = store;
+    }
+  }
+  if (!lastInit)
+    return nullptr;
+
+  Op *firstBody = lastInit->nextOp();
+  if (!firstBody)
+    return nullptr;
+
+  auto *bodyEntry = func->getRegion()->insertAfter(initBlock);
+  for (Op *op = firstBody; op; ) {
+    Op *next = op->nextOp();
+    op->moveToEnd(bodyEntry);
+    op = next;
+  }
+
+  Builder builder;
+  builder.setToBlockEnd(initBlock);
+  builder.create<GotoOp>({ new TargetAttr(bodyEntry) });
+  return bodyEntry;
 }
 
 void moveEntryState(FuncOp *func, BasicBlock *oldEntry,
@@ -125,7 +226,7 @@ void moveEntryState(FuncOp *func, BasicBlock *oldEntry,
 
 bool LoweredTCO::runImpl(FuncOp *func) {
   int argc = func->get<ArgCountAttr>()->count;
-  if (argc <= 0 || argc >= 16 || !isI32OnlyArgs(func)) {
+  if (argc <= 0 || argc >= 16 || !hasSupportedArgs(func)) {
     rejected++;
     return false;
   }
@@ -137,15 +238,60 @@ bool LoweredTCO::runImpl(FuncOp *func) {
     return false;
   }
 
-  BasicBlock *exitBlock = nullptr;
-  Op *retSlot = nullptr;
-  if (!findReturnSlot(func, exitBlock, retSlot)) {
+  std::vector<Op*> argSlots, getargs, initStores;
+  std::vector<int> argSlotSizes;
+  if (!collectArgSlots(func, argSlots, argSlotSizes, getargs, initStores)) {
     rejected++;
     return false;
   }
 
-  std::vector<Op*> argSlots, getargs, initStores;
-  if (!collectArgSlots(func, argSlots, getargs, initStores)) {
+  BasicBlock *voidExitBlock = nullptr;
+  if (findVoidExitBlock(func, voidExitBlock)) {
+    std::vector<CallOp*> tailCalls;
+    for (auto *call : func->findAll<CallOp>()) {
+      if (isVoidTailSelfCall(func, voidExitBlock, call))
+        tailCalls.push_back(cast<CallOp>(call));
+    }
+    if (!tailCalls.empty()) {
+      BasicBlock *bodyEntry = makeExplicitBodyEntry(func, initStores);
+      if (!bodyEntry) {
+        rejected++;
+        return false;
+      }
+
+      Builder builder;
+      int localRemoved = 0;
+      for (auto *call : tailCalls) {
+        if (call->getOperandCount() != argc) {
+          rejected++;
+          continue;
+        }
+
+        auto *go = call->nextOp();
+        builder.setBeforeOp(call);
+        for (int i = 0; i < argc; i++) {
+          if (isLoadFromSlot(call->getOperand(i).defining, argSlots[i]))
+            continue;
+          builder.create<StoreOp>({ call->getOperand(i), argSlots[i] },
+                                  { new SizeAttr(argSlotSizes[i]) });
+        }
+
+        call->erase();
+        builder.replace<GotoOp>(go, { new TargetAttr(bodyEntry) });
+        removed++;
+        localRemoved++;
+      }
+
+      if (localRemoved > 0) {
+        region->updatePreds();
+        return true;
+      }
+    }
+  }
+
+  BasicBlock *exitBlock = nullptr;
+  Op *retSlot = nullptr;
+  if (!findReturnSlot(func, exitBlock, retSlot)) {
     rejected++;
     return false;
   }
@@ -170,8 +316,12 @@ bool LoweredTCO::runImpl(FuncOp *func) {
     auto *go = store->nextOp();
 
     builder.setBeforeOp(call);
-    for (int i = 0; i < argc; i++)
-      builder.create<StoreOp>({ call->getOperand(i), argSlots[i] }, { new SizeAttr(4) });
+    for (int i = 0; i < argc; i++) {
+      if (isLoadFromSlot(call->getOperand(i).defining, argSlots[i]))
+        continue;
+      builder.create<StoreOp>({ call->getOperand(i), argSlots[i] },
+                              { new SizeAttr(argSlotSizes[i]) });
+    }
 
     store->erase();
     call->erase();
