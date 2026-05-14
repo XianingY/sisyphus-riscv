@@ -85,6 +85,13 @@ bool isLoopInvariant(Op *op, LoopInfo *loop, std::unordered_map<Op*, bool> &cach
     return true;
 }
 
+bool isDefinedOutsideLoop(Op *op, LoopInfo *loop) {
+    if (!op)
+        return false;
+    auto parent = op->getParent();
+    return !parent || !loop->contains(parent);
+}
+
 // Check if a store depends on a load (load→compute→store pattern).
 // This verifies that the stored value is derived from the loaded value,
 // which is the pattern we want to promote to a scalar accumulator.
@@ -202,6 +209,12 @@ std::vector<ScalarCandidate> collectCandidates(LoopInfo *loop) {
                 // Check if the address is loop-invariant.
                 if (!isLoopInvariant(addr, loop, invariantCache))
                     continue;
+                // The promotion inserts new loads/stores in the preheader/exit
+                // using this address SSA value. A semantically invariant address
+                // defined inside the loop, such as getglobal, does not dominate
+                // those insertion points.
+                if (!isDefinedOutsideLoop(addr, loop))
+                    continue;
 
                 addrMap[addr].addr = addr;
                 addrMap[addr].loads.push_back(op);
@@ -213,6 +226,8 @@ std::vector<ScalarCandidate> collectCandidates(LoopInfo *loop) {
 
                 // Check if the address is loop-invariant.
                 if (!isLoopInvariant(addr, loop, invariantCache))
+                    continue;
+                if (!isDefinedOutsideLoop(addr, loop))
                     continue;
 
                 addrMap[addr].addr = addr;
