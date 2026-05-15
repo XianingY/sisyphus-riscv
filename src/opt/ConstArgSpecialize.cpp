@@ -15,7 +15,6 @@ namespace {
 
 constexpr int kDefaultBudget = 64;
 constexpr int kDefaultMaxOps = 2000;
-constexpr int kDefaultRecursiveMaxConst = 1 << 30;
 
 bool envEnabled(const char *name, bool fallback) {
   auto env = std::getenv(name);
@@ -93,28 +92,6 @@ int opCount(FuncOp *func) {
   return count;
 }
 
-int recursiveArgScore(FuncOp *func, int index) {
-  int score = 0;
-  for (auto getarg : func->findAll<GetArgOp>()) {
-    if (V(getarg) != index)
-      continue;
-    for (auto use : getarg->getUses()) {
-      if (isa<DivIOp>(use) || isa<ModIOp>(use) || isa<EqOp>(use) ||
-          isa<NeOp>(use) || isa<LtOp>(use) || isa<LeOp>(use))
-        score += 8;
-      else if ((isa<AddIOp>(use) || isa<SubIOp>(use)) &&
-               ((use->DEF(0) == getarg && isa<IntOp>(use->DEF(1))) ||
-                (use->DEF(1) == getarg && isa<IntOp>(use->DEF(0)))))
-        score += 4;
-      else if (isa<CallOp>(use))
-        score += 2;
-      else
-        score += 1;
-    }
-  }
-  return score;
-}
-
 std::optional<int> immutableScalarGlobalValue(
     const std::string &name,
     const std::map<std::string, GlobalOp*> &gMap,
@@ -135,7 +112,7 @@ std::optional<int> immutableScalarGlobalValue(
   return iarr->vi[0];
 }
 
-bool mayStoreToGlobal(const std::string &name, Op *addr) {
+bool addressMentionsGlobal(const std::string &name, Op *addr) {
   if (!addr)
     return false;
   if (isa<GetGlobalOp>(addr))
@@ -148,6 +125,14 @@ bool mayStoreToGlobal(const std::string &name, Op *addr) {
       return true;
   }
   return false;
+}
+
+bool mayStoreToGlobal(const std::string &name, Op *addr,
+                      const std::set<std::string> &escapedGlobals) {
+  if (addressMentionsGlobal(name, addr))
+    return true;
+  auto alias = addr ? addr->find<AliasAttr>() : nullptr;
+  return escapedGlobals.count(name) && (!alias || alias->unknown);
 }
 
 std::optional<std::string> zeroOffsetGlobalName(Op *addr) {
@@ -281,10 +266,19 @@ void ConstArgSpecialize::run() {
 
   const int budget = envInt("SISY_CONST_ARG_SPECIALIZE_BUDGET", kDefaultBudget);
   const int maxOps = envInt("SISY_CONST_ARG_SPECIALIZE_MAX_OPS", kDefaultMaxOps);
-  const int recursiveMaxConst =
-    envInt("SISY_CONST_ARG_SPECIALIZE_RECURSIVE_MAX_CONST", kDefaultRecursiveMaxConst);
   std::set<std::string> produced;
   auto gMap = getGlobalMap();
+  std::set<std::string> escapedGlobals;
+  for (auto call : module->findAll<CallOp>()) {
+    for (auto operand : call->getOperands()) {
+      auto def = operand.defining;
+      if (!def || def->getResultType() != Value::i64)
+        continue;
+      for (auto &[name, _] : gMap)
+        if (addressMentionsGlobal(name, def))
+          escapedGlobals.insert(name);
+    }
+  }
   std::set<std::string> mutableGlobals;
   for (auto store : module->findAll<StoreOp>()) {
     if (store->getOperandCount() < 2)
@@ -293,9 +287,10 @@ void ConstArgSpecialize::run() {
     if (!addr)
       continue;
     for (auto &[name, _] : gMap)
-      if (mayStoreToGlobal(name, addr))
+      if (mayStoreToGlobal(name, addr, escapedGlobals))
         mutableGlobals.insert(name);
   }
+  mutableGlobals.insert(escapedGlobals.begin(), escapedGlobals.end());
 
   for (int round = 0; round < budget; round++) {
     while (foldTinyIntConstants(module));
@@ -314,14 +309,12 @@ void ConstArgSpecialize::run() {
       if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
         continue;
       bool recursive = isRecursiveFunc(func);
+      if (recursive)
+        continue;
 
       int argIndex = -1;
       int argValue = 0;
-      int bestScore = -1;
-      int start = recursive ? 0 : 0;
-      int end = call->getOperandCount();
-      int step = 1;
-      for (int i = start; i != end; i += step) {
+      for (int i = 0; i < call->getOperandCount(); i++) {
         auto def = call->DEF(i);
         if (!def)
           continue;
@@ -330,19 +323,8 @@ void ConstArgSpecialize::run() {
         if (!maybeValue)
           continue;
         int value = *maybeValue;
-        if (recursive) {
-          if (value < 0 || value > recursiveMaxConst)
-            continue;
-          int score = recursiveArgScore(func, i);
-          if (score < bestScore)
-            continue;
-          if (score == bestScore && argIndex >= i)
-            continue;
-          bestScore = score;
-        } else {
-          if (value < -1 || value > 16)
-            continue;
-        }
+        if (value < -1 || value > 16)
+          continue;
         argIndex = i;
         argValue = value;
         break;

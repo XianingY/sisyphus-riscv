@@ -14,25 +14,54 @@ using namespace sys;
 //      scalar (size == 1) integer global with a known initializer.
 //      This covers patterns like `const int base = 16;` which the frontend
 //      emits as a global variable rather than inlining the constant.
+static bool addressMentionsScalarGlobal(const std::string &name, Op *addr) {
+  if (!addr)
+    return false;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr) == name;
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown)
+    return false;
+  for (auto &[base, _] : alias->location)
+    if (base && isa<GlobalOp>(base) && NAME(base) == name)
+      return true;
+  return false;
+}
+
+static bool scalarGlobalEscapesToCall(const std::string &name, ModuleOp *module) {
+  for (auto call : module->findAll<CallOp>()) {
+    for (auto operand : call->getOperands()) {
+      auto def = operand.defining;
+      if (!def || def->getResultType() != Value::i64)
+        continue;
+      if (addressMentionsScalarGlobal(name, def))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool mayTouchScalarGlobal(const std::string &name, Op *addr, bool escaped) {
+  if (!addr)
+    return false;
+  if (addressMentionsScalarGlobal(name, addr))
+    return true;
+  auto alias = addr->find<AliasAttr>();
+  return escaped && (!alias || alias->unknown);
+}
+
 static bool hasStoreToScalarGlobal(
     const std::string &name,
     ModuleOp *module) {
+  bool escaped = scalarGlobalEscapesToCall(name, module);
   for (auto store : module->findAll<StoreOp>()) {
     if (store->getOperandCount() < 2)
       continue;
-    auto addr = store->DEF(1);
-    if (!addr)
-      continue;
-    if (isa<GetGlobalOp>(addr) && NAME(addr) == name)
+    if (mayTouchScalarGlobal(name, store->DEF(1), escaped))
       return true;
-    auto alias = addr->find<AliasAttr>();
-    if (!alias || alias->unknown)
-      continue;
-    for (auto &[base, _] : alias->location)
-      if (base && isa<GlobalOp>(base) && NAME(base) == name)
-        return true;
   }
-  return false;
+
+  return escaped;
 }
 
 static std::optional<int> immutableScalarGlobalValue(
