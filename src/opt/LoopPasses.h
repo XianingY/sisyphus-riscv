@@ -306,6 +306,32 @@ public:
   void run() override;
 };
 
+// Collapses pure repeat-doubling loops such as:
+//   while (n != 0) {
+//     x = x * 2;
+//     n = n - 1;
+//   }
+// into x * ((0 <= n && n < 32) ? (1 << n) : 0). This targets lowered
+// tail-recursive array helpers without changing loops that have side effects.
+class Pow2RepeatLoopFold : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+  int badCfg = 0;
+  int badBranch = 0;
+  int badCounter = 0;
+  int badValue = 0;
+  int impureBody = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  Pow2RepeatLoopFold(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "pow2-repeat-loop-fold"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class RotlRepeatLoopFold : public Pass {
   int visited = 0;
   int folded = 0;

@@ -219,6 +219,11 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::LICM>();
     if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
       pm.addPass<sys::ScalarReplace>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_POW2_REPEAT_LOOP_FOLD", true)) {
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+      pm.addPass<sys::Pow2RepeatLoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
     pm.addPass<sys::SCEV>();
