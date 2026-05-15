@@ -333,6 +333,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     pm.addPass<sys::AggressiveDCE>();
     pm.addPass<sys::SimplifyCFG>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ZERO_FACTOR_STORE_LOOP", true))
+      pm.addPass<sys::ZeroFactorStoreLoop>();
     pm.addPass<sys::InstSchedule>();
   };
 

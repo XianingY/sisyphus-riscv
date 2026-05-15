@@ -158,6 +158,18 @@ public:
   void run() override;
 };
 
+class ZeroFactorStoreLoop : public Pass {
+  int candidates = 0;
+  int replaced = 0;
+  int rejectedShape = 0;
+public:
+  ZeroFactorStoreLoop(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "zero-factor-store-loop"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Globalizes local arrays.
 class Globalize : public Pass {
   void runImpl(Region *region);
