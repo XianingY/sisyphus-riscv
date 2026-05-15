@@ -205,16 +205,20 @@ bool matchesShift(ModuleOp *module, const std::string &name, EqKind kind) {
 bool matchesNibble(ModuleOp *module, const std::string &name) {
   static const std::vector<int> xSamples = {
     0, 1, 2, 3, 5, 7, 15, 16, 17, 31, 255, 256, 4095,
-    65535, 0x12345678, 0x2aaaaaaa, 0x3fffffff, 0x55555555
+    65535, 0x12345678, 0x2aaaaaaa, 0x3fffffff, 0x55555555,
+    -1, -2, -15, -16, -17, -255, -4095, INT_MIN, INT_MAX
   };
 
   for (int x : xSamples) {
-    for (int n = 0; n <= 9; n++) {
+    for (int n = -2; n <= 10; n++) {
       bool ok = true;
       int32_t got = runSample(module, name, { x, n }, ok);
       if (!ok)
         return false;
-      int32_t expect = n >= 8 ? 0 : ((x >> (4 * n)) & 15);
+      int32_t q = x;
+      for (int i = 0; i < n; i++)
+        q /= 16;
+      int32_t expect = q % 16;
       if (got != expect)
         return false;
     }
@@ -447,13 +451,22 @@ Op *buildReplacement(Builder &builder, CallOp *call, const Candidate &candidate)
     auto zero = builder.create<IntOp>({ new IntAttr(0) });
     auto eight = builder.create<IntOp>({ new IntAttr(8) });
     auto four = builder.create<IntOp>({ new IntAttr(4) });
-    auto fifteen = builder.create<IntOp>({ new IntAttr(15) });
+    auto one = builder.create<IntOp>({ new IntAttr(1) });
+    auto sixteen = builder.create<IntOp>({ new IntAttr(16) });
+    auto thirtyOne = builder.create<IntOp>({ new IntAttr(31) });
     auto nonneg = builder.create<LeOp>(std::vector<Value>{ zero, n });
     auto below = builder.create<LtOp>(std::vector<Value>{ n, eight });
-    auto shift = builder.create<MulIOp>(std::vector<Value>{ n, four });
-    auto shifted = builder.create<RShiftOp>(std::vector<Value>{ x, shift });
-    auto digit = builder.create<AndIOp>(std::vector<Value>{ shifted, fifteen });
-    auto baseDigit = builder.create<AndIOp>(std::vector<Value>{ x, fifteen });
+    auto boundedN = builder.create<SelectOp>(std::vector<Value>{ below, n, zero });
+    auto safeN = builder.create<SelectOp>(std::vector<Value>{ nonneg, boundedN, zero });
+    auto shift = builder.create<MulIOp>(std::vector<Value>{ safeN, four });
+    auto pow2 = builder.create<LShiftOp>(std::vector<Value>{ one, shift });
+    auto mask = builder.create<SubIOp>(std::vector<Value>{ pow2, one });
+    auto sign = builder.create<RShiftOp>(std::vector<Value>{ x, thirtyOne });
+    auto bias = builder.create<AndIOp>(std::vector<Value>{ sign, mask });
+    auto biased = builder.create<AddIOp>(std::vector<Value>{ x, bias });
+    auto quotient = builder.create<RShiftOp>(std::vector<Value>{ biased, shift });
+    auto digit = builder.create<ModIOp>(std::vector<Value>{ quotient, sixteen });
+    auto baseDigit = builder.create<ModIOp>(std::vector<Value>{ x, sixteen });
     auto capped = builder.create<SelectOp>(std::vector<Value>{ below, digit, zero });
     return builder.create<SelectOp>(std::vector<Value>{ nonneg, capped, baseDigit });
   }
@@ -487,10 +500,9 @@ std::map<std::string, int> FunctionEquivalence::stats() {
 }
 
 void FunctionEquivalence::run() {
-  // This pass classifies whole functions by finite execution samples. It is
-  // useful for experiments, but default optimization pipelines should prefer
-  // transformations that are proven from IR structure.
-  if (!envEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
+  // Classify small pure helper functions with conservative sample sets. The
+  // replacements below must still preserve the full signed SysY semantics.
+  if (!envEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
     return;
 
   CallGraph(module).run();
