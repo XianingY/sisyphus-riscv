@@ -237,6 +237,19 @@ public:
   void run() override;
 };
 
+class StructuralModMul : public Pass {
+  int classified = 0;
+  int replaced = 0;
+  int guarded = 0;
+
+public:
+  StructuralModMul(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "structural-modmul"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Convert short parity-controlled accumulator branches into SelectOp. This is
 // deliberately narrower than the generic Select pass because it may hoist
 // loads out of the taken block.

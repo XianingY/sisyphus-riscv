@@ -38,6 +38,15 @@ bool isRecursiveFunc(FuncOp *func) {
   return std::find(callers.begin(), callers.end(), name) != callers.end();
 }
 
+bool hasOnlyI32Args(FuncOp *func) {
+  if (!func || !func->has<ArgTypesAttr>())
+    return false;
+  for (auto ty : func->get<ArgTypesAttr>()->types)
+    if (ty != Value::i32)
+      return false;
+  return true;
+}
+
 bool isSpecializedName(const std::string &name) {
   return name.rfind("__carg_", 0) == 0;
 }
@@ -305,6 +314,8 @@ void ConstArgSpecialize::run() {
 
       auto func = fmap[callee];
       if (!func->has<ArgCountAttr>() || opCount(func) > maxOps)
+        continue;
+      if (!hasOnlyI32Args(func))
         continue;
       if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
         continue;

@@ -192,6 +192,12 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DSE>();
     pm.addPass<sys::DLE>();
     pm.addPass<sys::GVN>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", true)) {
+      pm.addPass<sys::StructuralModMul>();
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::GVN>();
+    }
     if ((aggressive || enableO1LiteTail) && !economyMode)
       pm.addPass<sys::Reassociate>();
 
