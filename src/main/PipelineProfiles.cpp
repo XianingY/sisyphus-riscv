@@ -111,7 +111,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
   // "large" modules use an economy lane to cap compile-time, but "huge"
   // modules are safer with the full O1-style shrink pipeline before backend.
-  // This avoids sending oversized IR to regalloc on cases like 84_long_array2.
+  // This avoids sending oversized IR to register allocation.
   const bool economyMode = plan.largeModuleMode && !plan.hugeModuleMode;
 
   pm.addPass<sys::MoveAlloca>();
@@ -157,7 +157,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+    if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
       pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
@@ -259,7 +259,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::Range>();
       pm.addPass<sys::EqClass>();
       pm.addPass<sys::RangeAwareFold>();
-      if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+      if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
         pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
       pm.addPass<sys::Splice>();
     }
@@ -288,7 +288,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     pm.addPass<sys::DCE>();
     pm.addPass<sys::InlineStore>();
-    if (enableO2Experimental && plan.enableO2Heavy)
+    if (enableO2Experimental && plan.enableO2Heavy &&
+        getenvEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", false))
       pm.addPass<sys::Cached>();
     if (enableO2Experimental && plan.enableO2Heavy)
       pm.addPass<sys::SynthConstArray>();
@@ -422,8 +423,8 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   // O1 is the stable competition mainline; O2 is the only aggressive lane.
   plan.aggressive = opts.o2;
   plan.enableO2Experimental = opts.o2 && !opts.disableO2Experimental;
-  // O2Heavy enables SMT-based constant array synthesis for better performance on
-  // FFT, Huffman, and similar workloads. Safe since functional is 100%.
+  // O2Heavy enables expensive generic transforms such as SMT-based constant
+  // array synthesis. It is separate from the stable O1 competition mainline.
   // Can be disabled via SISY_O2_ENABLE_HEAVY=0.
   plan.enableO2Heavy = plan.enableO2Experimental && getenvEnabled("SISY_O2_ENABLE_HEAVY", true);
   // More loop rounds for O2 to catch optimization opportunities in tight loops.

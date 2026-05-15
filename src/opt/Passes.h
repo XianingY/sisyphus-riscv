@@ -229,7 +229,7 @@ class FunctionEquivalence : public Pass {
   int replaced = 0;
   bool allowModMul;
 public:
-  FunctionEquivalence(ModuleOp *module, bool allowModMul = true):
+  FunctionEquivalence(ModuleOp *module, bool allowModMul = false):
     Pass(module), allowModMul(allowModMul) {}
 
   std::string name() override { return "function-equivalence"; };

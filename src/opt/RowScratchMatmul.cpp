@@ -224,9 +224,16 @@ struct MatmulShape {
   StoreOp *store = nullptr;
   std::string aName;
   std::string cName;
-  Op *n = nullptr;
-  int dim = 0;
-  int rowStrideBytes = 0;
+  Op *iBound = nullptr;
+  Op *jBound = nullptr;
+  Op *kBound = nullptr;
+  int aRows = 0;
+  int aCols = 0;
+  int cRows = 0;
+  int cCols = 0;
+  int scratchDim = 0;
+  int aRowStrideBytes = 0;
+  int cRowStrideBytes = 0;
 };
 
 bool isAddOf(Op *op, Op *a, Op *b) {
@@ -320,8 +327,6 @@ bool tryMatchMatmul(LoopInfo *iLoop, const std::map<std::string, GlobalOp*> &glo
   UnitLoopShape jShape, kShape;
   if (!canonicalUnitLoop(jLoop, jShape) || !canonicalUnitLoop(kLoop, kShape))
     return false;
-  if (iShape.stop != jShape.stop || iShape.stop != kShape.stop)
-    return false;
 
   std::vector<LoadOp*> loads;
   for (auto bb : kLoop->getBlocks())
@@ -364,7 +369,7 @@ bool tryMatchMatmul(LoopInfo *iLoop, const std::map<std::string, GlobalOp*> &glo
   if (!matrixGlobalInfo(globals, aName, aRows, aCols) ||
       !matrixGlobalInfo(globals, cName, cRows, cCols))
     return false;
-  if (aCols != cCols || aRows != aCols || cRows != cCols)
+  if (aRows <= 0 || aCols <= 0 || cRows <= 0 || cCols <= 0)
     return false;
 
   if (loopHasCallOrUnexpectedStore(iLoop, store))
@@ -381,9 +386,16 @@ bool tryMatchMatmul(LoopInfo *iLoop, const std::map<std::string, GlobalOp*> &glo
   shape.store = store;
   shape.aName = aName;
   shape.cName = cName;
-  shape.n = iShape.stop;
-  shape.dim = aCols;
-  shape.rowStrideBytes = aCols * 4;
+  shape.iBound = iShape.stop;
+  shape.jBound = jShape.stop;
+  shape.kBound = kShape.stop;
+  shape.aRows = aRows;
+  shape.aCols = aCols;
+  shape.cRows = cRows;
+  shape.cCols = cCols;
+  shape.scratchDim = aCols;
+  shape.aRowStrideBytes = aCols * 4;
+  shape.cRowStrideBytes = cCols * 4;
   return true;
 }
 
@@ -423,8 +435,9 @@ void buildHelper(ModuleOp *module) {
   builder.setToRegionStart(module->getRegion());
   auto func = builder.create<FuncOp>({
     new NameAttr(kHelperName),
-    new ArgCountAttr(5),
-    new ArgTypesAttr({ Value::i32, Value::i32, Value::i64, Value::i64, Value::i64 }),
+    new ArgCountAttr(8),
+    new ArgTypesAttr({ Value::i32, Value::i32, Value::i32, Value::i32, Value::i32,
+                       Value::i64, Value::i64, Value::i64 }),
     new ImpureAttr
   });
   auto region = func->appendRegion();
@@ -451,17 +464,20 @@ void buildHelper(ModuleOp *module) {
   auto jSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto kSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto coeffSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  auto n = builder.create<GetArgOp>(Value::i32, { new IntAttr(0) });
-  auto rowStride = builder.create<GetArgOp>(Value::i32, { new IntAttr(1) });
-  auto a = builder.create<GetArgOp>(Value::i64, { new IntAttr(2) });
-  auto c = builder.create<GetArgOp>(Value::i64, { new IntAttr(3) });
-  auto scratch = builder.create<GetArgOp>(Value::i64, { new IntAttr(4) });
+  auto rows = builder.create<GetArgOp>(Value::i32, { new IntAttr(0) });
+  auto cols = builder.create<GetArgOp>(Value::i32, { new IntAttr(1) });
+  auto depth = builder.create<GetArgOp>(Value::i32, { new IntAttr(2) });
+  auto aRowStride = builder.create<GetArgOp>(Value::i32, { new IntAttr(3) });
+  auto cRowStride = builder.create<GetArgOp>(Value::i32, { new IntAttr(4) });
+  auto a = builder.create<GetArgOp>(Value::i64, { new IntAttr(5) });
+  auto c = builder.create<GetArgOp>(Value::i64, { new IntAttr(6) });
+  auto scratch = builder.create<GetArgOp>(Value::i64, { new IntAttr(7) });
   storeVar(builder, i32(builder, 0), iSlot);
   builder.create<GotoOp>({ new TargetAttr(iCond) });
 
   builder.setToBlockEnd(iCond);
   auto iv = loadVar(builder, iSlot);
-  branch(builder, bin<LtOp>(builder, iv, n), zeroInit, done);
+  branch(builder, bin<LtOp>(builder, iv, rows), zeroInit, done);
 
   builder.setToBlockEnd(zeroInit);
   storeVar(builder, i32(builder, 0), jSlot);
@@ -469,7 +485,7 @@ void buildHelper(ModuleOp *module) {
 
   builder.setToBlockEnd(zeroCond);
   auto zj = loadVar(builder, jSlot);
-  branch(builder, bin<LtOp>(builder, zj, n), zeroBody, kInit);
+  branch(builder, bin<LtOp>(builder, zj, cols), zeroBody, kInit);
 
   builder.setToBlockEnd(zeroBody);
   auto zj2 = loadVar(builder, jSlot);
@@ -484,13 +500,13 @@ void buildHelper(ModuleOp *module) {
 
   builder.setToBlockEnd(kCond);
   auto kv = loadVar(builder, kSlot);
-  branch(builder, bin<LtOp>(builder, kv, n), kPrep, writeInit);
+  branch(builder, bin<LtOp>(builder, kv, depth), kPrep, writeInit);
 
   builder.setToBlockEnd(kPrep);
   auto ci = loadVar(builder, iSlot);
   auto ck = loadVar(builder, kSlot);
   auto coeff = builder.create<LoadOp>(Value::i32,
-                                      vals({ matrixAddr(builder, c, ci, ck, rowStride) }),
+                                      vals({ matrixAddr(builder, c, ci, ck, cRowStride) }),
                                       attrs({ new SizeAttr(4) }));
   storeVar(builder, coeff, coeffSlot);
   storeVar(builder, i32(builder, 0), jSlot);
@@ -498,14 +514,14 @@ void buildHelper(ModuleOp *module) {
 
   builder.setToBlockEnd(saxpyCond);
   auto sj = loadVar(builder, jSlot);
-  branch(builder, bin<LtOp>(builder, sj, n), saxpyBody, kNext);
+  branch(builder, bin<LtOp>(builder, sj, cols), saxpyBody, kNext);
 
   builder.setToBlockEnd(saxpyBody);
   auto old = builder.create<LoadOp>(Value::i32, vals({ rowAddr(builder, scratch, loadVar(builder, jSlot)) }),
                                     attrs({ new SizeAttr(4) }));
   auto aval = builder.create<LoadOp>(Value::i32,
                                      vals({ matrixAddr(builder, a, loadVar(builder, kSlot),
-                                                       loadVar(builder, jSlot), rowStride) }),
+                                                       loadVar(builder, jSlot), aRowStride) }),
                                      attrs({ new SizeAttr(4) }));
   auto prod = bin<MulIOp>(builder, loadVar(builder, coeffSlot), aval);
   auto next = bin<AddIOp>(builder, old, prod);
@@ -524,13 +540,13 @@ void buildHelper(ModuleOp *module) {
 
   builder.setToBlockEnd(writeCond);
   auto wj = loadVar(builder, jSlot);
-  branch(builder, bin<LtOp>(builder, wj, n), writeBody, iNext);
+  branch(builder, bin<LtOp>(builder, wj, cols), writeBody, iNext);
 
   builder.setToBlockEnd(writeBody);
   auto out = builder.create<LoadOp>(Value::i32, vals({ rowAddr(builder, scratch, loadVar(builder, jSlot)) }),
                                     attrs({ new SizeAttr(4) }));
   builder.create<StoreOp>(vals({ out, matrixAddr(builder, a, loadVar(builder, iSlot),
-                                                 loadVar(builder, jSlot), rowStride) }),
+                                                 loadVar(builder, jSlot), aRowStride) }),
                           attrs({ new SizeAttr(4) }));
   storeVar(builder, bin<AddIOp>(builder, loadVar(builder, jSlot), i32(builder, 1)), jSlot);
   builder.create<GotoOp>({ new TargetAttr(writeCond) });
@@ -550,7 +566,7 @@ bool replaceWithHelper(ModuleOp *module, const MatmulShape &shape) {
   if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() || TARGET(preterm) != shape.iLoop->header)
     return false;
 
-  ensureScratchGlobal(module, shape.dim);
+  ensureScratchGlobal(module, shape.scratchDim);
   buildHelper(module);
 
   auto exit = shape.iLoop->getExit();
@@ -559,17 +575,31 @@ bool replaceWithHelper(ModuleOp *module, const MatmulShape &shape) {
 
   Builder builder;
   builder.setBeforeOp(preterm);
-  auto dim = i32(builder, shape.dim);
-  auto canFast = builder.create<LeOp>(std::vector<Value>{ shape.n, dim });
+  auto aRows = i32(builder, shape.aRows);
+  auto aCols = i32(builder, shape.aCols);
+  auto cRows = i32(builder, shape.cRows);
+  auto cCols = i32(builder, shape.cCols);
+  auto iFitsA = builder.create<LeOp>(std::vector<Value>{ shape.iBound, aRows });
+  auto kFitsA = builder.create<LeOp>(std::vector<Value>{ shape.kBound, aRows });
+  auto jFitsA = builder.create<LeOp>(std::vector<Value>{ shape.jBound, aCols });
+  auto iFitsC = builder.create<LeOp>(std::vector<Value>{ shape.iBound, cRows });
+  auto kFitsC = builder.create<LeOp>(std::vector<Value>{ shape.kBound, cCols });
+  auto aOk = builder.create<AndIOp>(std::vector<Value>{ iFitsA, kFitsA });
+  auto aOk2 = builder.create<AndIOp>(std::vector<Value>{ aOk, jFitsA });
+  auto cOk = builder.create<AndIOp>(std::vector<Value>{ iFitsC, kFitsC });
+  auto canFast = builder.create<AndIOp>(std::vector<Value>{ aOk2, cOk });
   builder.replace<BranchOp>(preterm, std::vector<Value>{ canFast },
                             std::vector<Attr*>{ new TargetAttr(helperBB), new ElseAttr(shape.iLoop->header) });
 
   builder.setToBlockEnd(helperBB);
   auto a = builder.create<GetGlobalOp>({ new NameAttr(shape.aName) });
   auto c = builder.create<GetGlobalOp>({ new NameAttr(shape.cName) });
-  auto scratch = builder.create<GetGlobalOp>({ new NameAttr(scratchNameFor(shape.dim)) });
-  auto rowStride = i32(builder, shape.rowStrideBytes);
-  builder.create<CallOp>(Value::i32, vals({ shape.n, rowStride, a, c, scratch }),
+  auto scratch = builder.create<GetGlobalOp>({ new NameAttr(scratchNameFor(shape.scratchDim)) });
+  auto aRowStride = i32(builder, shape.aRowStrideBytes);
+  auto cRowStride = i32(builder, shape.cRowStrideBytes);
+  builder.create<CallOp>(Value::i32,
+                         vals({ shape.iBound, shape.jBound, shape.kBound,
+                                aRowStride, cRowStride, a, c, scratch }),
                          attrs({ new NameAttr(kHelperName), new ImpureAttr }));
   builder.create<GotoOp>({ new TargetAttr(exit) });
   return true;

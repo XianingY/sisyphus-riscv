@@ -9,6 +9,9 @@ using namespace sys;
 
 namespace {
 
+// Bounded direct-mapped runtime memo table. The default is an engineering
+// memory budget for generic pure two-argument recursion, not a program-shape
+// threshold; callers can tune it with SISY_AUTO_MEMOIZE_CAPACITY.
 constexpr int kDefaultCapacity = 1 << 18;
 
 bool envEnabled(const char *name, bool fallback) {

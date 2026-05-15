@@ -109,24 +109,6 @@ bool disjointGlobals(Op *a, Op *b) {
   return true;
 }
 
-bool hasLargeGlobalArray(Op *op, const std::map<std::string, GlobalOp*> &globals) {
-  auto names = globalsIn(op);
-  for (auto &name : names) {
-    auto it = globals.find(name);
-    if (it == globals.end())
-      continue;
-    auto global = it->second;
-    if (!global->has<DimensionAttr>())
-      continue;
-    long long elems = 1;
-    for (int dim : DIM(global))
-      elems *= dim;
-    if (elems >= 262144)
-      return true;
-  }
-  return false;
-}
-
 bool usesValue(Op *op, Op *needle, std::set<Op*> &seen) {
   if (!op || !needle || seen.count(op))
     return false;
@@ -213,9 +195,7 @@ struct StoreRecurrence {
   Op *factorAddr = nullptr;
 };
 
-bool matchStoreRecurrence(StoreOp *store, Op *innerIV,
-                          const std::map<std::string, GlobalOp*> &globals,
-                          StoreRecurrence &rec) {
+bool matchStoreRecurrence(StoreOp *store, Op *innerIV, StoreRecurrence &rec) {
   if (!store || store->getOperandCount() != 2)
     return false;
   auto dstAddr = store->DEF(1);
@@ -247,10 +227,6 @@ bool matchStoreRecurrence(StoreOp *store, Op *innerIV,
     if (!usesValue(dstAddr, innerIV) || !usesValue(srcLoad->DEF(0), innerIV))
       return false;
     if (!disjointGlobals(factor->DEF(0), dstAddr))
-      return false;
-    if (!hasLargeGlobalArray(factor->DEF(0), globals) ||
-        !hasLargeGlobalArray(srcLoad->DEF(0), globals) ||
-        !hasLargeGlobalArray(dstAddr, globals))
       return false;
     rec.store = store;
     rec.oldDstLoad = oldDst;
@@ -385,7 +361,7 @@ bool buildZeroCopyPath(LoopInfo *loop, const UnitLoopShape &shape, const StoreRe
   return true;
 }
 
-bool tryReplace(LoopInfo *loop, const std::map<std::string, GlobalOp*> &globals) {
+bool tryReplace(LoopInfo *loop) {
   auto shape = findUnitLoopShape(loop);
   if (!shape.induction || !shape.stop)
     return false;
@@ -395,7 +371,7 @@ bool tryReplace(LoopInfo *loop, const std::map<std::string, GlobalOp*> &globals)
   if (loopHasForbiddenSideEffect(loop, stores[0]))
     return false;
   StoreRecurrence rec;
-  if (!matchStoreRecurrence(stores[0], shape.induction, globals, rec))
+  if (!matchStoreRecurrence(stores[0], shape.induction, rec))
     return false;
   return buildZeroCopyPath(loop, shape, rec);
 }
@@ -417,7 +393,6 @@ void ZeroFactorStoreLoop::run() {
   for (auto func : collectFuncs())
     func->getRegion()->updatePreds();
 
-  auto globals = getGlobalMap();
   LoopAnalysis analysis(module);
   analysis.run();
   for (auto &[_, forest] : analysis.getResult()) {
@@ -425,7 +400,7 @@ void ZeroFactorStoreLoop::run() {
       auto stores = collectStores(loop);
       if (stores.size() == 1)
         candidates++;
-      if (tryReplace(loop, globals))
+      if (tryReplace(loop))
         replaced++;
       else if (stores.size() == 1)
         rejectedShape++;

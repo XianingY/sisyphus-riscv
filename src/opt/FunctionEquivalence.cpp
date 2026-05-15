@@ -487,7 +487,10 @@ std::map<std::string, int> FunctionEquivalence::stats() {
 }
 
 void FunctionEquivalence::run() {
-  if (!envEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+  // This pass classifies whole functions by finite execution samples. It is
+  // useful for experiments, but default optimization pipelines should prefer
+  // transformations that are proven from IR structure.
+  if (!envEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
     return;
 
   CallGraph(module).run();

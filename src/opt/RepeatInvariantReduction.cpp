@@ -368,6 +368,9 @@ bool RepeatInvariantReduction::runImpl(LoopInfo *loop) {
     impureBody++;
     return false;
   }
+  // Profitability guard: this pass targets repeated pure work driven by memory
+  // reads. The guard is deliberately semantic-agnostic; it does not depend on
+  // array sizes, symbols, or benchmark-specific loop bounds.
   if (!loopHasGlobalLoad(loop))
     return false;
 
