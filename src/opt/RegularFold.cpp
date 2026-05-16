@@ -422,11 +422,13 @@ int RegularFold::runImpl(Region *region) {
     for (auto op : ops) {
       // Match each rule.
       bool success = false;
-      for (auto &rule : rules) {
-        success = rule.rewrite(op);
-        if (success) {
-          folded++;
-          break;
+      if (!op->has<ImpureAttr>()) {
+        for (auto &rule : rules) {
+          success = rule.rewrite(op);
+          if (success) {
+            folded++;
+            break;
+          }
         }
       }
 
