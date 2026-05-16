@@ -159,6 +159,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DCE>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
       pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", true)) {
+      pm.addPass<sys::StructuralBitwise>();
+      pm.addPass<sys::DCE>();
+    }
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::GVN>();

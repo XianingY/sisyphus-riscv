@@ -466,11 +466,11 @@ void RegularFold::run() {
       if (op->getResultType() != Value::i32 || op->getOperandCount() != 1)
         return false;
       auto addr = op->DEF(0);
-      if (!addr || !isa<GetGlobalOp>(addr))
+      auto name = zeroOffsetGlobalName(addr);
+      if (!name)
         return false;
 
-      auto name = NAME(addr);
-      auto value = immutableScalarGlobalValue(name, gMap, module);
+      auto value = immutableScalarGlobalValue(*name, gMap, module);
       if (!value)
         return false;
 

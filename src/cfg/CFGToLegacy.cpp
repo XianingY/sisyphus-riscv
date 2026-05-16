@@ -179,6 +179,8 @@ private:
           new DimensionAttr(dims),
         });
         g.defining->add<FPAttr>();
+        if (!sym.isMutable)
+          g.defining->add<ConstAttr>();
       } else {
         int *data = nullptr;
         if (!sym.intArrayInit.empty()) {
@@ -199,6 +201,8 @@ private:
           new NameAttr(sym.name),
           new DimensionAttr(dims),
         });
+        if (!sym.isMutable)
+          g.defining->add<ConstAttr>();
       }
       globals[sym.name] = g;
     }
