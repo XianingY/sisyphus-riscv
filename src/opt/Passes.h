@@ -161,6 +161,7 @@ public:
 class ZeroFactorStoreLoop : public Pass {
   int candidates = 0;
   int replaced = 0;
+  int affineReplaced = 0;
   int rejectedShape = 0;
 public:
   ZeroFactorStoreLoop(ModuleOp *module): Pass(module) {}

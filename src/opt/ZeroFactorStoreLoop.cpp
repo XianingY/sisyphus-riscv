@@ -12,6 +12,8 @@ using namespace sys;
 
 namespace {
 
+constexpr int kAffineUnroll = 4;
+
 bool envEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
   if (!raw || !raw[0])
@@ -38,6 +40,12 @@ Op *i32(Builder &builder, int value) {
 template<class T>
 Op *bin(Builder &builder, Op *a, Op *b) {
   return builder.create<T>(vals({ a, b }));
+}
+
+Op *ptrOffset(Builder &builder, Op *base, int bytes) {
+  if (bytes == 0)
+    return base;
+  return bin<AddLOp>(builder, base, i32(builder, bytes));
 }
 
 Op *stripSinglePhi(Op *op) {
@@ -311,6 +319,151 @@ Op *cloneExpr(Op *op, LoopInfo *oldLoop, Builder &builder, std::map<Op*, Op*> &s
   return clone;
 }
 
+void emitRowStore(Builder &builder, Op *dstPtr, Op *srcPtr, Op *factor, int offset) {
+  auto dstLane = ptrOffset(builder, dstPtr, offset);
+  auto srcLane = ptrOffset(builder, srcPtr, offset);
+  auto srcVal = builder.create<LoadOp>(Value::i32, vals({ srcLane }), attrs({ new SizeAttr(4) }));
+  Op *out = srcVal;
+  if (factor) {
+    auto dstVal = builder.create<LoadOp>(Value::i32, vals({ dstLane }), attrs({ new SizeAttr(4) }));
+    out = bin<AddIOp>(builder, bin<MulIOp>(builder, dstVal, factor), srcVal);
+  }
+  builder.create<StoreOp>(vals({ out, dstLane }), attrs({ new SizeAttr(4) }));
+}
+
+bool buildRowAffinePath(LoopInfo *loop, const UnitLoopShape &shape, const StoreRecurrence &rec) {
+  auto preterm = loop->preheader->getLastOp();
+  if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() || TARGET(preterm) != loop->header)
+    return false;
+
+  std::set<Op*> substituted = { shape.induction };
+  std::set<Op*> seen;
+  if (!canCloneExpr(rec.srcAddr, loop, substituted, seen))
+    return false;
+  seen.clear();
+  if (!canCloneExpr(rec.dstAddr, loop, substituted, seen))
+    return false;
+  seen.clear();
+  if (!canCloneExpr(rec.factorAddr, loop, substituted, seen))
+    return false;
+
+  auto region = loop->header->getParent();
+  auto dispatch = region->insertAfter(loop->preheader);
+  auto copyCond = region->insertAfter(dispatch);
+  auto copyBody = region->insertAfter(copyCond);
+  auto copyTailCond = region->insertAfter(copyBody);
+  auto copyTailBody = region->insertAfter(copyTailCond);
+  auto affineCond = region->insertAfter(copyTailBody);
+  auto affineBody = region->insertAfter(affineCond);
+  auto affineTailCond = region->insertAfter(affineBody);
+  auto affineTailBody = region->insertAfter(affineTailCond);
+  auto exit = loop->getExit();
+
+  Builder builder;
+  builder.setBeforeOp(preterm);
+  auto zero = i32(builder, 0);
+  auto four = i32(builder, kAffineUnroll);
+  auto rem = bin<ModIOp>(builder, shape.stop, four);
+  auto mainStop = bin<SubIOp>(builder, shape.stop, rem);
+  std::map<Op*, Op*> subst;
+  subst[shape.induction] = zero;
+  auto dstBase = cloneExpr(rec.dstAddr, loop, builder, subst);
+  auto srcBase = cloneExpr(rec.srcAddr, loop, builder, subst);
+  auto factorAddr = cloneExpr(rec.factorAddr, loop, builder, subst);
+  if (!dstBase || !srcBase || !factorAddr)
+    return false;
+  auto factor = builder.create<LoadOp>(Value::i32, vals({ factorAddr }), attrs({ new SizeAttr(4) }));
+  auto isZero = bin<EqOp>(builder, factor, zero);
+  builder.replace<BranchOp>(preterm, vals({ i32(builder, 1) }),
+                            attrs({ new TargetAttr(dispatch), new ElseAttr(loop->header) }));
+
+  builder.setToBlockEnd(dispatch);
+  builder.create<BranchOp>(vals({ isZero }), attrs({ new TargetAttr(copyCond), new ElseAttr(affineCond) }));
+
+  builder.setToBlockEnd(copyCond);
+  auto copyJ = builder.create<PhiOp>(vals({ zero }), attrs({ new FromAttr(dispatch) }));
+  auto copyDst = builder.create<PhiOp>(vals({ dstBase }), attrs({ new FromAttr(dispatch) }));
+  auto copySrc = builder.create<PhiOp>(vals({ srcBase }), attrs({ new FromAttr(dispatch) }));
+  builder.create<BranchOp>(vals({ bin<LtOp>(builder, copyJ, mainStop) }),
+                           attrs({ new TargetAttr(copyBody), new ElseAttr(copyTailCond) }));
+
+  builder.setToBlockEnd(copyBody);
+  for (int lane = 0; lane < kAffineUnroll; lane++)
+    emitRowStore(builder, copyDst, copySrc, nullptr, lane * 4);
+  auto copyJNext = bin<AddIOp>(builder, copyJ, four);
+  auto copyDstNext = ptrOffset(builder, copyDst, kAffineUnroll * 4);
+  auto copySrcNext = ptrOffset(builder, copySrc, kAffineUnroll * 4);
+  builder.create<GotoOp>({ new TargetAttr(copyCond) });
+  copyJ->pushOperand(copyJNext);
+  copyJ->add<FromAttr>(copyBody);
+  copyDst->pushOperand(copyDstNext);
+  copyDst->add<FromAttr>(copyBody);
+  copySrc->pushOperand(copySrcNext);
+  copySrc->add<FromAttr>(copyBody);
+
+  builder.setToBlockEnd(copyTailCond);
+  auto copyTailJ = builder.create<PhiOp>(vals({ copyJ }), attrs({ new FromAttr(copyCond) }));
+  auto copyTailDst = builder.create<PhiOp>(vals({ copyDst }), attrs({ new FromAttr(copyCond) }));
+  auto copyTailSrc = builder.create<PhiOp>(vals({ copySrc }), attrs({ new FromAttr(copyCond) }));
+  builder.create<BranchOp>(vals({ bin<LtOp>(builder, copyTailJ, shape.stop) }),
+                           attrs({ new TargetAttr(copyTailBody), new ElseAttr(exit) }));
+
+  builder.setToBlockEnd(copyTailBody);
+  emitRowStore(builder, copyTailDst, copyTailSrc, nullptr, 0);
+  auto copyTailJNext = bin<AddIOp>(builder, copyTailJ, i32(builder, 1));
+  auto copyTailDstNext = ptrOffset(builder, copyTailDst, 4);
+  auto copyTailSrcNext = ptrOffset(builder, copyTailSrc, 4);
+  builder.create<GotoOp>({ new TargetAttr(copyTailCond) });
+  copyTailJ->pushOperand(copyTailJNext);
+  copyTailJ->add<FromAttr>(copyTailBody);
+  copyTailDst->pushOperand(copyTailDstNext);
+  copyTailDst->add<FromAttr>(copyTailBody);
+  copyTailSrc->pushOperand(copyTailSrcNext);
+  copyTailSrc->add<FromAttr>(copyTailBody);
+
+  builder.setToBlockEnd(affineCond);
+  auto affineJ = builder.create<PhiOp>(vals({ zero }), attrs({ new FromAttr(dispatch) }));
+  auto affineDst = builder.create<PhiOp>(vals({ dstBase }), attrs({ new FromAttr(dispatch) }));
+  auto affineSrc = builder.create<PhiOp>(vals({ srcBase }), attrs({ new FromAttr(dispatch) }));
+  builder.create<BranchOp>(vals({ bin<LtOp>(builder, affineJ, mainStop) }),
+                           attrs({ new TargetAttr(affineBody), new ElseAttr(affineTailCond) }));
+
+  builder.setToBlockEnd(affineBody);
+  for (int lane = 0; lane < kAffineUnroll; lane++)
+    emitRowStore(builder, affineDst, affineSrc, factor, lane * 4);
+  auto affineJNext = bin<AddIOp>(builder, affineJ, four);
+  auto affineDstNext = ptrOffset(builder, affineDst, kAffineUnroll * 4);
+  auto affineSrcNext = ptrOffset(builder, affineSrc, kAffineUnroll * 4);
+  builder.create<GotoOp>({ new TargetAttr(affineCond) });
+  affineJ->pushOperand(affineJNext);
+  affineJ->add<FromAttr>(affineBody);
+  affineDst->pushOperand(affineDstNext);
+  affineDst->add<FromAttr>(affineBody);
+  affineSrc->pushOperand(affineSrcNext);
+  affineSrc->add<FromAttr>(affineBody);
+
+  builder.setToBlockEnd(affineTailCond);
+  auto affineTailJ = builder.create<PhiOp>(vals({ affineJ }), attrs({ new FromAttr(affineCond) }));
+  auto affineTailDst = builder.create<PhiOp>(vals({ affineDst }), attrs({ new FromAttr(affineCond) }));
+  auto affineTailSrc = builder.create<PhiOp>(vals({ affineSrc }), attrs({ new FromAttr(affineCond) }));
+  builder.create<BranchOp>(vals({ bin<LtOp>(builder, affineTailJ, shape.stop) }),
+                           attrs({ new TargetAttr(affineTailBody), new ElseAttr(exit) }));
+
+  builder.setToBlockEnd(affineTailBody);
+  emitRowStore(builder, affineTailDst, affineTailSrc, factor, 0);
+  auto affineTailJNext = bin<AddIOp>(builder, affineTailJ, i32(builder, 1));
+  auto affineTailDstNext = ptrOffset(builder, affineTailDst, 4);
+  auto affineTailSrcNext = ptrOffset(builder, affineTailSrc, 4);
+  builder.create<GotoOp>({ new TargetAttr(affineTailCond) });
+  affineTailJ->pushOperand(affineTailJNext);
+  affineTailJ->add<FromAttr>(affineTailBody);
+  affineTailDst->pushOperand(affineTailDstNext);
+  affineTailDst->add<FromAttr>(affineTailBody);
+  affineTailSrc->pushOperand(affineTailSrcNext);
+  affineTailSrc->add<FromAttr>(affineTailBody);
+  return true;
+}
+
 bool buildZeroCopyPath(LoopInfo *loop, const UnitLoopShape &shape, const StoreRecurrence &rec) {
   auto preterm = loop->preheader->getLastOp();
   if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() || TARGET(preterm) != loop->header)
@@ -361,7 +514,8 @@ bool buildZeroCopyPath(LoopInfo *loop, const UnitLoopShape &shape, const StoreRe
   return true;
 }
 
-bool tryReplace(LoopInfo *loop) {
+bool tryReplace(LoopInfo *loop, bool &usedAffine) {
+  usedAffine = false;
   auto shape = findUnitLoopShape(loop);
   if (!shape.induction || !shape.stop)
     return false;
@@ -373,6 +527,10 @@ bool tryReplace(LoopInfo *loop) {
   StoreRecurrence rec;
   if (!matchStoreRecurrence(stores[0], shape.induction, rec))
     return false;
+  if (buildRowAffinePath(loop, shape, rec)) {
+    usedAffine = true;
+    return true;
+  }
   return buildZeroCopyPath(loop, shape, rec);
 }
 
@@ -382,6 +540,7 @@ std::map<std::string, int> ZeroFactorStoreLoop::stats() {
   return {
     { "candidates", candidates },
     { "replaced", replaced },
+    { "affine-replaced", affineReplaced },
     { "rejected-shape", rejectedShape },
   };
 }
@@ -400,9 +559,12 @@ void ZeroFactorStoreLoop::run() {
       auto stores = collectStores(loop);
       if (stores.size() == 1)
         candidates++;
-      if (tryReplace(loop))
+      bool usedAffine = false;
+      if (tryReplace(loop, usedAffine)) {
         replaced++;
-      else if (stores.size() == 1)
+        if (usedAffine)
+          affineReplaced++;
+      } else if (stores.size() == 1)
         rejectedShape++;
     }
   }
