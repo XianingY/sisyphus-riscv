@@ -108,11 +108,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   const bool enableO1LiteTail = !aggressive;
   const bool armSafeStructured = opts.arm && !aggressive;
   // pure-rv keeps whole-algorithm and semantic helper recognition out of the
-  // default RISC-V pipeline. These passes are useful for experiments, but the
-  // strict competition profile should only use conventional IR and backend
-  // optimizations unless a developer explicitly opts in locally.
-  const bool enableRvSemanticPasses =
-    opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RV_SEMANTIC_PASSES", false);
+  // RISC-V pipeline. Keep the pass implementations in the tree for history and
+  // comparisons, but do not wire them into this strict competition profile.
+  constexpr bool enableRvSemanticPasses = false;
   const bool enablePrivatizeReduction =
     getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
   // "large" modules use an economy lane to cap compile-time, but "huge"
