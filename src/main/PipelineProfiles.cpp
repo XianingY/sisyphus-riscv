@@ -107,6 +107,12 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   const bool enableO2Experimental = plan.enableO2Experimental;
   const bool enableO1LiteTail = !aggressive;
   const bool armSafeStructured = opts.arm && !aggressive;
+  // pure-rv keeps whole-algorithm and semantic helper recognition out of the
+  // default RISC-V pipeline. These passes are useful for experiments, but the
+  // strict competition profile should only use conventional IR and backend
+  // optimizations unless a developer explicitly opts in locally.
+  const bool enableRvSemanticPasses =
+    opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RV_SEMANTIC_PASSES", false);
   const bool enablePrivatizeReduction =
     getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
   // "large" modules use an economy lane to cap compile-time, but "huge"
@@ -122,7 +128,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   };
 
   auto appendLoweredTail = [&]() {
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", false))
       pm.addPass<sys::RuntimeMemoize>();
     appendLoweredTCO();
     if (economyMode) {
@@ -157,9 +163,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
       pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", false)) {
       pm.addPass<sys::StructuralBitwise>();
       pm.addPass<sys::DCE>();
     }
@@ -196,7 +202,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DSE>();
     pm.addPass<sys::DLE>();
     pm.addPass<sys::GVN>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", false)) {
       pm.addPass<sys::StructuralModMul>();
       pm.addPass<sys::RegularFold>();
       pm.addPass<sys::DCE>();
@@ -209,16 +215,16 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", false))
       pm.addPass<sys::RowScratchMatmul>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", false)) {
       pm.addPass<sys::ModularAffineLoop>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", false)) {
       pm.addPass<sys::RotlRepeatLoopFold>();
       pm.addPass<sys::SimplifyCFG>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", false))
       pm.addPass<sys::RepeatInvariantReduction>();
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
@@ -231,7 +237,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::LICM>();
     if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
       pm.addPass<sys::ScalarReplace>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_POW2_REPEAT_LOOP_FOLD", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_POW2_REPEAT_LOOP_FOLD", false)) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
       pm.addPass<sys::Pow2RepeatLoopFold>();
       pm.addPass<sys::SimplifyCFG>();
@@ -269,7 +275,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::Range>();
       pm.addPass<sys::EqClass>();
       pm.addPass<sys::RangeAwareFold>();
-      if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
+      if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
         pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
       pm.addPass<sys::Splice>();
     }
@@ -344,7 +350,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     pm.addPass<sys::AggressiveDCE>();
     pm.addPass<sys::SimplifyCFG>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ZERO_FACTOR_STORE_LOOP", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ZERO_FACTOR_STORE_LOOP", false))
       pm.addPass<sys::ZeroFactorStoreLoop>();
     pm.addPass<sys::InstSchedule>();
   };
