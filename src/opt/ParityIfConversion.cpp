@@ -20,11 +20,65 @@ bool isConst(Op *op, int value) {
   return op && isa<IntOp>(op) && V(op) == value;
 }
 
+bool isAbsConst(Op *op, int value) {
+  return op && isa<IntOp>(op) && (V(op) == value || V(op) == -value);
+}
+
+Op *intConst(Builder &builder, int value) {
+  return builder.create<IntOp>({ new IntAttr(value) });
+}
+
+Op *parityTruthValue(Builder &builder, Op *cond) {
+  if (!cond)
+    return cond;
+
+  auto buildBit = [&](Op *value) {
+    return builder.create<AndIOp>(std::vector<Value>{ value, intConst(builder, 1) });
+  };
+
+  if (auto mod = dyn_cast<ModIOp>(cond);
+      mod && mod->getOperandCount() == 2 && isAbsConst(mod->DEF(1), 2))
+    return buildBit(mod->DEF(0));
+
+  auto normalizeCompare = [&](auto *cmp, bool isEq) -> Op* {
+    if (!cmp || cmp->getOperandCount() != 2)
+      return nullptr;
+    auto lhs = cmp->DEF(0);
+    auto rhs = cmp->DEF(1);
+    if (auto mod = dyn_cast<ModIOp>(lhs);
+        mod && mod->getOperandCount() == 2 && isAbsConst(mod->DEF(1), 2) &&
+        isConst(rhs, 0)) {
+      auto bit = buildBit(mod->DEF(0));
+      if (isEq)
+        return builder.create<EqOp>(std::vector<Value>{ bit, intConst(builder, 0) });
+      return builder.create<NeOp>(std::vector<Value>{ bit, intConst(builder, 0) });
+    }
+    if (auto mod = dyn_cast<ModIOp>(rhs);
+        mod && mod->getOperandCount() == 2 && isAbsConst(mod->DEF(1), 2) &&
+        isConst(lhs, 0)) {
+      auto bit = buildBit(mod->DEF(0));
+      if (isEq)
+        return builder.create<EqOp>(std::vector<Value>{ intConst(builder, 0), bit });
+      return builder.create<NeOp>(std::vector<Value>{ intConst(builder, 0), bit });
+    }
+    return nullptr;
+  };
+
+  if (auto eq = dyn_cast<EqOp>(cond))
+    if (auto folded = normalizeCompare(eq, true))
+      return folded;
+  if (auto ne = dyn_cast<NeOp>(cond))
+    if (auto folded = normalizeCompare(ne, false))
+      return folded;
+
+  return cond;
+}
+
 bool containsParityMod(Op *op, std::set<Op*> &seen) {
   if (!op || seen.count(op))
     return false;
   seen.insert(op);
-  if (isa<ModIOp>(op) && op->getOperandCount() == 2 && isConst(op->DEF(1), 2))
+  if (isa<ModIOp>(op) && op->getOperandCount() == 2 && isAbsConst(op->DEF(1), 2))
     return true;
   for (auto operand : op->getOperands())
     if (containsParityMod(operand.defining, seen))
@@ -169,7 +223,8 @@ bool convertOne(BranchOp *branch) {
     op->moveBefore(branch);
 
   builder.setBeforeOp(branch);
-  auto select = builder.create<SelectOp>(std::vector<Value>{ branch->DEF(0), trueValue, falseValue });
+  auto cond = parityTruthValue(builder, branch->DEF(0));
+  auto select = builder.create<SelectOp>(std::vector<Value>{ cond, trueValue, falseValue });
   phi->replaceAllUsesWith(select);
   phi->erase();
   builder.replace<GotoOp>(branch, { new TargetAttr(join) });

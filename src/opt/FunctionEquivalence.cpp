@@ -502,7 +502,7 @@ std::map<std::string, int> FunctionEquivalence::stats() {
 void FunctionEquivalence::run() {
   // Classify small pure helper functions with conservative sample sets. The
   // replacements below must still preserve the full signed SysY semantics.
-  if (!envEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+  if (!envEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
     return;
 
   CallGraph(module).run();

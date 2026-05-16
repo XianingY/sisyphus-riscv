@@ -72,6 +72,8 @@ static std::optional<int> immutableScalarGlobalValue(
   if (it == gMap.end())
     return std::nullopt;
   auto glob = it->second;
+  if (!glob->has<ConstAttr>())
+    return std::nullopt;
   auto iarr = glob->get<IntArrayAttr>();
   if (!iarr || iarr->size != 1)
     return std::nullopt;

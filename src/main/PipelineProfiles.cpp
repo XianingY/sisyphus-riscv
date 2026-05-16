@@ -157,7 +157,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+    if (opts.rv && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
       pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
@@ -256,7 +256,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DSE>();
       pm.addPass<sys::DLE>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", true)) {
       pm.addPass<sys::ParityIfConversion>();
       pm.addPass<sys::SimplifyCFG>();
     }

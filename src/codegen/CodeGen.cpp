@@ -414,6 +414,8 @@ void CodeGen::emit(ASTNode *node) {
           new NameAttr(vardecl->name),
           new DimensionAttr({ 1 }),
         });
+        if (!vardecl->mut)
+          addr->add<ConstAttr>();
         globals[vardecl->name] = addr;
         return;
       }
@@ -427,6 +429,8 @@ void CodeGen::emit(ASTNode *node) {
           new NameAttr(vardecl->name),
           new DimensionAttr({ 1 }),
         });
+        if (!vardecl->mut)
+          addr->add<ConstAttr>();
         globals[vardecl->name] = addr;
         return;
       }
@@ -464,6 +468,8 @@ void CodeGen::emit(ASTNode *node) {
           new DimensionAttr(arrTy ? arrTy->dims : std::vector { 1 }),
         });
       }
+      if (!vardecl->mut)
+        addr.defining->add<ConstAttr>();
       globals[vardecl->name] = addr;
       return;
     }

@@ -111,6 +111,8 @@ std::optional<int> immutableScalarGlobalValue(
   if (it == gMap.end())
     return std::nullopt;
   auto global = it->second;
+  if (!global->has<ConstAttr>())
+    return std::nullopt;
   if (!global->has<DimensionAttr>() || DIM(global).size() != 1 || DIM(global)[0] != 1)
     return std::nullopt;
   auto iarr = global->find<IntArrayAttr>();
