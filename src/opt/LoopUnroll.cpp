@@ -26,12 +26,185 @@ int envIntClamped(const char *name, int fallback, int low, int high) {
   return value;
 }
 
+Op *stripSinglePhi(Op *op) {
+  while (op && isa<PhiOp>(op) && op->getOperandCount() == 1)
+    op = op->DEF();
+  return op;
+}
+
+int loopOpCount(LoopInfo *loop) {
+  int loopsize = 0;
+  for (auto bb : loop->getBlocks())
+    loopsize += bb->getOpCount();
+  return loopsize;
+}
+
+Op *headerStop(LoopInfo *loop, bool &inclusive) {
+  inclusive = false;
+  if (!loop || !loop->header || !loop->getInduction())
+    return nullptr;
+  auto term = dyn_cast<BranchOp>(loop->header->getLastOp());
+  if (!term || term->getOperandCount() != 1)
+    return nullptr;
+  auto cond = stripSinglePhi(term->DEF());
+  if (auto lt = dyn_cast<LtOp>(cond)) {
+    if (stripSinglePhi(lt->DEF(0)) == stripSinglePhi(loop->getInduction()))
+      return stripSinglePhi(lt->DEF(1));
+  }
+  if (auto le = dyn_cast<LeOp>(cond)) {
+    if (stripSinglePhi(le->DEF(0)) == stripSinglePhi(loop->getInduction())) {
+      inclusive = true;
+      return stripSinglePhi(le->DEF(1));
+    }
+  }
+  return nullptr;
+}
+
+bool smallConstantTrip(LoopInfo *loop, int loopsize, int &trip) {
+  auto lower = stripSinglePhi(loop->getStart());
+  auto upper = stripSinglePhi(loop->getStop());
+  bool inclusive = false;
+  if (!upper)
+    upper = headerStop(loop, inclusive);
+  auto step = stripSinglePhi(loop->getStepOp());
+  if (!lower || !upper || !step || !isa<IntOp>(lower) ||
+      !isa<IntOp>(upper) || !isa<IntOp>(step))
+    return false;
+  int stepValue = V(step);
+  if (stepValue <= 0)
+    return false;
+  int span = V(upper) - V(lower) + (inclusive ? 1 : 0);
+  if (span <= 0 || span % stepValue != 0)
+    return false;
+  trip = span / stepValue;
+  if (trip <= 1 || trip > 16)
+    return false;
+  return loopsize > 0 && loopsize * (trip - 1) <= 200;
+}
+
+bool tryRotateSmallConstantLoop(LoopInfo *info) {
+  if (!info || !info->preheader || info->latches.size() != 1 ||
+      info->exits.size() != 1 || !info->getInduction())
+    return false;
+
+  int trip = 0;
+  int loopsize = loopOpCount(info);
+  if (!smallConstantTrip(info, loopsize, trip))
+    return false;
+
+  for (auto bb : info->getBlocks())
+    for (auto op : bb->getOps())
+      if (isa<CallOp>(op))
+        return false;
+
+  auto exit = info->getExit();
+  auto induction = info->getInduction();
+  auto header = info->header;
+  auto term = dyn_cast<BranchOp>(header->getLastOp());
+  if (!term || term->getOperandCount() != 1 || !term->has<TargetAttr>() ||
+      !term->has<ElseAttr>() || ELSE(term) != exit)
+    return false;
+
+  auto cond = stripSinglePhi(term->DEF());
+  Op *upper = nullptr;
+  if (auto lt = dyn_cast<LtOp>(cond)) {
+    if (stripSinglePhi(lt->DEF(0)) != stripSinglePhi(induction))
+      return false;
+    upper = stripSinglePhi(lt->DEF(1));
+  } else {
+    return false;
+  }
+  if (!upper || !isa<IntOp>(upper))
+    return false;
+
+  auto latch = info->getLatch();
+  auto latchterm = latch->getLastOp();
+  if (!isa<GotoOp>(latchterm) || !latchterm->has<TargetAttr>() ||
+      TARGET(latchterm) != header)
+    return false;
+
+  auto preheader = info->preheader;
+  auto preterm = preheader->getLastOp();
+  if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() ||
+      TARGET(preterm) != header)
+    return false;
+
+  auto headerPhis = header->getPhis();
+  std::map<Op*, Op*> valueMap, initMap;
+  for (auto phi : headerPhis) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    if (attrs.size() != 2 || ops.size() != 2)
+      return false;
+
+    auto bb1 = FROM(attrs[0]);
+    auto bb2 = FROM(attrs[1]);
+    if (bb1 == latch && bb2 == preheader) {
+      valueMap[phi] = ops[0].defining;
+      initMap[phi] = ops[1].defining;
+    } else if (bb2 == latch && bb1 == preheader) {
+      valueMap[phi] = ops[1].defining;
+      initMap[phi] = ops[0].defining;
+    } else {
+      return false;
+    }
+  }
+  if (!valueMap.count(induction))
+    return false;
+
+  for (auto phi : exit->getPhis()) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (FROM(attrs[i]) != header)
+        continue;
+      auto def = ops[i].defining;
+      if (!valueMap.count(def) || !initMap.count(def))
+        return false;
+    }
+  }
+
+  Builder builder;
+  builder.setBeforeOp(preterm);
+  Value cmp = builder.create<LtOp>(std::vector<Value> { info->getStart(), upper });
+  builder.replace<BranchOp>(preterm, { cmp }, { new TargetAttr(header), new ElseAttr(exit) });
+
+  auto target = TARGET(term);
+  builder.replace<GotoOp>(term, { new TargetAttr(target) });
+
+  builder.setBeforeOp(latchterm);
+  cmp = builder.create<LtOp>(std::vector<Value> { valueMap[induction], upper });
+  builder.replace<BranchOp>(latchterm, { cmp }, { new TargetAttr(header), new ElseAttr(exit) });
+
+  for (auto phi : exit->getPhis()) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (FROM(attrs[i]) != header)
+        continue;
+      auto def = ops[i].defining;
+      FROM(attrs[i]) = latch;
+      if (valueMap.count(def))
+        phi->setOperand(i, valueMap[def]);
+      phi->pushOperand(initMap.count(def) ? initMap[def] : def);
+      phi->add<FromAttr>(preheader);
+      break;
+    }
+  }
+
+  info->stop = upper;
+  header->getParent()->updatePreds();
+  (void)trip;
+  return true;
+}
+
 }
 
 std::map<std::string, int> ConstLoopUnroll::stats() {
   return {
     { "unrolled", unrolled },
-    { "factor-unrolled", factorUnrolled }
+    { "factor-unrolled", factorUnrolled },
+    { "rotated-for-unroll", rotatedForUnroll }
   };
 }
 
@@ -195,13 +368,21 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
 
   if (loop->exits.size() != 1)
     return false;
+  if (loop->latches.size() != 1)
+    return false;
 
   auto header = loop->header;
   auto preheader = loop->preheader;
   auto latch = loop->getLatch();
   // The loop is not rotated. Don't unroll it.
-  if (!isa<BranchOp>(latch->getLastOp()))
-    return false;
+  if (!isa<BranchOp>(latch->getLastOp())) {
+    if (tryRotateSmallConstantLoop(loop)) {
+      rotatedForUnroll++;
+      preheader = loop->preheader;
+    }
+    if (!isa<BranchOp>(latch->getLastOp()))
+      return false;
+  }
 
   auto exit = loop->getExit();
   // We don't want an internal `break` to interfere.
@@ -209,9 +390,7 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   if (exit->preds.size() > 2)
     return false;
 
-  int loopsize = 0;
-  for (auto bb : loop->getBlocks())
-    loopsize += bb->getOpCount();
+  int loopsize = loopOpCount(loop);
 
   // Not every loop can be unrolled, even not all constant-bounded loops.
   // See 65_color.sy, where we are attempting to unroll a nested loop with a total of 18^5*7 = 13226976 iterations.
@@ -569,7 +748,7 @@ bool ConstLoopUnroll::tryFactorUnroll(LoopInfo *loop, int factor) {
 
 static void postorder(LoopInfo *loop, std::vector<LoopInfo*> &order) {
   for (auto subloop : loop->subloops)
-    order.push_back(subloop);
+    postorder(subloop, order);
   order.push_back(loop);
 }
 

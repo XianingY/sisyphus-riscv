@@ -122,6 +122,7 @@ class ConstLoopUnroll : public Pass {
   std::map<Op*, Op*> exitlatch;
   int unrolled = 0;
   int factorUnrolled = 0;
+  int rotatedForUnroll = 0;
 
   // Returns true if changed.
   bool runImpl(LoopInfo *info);
