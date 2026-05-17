@@ -382,7 +382,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (isa<LiOp>(op))
         priority[op] = (V(op) <= 2047 && V(op) >= -2048) ? -3 : -1;
       if (isa<LaOp>(op))
-        priority[op] = -1;
+        priority[op] = op->getUses().size() <= 1 ? -1 : 100000;
 
       if (isa<PhiOp>(op)) {
         priority[op] = currentPriority + 1;
