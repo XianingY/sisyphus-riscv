@@ -90,10 +90,12 @@ void InstSchedule::runImpl(BasicBlock *bb) {
         result--;
       }
 
-      // Wait 8 instructions for multiplication.
-      // if ((isa<MulIOp>(def) || isa<MulLOp>(def)) && index - time[def] <= 8) {
-      //   result--;
-      // }
+      // Keep a small gap after integer multiplies when another ready op can
+      // fill it. This is a scheduling heuristic only; dependencies still
+      // control correctness.
+      if ((isa<MulIOp>(def) || isa<MulLOp>(def)) && index - time[def] <= 3) {
+        result--;
+      }
     }
 
     if (result < 0)
