@@ -115,7 +115,7 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SllwOp *op) {
-    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", true))
       return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -134,7 +134,7 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrawOp *op) {
-    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", true))
       return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -153,7 +153,7 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrlwOp *op) {
-    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", true))
       return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -172,7 +172,7 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SraOp *op) {
-    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", true))
       return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -191,7 +191,7 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SrlOp *op) {
-    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", true))
       return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -210,7 +210,7 @@ void InstCombine::run() {
   });
 
   runRewriter([&](SllOp *op) {
-    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", false))
+    if (!getenvEnabled("SISY_RV_ENABLE_SHIFT_IMM_COMBINE", true))
       return false;
     auto x = op->getOperand(0).defining;
     auto y = op->getOperand(1).defining;
@@ -394,9 +394,9 @@ void InstCombine::run() {
 
   runRewriter([&](AddiwOp *op) {
     if (V(op) == 0) {
-      op->replaceAllUsesWith(op->getOperand().defining);
-      op->erase();
-      return true;
+      // `addiw rd, rs, 0` sign-extends the low 32 bits on RV64; it is the
+      // canonical sext.w idiom, not a plain move.
+      return false;
     }
     //   %op   = addiw %1 <V>
     //   %addr = add %2 %op
