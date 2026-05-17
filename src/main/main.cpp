@@ -18,6 +18,7 @@
 #include "../hir/HIRBuilder.h"
 #include "../hir/HIRVerifier.h"
 #include "../hir/HIRCanonicalize.h"
+#include "../hir/HIRPolyhedral.h"
 #include "../pass/PassRegistry.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
@@ -323,6 +324,28 @@ int main(int argc, char **argv) {
                   << " dead_branches=" << stats.deadBranchesEliminated << "\n";
       }
     });
+
+    if (!cg && opts.rv) {
+      bool enableHIRPolyhedral = true;
+      if (const char *env = std::getenv("SISY_DISABLE_HIR_POLYHEDRAL"))
+        enableHIRPolyhedral = !(env[0] && std::strcmp(env, "0") != 0);
+      if (enableHIRPolyhedral) {
+        runStage("hir.polyhedral", [&]() {
+          sys::hir::PolyhedralOptimizer polyhedral;
+          auto stats = polyhedral.run(*hirModule);
+          if (const char *dumpAfterPoly = std::getenv("SISY_DUMP_HIR_AFTER_POLY")) {
+            if (dumpAfterPoly[0] && std::strcmp(dumpAfterPoly, "0") != 0) {
+              std::cerr << "===== HIR after polyhedral =====\n";
+              sys::hir::dump(*hirModule, std::cerr);
+            }
+          }
+          if (opts.verbose || opts.stats) {
+            std::cerr << "[hir-poly] reduction-jammed=" << stats.reductionJammed
+                      << " rejected=" << stats.rejected << "\n";
+          }
+        });
+      }
+    }
 
     if (opts.verifyHIR) {
       runStage("hir.verify.post", [&]() {
