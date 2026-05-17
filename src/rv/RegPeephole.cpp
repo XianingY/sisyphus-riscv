@@ -56,6 +56,59 @@ int getStackArgIndex(const std::vector<Value::Type> &types, int index) {
   return -1;
 }
 
+template <typename BranchTy, typename InverseBranchTy>
+bool rotateFallthroughLoop(BranchTy *op, Builder &builder) {
+  if (!op->template has<TargetAttr>() || op->template has<ElseAttr>())
+    return false;
+  auto header = op->getParent();
+  auto exit = op->template get<TargetAttr>()->bb;
+
+  auto &blocks = header->getParent()->getBlocks();
+  auto headerIt = blocks.begin();
+  for (; headerIt != blocks.end() && *headerIt != header; ++headerIt) {}
+  if (headerIt == blocks.end())
+    return false;
+
+  if (headerIt != blocks.begin()) {
+    auto prevIt = headerIt;
+    --prevIt;
+    auto prev = *prevIt;
+    if (prev->getOpCount() == 0)
+      return false;
+    auto prevTerm = prev->getLastOp();
+    if (!isa<JOp>(prevTerm) && !isa<RetOp>(prevTerm))
+      return false;
+  }
+
+  auto bodyIt = headerIt;
+  ++bodyIt;
+  if (bodyIt == blocks.end())
+    return false;
+  auto body = *bodyIt;
+  auto afterBodyIt = bodyIt;
+  ++afterBodyIt;
+
+  if (!exit || body == exit)
+    return false;
+  if (afterBodyIt == blocks.end() || *afterBodyIt != exit)
+    return false;
+  auto bodyTerm = body->getLastOp();
+  if (!bodyTerm || !isa<JOp>(bodyTerm) ||
+      bodyTerm->template get<TargetAttr>()->bb != header)
+    return false;
+  if (!op->template has<RsAttr>() || !op->template has<Rs2Attr>())
+    return false;
+
+  body->moveBefore(header);
+  bodyTerm->erase();
+  builder.replace<InverseBranchTy>(op, std::vector<Attr*> {
+    op->template get<RsAttr>(),
+    op->template get<Rs2Attr>(),
+    new TargetAttr(body),
+  });
+  return true;
+}
+
 }
 
 #define CREATE_MV(fp, rd, rs) \
@@ -732,6 +785,27 @@ void RegAlloc::tidyup(Region *region) {
   REPLACE_BRANCH(BltOp, BgeOp);
   REPLACE_BRANCH(BeqOp, BneOp);
   REPLACE_BRANCH(BleOp, BgtOp);
+
+  {
+    auto blocks = region->getBlocks();
+    for (auto bb : blocks) {
+      if (!bb || bb->getOpCount() == 0)
+        continue;
+      auto term = bb->getLastOp();
+      if (auto op = dyn_cast<BgeOp>(term))
+        changed |= rotateFallthroughLoop<BgeOp, BltOp>(op, builder);
+      else if (auto op = dyn_cast<BltOp>(term))
+        changed |= rotateFallthroughLoop<BltOp, BgeOp>(op, builder);
+      else if (auto op = dyn_cast<BgtOp>(term))
+        changed |= rotateFallthroughLoop<BgtOp, BleOp>(op, builder);
+      else if (auto op = dyn_cast<BleOp>(term))
+        changed |= rotateFallthroughLoop<BleOp, BgtOp>(op, builder);
+      else if (auto op = dyn_cast<BeqOp>(term))
+        changed |= rotateFallthroughLoop<BeqOp, BneOp>(op, builder);
+      else if (auto op = dyn_cast<BneOp>(term))
+        changed |= rotateFallthroughLoop<BneOp, BeqOp>(op, builder);
+    }
+  }
 
   auto inRange12 = [](int x) { return x > -2048 && x < 2048; };
   auto legalizeLargeMemOffsets = [&]() {
