@@ -387,7 +387,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::View>();
     pm.addPass<sys::LoopDCE>();
     pm.addPass<sys::TidyMemory>();
-    if (aggressive) {
+    if (aggressive || getenvEnabled("SISY_ENABLE_O1_FUSION", false)) {
       pm.addPass<sys::Fusion>();
     }
     // Repeat Unswitch after simplification to expose later loop cleanup.
