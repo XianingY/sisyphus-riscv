@@ -296,114 +296,100 @@ void LoopTiling::run() {
     return;
 
   int tileSize = envInt("SISY_TILE_SIZE", kDefaultTileSize);
+  int maxRounds = envInt("SISY_TILE_ROUNDS", 3);
 
-  for (auto func : collectFuncs())
-    func->getRegion()->updatePreds();
+  // Run multiple rounds to handle deeper nests (tile from inside out).
+  for (int round = 0; round < maxRounds; round++) {
+    for (auto func : collectFuncs())
+      func->getRegion()->updatePreds();
 
-  LoopAnalysis analysis(module);
-  analysis.run();
+    LoopAnalysis analysis(module);
+    analysis.run();
 
-  for (auto &[func, forest] : analysis.getResult()) {
-    for (auto loop : forest.getLoops()) {
-      // Only process top-level loops (not already inside another loop)
-      if (loop->parent)
-        continue;
+    bool changed = false;
 
-      // Relax: check if the loop has an induction variable at all
-      if (!loop->getInduction())
-        continue;
-      if (!loop->preheader || loop->latches.size() != 1 || loop->exits.size() != 1)
-        continue;
-
-      // Check for subloops (need at least 1 for a 2-level nest)
-      if (loop->subloops.empty())
-        continue;
-
-      // Try canonical unit loop
-      if (!isCanonicalUnitLoop(loop)) {
-        rejectedShape++;
-        continue;
-      }
-
-      // Check if this is a 2+ level perfect nest
-      if (loop->subloops.size() != 1) {
-        rejectedShape++;
-        continue;
-      }
-      auto inner = loop->subloops[0];
-      if (!isCanonicalUnitLoop(inner)) {
-        rejectedShape++;
-        continue;
-      }
-      if (!isPerfectSubNest(loop, inner)) {
-        rejectedShape++;
-        continue;
-      }
-
-      // Don't tile if inner has further subloops (too complex)
-      if (!inner->subloops.empty()) {
-        rejectedShape++;
-        continue;
-      }
-
-      // Don't tile if inner loop header has extra phis (reductions etc.)
-      {
-        auto innerPhis = inner->header->getPhis();
-        int phiCount = 0;
-        for (auto phi : innerPhis) { (void)phi; phiCount++; }
-        if (phiCount > 1) { // more than just the IV phi
-          rejectedShape++;
+    for (auto &[func, forest] : analysis.getResult()) {
+      // Process innermost loops first: collect all candidate pairs.
+      // A candidate is a 2-level nest where the inner has no subloops.
+      for (auto loop : forest.getLoops()) {
+        if (loop->parent)
           continue;
+
+        // Walk the nest tree to find the deepest tileable pair.
+        // Use a recursive helper via worklist.
+        std::vector<LoopInfo*> worklist;
+        worklist.push_back(loop);
+
+        while (!worklist.empty()) {
+          auto cur = worklist.back();
+          worklist.pop_back();
+
+          if (!isCanonicalUnitLoop(cur))
+            continue;
+          if (cur->subloops.size() != 1)
+            continue;
+          auto inner = cur->subloops[0];
+
+          // If inner has subloops, try deeper first.
+          if (!inner->subloops.empty()) {
+            worklist.push_back(inner);
+            continue;
+          }
+
+          // inner has no subloops — this is a tileable 2-level pair.
+          if (!isCanonicalUnitLoop(inner))
+            continue;
+          if (!isPerfectSubNest(cur, inner))
+            continue;
+
+          // Don't tile if inner or outer has extra phis
+          {
+            auto innerPhis = inner->header->getPhis();
+            int phiCount = 0;
+            for (auto phi : innerPhis) { (void)phi; phiCount++; }
+            if (phiCount > 1) continue;
+
+            auto outerPhis = cur->header->getPhis();
+            int outerPhiCount = 0;
+            for (auto phi : outerPhis) { (void)phi; outerPhiCount++; }
+            if (outerPhiCount > 1) continue;
+
+            auto outerIV = cur->getInduction();
+            if (!outerIV || outerIV->getOperandCount() != 2)
+              continue;
+          }
+
+          candidates++;
+
+          if (!isTilingSafe(cur, inner)) {
+            rejectedShape++;
+            continue;
+          }
+
+          int trip = estimateTrip(cur);
+          if (trip > 0 && trip < kMinTripForTiling) {
+            rejectedProfit++;
+            continue;
+          }
+
+          if (applyStripMine(cur, tileSize)) {
+            tiled++;
+            changed = true;
+            break; // Re-run analysis after modifying
+          } else {
+            rejectedShape++;
+          }
         }
-        // Also check outer loop header
-        auto outerPhis = loop->header->getPhis();
-        int outerPhiCount = 0;
-        for (auto phi : outerPhis) { (void)phi; outerPhiCount++; }
-        if (outerPhiCount > 1) {
-          rejectedShape++;
-          continue;
-        }
-        // IV phi must have exactly 2 operands
-        auto outerIV = loop->getInduction();
-        if (!outerIV || outerIV->getOperandCount() != 2) {
-          rejectedShape++;
-          continue;
-        }
+
+        if (changed) break;
       }
 
-      candidates++;
-
-      // Safety check
-      if (!isTilingSafe(loop, inner)) {
-        rejectedShape++;
-        continue;
-      }
-
-      // Only tile when outer trip count is known-large or runtime (assumed large)
-      int outerTrip = estimateTrip(loop);
-      // outerTrip==0 means runtime bound (assume large enough)
-      // outerTrip>0 but < threshold means known-small (skip)
-      if (outerTrip > 0 && outerTrip < kMinTripForTiling) {
-        rejectedProfit++;
-        continue;
-      }
-
-      // Safety check
-      if (!isTilingSafe(loop, inner)) {
-        rejectedShape++;
-        continue;
-      }
-
-      // Apply strip-mining to the outer loop
-      if (applyStripMine(loop, tileSize)) {
-        tiled++;
-      } else {
-        rejectedShape++;
-      }
+      if (changed) break;
     }
+
+    if (!changed) break;
   }
 
-  // Update predecessors after transformation
   for (auto func : collectFuncs())
     func->getRegion()->updatePreds();
 }
