@@ -14,7 +14,7 @@ std::map<std::string, int> LoweredTCO::stats() {
 namespace {
 
 bool isSupportedArgType(Value::Type ty) {
-  return ty == Value::i32;
+  return ty == Value::i32 || ty == Value::i64;
 }
 
 int valueSize(Value::Type ty) {
