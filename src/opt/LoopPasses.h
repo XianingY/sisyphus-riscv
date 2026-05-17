@@ -224,6 +224,21 @@ public:
   void run() override;
 };
 
+// Loop tiling (strip-mining) for cache locality improvement.
+// Wraps a loop with a tile-level outer loop iterating in steps of T.
+class LoopTiling : public Pass {
+  int candidates = 0;
+  int tiled = 0;
+  int rejectedShape = 0;
+  int rejectedProfit = 0;
+public:
+  LoopTiling(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "loop-tiling"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Promotes loop-invariant load/store patterns to scalar registers.
 // For loops where the same address is repeatedly loaded, computed on, and stored,
 // this pass hoists the load to the preheader, replaces in-loop accesses with a phi,

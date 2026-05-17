@@ -227,6 +227,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
       pm.addPass<sys::LoopInterchange>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_LOOP_TILING", true))
+      pm.addPass<sys::LoopTiling>();
     if (enablePrivatizeReduction)
       pm.addPass<sys::PrivatizeReduction>();
     // Early Unswitch before first LICM is useful for invariant branches at O1.

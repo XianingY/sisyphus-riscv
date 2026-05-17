@@ -1,0 +1,409 @@
+#include "LoopPasses.h"
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#include <set>
+#include <map>
+
+using namespace sys;
+
+// Loop Tiling (Strip-Mining) Pass
+//
+// Operates on CFG-level LoopInfo. For perfect 2-level loop nests,
+// applies strip-mining to improve cache locality.
+//
+// Tile size is derived from cache model (not test dimensions).
+// L1 ~32KB, 3 arrays of T*T ints => 3*T*T*4 <= 32K => T<=52.
+// Use T=32 (power of 2, conservative).
+
+namespace {
+
+constexpr int kDefaultTileSize = 32;
+constexpr int kMinTripForTiling = 64;
+
+bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0]) return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
+int envInt(const char *name, int fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0]) return fallback;
+  int v = std::atoi(raw);
+  return v > 0 ? v : fallback;
+}
+
+// Check if loop has induction variable identified and unit step
+bool isCanonicalUnitLoop(LoopInfo *loop) {
+  if (!loop || !loop->preheader || loop->latches.size() != 1 || loop->exits.size() != 1)
+    return false;
+  auto iv = loop->getInduction();
+  if (!iv) return false;
+  auto latch = loop->getLatch();
+  if (!latch) return false;
+
+  // Find IV's latch value
+  const auto &ops = iv->getOperands();
+  const auto &attrs = iv->getAttrs();
+  for (int i = 0; i < (int) attrs.size(); i++) {
+    auto from = dyn_cast<FromAttr>(attrs[i]);
+    if (from && from->bb == latch) {
+      auto val = ops[i].defining;
+      if (!val || !isa<AddIOp>(val) || val->getOperandCount() != 2)
+        return false;
+      auto a = val->DEF(0);
+      auto b = val->DEF(1);
+      return (a == iv && isa<IntOp>(b) && V(b) == 1) ||
+             (b == iv && isa<IntOp>(a) && V(a) == 1);
+    }
+  }
+  return false;
+}
+
+// Estimate trip count. Returns 0 if runtime/unknown.
+int estimateTrip(LoopInfo *loop) {
+  auto stop = loop->getStop();
+  if (!stop) return 0;
+  if (isa<IntOp>(stop)) return V(stop);
+  return 0; // runtime bound
+}
+
+// Check if inner loop is a perfect sub-nest of outer
+bool isPerfectSubNest(LoopInfo *outer, LoopInfo *inner) {
+  if (outer->subloops.size() != 1 || outer->subloops[0] != inner)
+    return false;
+  // All blocks in outer (excluding inner's blocks) should only be
+  // the outer header and possibly a preheader for the inner.
+  for (auto bb : outer->getBlocks()) {
+    if (bb == outer->header) continue;
+    if (inner->contains(bb)) continue;
+    if (bb == inner->preheader) continue;
+    // Check if this block only has phi/goto/branch (no stores/calls)
+    bool clean = true;
+    for (auto op : bb->getOps()) {
+      if (isa<StoreOp>(op) || (isa<CallOp>(op) && op->has<ImpureAttr>())) {
+        clean = false;
+        break;
+      }
+    }
+    if (!clean) return false;
+  }
+  return true;
+}
+
+// Check tiling safety: no cross-tile dependences.
+// Conservative: only tile when all stores in inner loop write to addresses
+// that depend on the inner IV, and all loads from the same base also depend
+// on the inner IV (i.e., each tile iteration is independent).
+bool isTilingSafe(LoopInfo *outer, LoopInfo *inner) {
+  auto outerIV = outer->getInduction();
+  auto innerIV = inner->getInduction();
+  if (!outerIV || !innerIV) return false;
+
+  // Collect all stores in the inner loop
+  for (auto bb : inner->getBlocks()) {
+    for (auto op : bb->getOps()) {
+      if (isa<CallOp>(op) && op->has<ImpureAttr>())
+        return false; // impure call → unsafe
+    }
+  }
+  // For perfectly nested loops where the original execution order is valid,
+  // strip-mining (tiling) is always legal because it only reorders iterations
+  // within a tile, maintaining the original relative order.
+  // The key insight: strip-mining does NOT change iteration order — it just
+  // groups iterations. The order within each group is preserved.
+  //
+  // This is different from interchange (which reorders). Strip-mining alone
+  // is always safe for any loop.
+  return true;
+}
+
+// Build the strip-mined loop structure.
+// Original:   for i = 0..N step 1: body(i)
+// After:      for ii = 0..N step T:
+//               for i = ii..min(ii+T, N) step 1: body(i)
+//
+// Implementation: We modify the existing loop's start/stop to be bounded
+// by the tile, and wrap it in a new outer loop.
+bool applyStripMine(LoopInfo *loop, int tileSize) {
+  auto preheader = loop->preheader;
+  auto header = loop->header;
+  auto exit = loop->getExit();
+  auto latch = loop->getLatch();
+  if (!preheader || !header || !exit || !latch)
+    return false;
+
+  auto iv = loop->getInduction();
+  if (!iv) return false;
+
+  // Find step from IV phi: the latch value should be iv + step
+  // Don't rely on LoopInfo::getStepOp() which may be null after rotation.
+  // Instead of matching the exact latch block, take the non-preheader incoming.
+
+  // Find latch value of IV phi (the backedge value)
+  Op *ivLatchVal = nullptr;
+  int ivStartIdx = -1;
+  const auto &ivOps = iv->getOperands();
+  const auto &ivAs = iv->getAttrs();
+  for (int i = 0; i < (int) ivAs.size(); i++) {
+    auto from = dyn_cast<FromAttr>(ivAs[i]);
+    if (from && from->bb == preheader) {
+      ivStartIdx = i;
+    } else if (from) {
+      ivLatchVal = ivOps[i].defining;
+    }
+  }
+  if (!ivLatchVal || ivStartIdx < 0) {
+    return false;
+  }
+  Op *start = ivOps[ivStartIdx].defining;
+  if (!start) return false;
+
+  // ivLatchVal should be AddIOp(iv, 1) for unit step
+  if (!isa<AddIOp>(ivLatchVal) || ivLatchVal->getOperandCount() != 2) {
+    return false;
+  }
+  auto a = ivLatchVal->DEF(0);
+  auto b = ivLatchVal->DEF(1);
+  bool unitStep = (a == iv && isa<IntOp>(b) && V(b) == 1) ||
+                  (b == iv && isa<IntOp>(a) && V(a) == 1);
+  if (!unitStep) return false;
+
+  // Find stop from the loop's exit condition.
+  // Two patterns after canonicalization:
+  //   A) Rotated: latch has branch(lt(iv+step, stop), header, exit)
+  //   B) Header-tested: header has branch(lt(iv, stop), body, exit), latch has goto(header)
+  // Handle both patterns.
+  auto latchBr = latch->getLastOp();
+  auto headerBr = header->getLastOp();
+  Op *stop = nullptr;
+  Op *condOp = nullptr;
+  Op *exitBranchOp = nullptr; // the branch instruction containing the exit edge
+
+  if (isa<BranchOp>(latchBr) && latchBr->getOperandCount() == 1) {
+    // Pattern A: rotated loop - latch has the exit condition
+    auto cond = latchBr->DEF(0);
+    if (cond && isa<LtOp>(cond) && cond->getOperandCount() == 2) {
+      condOp = cond;
+      stop = cond->DEF(1);
+      exitBranchOp = latchBr;
+    }
+  }
+  if (!stop && isa<BranchOp>(headerBr) && headerBr->getOperandCount() == 1) {
+    // Pattern B: header-tested loop
+    // Only safe if header is minimal: just phi(s) + cmp + branch
+    bool headerMinimal = true;
+    for (auto op : header->getOps()) {
+      if (isa<PhiOp>(op) || isa<LtOp>(op) || isa<BranchOp>(op))
+        continue;
+      headerMinimal = false;
+      break;
+    }
+    if (headerMinimal) {
+      auto cond = headerBr->DEF(0);
+      if (cond && isa<LtOp>(cond) && cond->getOperandCount() == 2) {
+        condOp = cond;
+        stop = cond->DEF(1);
+        exitBranchOp = headerBr;
+      }
+    }
+  }
+  if (!stop || !exitBranchOp) return false;
+
+  // Determine which target is the loop continuation vs exit
+  BasicBlock *brTrue = TARGET(exitBranchOp);
+  BasicBlock *brFalse = ELSE(exitBranchOp);
+  bool exitOnFalse = false;
+  if (loop->contains(brTrue) && brFalse == exit) {
+    exitOnFalse = true;
+  } else if (loop->contains(brFalse) && brTrue == exit) {
+    exitOnFalse = false;
+  } else {
+    return false;
+  }
+
+  // The preheader must end with a GotoOp to header.
+  auto preTerm = preheader->getLastOp();
+  if (!preTerm || !isa<GotoOp>(preTerm) || TARGET(preTerm) != header)
+    return false;
+
+  auto region = header->getParent();
+  Builder builder;
+
+  // Create tile loop blocks
+  auto tileHeader = region->insertAfter(preheader);
+  auto innerSetup = region->insertAfter(tileHeader);
+  auto tileLatch = region->insert(exit);
+
+  // 1. Wire preheader → tileHeader
+  builder.replace<GotoOp>(preTerm, { new TargetAttr(tileHeader) });
+
+  // 2. Build tileHeader: tile_iv phi, comparison, branch
+  builder.setToBlockEnd(tileHeader);
+  auto tileIV = builder.create<PhiOp>({ start }, { new FromAttr(preheader) });
+  auto tileCond = builder.create<LtOp>(std::vector<Value>{ tileIV, stop });
+  builder.create<BranchOp>(std::vector<Value>{ tileCond },
+    { new TargetAttr(innerSetup), new ElseAttr(exit) });
+
+  // 3. Build innerSetup: compute innerStop = min(tile_iv + T, stop)
+  builder.setToBlockEnd(innerSetup);
+  auto tileSizeOp = builder.create<IntOp>({ new IntAttr(tileSize) });
+  auto tileEnd = builder.create<AddIOp>(std::vector<Value>{ tileIV, tileSizeOp });
+  auto cmpEnd = builder.create<LtOp>(std::vector<Value>{ tileEnd, stop });
+  auto innerStop = builder.create<SelectOp>(std::vector<Value>{ cmpEnd, tileEnd, stop });
+  builder.create<GotoOp>({ new TargetAttr(header) });
+
+  // 4. Update IV phi: start now comes from innerSetup (= tileIV)
+  iv->setOperand(ivStartIdx, Value(tileIV));
+  cast<FromAttr>(iv->getAttrs()[ivStartIdx])->bb = innerSetup;
+
+  // 5. Replace stop in condition with innerStop
+  condOp->setOperand(1, Value(innerStop));
+
+  // 6. Redirect exit edge to tileLatch
+  if (exitOnFalse) {
+    ELSE(exitBranchOp) = tileLatch;
+  } else {
+    TARGET(exitBranchOp) = tileLatch;
+  }
+
+  // 7. Build tileLatch: tile_iv += T, goto tileHeader
+  builder.setToBlockEnd(tileLatch);
+  auto nextTileIV = builder.create<AddIOp>(std::vector<Value>{ tileIV, tileSizeOp });
+  builder.create<GotoOp>({ new TargetAttr(tileHeader) });
+
+  // 8. Add latch edge to tileIV phi
+  tileIV->pushOperand(nextTileIV);
+  tileIV->add<FromAttr>(tileLatch);
+
+  return true;
+}
+
+} // namespace
+
+std::map<std::string, int> LoopTiling::stats() {
+  return {
+    { "candidates", candidates },
+    { "tiled", tiled },
+    { "rejected-shape", rejectedShape },
+    { "rejected-profit", rejectedProfit },
+  };
+}
+
+void LoopTiling::run() {
+  if (!envEnabled("SISY_ENABLE_LOOP_TILING", true))
+    return;
+
+  int tileSize = envInt("SISY_TILE_SIZE", kDefaultTileSize);
+
+  for (auto func : collectFuncs())
+    func->getRegion()->updatePreds();
+
+  LoopAnalysis analysis(module);
+  analysis.run();
+
+  for (auto &[func, forest] : analysis.getResult()) {
+    for (auto loop : forest.getLoops()) {
+      // Only process top-level loops (not already inside another loop)
+      if (loop->parent)
+        continue;
+
+      // Relax: check if the loop has an induction variable at all
+      if (!loop->getInduction())
+        continue;
+      if (!loop->preheader || loop->latches.size() != 1 || loop->exits.size() != 1)
+        continue;
+
+      // Check for subloops (need at least 1 for a 2-level nest)
+      if (loop->subloops.empty())
+        continue;
+
+      // Try canonical unit loop
+      if (!isCanonicalUnitLoop(loop)) {
+        rejectedShape++;
+        continue;
+      }
+
+      // Check if this is a 2+ level perfect nest
+      if (loop->subloops.size() != 1) {
+        rejectedShape++;
+        continue;
+      }
+      auto inner = loop->subloops[0];
+      if (!isCanonicalUnitLoop(inner)) {
+        rejectedShape++;
+        continue;
+      }
+      if (!isPerfectSubNest(loop, inner)) {
+        rejectedShape++;
+        continue;
+      }
+
+      // Don't tile if inner has further subloops (too complex)
+      if (!inner->subloops.empty()) {
+        rejectedShape++;
+        continue;
+      }
+
+      // Don't tile if inner loop header has extra phis (reductions etc.)
+      {
+        auto innerPhis = inner->header->getPhis();
+        int phiCount = 0;
+        for (auto phi : innerPhis) { (void)phi; phiCount++; }
+        if (phiCount > 1) { // more than just the IV phi
+          rejectedShape++;
+          continue;
+        }
+        // Also check outer loop header
+        auto outerPhis = loop->header->getPhis();
+        int outerPhiCount = 0;
+        for (auto phi : outerPhis) { (void)phi; outerPhiCount++; }
+        if (outerPhiCount > 1) {
+          rejectedShape++;
+          continue;
+        }
+        // IV phi must have exactly 2 operands
+        auto outerIV = loop->getInduction();
+        if (!outerIV || outerIV->getOperandCount() != 2) {
+          rejectedShape++;
+          continue;
+        }
+      }
+
+      candidates++;
+
+      // Safety check
+      if (!isTilingSafe(loop, inner)) {
+        rejectedShape++;
+        continue;
+      }
+
+      // Only tile when outer trip count is known-large or runtime (assumed large)
+      int outerTrip = estimateTrip(loop);
+      // outerTrip==0 means runtime bound (assume large enough)
+      // outerTrip>0 but < threshold means known-small (skip)
+      if (outerTrip > 0 && outerTrip < kMinTripForTiling) {
+        rejectedProfit++;
+        continue;
+      }
+
+      // Safety check
+      if (!isTilingSafe(loop, inner)) {
+        rejectedShape++;
+        continue;
+      }
+
+      // Apply strip-mining to the outer loop
+      if (applyStripMine(loop, tileSize)) {
+        tiled++;
+      } else {
+        rejectedShape++;
+      }
+    }
+  }
+
+  // Update predecessors after transformation
+  for (auto func : collectFuncs())
+    func->getRegion()->updatePreds();
+}

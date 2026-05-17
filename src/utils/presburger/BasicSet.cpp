@@ -156,3 +156,23 @@ void BasicSet::dump(std::ostream &os) {
     os << "\n";
   }
 }
+
+BasicSet BasicSet::intersect(const BasicSet &other) const {
+  std::vector<AffineExpr> combined;
+  combined.reserve(tableau.size() + other.tableau.size());
+  for (const auto &row : tableau)
+    combined.push_back(row);
+  for (const auto &row : other.tableau)
+    combined.push_back(row);
+  return BasicSet(combined);
+}
+
+int BasicSet::numVars() const {
+  if (tableau.empty())
+    return 0;
+  return (int) tableau[0].size() - 1;
+}
+
+void BasicSet::addConstraint(const AffineExpr &row) {
+  tableau.push_back(row);
+}
