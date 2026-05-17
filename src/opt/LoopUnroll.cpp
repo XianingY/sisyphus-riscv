@@ -442,7 +442,7 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
 
   auto runtimeUnrollEnabled = []() {
     auto env = std::getenv("SISY_ENABLE_RUNTIME_UNROLL");
-    return env && std::strcmp(env, "1") == 0;
+    return !env || std::strcmp(env, "0") != 0;
   };
 
   auto estimateUpperBound = [](Op* expr) -> int64_t {
