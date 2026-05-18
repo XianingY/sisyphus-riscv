@@ -243,6 +243,78 @@ ReductionPattern matchReductionPattern(LoopInfo *outer) {
   return pat;
 }
 
+// Block cloning utility.
+// Clones the given set of blocks into the same region (right before `insertBefore`).
+// Maintains SSA: operands within the cloned region are remapped.
+// Returns: blockMap (old → new) and opMap (old → new).
+struct CloneResult {
+  std::map<BasicBlock*, BasicBlock*> blockMap;
+  std::map<Op*, Op*> opMap;
+};
+
+CloneResult cloneBlocks(const std::vector<BasicBlock*> &blocks, BasicBlock *insertBefore) {
+  CloneResult result;
+  if (blocks.empty()) return result;
+
+  auto region = blocks[0]->getParent();
+  Builder builder;
+
+  // Step 1: create empty new blocks
+  BasicBlock *prev = insertBefore;
+  for (auto bb : blocks) {
+    auto newbb = region->insert(prev);
+    result.blockMap[bb] = newbb;
+    prev = insertBefore; // always insert before the same anchor
+  }
+
+  // Step 2: copy ops into new blocks (without rewiring operands yet)
+  for (auto [oldBB, newBB] : result.blockMap) {
+    builder.setToBlockEnd(newBB);
+    for (auto op : oldBB->getOps()) {
+      auto copied = builder.copy(op);
+      result.opMap[op] = copied;
+    }
+  }
+
+  // Step 3: remap operands in cloned ops
+  for (auto [oldOp, newOp] : result.opMap) {
+    (void) oldOp;
+    auto operands = newOp->getOperands();
+    newOp->removeAllOperands();
+    for (auto operand : operands) {
+      auto def = operand.defining;
+      if (result.opMap.count(def)) {
+        newOp->pushOperand(result.opMap[def]);
+      } else {
+        newOp->pushOperand(operand);
+      }
+    }
+  }
+
+  // Step 4: remap branch targets (TargetAttr / ElseAttr) to cloned blocks
+  for (auto [oldBB, newBB] : result.blockMap) {
+    (void) oldBB;
+    auto term = newBB->getLastOp();
+    if (!term) continue;
+    if (auto target = term->find<TargetAttr>(); target && result.blockMap.count(target->bb))
+      target->bb = result.blockMap[target->bb];
+    if (auto els = term->find<ElseAttr>(); els && result.blockMap.count(els->bb))
+      els->bb = result.blockMap[els->bb];
+  }
+
+  // Step 5: remap phi FromAttrs to cloned predecessor blocks
+  for (auto [oldOp, newOp] : result.opMap) {
+    (void) oldOp;
+    if (!isa<PhiOp>(newOp)) continue;
+    for (auto attr : newOp->getAttrs()) {
+      if (auto from = dyn_cast<FromAttr>(attr); from && result.blockMap.count(from->bb))
+        from->bb = result.blockMap[from->bb];
+    }
+  }
+
+  return result;
+}
+
 } // namespace
 
 std::map<std::string, int> ReductionInterchange::stats() {
@@ -277,7 +349,43 @@ void ReductionInterchange::run() {
       }
 
       candidates++;
-      // Phase 1: detection only. Phase 2+ will implement the transformation.
+      // Phase 1: detection only.
+      //
+      // Phase 2-6 implementation plan (each ~300-500 lines, requires
+      // extensive QEMU verification after each step):
+      //
+      // Phase 2: Clone j loop blocks for inner-j position
+      //   - Use a block map to clone all blocks in j's loop body (excluding
+      //     k's blocks). Maintain SSA: cloned ops reference cloned operands.
+      //   - The cloned j becomes the new "inner j" inside the swapped k loop.
+      //
+      // Phase 3: Clone k loop blocks for outer-k position
+      //   - Clone k's header, body, and latch as the new "outer k" loop.
+      //   - The cloned k's body inserts the cloned j as its inner.
+      //
+      // Phase 4: Build init loop
+      //   - Create a new for-j loop before the swapped structure.
+      //   - Body: load address A[g(j)], store IntOp(0) to it.
+      //   - Reuse j's bounds (start, stop, step) — same iteration count.
+      //
+      // Phase 5: Replace reduction phi with load-modify-store
+      //   - In the cloned inner j body (where k's reduction was):
+      //     * Insert load A[g(j)] at the start
+      //     * Replace redPhi uses with the load result
+      //     * Insert store of (load + f(j,k)) at the end
+      //     * Remove redPhi and final redStore
+      //
+      // Phase 6: Wire CFG
+      //   - Rewire i-body's start to point to the init loop
+      //   - Rewire init loop's exit to outer-k preheader
+      //   - Rewire outer-k's exit to i-latch
+      //   - Erase original j loop and its reduction store
+      //   - Update all phi incoming edges to reflect new predecessors
+      //
+      // Risk: each phase introduces a window where IR is invalid. A single
+      // bug in phi rewiring causes silent miscompilation. Recommended approach
+      // is to use a "build new, delete old" pattern with full IR verification
+      // after the build step.
     }
   }
 }
