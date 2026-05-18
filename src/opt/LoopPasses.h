@@ -239,6 +239,21 @@ public:
   void run() override;
 };
 
+// Reduction-aware loop interchange.
+// Transforms i-j-k loops with a reduction in j (storing temp to A[g(j)])
+// into i-k-j by distributing the reduction.
+class ReductionInterchange : public Pass {
+  int candidates = 0;
+  int interchanged = 0;
+  int rejectedShape = 0;
+public:
+  ReductionInterchange(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "reduction-interchange"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Promotes loop-invariant load/store patterns to scalar registers.
 // For loops where the same address is repeatedly loaded, computed on, and stored,
 // this pass hoists the load to the preheader, replaces in-loop accesses with a phi,
