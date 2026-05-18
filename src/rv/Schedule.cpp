@@ -1,0 +1,305 @@
+#include "RvPasses.h"
+#include "../opt/Analysis.h"
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <list>
+#include <climits>
+
+using namespace sys;
+using namespace sys::rv;
+
+// Pre-RA Instruction Scheduling for RV ops.
+//
+// Reorders instructions within basic blocks to hide pipeline latencies:
+//   - Load: ~3 cycles to result available
+//   - Multiply: ~3 cycles
+//   - Divide/Remainder: ~30+ cycles (variable)
+//   - Most ALU: 1 cycle
+//
+// Uses list scheduling with a goodness heuristic that prefers:
+//   1. Producers of high-latency operations (start them early)
+//   2. Operations that consume high-latency results that are now ready
+//   3. Pure address computations (small) over loads (delay loads)
+//
+// Respects:
+//   - Memory dependencies (load-after-store, store-after-load, store-after-store)
+//   - Register dependencies (data flow)
+//   - Pinned operations (calls with side effects, write_reg/read_reg pairs)
+
+namespace {
+
+bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0]) return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
+// Latency model for RV ops (cycles until result is available)
+int latency(Op *op) {
+  if (isa<rv::LoadOp>(op) || isa<FldOp>(op))
+    return 3;
+  if (isa<MulOp>(op) || isa<MulwOp>(op) || isa<MulhOp>(op) || isa<MulhuOp>(op))
+    return 3;
+  if (isa<DivOp>(op) || isa<DivwOp>(op) || isa<RemOp>(op) || isa<RemwOp>(op))
+    return 20;
+  if (isa<FmulOp>(op) || isa<FdivOp>(op))
+    return 4;
+  return 1;
+}
+
+// Is this op a memory operation we need to track for ordering?
+bool isMemoryOp(Op *op) {
+  return isa<rv::LoadOp>(op) || isa<rv::StoreOp>(op) || isa<FldOp>(op) || isa<FsdOp>(op);
+}
+
+bool isStore(Op *op) {
+  return isa<rv::StoreOp>(op) || isa<FsdOp>(op);
+}
+
+bool isLoad(Op *op) {
+  return isa<rv::LoadOp>(op) || isa<FldOp>(op);
+}
+
+// Get the address operand of a memory op.
+// LoadOp: address is the only / first operand
+// StoreOp: operand 0 is value, operand 1 is address
+Op *getMemAddr(Op *op) {
+  if (isa<rv::LoadOp>(op) || isa<FldOp>(op))
+    return op->getOperandCount() > 0 ? op->DEF(0) : nullptr;
+  if (isa<rv::StoreOp>(op) || isa<FsdOp>(op))
+    return op->getOperandCount() > 1 ? op->DEF(1) : nullptr;
+  return nullptr;
+}
+
+// Pinned ops cannot be moved (they have side effects or implicit register constraints).
+bool isPinned(Op *op) {
+  return isa<rv::CallOp>(op) ||
+         isa<RetOp>(op) ||
+         isa<JOp>(op) ||
+         isa<BneOp>(op) || isa<BeqOp>(op) ||
+         isa<BltOp>(op) || isa<BgeOp>(op) ||
+         isa<BleOp>(op) || isa<BgtOp>(op) ||
+         isa<WriteRegOp>(op) || isa<ReadRegOp>(op) ||
+         isa<PlaceHolderOp>(op);
+}
+
+// Conservative may-alias for RV-level addresses.
+// Without high-level alias info at this stage, we use:
+//   - If both addresses have the SAME defining op, may-alias is true
+//   - If addresses differ but both come from the same base register
+//     with different constant offsets, they don't alias
+//   - Otherwise, conservatively may-alias
+bool addressMayAlias(Op *addr1, Op *addr2) {
+  if (!addr1 || !addr2) return true;
+  if (addr1 == addr2) return true;
+  // TODO: more precise alias analysis at RV level using AliasAttr
+  // For now, be conservative.
+  return true;
+}
+
+} // namespace
+
+namespace sys { namespace rv {
+
+std::map<std::string, int> Schedule::stats() {
+  return {
+    { "reordered", reordered },
+  };
+}
+
+void Schedule::runImpl(BasicBlock *bb) {
+  if (!bb || bb->getOpCount() == 0)
+    return;
+
+  // Collect all schedulable ops (skip phis, terminator, and pinned ops at boundaries).
+  auto term = bb->getLastOp();
+  if (!term)
+    return;
+
+  // Don't reorder blocks with calls or other pinned non-terminator ops at all.
+  // This is the safe-but-conservative choice for the first version.
+  for (auto op : bb->getOps()) {
+    if (op == term) continue;
+    if (isa<PhiOp>(op)) continue;
+    if (isPinned(op)) return; // bail out on calls etc.
+  }
+
+  // Build dependence DAG.
+  // For each op, count how many predecessors it depends on (degree).
+  // Memory ordering: stores can't move past stores or aliased loads/stores.
+  std::vector<Op*> stores, loads;
+  std::unordered_map<Op*, std::vector<Op*>> memDeps; // op → ops it must come after
+
+  for (auto op : bb->getOps()) {
+    if (op == term || isa<PhiOp>(op)) continue;
+
+    if (isLoad(op)) {
+      auto addr = getMemAddr(op);
+      // Load must come after any aliased store
+      for (auto s : stores) {
+        if (addressMayAlias(addr, getMemAddr(s)))
+          memDeps[op].push_back(s);
+      }
+      loads.push_back(op);
+    } else if (isStore(op)) {
+      auto addr = getMemAddr(op);
+      // Store must come after aliased prior stores and prior loads
+      for (auto s : stores) {
+        if (addressMayAlias(addr, getMemAddr(s)))
+          memDeps[op].push_back(s);
+      }
+      for (auto l : loads) {
+        if (addressMayAlias(addr, getMemAddr(l)))
+          memDeps[op].push_back(l);
+      }
+      stores.push_back(op);
+    }
+  }
+
+  // Compute degree (number of unmet dependencies).
+  std::unordered_map<Op*, int> degree;
+  std::unordered_map<Op*, std::vector<Op*>> users; // reverse map: op → ops that depend on it
+  std::unordered_set<Op*> schedulable;
+
+  for (auto op : bb->getOps()) {
+    if (op == term || isa<PhiOp>(op)) continue;
+    schedulable.insert(op);
+  }
+
+  for (auto op : schedulable) {
+    // Data dependencies: op depends on its operand definitions (if in this block)
+    for (auto operand : op->getOperands()) {
+      auto def = operand.defining;
+      if (def && schedulable.count(def)) {
+        degree[op]++;
+        users[def].push_back(op);
+      }
+    }
+    // Memory dependencies
+    for (auto pred : memDeps[op]) {
+      if (schedulable.count(pred)) {
+        degree[op]++;
+        users[pred].push_back(op);
+      }
+    }
+  }
+
+  // Initialize ready list with degree-0 ops.
+  std::list<Op*> ready;
+  for (auto op : schedulable) {
+    if (degree[op] == 0)
+      ready.push_back(op);
+  }
+
+  // Track when each op was scheduled (for latency-aware goodness).
+  std::unordered_map<Op*, int> issueTime;
+  int currentTime = 0;
+  int origCount = schedulable.size();
+
+  // Compute the original position of each op (to detect reordering).
+  std::unordered_map<Op*, int> origPos;
+  int pos = 0;
+  for (auto op : bb->getOps()) {
+    if (schedulable.count(op))
+      origPos[op] = pos++;
+  }
+
+  // Goodness function: higher is better.
+  // Priorities:
+  //   1. Operations whose operands are still in latency window get penalized
+  //      (we want to wait for them)
+  //   2. High-latency ops (loads, mul, div) get priority (start them early)
+  //   3. Stores prefer to be placed when their value is ready
+  //   4. Tie-break by original position to keep stable ordering
+  auto goodness = [&](Op *op) -> int {
+    int score = 0;
+
+    // Penalty: if any operand was scheduled recently, this op stalls.
+    for (auto operand : op->getOperands()) {
+      auto def = operand.defining;
+      auto it = issueTime.find(def);
+      if (it != issueTime.end()) {
+        int gap = currentTime - it->second;
+        int needed = latency(def);
+        if (gap < needed) {
+          // Each cycle short of latency costs us
+          score -= (needed - gap) * 4;
+        }
+      }
+    }
+
+    // Bonus: starting a high-latency op early benefits the schedule.
+    int lat = latency(op);
+    if (lat >= 3) score += lat * 2;
+
+    // Slight penalty for loads if we have many in-flight already (avoid stalls)
+    // Currently approximated by load latency bonus above.
+
+    // Prefer earlier original position for stability.
+    score -= origPos[op] / 100;
+
+    return score;
+  };
+
+  // Output ordering.
+  std::vector<Op*> newOrder;
+  newOrder.reserve(origCount);
+
+  while (!ready.empty()) {
+    // Find best op in ready list.
+    auto bestIt = ready.begin();
+    int bestScore = goodness(*bestIt);
+    for (auto it = std::next(ready.begin()); it != ready.end(); ++it) {
+      int s = goodness(*it);
+      if (s > bestScore) {
+        bestScore = s;
+        bestIt = it;
+      }
+    }
+    Op *op = *bestIt;
+    ready.erase(bestIt);
+
+    issueTime[op] = currentTime;
+    currentTime++;
+    newOrder.push_back(op);
+
+    // Wake up dependents.
+    for (auto user : users[op]) {
+      if (--degree[user] == 0)
+        ready.push_back(user);
+    }
+  }
+
+  // Sanity check: did we schedule everything?
+  if ((int) newOrder.size() != origCount)
+    return; // leave the block unchanged if something went wrong
+
+  // Apply the new ordering: move ops in newOrder to be right before term.
+  // We always apply (even if it happens to match the original) — moveBefore
+  // is idempotent for already-positioned ops.
+
+  // Move each scheduled op to be immediately before the terminator,
+  // in the order they appear in newOrder. Since moveBefore() inserts before
+  // the target, calling it in order builds the sequence.
+  for (auto op : newOrder)
+    op->moveBefore(term);
+
+  reordered++;
+}
+
+void Schedule::run() {
+  if (!envEnabled("SISY_RV_ENABLE_SCHEDULE", true))
+    return;
+
+  for (auto func : collectFuncs()) {
+    auto region = func->getRegion();
+    for (auto bb : region->getBlocks()) {
+      runImpl(bb);
+    }
+  }
+}
+
+}} // namespace sys::rv

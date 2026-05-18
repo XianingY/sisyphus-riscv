@@ -76,6 +76,8 @@ void appendRvBackend(sys::PassManager &pm, const sys::Options &opts, const Pipel
     pm.addPass<sys::rv::InstCombine>();
   pm.addPass<sys::rv::RvDCE>();
   pm.addPass<sys::GVN>();
+  if (getenvEnabled("SISY_RV_ENABLE_SCHEDULE", true))
+    pm.addPass<sys::rv::Schedule>();
   pm.addPass<sys::rv::RegAlloc>(plan.backendFastMode);
   pm.addPass<sys::rv::Dump>(opts.outputFile);
 }
