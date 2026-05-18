@@ -114,7 +114,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   // comparisons, but do not wire them into this strict competition profile.
   constexpr bool enableRvSemanticPasses = false;
   const bool enablePrivatizeReduction =
-    getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
+    getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", true);
   // "large" modules use an economy lane to cap compile-time, but "huge"
   // modules are safer with the full O1-style shrink pipeline before backend.
   // This avoids sending oversized IR to register allocation.

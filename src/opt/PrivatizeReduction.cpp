@@ -39,6 +39,13 @@ void PrivatizeReduction::runImpl(LoopInfo *L) {
     }
     
     if (ext_count != 1 || !V_init.defining) continue;
+
+    // Safety: if V_init is already 0, privatization is a no-op (safe but useless).
+    // Only transform when V_init is a non-zero constant that we can safely factor out.
+    // For now, only allow IntOp constants to avoid issues with runtime-dependent inits.
+    if (!isa<IntOp>(V_init.defining)) continue;
+    // If V_init is 0, there's nothing to privatize (already zero-initialized).
+    if (V_init.defining && isa<IntOp>(V_init.defining) && V(V_init.defining) == 0) continue;
     
     // Check if it's a pure reduction (only used in additive chains, not as address)
     std::set<Op*> S;
@@ -115,41 +122,43 @@ void PrivatizeReduction::runImpl(LoopInfo *L) {
     
     if (!ok) continue;
 
-    // Reject if any value in the reduction chain is stored to memory
-    // inside the loop. This means intermediate values are observable
-    // and zeroing the initial value would corrupt them.
-    for (auto sop : S) {
-      for (auto user : sop->getUses()) {
-        if (!L->contains(user->getParent()))
-          continue;
-        // Direct store of reduction value
-        if (isa<sys::StoreOp>(user) && user->getOperandCount() >= 2 &&
-            user->DEF(0) == sop) {
-          ok = false;
-          break;
-        }
-        // Used in address computation (AddLOp) → likely pointer, not reduction
-        if (isa<AddLOp>(user)) {
-          ok = false;
-          break;
-        }
-        // Used in a multiply that feeds a store → also observable
-        if (isa<MulIOp>(user) || isa<SubIOp>(user)) {
-          for (auto muser : user->getUses()) {
-            if (!L->contains(muser->getParent()))
-              continue;
-            if (isa<sys::StoreOp>(muser) && muser->getOperandCount() >= 2 &&
-                muser->DEF(0) == user) {
-              ok = false;
-              break;
-            }
+    // Reject if any value in the reduction chain can reach a store
+    // (as the stored value) through in-loop def-use chains.
+    // This uses BFS from each S member to check if any downstream
+    // computation within the loop produces a value that gets stored.
+    {
+      std::set<Op*> visited;
+      std::vector<Op*> reachWork;
+      for (auto sop : S)
+        reachWork.push_back(sop);
+
+      while (!reachWork.empty() && ok) {
+        auto cur = reachWork.back();
+        reachWork.pop_back();
+        if (visited.count(cur)) continue;
+        visited.insert(cur);
+
+        for (auto user : cur->getUses()) {
+          if (!L->contains(user->getParent()))
+            continue;
+          // If this value is stored to memory (as value or address), reject
+          if (isa<sys::StoreOp>(user)) {
+            ok = false;
+            break;
           }
-          if (!ok) break;
+          // If used as address for a load, it affects control flow of the reduction
+          if (isa<sys::LoadOp>(user)) {
+            ok = false;
+            break;
+          }
+          // Follow the def-use chain (any op that uses cur produces a derived value)
+          if (!S.count(user) && !visited.count(user)) {
+            reachWork.push_back(user);
+          }
         }
       }
-      if (!ok) break;
     }
-    
+
     if (!ok) continue;
     
     // Transform
