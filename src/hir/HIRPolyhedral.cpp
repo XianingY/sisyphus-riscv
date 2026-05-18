@@ -232,6 +232,70 @@ bool isAdditiveReductionUpdate(const Op *store, const std::string &acc) {
   return isScalarLoad(rhs->children[0].get(), acc) || isScalarLoad(rhs->children[1].get(), acc);
 }
 
+bool containsArrayAccessTo(const Op *op, const std::string &symbol) {
+  if (!op)
+    return false;
+  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
+      op->symbol == symbol && !op->children.empty())
+    return true;
+  for (const auto &child : op->children)
+    if (containsArrayAccessTo(child.get(), symbol))
+      return true;
+  return false;
+}
+
+bool sameArrayDestination(const Op *lhs, const Op *rhs) {
+  if (!lhs || !rhs || lhs->kind != OpKind::Store || rhs->kind != OpKind::Store)
+    return false;
+  if (lhs->symbol != rhs->symbol || lhs->children.empty() || rhs->children.empty())
+    return false;
+  size_t lhsIndexCount = lhs->children.size() - 1;
+  size_t rhsIndexCount = rhs->children.size() - 1;
+  if (lhsIndexCount != rhsIndexCount)
+    return false;
+  for (size_t i = 0; i < lhsIndexCount; i++) {
+    const Op *a = lhs->children[i].get();
+    const Op *b = rhs->children[i].get();
+    if (!a || !b || a->kind != b->kind || a->symbol != b->symbol ||
+        a->hasIntValue != b->hasIntValue || a->intValue != b->intValue ||
+        a->children.size() != b->children.size())
+      return false;
+  }
+  return true;
+}
+
+std::unique_ptr<Op> makeLoadFromStoreDestination(const Op *store) {
+  if (!store || store->kind != OpKind::Store || store->children.empty())
+    return nullptr;
+  auto load = std::make_unique<Op>(OpKind::Load, store->origin);
+  load->type = TypeKind::Int;
+  load->symbol = store->symbol;
+  for (size_t i = 0; i + 1 < store->children.size(); i++)
+    load->children.push_back(cloneOp(store->children[i].get()));
+  return load;
+}
+
+std::unique_ptr<Op> cloneReplacingScalarLoad(const Op *op, const std::string &scalar,
+                                             const Op *replacement) {
+  if (!op)
+    return nullptr;
+  if (isScalarLoad(op, scalar))
+    return cloneOp(replacement);
+
+  auto out = std::make_unique<Op>(op->kind, op->origin);
+  out->type = op->type;
+  out->traits = op->traits;
+  out->symbol = op->symbol;
+  out->hasIntValue = op->hasIntValue;
+  out->intValue = op->intValue;
+  out->hasFloatValue = op->hasFloatValue;
+  out->floatValue = op->floatValue;
+  out->arrayDims = op->arrayDims;
+  for (const auto &child : op->children)
+    out->children.push_back(cloneReplacingScalarLoad(child.get(), scalar, replacement));
+  return out;
+}
+
 std::unique_ptr<Op> cloneReplacing(const Op *op,
                                    const std::unordered_map<std::string, std::string> &scalarRenames,
                                    const std::unordered_map<std::string, int> &ivOffsets) {
