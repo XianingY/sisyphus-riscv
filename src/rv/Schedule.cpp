@@ -86,17 +86,30 @@ bool isPinned(Op *op) {
          isa<PlaceHolderOp>(op);
 }
 
-// Conservative may-alias for RV-level addresses.
-// Without high-level alias info at this stage, we use:
-//   - If both addresses have the SAME defining op, may-alias is true
-//   - If addresses differ but both come from the same base register
-//     with different constant offsets, they don't alias
-//   - Otherwise, conservatively may-alias
-bool addressMayAlias(Op *addr1, Op *addr2) {
+// May-alias check for RV-level addresses.
+// Leverages AliasAttr if present on the load/store ops themselves.
+// AliasAttr is computed pre-lowering and copied to rv::LoadOp/StoreOp during rv::Lower.
+bool addressMayAlias(Op *memOp1, Op *memOp2) {
+  if (!memOp1 || !memOp2) return true;
+  if (memOp1 == memOp2) return true;
+
+  // Check if both ops have AliasAttr
+  auto alias1 = memOp1->find<AliasAttr>();
+  auto alias2 = memOp2->find<AliasAttr>();
+
+  if (alias1 && alias2 && !alias1->unknown && !alias2->unknown) {
+    // If both have known alias info, use neverAlias check
+    if (alias1->neverAlias(alias2))
+      return false;
+  }
+
+  // Fallback: check if address operands are the same SSA value
+  Op *addr1 = getMemAddr(memOp1);
+  Op *addr2 = getMemAddr(memOp2);
   if (!addr1 || !addr2) return true;
   if (addr1 == addr2) return true;
-  // TODO: more precise alias analysis at RV level using AliasAttr
-  // For now, be conservative.
+
+  // Different address SSA values with no alias info → conservative
   return true;
 }
 
@@ -137,22 +150,20 @@ void Schedule::runImpl(BasicBlock *bb) {
     if (op == term || isa<PhiOp>(op)) continue;
 
     if (isLoad(op)) {
-      auto addr = getMemAddr(op);
       // Load must come after any aliased store
       for (auto s : stores) {
-        if (addressMayAlias(addr, getMemAddr(s)))
+        if (addressMayAlias(op, s))
           memDeps[op].push_back(s);
       }
       loads.push_back(op);
     } else if (isStore(op)) {
-      auto addr = getMemAddr(op);
       // Store must come after aliased prior stores and prior loads
       for (auto s : stores) {
-        if (addressMayAlias(addr, getMemAddr(s)))
+        if (addressMayAlias(op, s))
           memDeps[op].push_back(s);
       }
       for (auto l : loads) {
-        if (addressMayAlias(addr, getMemAddr(l)))
+        if (addressMayAlias(op, l))
           memDeps[op].push_back(l);
       }
       stores.push_back(op);

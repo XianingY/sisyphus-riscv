@@ -38,7 +38,7 @@ void PrivatizeReduction::runImpl(LoopInfo *L) {
     
     if (ext_count != 1 || !V_init.defining) continue;
     
-    // Check if it's a pure reduction
+    // Check if it's a pure reduction (only used in additive chains, not as address)
     std::set<Op*> S;
     std::vector<Op*> Q;
     S.insert(op);
@@ -54,13 +54,31 @@ void PrivatizeReduction::runImpl(LoopInfo *L) {
           continue; // Escapes, will fix later
         }
         
-        if (isa<AddIOp>(user) || isa<AddLOp>(user)) {
+        if (isa<AddIOp>(user)) {
           if (S.count(user)) continue;
           if (S.count(user->getOperand(0).defining) && S.count(user->getOperand(1).defining)) {
             ok = false; break;
           }
+          // Make sure this AddIOp is NOT used as a memory address.
+          // If any use of this add is a LoadOp's address or StoreOp's address,
+          // it's pointer arithmetic, not a reduction.
+          for (auto addrUse : user->getUses()) {
+            if (isa<sys::LoadOp>(addrUse) && addrUse->DEF(0) == user) {
+              ok = false; break;
+            }
+            if (isa<sys::StoreOp>(addrUse) && addrUse->getOperandCount() >= 2 && addrUse->DEF(1) == user) {
+              ok = false; break;
+            }
+            if (isa<AddLOp>(addrUse)) {
+              ok = false; break; // used in pointer arithmetic
+            }
+          }
+          if (!ok) break;
           S.insert(user);
           Q.push_back(user);
+        } else if (isa<AddLOp>(user)) {
+          // AddLOp is pointer arithmetic — NOT a valid reduction chain
+          ok = false; break;
         } else if (isa<PhiOp>(user)) {
           if (S.count(user)) continue;
           bool has_ext = false;
