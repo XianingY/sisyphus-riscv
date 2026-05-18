@@ -24,6 +24,8 @@ void PrivatizeReduction::runImpl(LoopInfo *L) {
 
   for (auto op : header->getOps()) {
     if (!isa<PhiOp>(op)) continue;
+    // Only consider i32 phis (not pointers or other types)
+    if (op->getResultType() != Value::i32) continue;
     
     // Find V_init
     Value V_init = nullptr;
@@ -109,6 +111,43 @@ void PrivatizeReduction::runImpl(LoopInfo *L) {
           }
         }
       }
+    }
+    
+    if (!ok) continue;
+
+    // Reject if any value in the reduction chain is stored to memory
+    // inside the loop. This means intermediate values are observable
+    // and zeroing the initial value would corrupt them.
+    for (auto sop : S) {
+      for (auto user : sop->getUses()) {
+        if (!L->contains(user->getParent()))
+          continue;
+        // Direct store of reduction value
+        if (isa<sys::StoreOp>(user) && user->getOperandCount() >= 2 &&
+            user->DEF(0) == sop) {
+          ok = false;
+          break;
+        }
+        // Used in address computation (AddLOp) → likely pointer, not reduction
+        if (isa<AddLOp>(user)) {
+          ok = false;
+          break;
+        }
+        // Used in a multiply that feeds a store → also observable
+        if (isa<MulIOp>(user) || isa<SubIOp>(user)) {
+          for (auto muser : user->getUses()) {
+            if (!L->contains(muser->getParent()))
+              continue;
+            if (isa<sys::StoreOp>(muser) && muser->getOperandCount() >= 2 &&
+                muser->DEF(0) == user) {
+              ok = false;
+              break;
+            }
+          }
+          if (!ok) break;
+        }
+      }
+      if (!ok) break;
     }
     
     if (!ok) continue;
