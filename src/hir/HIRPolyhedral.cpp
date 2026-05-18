@@ -454,6 +454,31 @@ std::unique_ptr<Op> makeReductionInitLoop(const ReductionPattern &pat) {
   return makeWhile(std::move(cond), std::move(body));
 }
 
+std::unique_ptr<Op> makeReductionLmsStore(const ReductionPattern &pat) {
+  if (!pat.accUpdate || !pat.destStore || pat.accUpdate->children.size() != 1)
+    return nullptr;
+  auto oldValue = makeLoadFromStoreDestination(pat.destStore);
+  if (!oldValue)
+    return nullptr;
+  auto nextValue = cloneReplacingScalarLoad(pat.accUpdate->children[0].get(),
+                                            pat.acc,
+                                            oldValue.get());
+  if (!nextValue)
+    return nullptr;
+  return makeArrayStoreLike(pat.destStore, std::move(nextValue));
+}
+
+std::unique_ptr<Op> makeReductionLmsJLoop(const ReductionPattern &pat) {
+  auto body = makeBlock();
+  auto lms = makeReductionLmsStore(pat);
+  if (!lms)
+    return nullptr;
+  body->children.push_back(std::move(lms));
+  body->children.push_back(cloneOp(pat.jStep));
+  auto cond = makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound));
+  return makeWhile(std::move(cond), std::move(body));
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
