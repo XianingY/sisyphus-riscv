@@ -341,6 +341,7 @@ int main(int argc, char **argv) {
           }
           if (opts.verbose || opts.stats) {
             std::cerr << "[hir-poly] reduction-jammed=" << stats.reductionJammed
+                      << " reduction-interchanged=" << stats.reductionInterchanged
                       << " rejected=" << stats.rejected << "\n";
           }
         });

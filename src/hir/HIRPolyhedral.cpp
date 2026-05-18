@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -258,24 +259,14 @@ bool containsArrayAccessTo(const Op *op, const std::string &symbol) {
   return false;
 }
 
-bool sameArrayDestination(const Op *lhs, const Op *rhs) {
-  if (!lhs || !rhs || lhs->kind != OpKind::Store || rhs->kind != OpKind::Store)
-    return false;
-  if (lhs->symbol != rhs->symbol || lhs->children.empty() || rhs->children.empty())
-    return false;
-  size_t lhsIndexCount = lhs->children.size() - 1;
-  size_t rhsIndexCount = rhs->children.size() - 1;
-  if (lhsIndexCount != rhsIndexCount)
-    return false;
-  for (size_t i = 0; i < lhsIndexCount; i++) {
-    const Op *a = lhs->children[i].get();
-    const Op *b = rhs->children[i].get();
-    if (!a || !b || a->kind != b->kind || a->symbol != b->symbol ||
-        a->hasIntValue != b->hasIntValue || a->intValue != b->intValue ||
-        a->children.size() != b->children.size())
-      return false;
-  }
-  return true;
+void collectArrayAccessSymbols(const Op *op, std::unordered_set<std::string> &symbols) {
+  if (!op)
+    return;
+  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
+      !op->symbol.empty() && !op->children.empty())
+    symbols.insert(op->symbol);
+  for (const auto &child : op->children)
+    collectArrayAccessSymbols(child.get(), symbols);
 }
 
 std::unique_ptr<Op> makeLoadFromStoreDestination(const Op *store) {
@@ -348,7 +339,9 @@ struct ReductionPattern {
   const Op *jBound = nullptr;
   const Op *kInit = nullptr;
   const Op *accInit = nullptr;
+  const Op *kBound = nullptr;
   Op *kWhile = nullptr;
+  Op *kStep = nullptr;
   Op *accUpdate = nullptr;
   Op *destStore = nullptr;
   Op *jStep = nullptr;
@@ -430,9 +423,37 @@ bool matchReductionPattern(Op *jWhile, ReductionPattern &pat) {
   pat.acc = accSym;
   pat.kInit = body->children[0].get();
   pat.accInit = body->children[1].get();
+  pat.kBound = kLoop.bound;
   pat.kWhile = body->children[2].get();
+  pat.kStep = kLoop.step;
   pat.accUpdate = accUpdate;
   pat.destStore = destStore;
+  return true;
+}
+
+bool strictReductionInterchangeLegal(const ReductionPattern &pat,
+                                     const std::unordered_set<std::string> &globalArrays) {
+  if (!pat.destStore || pat.destStore->children.size() < 2)
+    return false;
+  if (!pat.accUpdate || pat.accUpdate->children.size() != 1)
+    return false;
+  if (!globalArrays.count(pat.destStore->symbol))
+    return false;
+
+  // Strict mode: do not interchange an in-place reduction. If the destination
+  // array is read while computing the reduction, swapping k outside j changes
+  // the order of visible writes (many_mat_cal has exactly this hazard).
+  if (containsArrayAccessTo(pat.accUpdate->children[0].get(), pat.destStore->symbol))
+    return false;
+
+  std::unordered_set<std::string> rhsArrays;
+  collectArrayAccessSymbols(pat.accUpdate->children[0].get(), rhsArrays);
+  for (const auto &symbol : rhsArrays)
+    if (!globalArrays.count(symbol))
+      return false;
+
+  if (exprUsesScalar(pat.destStore, pat.k))
+    return false;
   return true;
 }
 
@@ -479,12 +500,36 @@ std::unique_ptr<Op> makeReductionLmsJLoop(const ReductionPattern &pat) {
   return makeWhile(std::move(cond), std::move(body));
 }
 
+std::unique_ptr<Op> makeReductionInterchangedKLoop(const ReductionPattern &pat,
+                                                   const Op *jInit) {
+  if (!jInit || !pat.kWhile || !pat.kStep)
+    return nullptr;
+  auto body = makeBlock();
+  body->children.push_back(cloneOp(jInit));
+  auto jLoop = makeReductionLmsJLoop(pat);
+  if (!jLoop)
+    return nullptr;
+  body->children.push_back(std::move(jLoop));
+  body->children.push_back(cloneOp(pat.kStep));
+  auto cond = cloneOp(pat.kWhile->children[0].get());
+  if (!cond)
+    return nullptr;
+  return makeWhile(std::move(cond), std::move(body));
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   PolyhedralStats stats;
   if (!module.root)
     return stats;
+  globalArrays.clear();
+  for (const auto &child : module.root->children) {
+    const Op *decl = unwrapSingleDecl(child.get());
+    if (decl && decl->kind == OpKind::VarDecl && !decl->symbol.empty() &&
+        !decl->arrayDims.empty())
+      globalArrays.insert(decl->symbol);
+  }
   optimizeBlock(module.root.get(), stats);
   return stats;
 }
@@ -501,12 +546,57 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     return changed;
 
   for (size_t i = 0; i + 1 < block->children.size(); i++) {
+    if (tryReductionInterchange(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
     if (tryReductionJam(block, i, stats)) {
       changed = true;
       i = 0;
     }
   }
   return changed;
+}
+
+bool PolyhedralOptimizer::tryReductionInterchange(Op *block, size_t initIndex,
+                                                  PolyhedralStats &stats) {
+  if (!block || initIndex + 1 >= block->children.size())
+    return false;
+
+  Op *whileOp = block->children[initIndex + 1].get();
+  ReductionPattern pat;
+  if (!matchReductionPattern(whileOp, pat))
+    return false;
+  if (!matchLoopInit(block->children[initIndex].get(), pat.j))
+    return false;
+  if (!strictReductionInterchangeLegal(pat, globalArrays))
+    return false;
+
+  auto initLoop = makeReductionInitLoop(pat);
+  auto swappedKLoop = makeReductionInterchangedKLoop(pat, block->children[initIndex].get());
+  if (!initLoop || !swappedKLoop) {
+    stats.rejected++;
+    return false;
+  }
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 2);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == initIndex) {
+      replacement.push_back(std::move(block->children[i]));
+      replacement.push_back(std::move(initLoop));
+      replacement.push_back(cloneOp(pat.kInit));
+      replacement.push_back(std::move(swappedKLoop));
+      i++; // skip the original j loop
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+
+  block->children = std::move(replacement);
+  stats.reductionInterchanged++;
+  return true;
 }
 
 bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats) {
