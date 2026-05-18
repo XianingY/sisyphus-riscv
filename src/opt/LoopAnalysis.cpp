@@ -186,8 +186,10 @@ LoopForest LoopAnalysis::runImpl(Region *region) {
             continue;
           }
 
+          // Non-rotated: condition is in the header.
+          auto headerTerm = header->getLastOp();
           // br: (br (lt x y))
-          if (!br.match(term, { { "x", loop->induction } }))
+          if (!br.match(headerTerm, { { "x", loop->induction } }))
             continue;
 
           loop->stop = br.extract("y");
