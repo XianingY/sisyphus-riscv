@@ -34,29 +34,40 @@ int envInt(const char *name, int fallback) {
   return v > 0 ? v : fallback;
 }
 
-// Check if loop has induction variable identified and unit step
+// Check if loop has unit-step induction variable.
+// More robust than relying on LoopAnalysis::getInduction() which may miss patterns.
 bool isCanonicalUnitLoop(LoopInfo *loop) {
   if (!loop || !loop->preheader || loop->latches.size() != 1 || loop->exits.size() != 1)
     return false;
-  auto iv = loop->getInduction();
-  if (!iv) return false;
+
   auto latch = loop->getLatch();
   if (!latch) return false;
+  auto header = loop->header;
+  if (!header) return false;
 
-  // Find IV's latch value
-  const auto &ops = iv->getOperands();
-  const auto &attrs = iv->getAttrs();
-  for (int i = 0; i < (int) attrs.size(); i++) {
-    auto from = dyn_cast<FromAttr>(attrs[i]);
-    if (from && from->bb == latch) {
-      auto val = ops[i].defining;
-      if (!val || !isa<AddIOp>(val) || val->getOperandCount() != 2)
-        return false;
-      auto a = val->DEF(0);
-      auto b = val->DEF(1);
-      return (a == iv && isa<IntOp>(b) && V(b) == 1) ||
-             (b == iv && isa<IntOp>(a) && V(a) == 1);
+  // Look for ANY phi at the header whose latch-incoming is phi+1
+  for (auto phi : header->getPhis()) {
+    if (phi->getResultType() != Value::i32)
+      continue;
+
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+
+    Op *latchVal = nullptr;
+    for (int i = 0; i < (int) attrs.size(); i++) {
+      auto from = dyn_cast<FromAttr>(attrs[i]);
+      if (!from) continue;
+      if (from->bb == latch)
+        latchVal = ops[i].defining;
     }
+    if (!latchVal) continue;
+    if (!isa<AddIOp>(latchVal) || latchVal->getOperandCount() != 2)
+      continue;
+    auto a = latchVal->DEF(0);
+    auto b = latchVal->DEF(1);
+    bool unit = (a == phi && isa<IntOp>(b) && V(b) == 1) ||
+                (b == phi && isa<IntOp>(a) && V(a) == 1);
+    if (unit) return true;
   }
   return false;
 }
@@ -325,10 +336,12 @@ void LoopTiling::run() {
           auto cur = worklist.back();
           worklist.pop_back();
 
-          if (!isCanonicalUnitLoop(cur))
+          if (!isCanonicalUnitLoop(cur)) {
             continue;
-          if (cur->subloops.size() != 1)
+          }
+          if (cur->subloops.size() != 1) {
             continue;
+          }
           auto inner = cur->subloops[0];
 
           // If inner has subloops, try deeper first.
@@ -338,26 +351,31 @@ void LoopTiling::run() {
           }
 
           // inner has no subloops — this is a tileable 2-level pair.
-          if (!isCanonicalUnitLoop(inner))
+          if (!isCanonicalUnitLoop(inner)) {
             continue;
-          if (!isPerfectSubNest(cur, inner))
+          }
+          if (!isPerfectSubNest(cur, inner)) {
             continue;
+          }
 
-          // Don't tile if inner or outer has extra phis
+          // Don't tile if outer has extra phis (state-carrying across iterations)
+          // Strip-mining is only safe when non-IV phis are absent or loop-invariant.
           {
-            auto innerPhis = inner->header->getPhis();
-            int phiCount = 0;
-            for (auto phi : innerPhis) { (void)phi; phiCount++; }
-            if (phiCount > 1) continue;
-
+            auto outerIV = cur->getInduction();
+            auto innerIV = inner->getInduction();
+            if (!outerIV || !innerIV)
+              continue;
+            // Both must have only the IV phi — any extra phi means
+            // state is carried that strip-mining could disrupt.
             auto outerPhis = cur->header->getPhis();
             int outerPhiCount = 0;
             for (auto phi : outerPhis) { (void)phi; outerPhiCount++; }
             if (outerPhiCount > 1) continue;
-
-            auto outerIV = cur->getInduction();
-            if (!outerIV || outerIV->getOperandCount() != 2)
-              continue;
+            auto innerPhis = inner->header->getPhis();
+            int innerPhiCount = 0;
+            for (auto phi : innerPhis) { (void)phi; innerPhiCount++; }
+            if (innerPhiCount > 1) continue;
+            if (outerIV->getOperandCount() != 2) continue;
           }
 
           candidates++;
