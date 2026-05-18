@@ -74,6 +74,20 @@ std::unique_ptr<Op> makeStore(const std::string &symbol, std::unique_ptr<Op> val
   return op;
 }
 
+std::unique_ptr<Op> makeArrayStoreLike(const Op *store, std::unique_ptr<Op> value) {
+  if (!store || store->kind != OpKind::Store || store->children.empty())
+    return nullptr;
+  auto out = std::make_unique<Op>(OpKind::Store, store->origin);
+  out->symbol = store->symbol;
+  out->type = store->type;
+  out->traits = store->traits;
+  out->arrayDims = store->arrayDims;
+  for (size_t i = 0; i + 1 < store->children.size(); i++)
+    out->children.push_back(cloneOp(store->children[i].get()));
+  out->children.push_back(std::move(value));
+  return out;
+}
+
 std::unique_ptr<Op> makeVarDecl(const std::string &symbol, std::unique_ptr<Op> value) {
   auto op = std::make_unique<Op>(OpKind::VarDecl);
   op->type = TypeKind::Int;
@@ -424,6 +438,20 @@ bool matchReductionPattern(Op *jWhile, ReductionPattern &pat) {
 
 std::unique_ptr<Op> makeJamStep(const std::string &iv) {
   return makeStore(iv, makeArith("+", makeLoad(iv), makeConstInt(kJamFactor)));
+}
+
+std::unique_ptr<Op> makeReductionInitLoop(const ReductionPattern &pat) {
+  auto body = makeBlock();
+  auto init = cloneOp(initValue(pat.accInit));
+  if (!init)
+    init = makeConstInt(0);
+  auto initStore = makeArrayStoreLike(pat.destStore, std::move(init));
+  if (!initStore)
+    return nullptr;
+  body->children.push_back(std::move(initStore));
+  body->children.push_back(cloneOp(pat.jStep));
+  auto cond = makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound));
+  return makeWhile(std::move(cond), std::move(body));
 }
 
 }  // namespace
