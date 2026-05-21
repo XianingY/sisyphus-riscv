@@ -334,12 +334,13 @@ int RegAlloc::latePeephole(Op *funcOp) {
 
         if (isa<rv::LoadOp>(op) && op->has<RdAttr>() && op->has<RsAttr>() &&
             op->has<IntAttr>()) {
-          LoadKey key{false, RS(op), V(op), (int) SIZE(op), op->getResultType()};
+          bool fpLoad = isFP(RD(op));
+          LoadKey key{fpLoad, RS(op), V(op), (int) SIZE(op), op->getResultType()};
           auto it = available.find(key);
           if (it != available.end() && RD(op) != key.base) {
             converted++;
             builder.setBeforeOp(op);
-            builder.create<MvOp>({ RDC(RD(op)), RSC(it->second) });
+            CREATE_MV(fpLoad, RD(op), it->second);
             op->erase();
             op = next;
             continue;
