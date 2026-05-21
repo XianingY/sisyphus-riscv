@@ -17,6 +17,10 @@ bool envEnabled(const char *name, bool fallback) {
   return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
 }
 
+int valueSize(Value::Type ty) {
+  return ty == Value::i64 ? 8 : 4;
+}
+
 }
 
 std::map<std::string, int> Inline::stats() {
@@ -61,9 +65,10 @@ void doInline(Op *call, Region *fnRegion) {
     body.push_back(callRegion->insert(end));
 
   builder.setToBlockEnd(bb);
-  // The address of return value.
-  // It can only be 4 bytes because no pointers can be returned.
-  auto addr = builder.create<AllocaOp>({ new SizeAttr(4) });
+  // The address of return value. SysY returns scalars here; keep the slot size
+  // tied to the call result so recursive inlining stays correct for i64 IR.
+  auto retSize = valueSize(call->getResultType());
+  auto addr = builder.create<AllocaOp>({ new SizeAttr(retSize) });
 
   // Copy the operations block by block (phase 1: clone without remapping).
   int i = 0;
@@ -125,7 +130,7 @@ void doInline(Op *call, Region *fnRegion) {
 
       auto ret = v->getOperand().defining;
       builder.setBeforeOp(v);
-      builder.create<StoreOp>({ ret, addr }, { new SizeAttr(4) });
+      builder.create<StoreOp>({ ret, addr }, { new SizeAttr(retSize) });
       builder.replace<GotoOp>(v, { new TargetAttr(end) });
       continue;
     }
@@ -277,7 +282,7 @@ void Inline::run() {
     return true;
   });
 
-  if (envEnabled("SISY_ENABLE_RECURSIVE_INLINE", false)) {
+  if (envEnabled("SISY_ENABLE_RECURSIVE_INLINE", true)) {
     std::vector<Op*> recursiveCalls;
     for (auto func : collectFuncs()) {
       if (!recursive.count(func) && !isRecursive(func))
