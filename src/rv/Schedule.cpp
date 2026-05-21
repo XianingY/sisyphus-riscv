@@ -50,11 +50,6 @@ int latency(Op *op) {
   return 1;
 }
 
-// Is this op a memory operation we need to track for ordering?
-bool isMemoryOp(Op *op) {
-  return isa<rv::LoadOp>(op) || isa<rv::StoreOp>(op) || isa<FldOp>(op) || isa<FsdOp>(op);
-}
-
 bool isStore(Op *op) {
   return isa<rv::StoreOp>(op) || isa<FsdOp>(op);
 }
@@ -173,14 +168,16 @@ void Schedule::runImpl(BasicBlock *bb) {
   // Compute degree (number of unmet dependencies).
   std::unordered_map<Op*, int> degree;
   std::unordered_map<Op*, std::vector<Op*>> users; // reverse map: op → ops that depend on it
+  std::vector<Op*> orderedSchedulable;
   std::unordered_set<Op*> schedulable;
 
   for (auto op : bb->getOps()) {
     if (op == term || isa<PhiOp>(op)) continue;
+    orderedSchedulable.push_back(op);
     schedulable.insert(op);
   }
 
-  for (auto op : schedulable) {
+  for (auto op : orderedSchedulable) {
     // Data dependencies: op depends on its operand definitions (if in this block)
     for (auto operand : op->getOperands()) {
       auto def = operand.defining;
@@ -200,7 +197,7 @@ void Schedule::runImpl(BasicBlock *bb) {
 
   // Initialize ready list with degree-0 ops.
   std::list<Op*> ready;
-  for (auto op : schedulable) {
+  for (auto op : orderedSchedulable) {
     if (degree[op] == 0)
       ready.push_back(op);
   }
@@ -213,10 +210,8 @@ void Schedule::runImpl(BasicBlock *bb) {
   // Compute the original position of each op (to detect reordering).
   std::unordered_map<Op*, int> origPos;
   int pos = 0;
-  for (auto op : bb->getOps()) {
-    if (schedulable.count(op))
-      origPos[op] = pos++;
-  }
+  for (auto op : orderedSchedulable)
+    origPos[op] = pos++;
 
   // Goodness function: higher is better.
   // Priorities:
@@ -287,6 +282,16 @@ void Schedule::runImpl(BasicBlock *bb) {
   // Sanity check: did we schedule everything?
   if ((int) newOrder.size() != origCount)
     return; // leave the block unchanged if something went wrong
+
+  bool changedOrder = false;
+  for (int i = 0; i < origCount; i++) {
+    if (orderedSchedulable[i] != newOrder[i]) {
+      changedOrder = true;
+      break;
+    }
+  }
+  if (!changedOrder)
+    return;
 
   // Apply the new ordering: move ops in newOrder to be right before term.
   // We always apply (even if it happens to match the original) — moveBefore
