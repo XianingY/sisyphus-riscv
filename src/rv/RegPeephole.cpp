@@ -2,6 +2,8 @@
 #include "Regs.h"
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <tuple>
 
 using namespace sys::rv;
 using namespace sys;
@@ -15,6 +17,10 @@ bool envEnabled(const char *name, bool fallback = true) {
   if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
     return false;
   return true;
+}
+
+bool isMemoryClobber(Op *op) {
+  return isa<rv::StoreOp>(op) || isa<FsdOp>(op) || isa<rv::CallOp>(op);
 }
 
 std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
@@ -287,6 +293,83 @@ int RegAlloc::latePeephole(Op *funcOp) {
           continue;
         }
 
+        op = next;
+      }
+    }
+  }
+
+  if (envEnabled("SISY_RV_ENABLE_BLOCK_LOAD_CSE", true)) {
+    struct LoadKey {
+      bool fp = false;
+      Reg base = Reg::zero;
+      int offset = 0;
+      int size = 0;
+      Value::Type type = Value::i32;
+
+      bool operator<(const LoadKey &other) const {
+        return std::tie(fp, base, offset, size, type) <
+               std::tie(other.fp, other.base, other.offset, other.size, other.type);
+      }
+    };
+
+    auto removeReg = [](std::map<LoadKey, Reg> &available, Reg reg) {
+      for (auto it = available.begin(); it != available.end(); ) {
+        if (it->first.base == reg || it->second == reg)
+          it = available.erase(it);
+        else
+          ++it;
+      }
+    };
+
+    for (auto bb : funcOp->getRegion()->getBlocks()) {
+      std::map<LoadKey, Reg> available;
+      for (Op *op = bb->getFirstOp(); op; ) {
+        Op *next = op->atBack() ? nullptr : op->nextOp();
+
+        if (isMemoryClobber(op)) {
+          available.clear();
+          op = next;
+          continue;
+        }
+
+        if (isa<rv::LoadOp>(op) && op->has<RdAttr>() && op->has<RsAttr>() &&
+            op->has<IntAttr>()) {
+          LoadKey key{false, RS(op), V(op), (int) SIZE(op), op->getResultType()};
+          auto it = available.find(key);
+          if (it != available.end() && RD(op) != key.base) {
+            converted++;
+            builder.setBeforeOp(op);
+            builder.create<MvOp>({ RDC(RD(op)), RSC(it->second) });
+            op->erase();
+            op = next;
+            continue;
+          }
+          removeReg(available, RD(op));
+          available[key] = RD(op);
+          op = next;
+          continue;
+        }
+
+        if (isa<FldOp>(op) && op->has<RdAttr>() && op->has<RsAttr>() &&
+            op->has<IntAttr>()) {
+          LoadKey key{true, RS(op), V(op), 8, op->getResultType()};
+          auto it = available.find(key);
+          if (it != available.end() && RD(op) != key.base) {
+            converted++;
+            builder.setBeforeOp(op);
+            builder.create<FmvOp>({ RDC(RD(op)), RSC(it->second) });
+            op->erase();
+            op = next;
+            continue;
+          }
+          removeReg(available, RD(op));
+          available[key] = RD(op);
+          op = next;
+          continue;
+        }
+
+        if (op->has<RdAttr>())
+          removeReg(available, RD(op));
         op = next;
       }
     }
