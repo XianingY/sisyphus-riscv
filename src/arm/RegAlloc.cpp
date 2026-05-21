@@ -221,6 +221,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   const int regcount = isLeaf ? leafRegCnt : normalRegCnt;
   const int regcountf = isLeaf ? leafRegCntf : normalRegCntf;
 
+  int opCount = 0;
+  for (auto bb : region->getBlocks()) { opCount += bb->getOps().size(); }
+  bool localFastMode = fastMode || (opCount > 3000);
+
   Builder builder;
   
   std::unordered_map<Op*, Reg> assignment;
@@ -348,7 +352,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   std::unordered_map<Op*, int> spillOffset;
   int currentOffset = STACKOFF(funcOp);
   int highest = 0;
-  if (!fastMode) {
+  if (!localFastMode) {
     // Interference graph.
     std::unordered_map<Op*, std::unordered_set<Op*>> interf, spillInterf;
     std::unordered_map<Op*, long long> spillWeight;
@@ -406,7 +410,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         priority[op] = currentPriority + 1;
         for (auto x : op->getOperands()) {
           priority[x.defining] = currentPriority;
-          if (!fastMode && (!limitPrefer || preferCount < preferBudget)) {
+          if (!localFastMode && (!limitPrefer || preferCount < preferBudget)) {
             prefer[x.defining] = op;
             preferCount++;
           }
@@ -416,7 +420,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       }
 
       // Preserve copy chains to reduce move pressure after allocation.
-      if (!fastMode && (isa<MovROp>(op) || isa<FmovOp>(op)) && op->getOperandCount() == 1) {
+      if (!localFastMode && (isa<MovROp>(op) || isa<FmovOp>(op)) && op->getOperandCount() == 1) {
         auto src = op->DEF(0);
         if (!limitPrefer || preferCount < preferBudget) {
           prefer[op] = src;
@@ -434,7 +438,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
     // Penalize long-lived values and values spanning call-like operations.
     std::vector<int> callPrefix;
-    if (!fastMode) {
+    if (!localFastMode) {
       callPrefix.assign(ops.size() + 1, 0);
       int callIdx = 0;
       for (auto liveOp : ops) {
@@ -450,7 +454,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       int span = last - def;
       spillWeight[op] += 3LL * localWeight * span;
 
-      if (!fastMode) {
+      if (!localFastMode) {
         int l = std::max(0, def + 1);
         int r = std::min<int>(ops.size(), last);
         int callCount = callPrefix[r] - callPrefix[l];

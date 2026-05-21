@@ -1180,8 +1180,15 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     assert(argOffsets.count(op));
     int myoffset = offset + argOffsets[op];
     builder.setBeforeOp(op);
-    bool fp = isFP(RD(op));
-    emitStackGetArgLoad(builder, RD(op), fp, myoffset);
+    Reg rdReg;
+    bool fp = op->getResultType() == Value::f32;
+    if (op->has<RdAttr>()) {
+      rdReg = RD(op);
+      fp = isFP(rdReg);
+    } else {
+      rdReg = fp ? fspillReg : spillReg;
+    }
+    emitStackGetArgLoad(builder, rdReg, fp, myoffset);
     auto created = op->prevOp();
     if (created)
       op->replaceAllUsesWith(created);

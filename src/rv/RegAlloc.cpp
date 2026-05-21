@@ -216,6 +216,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   const int regcount = isLeaf ? leafRegCnt : normalRegCnt;
   const int regcountf = isLeaf ? leafRegCntf : normalRegCntf;
 
+  int opCount = 0;
+  for (auto bb : region->getBlocks()) { opCount += bb->getOps().size(); }
+  bool localFastMode = fastMode || (opCount > 3000);
+
   Builder builder;
   
   std::unordered_map<Op*, Reg> assignment;
@@ -330,7 +334,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     currentOffset = currentOffset / 8 * 8 + 8;
   int highest = 0;
 
-  if (!fastMode) {
+  if (!localFastMode) {
     // Interference graph.
     std::unordered_map<Op*, std::unordered_set<Op*>> interf, spillInterf;
     std::unordered_map<Op*, long long> spillWeight;
@@ -388,7 +392,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         priority[op] = currentPriority + 1;
         for (auto x : op->getOperands()) {
           priority[x.defining] = currentPriority;
-          if (!fastMode)
+          if (!localFastMode)
             prefer[x.defining] = op;
           phiOperand[op].push_back(x.defining);
         }
@@ -396,7 +400,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       }
 
       // Preserve copy chains to reduce move pressure after allocation.
-      if (!fastMode && (isa<MvOp>(op) || isa<FmvOp>(op)) && op->getOperandCount() == 1) {
+      if (!localFastMode && (isa<MvOp>(op) || isa<FmvOp>(op)) && op->getOperandCount() == 1) {
         auto src = op->DEF(0);
         prefer[op] = src;
         bumpPriority(op, currentPriority + 2);
@@ -411,7 +415,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
     // Penalize long-lived values and values spanning calls.
     std::vector<int> callPrefix;
-    if (!fastMode) {
+    if (!localFastMode) {
       callPrefix.assign(ops.size() + 1, 0);
       int callIdx = 0;
       for (auto liveOp : ops) {
@@ -426,7 +430,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       int span = last - def;
       spillWeight[op] += 3LL * localWeight * span;
 
-      if (!fastMode) {
+      if (!localFastMode) {
         int l = std::max(0, def + 1);
         int r = std::min<int>(ops.size(), last);
         int callCount = callPrefix[r] - callPrefix[l];
@@ -650,14 +654,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   // Only a single register is spilled. Let's use s10.
   // Fast mode keeps spill semantics simple and uniform (stack-only).
-  if (!fastMode && highest == currentOffset) {
+  if (!localFastMode && highest == currentOffset) {
     for (auto [op, _] : spillOffset)
       assignment[op] = fpreg(op->getResultType()) ? fspillReg : spillReg;
     spillOffset.clear();
   }
 
   // Only 2 registers are spilled. Let's use s10 and s11..
-  if (!fastMode && highest == currentOffset + 8) {
+  if (!localFastMode && highest == currentOffset + 8) {
     for (auto [op, offset] : spillOffset) {
       auto fp = fpreg(op->getResultType());
       assignment[op] = offset ? (fp ? fspillReg2 : spillReg2) : (fp ? fspillReg : spillReg);
@@ -667,7 +671,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   // Mapping integer spill slots to FP registers is fragile around large
   // argument frames and dynamic call-frame deltas. Keep it opt-in.
-  if (!fastMode && spillOffset.size() && envEnabled("SISY_RV_SPILL_TO_FP", false)) {
+  if (!localFastMode && spillOffset.size() && envEnabled("SISY_RV_SPILL_TO_FP", false)) {
     // Try to reuse floating-point registers for spilling.
     std::unordered_set<Reg> used;
     for (auto [op, x] : assignment) {
@@ -1137,7 +1141,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
-          emitStackLoad(builder, reg, ldty, offset, spillReg2);
+          emitStackLoad(builder, reg, ldty, offset, spillReg);
         op->add<RsAttr>(reg);
       }
 
@@ -1157,7 +1161,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
-          emitStackLoad(builder, reg, ldty, offset, spillReg);
+          emitStackLoad(builder, reg, ldty, offset, spillReg2);
         op->add<Rs2Attr>(reg);
       }
     }

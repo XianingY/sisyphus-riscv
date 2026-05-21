@@ -1115,7 +1115,14 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     int myoffset = offset + argOffsets[op];
     Value::Type loadTy = argTypes[V(op)];
     builder.setBeforeOp(op);
-    emitStackLoad(builder, RD(op), loadTy, myoffset);
+    Reg rdReg;
+    if (op->has<RdAttr>()) {
+      rdReg = RD(op);
+    } else {
+      bool fp = op->getResultType() == Value::f32;
+      rdReg = fp ? fspillReg : spillReg;
+    }
+    emitStackLoad(builder, rdReg, loadTy, myoffset);
     auto created = op->prevOp();
     if (created)
       op->replaceAllUsesWith(created);
