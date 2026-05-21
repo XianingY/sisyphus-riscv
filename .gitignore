@@ -2,6 +2,9 @@ build
 build-*
 build_*
 .DS_Store
+*.tmp
+*~
+/temp.s
 .kiro/
 output/
 tests/.out

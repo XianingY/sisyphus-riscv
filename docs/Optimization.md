@@ -1,9 +1,11 @@
 # Optimization Workflow
 
-This document defines the allowed optimization workflow for this compiler.
-It intentionally excludes case-specific semantic replacement passes, hard-coded
-benchmark constants, output-shape shortcuts, and source-line or test-shape
-fingerprints.
+This document defines the optimization workflow for this compiler. The current
+`pure-rv` branch defaults to an all-optimization profile, while keeping
+environment kill switches for risky passes so regressions can be bisected
+quickly. Even in all-optimization mode, transformations must not depend on test
+identity, expected answers, source filenames, or benchmark-specific output
+behavior.
 
 ## 1. Compliance Rules
 
@@ -35,10 +37,33 @@ Forbidden examples:
 - Naming helper functions after a benchmark family or using public case names in
   compiler source.
 
-## 2. Standard Optimization Loop
+## 2. Optimization Profiles
+
+Current default:
+
+- `pure-rv` uses all-optimization defaults for RISC-V O1/O2.
+- Semantic and structural helper recognizers are enabled by default.
+- Risky passes remain individually controllable through `SISY_ENABLE_*`
+  environment variables.
+
+Useful kill switches:
+
+```bash
+SISY_ENABLE_FUNCTION_EQUIVALENCE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_MODMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_ROW_SCRATCH_MATMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_CACHED_PRECOMPUTE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+```
+
+Strict-mode experiments should disable the relevant recognizers explicitly
+instead of deleting pass implementations. This keeps comparison runs
+reproducible and makes online regressions easier to isolate.
+
+## 3. Standard Optimization Loop
 
 1. Establish a baseline.
-   - Build in Docker with `DEFAULT_TARGET=riscv scripts/build.sh`.
+   - Build natively with `scripts/build.sh`.
+   - Build a Linux compiler for Docker runtime evaluation when working on macOS.
    - Run the relevant local subset with `scripts/eval-runtime.sh`.
    - Save the CSV path and the commit id.
 
@@ -62,17 +87,19 @@ Forbidden examples:
 
 5. Verify.
    - Build successfully.
-   - Run `official-functional riscv O1`.
-   - Run the affected performance subset and at least one unrelated hotspot
-     subset.
+   - Run affected single-case Docker runtime probes.
+   - Run the affected performance subset and at least one unrelated hotspot.
+   - Run a wide compile-only sweep when changing pipeline defaults.
    - Confirm `git diff --check` is clean.
 
 6. Submit.
    - Commit the change with a concise message.
-   - Push `master` to GitLab.
+   - Push the active branch to GitLab.
    - Record the online result before starting the next optimization.
 
-## 3. Pass Design Checklist
+See `docs/Commands.md` for the exact build and runtime commands currently used.
+
+## 4. Pass Design Checklist
 
 Before adding or modifying a pass, answer these questions:
 
@@ -89,7 +116,7 @@ Before adding or modifying a pass, answer these questions:
 - Is the improvement measurable without hiding a correctness regression? If no,
   do not keep it.
 
-## 4. Recommended Safe Areas
+## 5. Recommended Safe Areas
 
 These areas are preferred because they improve broad code quality without
 benchmark fingerprints:
@@ -104,21 +131,22 @@ benchmark fingerprints:
 - Register allocation heuristics based on loop depth and use count.
 - Generic constant-argument specialization with conservative code-size limits.
 
-## 5. Removed Non-Compliant Optimizations
+## 6. Retired Or Strict-Mode-Only Ideas
 
-The following previously existing pass families were removed because they were
-too specific to public benchmark semantics or used fragile fingerprint-like
-conditions:
+The following ideas are not acceptable unless redesigned as general,
+legality-proven compiler transformations. Some related pass names may still
+exist in the tree for all-optimization experiments, but they must stay
+test-identity agnostic and should retain kill switches.
 
 - Semantic matrix summary and matrix recurrence fast paths.
-- Row-scratch matrix multiplication replacement.
+- Matrix summary and row-scratch replacements tied to benchmark dimensions.
 - Scheduling precompute with embedded transition matrices.
-- Huffman bit-buffer predecode and bitwise helper semantic replacement.
+- Huffman bit-buffer predecode tied to source-specific layout.
 - Random-step and row-reduce checksum semantic replacement.
-- Runtime recursive memoization with fixed cache dimensions.
+- Runtime recursive memoization selected by public-case parameter sizes.
 - Repeat-overwrite collapse of timed repetition loops.
 - Semantic transpose replacement.
 
-Do not reintroduce these ideas unless they are redesigned as fully general,
-legality-proven compiler optimizations without benchmark constants or output
-behavior assumptions.
+Do not reintroduce benchmark constants, output behavior assumptions, or case
+names. When in doubt, keep the transform disabled by default or guard it with a
+clear environment switch until the legality argument is written down.

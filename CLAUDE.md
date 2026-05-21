@@ -18,6 +18,12 @@ DEFAULT_TARGET=arm scripts/build.sh
 # Manual CMake
 cmake -S . -B build -DDEFAULT_TARGET=riscv
 cmake --build build -j
+
+# Linux compiler for Docker/QEMU runtime evaluation on macOS
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:$PWD" -w "$PWD" \
+  sisyphus/compiler-dev-dual:latest \
+  bash -lc 'cmake -S . -B build-linux -G "Unix Makefiles" && cmake --build build-linux -j 8'
 ```
 
 Output: `build/compiler`
@@ -33,6 +39,11 @@ scripts/regression.sh tests/smoke riscv O0
 scripts/regression.sh tests/smoke arm O0
 
 # Runtime evaluation
+scripts/eval-runtime.sh official-functional riscv O1
+
+# Runtime evaluation with Docker-built Linux compiler
+SISY_COMPILER_PATH="$PWD/build-linux/compiler" \
+RUNTIME_SYLIB_C="$PWD/runtime/sylib.c" \
 scripts/eval-runtime.sh official-functional riscv O1
 ```
 
@@ -82,6 +93,11 @@ src/
 - **O0**: MoveAlloca, EarlyConstFold, RaiseToFor, FlattenCFG, Mem2Reg, RegularFold
 - **O1**: O0 + structured CFG optimization, alias analysis, DSE, DLE, GVN, LICM, inlining
 - **O2**: O1 + Fusion, Unswitch, Reassociate, Range+Splice, additional tail optimization rounds
+
+The current `pure-rv` branch defaults to all-optimization mode for RISC-V.
+Riskier passes keep `SISY_ENABLE_*` environment kill switches for bisection.
+See `docs/Commands.md` and `docs/Optimization.md` before changing pipeline
+defaults.
 
 ### Key Optimization Passes
 
