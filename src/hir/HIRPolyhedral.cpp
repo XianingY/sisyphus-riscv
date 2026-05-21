@@ -1,6 +1,8 @@
 #include "HIRPolyhedral.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -13,6 +15,22 @@ namespace sys::hir {
 namespace {
 
 constexpr int kJamFactor = 4;
+constexpr int kDefaultHirTileSize = 32;
+
+bool hirEnvEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
+int hirEnvInt(const char *name, int fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  int v = std::atoi(raw);
+  return v > 0 ? v : fallback;
+}
 
 std::unique_ptr<Op> cloneOp(const Op *op) {
   if (!op)
@@ -517,12 +535,89 @@ std::unique_ptr<Op> makeReductionInterchangedKLoop(const ReductionPattern &pat,
   return makeWhile(std::move(cond), std::move(body));
 }
 
+// ===========================================================================
+// Loop Tiling Helpers
+// ===========================================================================
+
+// Check whether an Op tree contains any control-flow altering ops (Call,
+// Return, Break, Continue) that would make loop tiling unsafe.
+bool tilingSafeBody(const Op *op) {
+  if (!op)
+    return true;
+  switch (op->kind) {
+  case OpKind::Call:
+  case OpKind::Return:
+  case OpKind::Break:
+  case OpKind::Continue:
+    return false;
+  default:
+    break;
+  }
+  for (const auto &child : op->children)
+    if (!tilingSafeBody(child.get()))
+      return false;
+  return true;
+}
+
+// Returns true if the two bound expressions are syntactically identical
+// (conservative but sufficient for most cases).
+bool boundsEqual(const Op *a, const Op *b) {
+  if (!a && !b)
+    return true;
+  if (!a || !b)
+    return false;
+  if (a->kind != b->kind)
+    return false;
+  if (a->hasIntValue && b->hasIntValue)
+    return a->intValue == b->intValue;
+  if (a->hasFloatValue && b->hasFloatValue)
+    return a->floatValue == b->floatValue;
+  if (a->symbol != b->symbol)
+    return false;
+  if (a->children.size() != b->children.size())
+    return false;
+  for (size_t i = 0; i < a->children.size(); i++)
+    if (!boundsEqual(a->children[i].get(), b->children[i].get()))
+      return false;
+  return true;
+}
+
+// Two loops can be fused when B does not depend on scalars exclusively defined by A.
+bool collectDefinedScalars(const Op *block, std::unordered_set<std::string> &syms) {
+  if (!block)
+    return true;
+  for (const auto &child : block->children) {
+    const Op *op = child.get();
+    if (!op)
+      continue;
+    if ((op->kind == OpKind::VarDecl || op->kind == OpKind::Store) &&
+        !op->symbol.empty() && op->arrayDims.empty())
+      syms.insert(op->symbol);
+    collectDefinedScalars(op, syms);
+  }
+  return true;
+}
+
+bool bodyUsesAnyOf(const Op *op, const std::unordered_set<std::string> &syms) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Load && op->children.empty() && syms.count(op->symbol))
+    return true;
+  for (const auto &child : op->children)
+    if (bodyUsesAnyOf(child.get(), syms))
+      return true;
+  return false;
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   PolyhedralStats stats;
   if (!module.root)
     return stats;
+  hirTileSize = hirEnvInt("SISY_HIR_TILE_SIZE", kDefaultHirTileSize);
+  if (hirTileSize < 4)
+    hirTileSize = 4;
   globalArrays.clear();
   for (const auto &child : module.root->children) {
     const Op *decl = unwrapSingleDecl(child.get());
@@ -545,6 +640,31 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   if (block->kind != OpKind::Block && block->kind != OpKind::Module)
     return changed;
 
+  for (size_t i = 0; i < block->children.size(); i++) {
+    // Loop tiling: strip-mine loops that have an inner while.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_TILING", true)) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryLoopTiling(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
+    // Loop fusion: merge adjacent canonical while-loops with equal bounds.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_FUSION", true)) {
+      if (i + 1 < block->children.size() &&
+          block->children[i] && block->children[i]->kind == OpKind::While &&
+          block->children[i + 1] && block->children[i + 1]->kind == OpKind::While) {
+        if (tryLoopFusion(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
+  }
+
   for (size_t i = 0; i + 1 < block->children.size(); i++) {
     if (tryReductionInterchange(block, i, stats)) {
       changed = true;
@@ -557,6 +677,212 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     }
   }
   return changed;
+}
+
+// ===========================================================================
+// Loop Tiling Implementation
+// ===========================================================================
+//
+// Strip-mines the outer loop of any loop nest that has:
+//   - A canonical unit-step while form: while (iv < bound) { ...; iv++; }
+//   - At least one inner while loop in the body
+//   - No break/continue/call in the body at any depth
+//
+// Transformation:
+//   iv_init; while (iv < N): [... inner loops ...]; iv++
+// →
+//   iv_init; __tile = 0; while (__tile < N):
+//     __tile_stop = __tile + T; if (N < __tile_stop) { __tile_stop = N; }
+//     iv = __tile;
+//     while (iv < __tile_stop): [... inner loops ...]; iv++
+//     __tile = __tile + T
+
+bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
+                                         PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size())
+    return false;
+
+  Op *whileOp = block->children[idx].get();
+  CanonicalLoop outer;
+  if (!matchCanonicalWhile(whileOp, outer)) {
+    stats.tilingRejected++;
+    return false;
+  }
+
+  // Body must be tiling-safe (no break/continue/call at any depth).
+  if (!tilingSafeBody(outer.body)) {
+    stats.tilingRejected++;
+    return false;
+  }
+
+  // Must have at least one inner while loop (otherwise tiling does nothing).
+  bool hasInnerWhile = false;
+  for (const auto &child : outer.body->children)
+    if (child && child->kind == OpKind::While) { hasInnerWhile = true; break; }
+  if (!hasInnerWhile) {
+    stats.tilingRejected++;
+    return false;
+  }
+
+  // Don't tile if there's already a tile IV variable with our prefix (idempotency guard).
+  if (outer.iv.rfind("__hir_tile_", 0) == 0) {
+    stats.tilingRejected++;
+    return false;
+  }
+
+  const std::string tileIV = "__hir_tile_" + outer.iv + "_" + std::to_string(uniqueId);
+  const std::string stopVar = "__hir_tile_stop_" + outer.iv + "_" + std::to_string(uniqueId);
+  uniqueId++;
+
+  // --- Build the tile while body ---
+  //   int __tile_stop = __tile + T;
+  //   if (N < __tile_stop) { __tile_stop = N; }
+  //   iv = __tile;          // re-init original IV for inner loop
+  //   while (iv < __tile_stop): [...original body...]
+  //   __tile = __tile + T;
+  auto tileBody = makeBlock();
+
+  // stopVar = tileIV + T
+  tileBody->children.push_back(
+    makeVarDecl(stopVar, makeArith("+", makeLoad(tileIV), makeConstInt(hirTileSize))));
+
+  // if (bound < stopVar) { stopVar = bound; }
+  {
+    auto ifCond = makeCmp("<", cloneOp(outer.bound), makeLoad(stopVar));
+    auto thenBlk = makeBlock();
+    thenBlk->children.push_back(makeStore(stopVar, cloneOp(outer.bound)));
+    auto ifOp = std::make_unique<Op>(OpKind::If);
+    ifOp->children.push_back(std::move(ifCond));
+    ifOp->children.push_back(std::move(thenBlk));
+    tileBody->children.push_back(std::move(ifOp));
+  }
+
+  // iv = tileIV  (reset outer IV at the start of each tile)
+  tileBody->children.push_back(makeStore(outer.iv, makeLoad(tileIV)));
+
+  // Clone the original while with condition bound replaced by stopVar.
+  auto innerCond = makeCmp("<", makeLoad(outer.iv), makeLoad(stopVar));
+  auto innerBody = cloneOp(outer.body);
+  tileBody->children.push_back(makeWhile(std::move(innerCond), std::move(innerBody)));
+
+  // tileIV += T
+  tileBody->children.push_back(
+    makeStore(tileIV, makeArith("+", makeLoad(tileIV), makeConstInt(hirTileSize))));
+
+  // --- Build the tile while ---
+  auto tileCond = makeCmp("<", makeLoad(tileIV), cloneOp(outer.bound));
+  auto tileWhile = makeWhile(std::move(tileCond), std::move(tileBody));
+  // Tile IV init: int tileIV = 0;
+  auto tileInit = makeVarDecl(tileIV, makeConstInt(0));
+
+  // --- Splice into block ---
+  // Insert tileInit + tileWhile at position idx, replacing the original while.
+  // The original outer IV init (VarDecl/Store) before idx is kept intact
+  // (it just becomes dead-assigned; DCE will clean it up later).
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 1);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(std::move(tileInit));
+      replacement.push_back(std::move(tileWhile));
+      // Skip the original while (don't push block->children[idx]).
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.tilingApplied++;
+  return true;
+}
+
+
+// ===========================================================================
+// Loop Fusion Implementation
+// ===========================================================================
+//
+// Fuse two adjacent canonical while-loops A and B that iterate over the
+// same range, when B does not depend on scalars defined only in A:
+//
+//   i = 0; while (i < N): bodyA; i++
+//   j = 0; while (j < N): bodyB[j renamed to i]; j++
+//
+// Becomes:
+//   i = 0; while (i < N): bodyA; bodyB[j→i]; i++
+
+bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
+                                         PolyhedralStats &stats) {
+  if (!block || idx + 1 >= block->children.size())
+    return false;
+
+  Op *whileA = block->children[idx].get();
+  Op *whileB = block->children[idx + 1].get();
+  if (!whileA || !whileB)
+    return false;
+
+  CanonicalLoop loopA, loopB;
+  if (!matchCanonicalWhile(whileA, loopA) || !matchCanonicalWhile(whileB, loopB)) {
+    stats.fusionRejected++;
+    return false;
+  }
+
+  // Bounds must be equal.
+  if (!boundsEqual(loopA.bound, loopB.bound)) {
+    stats.fusionRejected++;
+    return false;
+  }
+
+  // Safety: no control/call ops in either body.
+  if (!tilingSafeBody(loopA.body) || !tilingSafeBody(loopB.body)) {
+    stats.fusionRejected++;
+    return false;
+  }
+
+  // Check that loop B's body does not depend on scalars exclusively defined
+  // by loop A's body (other than the IV itself, which we will rename).
+  std::unordered_set<std::string> aDefinedScalars;
+  collectDefinedScalars(loopA.body, aDefinedScalars);
+  // Remove loopA's IV — it's fine if B uses it (renamed to A's IV).
+  aDefinedScalars.erase(loopA.iv);
+
+  if (bodyUsesAnyOf(loopB.body, aDefinedScalars)) {
+    stats.fusionRejected++;
+    return false;
+  }
+
+  // Fuse: clone loop B's body, renaming its IV to loop A's IV, then append
+  // to loop A's body (before the step).
+  // Loop B's step store is the last child of its body; skip it.
+  std::unordered_map<std::string, std::string> renames = { { loopB.iv, loopA.iv } };
+  std::unordered_map<std::string, int> noOffsets;
+
+  // Build the fused body: loopA's body statements + loopB's body statements
+  // (excluding loopB's step, since loopA's step covers both).
+  auto &aBodyChildren = loopA.body->children;
+  // Insert all loopB body children (except last = loopB's step) before loopA's step.
+  // loopA's step is aBodyChildren.back().
+  size_t insertPos = aBodyChildren.size() - 1; // before loopA's step
+  std::vector<std::unique_ptr<Op>> bStatements;
+  auto &bBodyChildren = loopB.body->children;
+  for (size_t i = 0; i + 1 < bBodyChildren.size(); i++) { // skip last (step)
+    bStatements.push_back(cloneReplacing(bBodyChildren[i].get(), renames, noOffsets));
+  }
+  // Also need to declare loopB's IV as an alias (we just renamed it, so no decl needed
+  // if loopB.iv was already declared before the while). We need to handle the case where
+  // the loop B init (before the while) declared loopB.iv. After fusion, loop B's init
+  // becomes dead. We keep it for safety (it's just an extra assignment to a dead var).
+
+  for (auto &stmt : bStatements)
+    aBodyChildren.insert(aBodyChildren.begin() + insertPos++, std::move(stmt));
+
+  // Remove loop B's while (idx+1) from the block.
+  // Also try to remove loop B's init statement (idx) if it's right before the while.
+  // loopB's while is at idx+1. loopB's init should be at some position before idx+1.
+  // For simplicity, just remove the while at idx+1 (the init becomes dead code,
+  // which DCE will clean up).
+  block->children.erase(block->children.begin() + idx + 1);
+
+  stats.fusionApplied++;
+  return true;
 }
 
 bool PolyhedralOptimizer::tryReductionInterchange(Op *block, size_t initIndex,

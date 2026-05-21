@@ -85,9 +85,9 @@ bool smallConstantTrip(LoopInfo *loop, int loopsize, int &trip) {
   if (span <= 0 || span % stepValue != 0)
     return false;
   trip = span / stepValue;
-  if (trip <= 1 || trip > 32)
+  if (trip <= 1 || trip > 128)
     return false;
-  return loopsize > 0 && loopsize * (trip - 1) <= 1200;
+  return loopsize > 0 && loopsize * (trip - 1) <= 3000;
 }
 
 bool tryRotateSmallConstantLoop(LoopInfo *info) {

@@ -292,6 +292,113 @@ std::string IncreaseAttr::toString() {
   return ss.str();
 }
 
+static std::optional<long long> evalConstIntExpr(Op *op) {
+  if (!op) return std::nullopt;
+  if (isa<IntOp>(op)) return V(op);
+  return std::nullopt;
+}
+
+static std::optional<long long> evalDiff(Op *a, Op *b, int depth = 0) {
+  if (a == b) return 0;
+  if (depth > 16) return std::nullopt;
+
+  if (!a) {
+    auto val = evalConstIntExpr(b);
+    if (val) return -*val;
+    if (isa<AddLOp>(b) || isa<AddIOp>(b)) {
+      auto d1 = evalDiff(nullptr, b->DEF(0), depth + 1);
+      auto d2 = evalDiff(nullptr, b->DEF(1), depth + 1);
+      if (d1 && d2) return *d1 + *d2;
+    }
+    if (isa<SubLOp>(b) || isa<SubIOp>(b)) {
+      auto d1 = evalDiff(nullptr, b->DEF(0), depth + 1);
+      auto d2 = evalDiff(nullptr, b->DEF(1), depth + 1);
+      if (d1 && d2) return *d1 - *d2;
+    }
+    return std::nullopt;
+  }
+  if (!b) {
+    auto val = evalConstIntExpr(a);
+    if (val) return *val;
+    if (isa<AddLOp>(a) || isa<AddIOp>(a)) {
+      auto d1 = evalDiff(a->DEF(0), nullptr, depth + 1);
+      auto d2 = evalDiff(a->DEF(1), nullptr, depth + 1);
+      if (d1 && d2) return *d1 + *d2;
+    }
+    if (isa<SubLOp>(a) || isa<SubIOp>(a)) {
+      auto d1 = evalDiff(a->DEF(0), nullptr, depth + 1);
+      auto d2 = evalDiff(a->DEF(1), nullptr, depth + 1);
+      if (d1 && d2) return *d1 - *d2;
+    }
+    return std::nullopt;
+  }
+
+  if ((isa<AddLOp>(a) || isa<AddIOp>(a)) && (isa<AddLOp>(b) || isa<AddIOp>(b))) {
+    if (a->DEF(0) == b->DEF(0)) return evalDiff(a->DEF(1), b->DEF(1), depth + 1);
+    if (a->DEF(1) == b->DEF(1)) return evalDiff(a->DEF(0), b->DEF(0), depth + 1);
+    if (a->DEF(0) == b->DEF(1)) return evalDiff(a->DEF(1), b->DEF(0), depth + 1);
+    if (a->DEF(1) == b->DEF(0)) return evalDiff(a->DEF(0), b->DEF(1), depth + 1);
+  }
+  if ((isa<SubLOp>(a) || isa<SubIOp>(a)) && (isa<SubLOp>(b) || isa<SubIOp>(b))) {
+    if (a->DEF(0) == b->DEF(0)) return evalDiff(b->DEF(1), a->DEF(1), depth + 1);
+    if (a->DEF(1) == b->DEF(1)) return evalDiff(a->DEF(0), b->DEF(0), depth + 1);
+  }
+
+  if (isa<AddLOp>(a) || isa<AddIOp>(a)) {
+    if (a->DEF(0) == b) return evalDiff(a->DEF(1), nullptr, depth + 1);
+    if (a->DEF(1) == b) return evalDiff(a->DEF(0), nullptr, depth + 1);
+
+    auto constOffset = evalConstIntExpr(a->DEF(1));
+    if (constOffset) {
+      auto diff = evalDiff(a->DEF(0), b, depth + 1);
+      if (diff) return *diff + *constOffset;
+    }
+    auto constBase = evalConstIntExpr(a->DEF(0));
+    if (constBase) {
+      auto diff = evalDiff(a->DEF(1), b, depth + 1);
+      if (diff) return *diff + *constBase;
+    }
+  }
+
+  if (isa<AddLOp>(b) || isa<AddIOp>(b)) {
+    if (b->DEF(0) == a) return evalDiff(nullptr, b->DEF(1), depth + 1);
+    if (b->DEF(1) == a) return evalDiff(nullptr, b->DEF(0), depth + 1);
+
+    auto constOffset = evalConstIntExpr(b->DEF(1));
+    if (constOffset) {
+      auto diff = evalDiff(a, b->DEF(0), depth + 1);
+      if (diff) return *diff - *constOffset;
+    }
+    auto constBase = evalConstIntExpr(b->DEF(0));
+    if (constBase) {
+      auto diff = evalDiff(a, b->DEF(1), depth + 1);
+      if (diff) return *diff - *constBase;
+    }
+  }
+
+  if (isa<SubLOp>(a) || isa<SubIOp>(a)) {
+    if (a->DEF(0) == b) return evalDiff(nullptr, a->DEF(1), depth + 1);
+
+    auto constOffset = evalConstIntExpr(a->DEF(1));
+    if (constOffset) {
+      auto diff = evalDiff(a->DEF(0), b, depth + 1);
+      if (diff) return *diff - *constOffset;
+    }
+  }
+
+  if (isa<SubLOp>(b) || isa<SubIOp>(b)) {
+    if (b->DEF(0) == a) return evalDiff(b->DEF(1), nullptr, depth + 1);
+
+    auto constOffset = evalConstIntExpr(b->DEF(1));
+    if (constOffset) {
+      auto diff = evalDiff(a, b->DEF(0), depth + 1);
+      if (diff) return *diff + *constOffset;
+    }
+  }
+
+  return std::nullopt;
+}
+
 bool sys::mustAlias(Op *a, Op *b) {
   if (a->has<AliasAttr>() && b->has<AliasAttr>())
     return ALIAS(a)->mustAlias(ALIAS(b));
@@ -299,8 +406,13 @@ bool sys::mustAlias(Op *a, Op *b) {
 }
 
 bool sys::neverAlias(Op *a, Op *b) {
-  if (a->has<AliasAttr>() && b->has<AliasAttr>())
-    return ALIAS(a)->neverAlias(ALIAS(b));
+  if (a->has<AliasAttr>() && b->has<AliasAttr>()) {
+    if (ALIAS(a)->neverAlias(ALIAS(b)))
+      return true;
+  }
+  auto diff = evalDiff(a, b);
+  if (diff && *diff != 0)
+    return true;
   return false;
 }
 
