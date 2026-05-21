@@ -1,5 +1,7 @@
 #include "Analysis.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -7,6 +9,14 @@
 using namespace sys;
 
 namespace {
+
+bool envEnabled(const char *name, bool fallback = false) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
 
 int clampToInt(long long v) {
   if (v > INT_MAX)
@@ -171,6 +181,13 @@ Op *buildOffsetValue(Builder &builder, const LinearExpr &expr) {
 }  // namespace
 
 void ArrayStrideAnalysis::run() {
+  // This pass rebuilds address-offset expressions from flattened AddL chains.
+  // It currently lacks access-size/object-bound reasoning, so keep it opt-in:
+  // otherwise large global arrays and loop-exit IVs can be folded into an
+  // incorrect row address after O1 middle-end cleanup.
+  if (!envEnabled("SISY_ENABLE_ARRAY_STRIDE_ANALYSIS"))
+    return;
+
   auto funcs = collectFuncs();
   Builder builder;
 

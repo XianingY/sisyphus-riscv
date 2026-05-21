@@ -642,7 +642,10 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
 
   for (size_t i = 0; i < block->children.size(); i++) {
     // Loop tiling: strip-mine loops that have an inner while.
-    if (hirEnvEnabled("SISY_HIR_ENABLE_TILING", true)) {
+    // HIR tiling rewrites loop structure before CFG construction. Keep it
+    // opt-in until the transform can prove that loop-exit IV values remain
+    // identical for users after the loop.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_TILING", false)) {
       if (block->children[i] && block->children[i]->kind == OpKind::While) {
         if (tryLoopTiling(block, i, stats)) {
           changed = true;
@@ -691,7 +694,7 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
 // Transformation:
 //   iv_init; while (iv < N): [... inner loops ...]; iv++
 // →
-//   iv_init; __tile = 0; while (__tile < N):
+//   iv_init; __tile = iv; while (__tile < N):
 //     __tile_stop = __tile + T; if (N < __tile_stop) { __tile_stop = N; }
 //     iv = __tile;
 //     while (iv < __tile_stop): [... inner loops ...]; iv++
@@ -772,8 +775,10 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
   // --- Build the tile while ---
   auto tileCond = makeCmp("<", makeLoad(tileIV), cloneOp(outer.bound));
   auto tileWhile = makeWhile(std::move(tileCond), std::move(tileBody));
-  // Tile IV init: int tileIV = 0;
-  auto tileInit = makeVarDecl(tileIV, makeConstInt(0));
+  // Tile IV init: start from the loop's current IV value. Loops such as
+  // stencil kernels often begin at 1, and forcing tileIV to 0 would introduce
+  // out-of-bounds accesses before the original iteration domain.
+  auto tileInit = makeVarDecl(tileIV, makeLoad(outer.iv));
 
   // --- Splice into block ---
   // Insert tileInit + tileWhile at position idx, replacing the original while.

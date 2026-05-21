@@ -554,7 +554,7 @@ private:
     for (size_t i = 0; i < indices.size(); i++) {
       auto idx = resolveToken(st, bid, indices[i], hir::TypeKind::Int, false);
       auto stride = builder.create<IntOp>({ new IntAttr((int) strides[i]) });
-      auto offset = builder.create<MulIOp>({ idx, stride });
+      auto offset = builder.create<MulLOp>({ idx, stride });
       addr = builder.create<AddLOp>({ addr, offset });
     }
     return addr;

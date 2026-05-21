@@ -1,5 +1,8 @@
 #include "Attrs.h"
 #include "Ops.h"
+#include <cstdlib>
+#include <cstring>
+#include <optional>
 #include <sstream>
 
 using namespace sys;
@@ -399,6 +402,14 @@ static std::optional<long long> evalDiff(Op *a, Op *b, int depth = 0) {
   return std::nullopt;
 }
 
+static bool envEnabled(const char *name, bool fallback = false) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
+
 bool sys::mustAlias(Op *a, Op *b) {
   if (a->has<AliasAttr>() && b->has<AliasAttr>())
     return ALIAS(a)->mustAlias(ALIAS(b));
@@ -410,9 +421,14 @@ bool sys::neverAlias(Op *a, Op *b) {
     if (ALIAS(a)->neverAlias(ALIAS(b)))
       return true;
   }
-  auto diff = evalDiff(a, b);
-  if (diff && *diff != 0)
-    return true;
+  // This fallback only compares address expressions. Without access sizes and
+  // object bounds it can treat adjacent or partially overlapping accesses as
+  // disjoint, so keep it out of the default correctness path.
+  if (envEnabled("SISY_ENABLE_EXPR_DIFF_ALIAS")) {
+    auto diff = evalDiff(a, b);
+    if (diff && *diff != 0)
+      return true;
+  }
   return false;
 }
 

@@ -328,7 +328,9 @@ int main(int argc, char **argv) {
     if (!cg && opts.rv) {
       bool enableHIRPolyhedral = true;
       if (const char *env = std::getenv("SISY_DISABLE_HIR_POLYHEDRAL"))
-        enableHIRPolyhedral = !(env[0] && std::strcmp(env, "0") != 0);
+        enableHIRPolyhedral = !(env[0] && std::strcmp(env, "0") != 0 &&
+                                std::strcmp(env, "false") != 0 &&
+                                std::strcmp(env, "FALSE") != 0);
       if (enableHIRPolyhedral) {
         runStage("hir.polyhedral", [&]() {
           sys::hir::PolyhedralOptimizer polyhedral;

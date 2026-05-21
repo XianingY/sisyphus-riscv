@@ -323,7 +323,7 @@ Value CodeGen::emitExpr(ASTNode *node) {
     for (int i = 0; i < access->indices.size(); i++) {
       auto index = emitExpr(access->indices[i]);
       auto strideVal = builder.create<IntOp>({ new IntAttr(sizes[i]) });
-      auto stride = builder.create<MulIOp>({ index, strideVal });
+      auto stride = builder.create<MulLOp>({ index, strideVal });
       addr = builder.create<AddLOp>({ addr, stride });
     }
     // This is not a value, but just an address.
@@ -541,7 +541,7 @@ void CodeGen::emit(ASTNode *node) {
           
           builder.setToRegionStart(body);
 
-          auto offset = builder.create<MulIOp>({ loop, stride });
+          auto offset = builder.create<MulLOp>({ loop, stride });
           auto place = builder.create<AddLOp>({ addr, offset });
           builder.create<StoreOp>({ zero, place });
         }
@@ -675,7 +675,7 @@ void CodeGen::emit(ASTNode *node) {
     for (int i = 0; i < write->indices.size(); i++) {
       auto index = emitExpr(write->indices[i]);
       auto strideVal = builder.create<IntOp>({ new IntAttr(sizes[i]) });
-      auto stride = builder.create<MulIOp>({ index, strideVal });
+      auto stride = builder.create<MulLOp>({ index, strideVal });
       addr = builder.create<AddLOp>({ addr, stride });
     }
     // Store the value in addr.
