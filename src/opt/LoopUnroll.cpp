@@ -39,6 +39,14 @@ int loopOpCount(LoopInfo *loop) {
   return loopsize;
 }
 
+bool loopHasCall(LoopInfo *loop) {
+  for (auto bb : loop->getBlocks())
+    for (auto op : bb->getOps())
+      if (isa<CallOp>(op))
+        return true;
+  return false;
+}
+
 Op *headerStop(LoopInfo *loop, bool &inclusive) {
   inclusive = false;
   if (!loop || !loop->header || !loop->getInduction())
@@ -77,9 +85,9 @@ bool smallConstantTrip(LoopInfo *loop, int loopsize, int &trip) {
   if (span <= 0 || span % stepValue != 0)
     return false;
   trip = span / stepValue;
-  if (trip <= 1 || trip > 16)
+  if (trip <= 1 || trip > 32)
     return false;
-  return loopsize > 0 && loopsize * (trip - 1) <= 200;
+  return loopsize > 0 && loopsize * (trip - 1) <= 1200;
 }
 
 bool tryRotateSmallConstantLoop(LoopInfo *info) {
@@ -400,7 +408,28 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
 
   auto phis = header->getPhis();
   // Phis will give immense register pressure. Don't unroll when there are too many.
-  if (phis.size() >= 5)
+  auto fixedTripCandidate = [&]() -> int {
+    auto lower = stripSinglePhi(loop->getStart());
+    auto upper = stripSinglePhi(loop->getStop());
+    bool inclusive = false;
+    if (!upper)
+      upper = headerStop(loop, inclusive);
+    auto step = stripSinglePhi(loop->getStepOp());
+    if (!lower || !upper || !step || !isa<IntOp>(lower) ||
+        !isa<IntOp>(upper) || !isa<IntOp>(step))
+      return -1;
+    int stepValue = V(step);
+    if (stepValue <= 0)
+      return -1;
+    int span = V(upper) - V(lower) + (inclusive ? 1 : 0);
+    if (span <= 0 || span % stepValue != 0)
+      return -1;
+    return span / stepValue;
+  }();
+  bool callFree = !loopHasCall(loop);
+  size_t phiLimit = (callFree && fixedTripCandidate > 1 && fixedTripCandidate <= 32 &&
+                     loopsize <= 80) ? 8 : 4;
+  if (phis.size() > phiLimit)
     return false;
 
   // Ensure that every phi at header is either from preheader or from the latch.
@@ -489,7 +518,9 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     int low = V(lower);
     int high = V(upper);
     int times = (high - low) / V(step);
-    if (times <= 2000 / loopsize)
+    if (times <= 2000 / loopsize ||
+        (callFree && times > 1 && times <= 32 && loopsize <= 80 &&
+         loopsize * (times - 1) <= 1800))
       unroll = times;
   } else if (runtimeUnrollEnabled()) {
     // Partial unrolling for runtime-bounded loops.
@@ -539,7 +570,8 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   // Guardrail: keep duplicated loop body within a bounded growth budget.
   // Relaxed for better performance on small tight loops.
   int estimatedGrowth = loopsize * (unroll - 1);
-  if (estimatedGrowth > 800)
+  int growthLimit = (callFree && unroll <= 32 && loopsize <= 80) ? 1800 : 800;
+  if (estimatedGrowth > growthLimit)
     return false;
 
   // Record the phi values at the beginning of `exit` that are taken from the latch.
