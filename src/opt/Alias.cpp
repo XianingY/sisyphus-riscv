@@ -85,8 +85,7 @@ static void postorder(BasicBlock *current,
 
 void Alias::runImpl(Region *region) {
   // Run local analysis over RPO of the dominator tree.
-
-  // First calculate RPO.
+  // Using iterative fixed-point propagation to handle loops and phis.
   DomTree tree = getDomTree(region);
 
   BasicBlock *entry = region->getFirstBlock();
@@ -96,67 +95,163 @@ void Alias::runImpl(Region *region) {
   postorder(entry, tree, rpo, visiting, visited);
   std::reverse(rpo.begin(), rpo.end());
 
-  // Then traverse the CFG in that order.
-  // This should guarantee definition comes before all uses.
-  for (auto bb : rpo) {
-    std::unordered_map<Op*, std::optional<long long>> constMemo;
-    std::unordered_set<Op*> constVisiting;
-    for (auto op : bb->getOps()) {
-      if (isa<AllocaOp>(op)) {
-        op->remove<AliasAttr>();
-        op->add<AliasAttr>(op, 0);
-        continue;
-      }
+  constexpr int kMaxIterations = 16;
+  bool changed = true;
+  int iterations = 0;
+  bool hitIterationLimit = false;
+  while (changed) {
+    if (iterations >= kMaxIterations) {
+      hitIterationLimit = true;
+      break;
+    }
+    changed = false;
+    iterations++;
 
-      if (isa<GetGlobalOp>(op)) {
-        op->remove<AliasAttr>();
-        op->add<AliasAttr>(gMap[NAME(op)], 0);
-        continue;
-      }
-      
-      if (isa<AddLOp>(op)) {
-        op->remove<AliasAttr>();
-        auto x = op->getOperand(0).defining;
-        auto y = op->getOperand(1).defining;
-        if (!x->has<AliasAttr>() && !y->has<AliasAttr>()) {
-          op->add<AliasAttr>(/*unknown*/);
+    for (auto bb : rpo) {
+      std::unordered_map<Op*, std::optional<long long>> constMemo;
+      std::unordered_set<Op*> constVisiting;
+      for (auto op : bb->getOps()) {
+        if (isa<AllocaOp>(op)) {
+          if (!op->has<AliasAttr>()) {
+            op->add<AliasAttr>(op, 0);
+            changed = true;
+          }
           continue;
         }
 
-        if (!x->has<AliasAttr>())
-          std::swap(x, y);
-
-        // Now `x` is the address and `y` is the offset. 
-        // Note this swap won't affect the original op.
-        auto alias = ALIAS(x)->clone();
-        auto constOffset = evalConstIntExpr(y, constMemo, constVisiting);
-        if (constOffset) {
-          auto delta = clampToInt(*constOffset);
-          for (auto &[_, offset] : alias->location) {
-            for (auto &value : offset) {
-              if (value != -1)
-                value += delta;
-            }
+        if (isa<GetGlobalOp>(op)) {
+          if (!op->has<AliasAttr>()) {
+            op->add<AliasAttr>(gMap[NAME(op)], 0);
+            changed = true;
           }
-        } else {
-          // Unknown offset. Set all offsets to -1.
-          for (auto &[_, offset] : alias->location)
-            offset = { -1 };
+          continue;
         }
 
-        if (ALIAS(x)->unknown)
-          op->add<AliasAttr>(/*unknown*/);
-        else
-          op->add<AliasAttr>(alias->location);
-        delete alias;
-        continue;
+        if (isa<GetArgOp>(op) && op->getResultType() == Value::i64) {
+          if (!op->has<AliasAttr>()) {
+            op->add<AliasAttr>(op, 0); // unique virtual base
+            changed = true;
+          }
+          continue;
+        }
+
+        if (isa<PhiOp>(op) && op->getResultType() == Value::i64) {
+          bool hasAlias = op->has<AliasAttr>();
+          AliasAttr newAlias;
+          newAlias.unknown = false;
+          bool hasAnyIncoming = false;
+
+          for (int i = 0; i < op->getOperandCount(); i++) {
+            auto incoming = op->getOperand(i).defining;
+            if (incoming->has<AliasAttr>()) {
+              hasAnyIncoming = true;
+              auto incomingAlias = ALIAS(incoming);
+              if (incomingAlias->unknown) {
+                newAlias.unknown = true;
+                break;
+              } else {
+                for (auto &[base, offsets] : incomingAlias->location) {
+                  for (auto off : offsets) {
+                    newAlias.add(base, off);
+                  }
+                }
+              }
+            }
+          }
+
+          if (hasAnyIncoming) {
+            if (newAlias.unknown) {
+              if (!hasAlias || !ALIAS(op)->unknown) {
+                op->remove<AliasAttr>();
+                op->add<AliasAttr>(); // unknown
+                changed = true;
+              }
+            } else {
+              if (!hasAlias || ALIAS(op)->unknown || ALIAS(op)->location != newAlias.location) {
+                op->remove<AliasAttr>();
+                op->add<AliasAttr>(newAlias.location);
+                changed = true;
+              }
+            }
+          }
+          continue;
+        }
+
+        if (isa<AddLOp>(op)) {
+          auto x = op->getOperand(0).defining;
+          auto y = op->getOperand(1).defining;
+          if (!x->has<AliasAttr>() && !y->has<AliasAttr>()) {
+            if (!op->has<AliasAttr>() || !ALIAS(op)->unknown) {
+              op->remove<AliasAttr>();
+              op->add<AliasAttr>(); // unknown
+              changed = true;
+            }
+            continue;
+          }
+
+          if (!x->has<AliasAttr>())
+            std::swap(x, y);
+
+          if (!x->has<AliasAttr>())
+            continue;
+
+          bool hasAlias = op->has<AliasAttr>();
+          auto alias = ALIAS(x)->clone();
+          auto constOffset = evalConstIntExpr(y, constMemo, constVisiting);
+          if (constOffset) {
+            auto delta = clampToInt(*constOffset);
+            for (auto &[_, offset] : alias->location) {
+              for (auto &value : offset) {
+                if (value != -1)
+                  value += delta;
+              }
+            }
+          } else {
+            for (auto &[_, offset] : alias->location)
+              offset = { -1 };
+          }
+
+          bool isNewUnknown = ALIAS(x)->unknown;
+          if (isNewUnknown) {
+            if (!hasAlias || !ALIAS(op)->unknown) {
+              op->remove<AliasAttr>();
+              op->add<AliasAttr>(); // unknown
+              changed = true;
+            }
+          } else {
+            if (!hasAlias || ALIAS(op)->unknown || ALIAS(op)->location != alias->location) {
+              op->remove<AliasAttr>();
+              op->add<AliasAttr>(alias->location);
+              changed = true;
+            }
+          }
+          delete alias;
+          continue;
+        }
       }
+    }
+  }
+  iterationsTotal += iterations;
+
+  if (!hitIterationLimit)
+    return;
+
+  maxIterationsHit++;
+  for (auto bb : rpo) {
+    for (auto op : bb->getOps()) {
+      if (!op->has<AliasAttr>())
+        continue;
+      if (isa<AllocaOp>(op) || isa<GetGlobalOp>(op))
+        continue;
+      op->remove<AliasAttr>();
+      op->add<AliasAttr>();
+      degradedToUnknown++;
     }
   }
 }
 
 // This has better precision after Mem2Reg, because less `int**` is possible.
-// Before Mem2Reg, we can store the address of an array in an alloca. 
+// Before Mem2Reg, we can store the address of an array in an alloca.
 // Some nested address patterns are still not fully eliminated after this pass.
 // Moreover, it's more useful when all unnecessary alloca's have been removed.
 //
@@ -164,6 +259,17 @@ void Alias::runImpl(Region *region) {
 void Alias::run() {
   auto funcs = collectFuncs();
   gMap = getGlobalMap();
+
+  // First run: assign a unique virtual base to all pointer parameters (GetArgOp with i64 type)
+  // that do not currently have any alias attribute.
+  for (auto func : funcs) {
+    auto args = func->findAll<GetArgOp>();
+    for (auto arg : args) {
+      if (arg->getResultType() == Value::i64 && !arg->has<AliasAttr>()) {
+        arg->add<AliasAttr>(arg, 0);
+      }
+    }
+  }
 
   for (auto func : funcs)
     runImpl(func->getRegion());
@@ -195,17 +301,40 @@ void Alias::run() {
       runRewriter(fnMap[name], [&](GetArgOp *op) {
         int index = V(op);
         auto def = call->getOperand(index).defining;
-        if (!def->has<AliasAttr>())
+        if (!def->has<AliasAttr>()) {
+          if (op->has<AliasAttr>()) {
+            auto current = ALIAS(op);
+            if (!current->unknown) {
+              op->remove<AliasAttr>();
+              op->add<AliasAttr>(); // unknown
+              changed = true;
+            }
+          } else {
+            op->add<AliasAttr>(); // unknown
+            changed = true;
+          }
           return false;
+        }
 
         auto defLoc = ALIAS(def);
-        if (op->has<AliasAttr>())
-          changed |= ALIAS(op)->addAll(defLoc);
-        else {
+        if (op->has<AliasAttr>()) {
+          auto current = ALIAS(op);
+          // If current is just the virtual self-base, override it completely
+          // with the incoming concrete caller alias info.
+          if (!current->unknown && current->location.size() == 1 && current->location.count(op)) {
+            if (current->unknown != defLoc->unknown || current->location != defLoc->location) {
+              op->remove<AliasAttr>();
+              op->add<AliasAttr>(*defLoc);
+              changed = true;
+            }
+          } else {
+            changed |= current->addAll(defLoc);
+          }
+        } else {
           op->add<AliasAttr>(*defLoc);
           changed = true;
         }
-        
+
         // Do it only once.
         return false;
       });

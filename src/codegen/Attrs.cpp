@@ -47,7 +47,7 @@ FloatArrayAttr::FloatArrayAttr(float *vf, int size): vf(vf), size(size), allZero
 std::string IntArrayAttr::toString() {
   if (allZero)
     return "<array = 0 x " + std::to_string(size) + ">";
-  
+
   std::stringstream ss;
   ss << "<array = ";
   if (size > 0)
@@ -61,7 +61,7 @@ std::string IntArrayAttr::toString() {
 std::string FloatArrayAttr::toString() {
   if (allZero)
     return "<array = 0.0f x " + std::to_string(size) + ">";
-  
+
   std::stringstream ss;
   ss << "<array = ";
   if (size > 0)
@@ -99,7 +99,7 @@ std::string CallerAttr::toString() {
   std::stringstream ss;
   if (!callers.size())
     return "<no caller>";
-  
+
   ss << "<caller = " << callers[0];
   for (int i = 1; i < callers.size(); i++)
     ss << ", " << callers[i];
@@ -125,12 +125,12 @@ std::string AliasAttr::toString() {
       ss << "global " << NAME(base);
     else
       ss << "alloca " << getValueNumber(base->getResult());
-    
+
     assert(offset.size() > 0);
     ss << ": " << offset[0];
     for (int i = 1; i < offset.size(); i++)
       ss << ", " << offset[i];
-    
+
     ss << "; ";
   }
 
@@ -163,6 +163,11 @@ bool AliasAttr::add(Op *base, int offset) {
   // Known base, but unknown offset.
   if (offset == -1) {
     if (!location.count(base)) {
+      if (location.size() >= 3) {
+        unknown = true;
+        location.clear();
+        return true;
+      }
       location[base] = { -1 };
       return true;
     }
@@ -174,14 +179,25 @@ bool AliasAttr::add(Op *base, int offset) {
   }
 
   // Both known base and known offset.
+  if (!location.count(base)) {
+    if (location.size() >= 3) {
+      unknown = true;
+      location.clear();
+      return true;
+    }
+  }
   auto &vec = location[base];
 
   // Adding a known offset into an unknown offset.
   if (vec.size() == 1 && vec[0] == -1)
     return false;
-  
+
   if (std::find(vec.begin(), vec.end(), offset) != vec.end())
     return false;
+  if (vec.size() >= 3) {
+    vec = { -1 };
+    return true;
+  }
   vec.push_back(offset);
   return true;
 }
@@ -189,11 +205,20 @@ bool AliasAttr::add(Op *base, int offset) {
 bool AliasAttr::addAll(const AliasAttr *other) {
   if (unknown)
     return false;
-  
+
+  if (other->unknown) {
+    unknown = true;
+    location.clear();
+    return true;
+  }
+
   bool changed = false;
   for (auto &[b, o] : other->location) {
-    for (auto v : o)
-      changed = add(b, v);
+    for (auto v : o) {
+      changed |= add(b, v);
+      if (unknown)
+        return true;
+    }
   }
   return changed;
 }

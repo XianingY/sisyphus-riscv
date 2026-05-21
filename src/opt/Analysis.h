@@ -34,12 +34,21 @@ public:
 // Gives an AliasAttr to values, if they are addresses.
 class Alias : public Pass {
   std::map<std::string, GlobalOp*> gMap;
+  int iterationsTotal = 0;
+  int maxIterationsHit = 0;
+  int degradedToUnknown = 0;
   void runImpl(Region *region);
 public:
   Alias(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "alias"; };
-  std::map<std::string, int> stats() override { return {}; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "iterations", iterationsTotal },
+      { "max-iterations-hit", maxIterationsHit },
+      { "degraded-to-unknown", degradedToUnknown },
+    };
+  }
   void run() override;
 };
 
