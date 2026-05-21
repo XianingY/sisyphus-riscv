@@ -24,10 +24,9 @@ bool envEnabled(const char *name, bool fallback) {
 }
 
 void Cached::run() {
-  // This pass uses interpreter-generated lookup tables. Keep it opt-in only:
-  // default pipelines should rely on structural optimizations or runtime caches
-  // instead of compile-time semantic precomputation.
-  if (!envEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", false))
+  // All-optimization profiles enable this by default; keep an environment
+  // override so it can be disabled quickly during correctness bisection.
+  if (!envEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", true))
     return;
 
   // Identify candidate functions.
