@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 using namespace sys;
 
@@ -36,10 +37,50 @@ void RangeAwareFold::run() {
     return true;
   };
 
+  auto knownTruthyValue = [](Op *op) -> std::optional<int> {
+    if (!op || op->getResultType() == Value::f32 || !op->has<RangeAttr>())
+      return std::nullopt;
+    auto [low, high] = RANGE(op);
+    if (low == 0 && high == 0)
+      return 0;
+    if (high < 0 || low > 0)
+      return 1;
+    return std::nullopt;
+  };
+
   runRewriter([&](EqOp *op) { return foldKnownBool(op); });
   runRewriter([&](NeOp *op) { return foldKnownBool(op); });
   runRewriter([&](LtOp *op) { return foldKnownBool(op); });
   runRewriter([&](LeOp *op) { return foldKnownBool(op); });
+
+  runRewriter([&](NotOp *op) {
+    auto truth = knownTruthyValue(op->DEF());
+    if (!truth)
+      return false;
+    folded++;
+    builder.replace<IntOp>(op, { new IntAttr(*truth ? 0 : 1) });
+    return true;
+  });
+
+  runRewriter([&](SetNotZeroOp *op) {
+    auto truth = knownTruthyValue(op->DEF());
+    if (!truth)
+      return false;
+    folded++;
+    builder.replace<IntOp>(op, { new IntAttr(*truth) });
+    return true;
+  });
+
+  runRewriter([&](BranchOp *op) {
+    auto truth = knownTruthyValue(op->DEF());
+    if (!truth)
+      return false;
+    folded++;
+    builder.setBeforeOp(op);
+    auto value = builder.create<IntOp>({ new IntAttr(*truth) });
+    op->replaceOperand(op->DEF(), value);
+    return false;
+  });
 
   // Fold left/right shifts early.
   runRewriter([&](DivIOp *op) {

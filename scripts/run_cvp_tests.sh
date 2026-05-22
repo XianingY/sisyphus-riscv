@@ -45,4 +45,15 @@ if ! grep -A2 '^range-aware-fold:$' <<<"${reversed_stats}" | grep -Eq 'folded-op
   exit 1
 fi
 
+nonzero_stats="$("${COMPILER}" "${CASE_DIR}/nonzero_refines_not.sy" -S \
+  -o "${OUT_DIR}/nonzero_refines_not.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${nonzero_stats}"
+
+if ! grep -A2 '^range-aware-fold:$' <<<"${nonzero_stats}" | grep -Eq 'folded-ops : [1-9]'; then
+  echo "expected RangeAwareFold to fold !x when correlated range proves x is nonzero" >&2
+  exit 1
+fi
+
 echo "Correlated value propagation range folding tests passed."
