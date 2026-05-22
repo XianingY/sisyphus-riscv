@@ -630,6 +630,119 @@ bool bodyUsesAnyOf(const Op *op, const std::unordered_set<std::string> &syms) {
   return false;
 }
 
+std::unique_ptr<Op> cloneBlockWithoutLast(const Op *block) {
+  if (!block || block->kind != OpKind::Block || block->children.empty())
+    return nullptr;
+  auto out = makeBlock();
+  for (size_t i = 0; i + 1 < block->children.size(); i++)
+    out->children.push_back(cloneOp(block->children[i].get()));
+  return out;
+}
+
+bool collectCanonicalLoopIVs(const Op *op, std::unordered_set<std::string> &ivs) {
+  if (!op)
+    return true;
+  if (op->kind == OpKind::While) {
+    affine::CanonicalLoop loop;
+    if (!affine::matchCanonicalLoop(op, loop))
+      return false;
+    ivs.insert(loop.iv);
+    return collectCanonicalLoopIVs(loop.body, ivs);
+  }
+  for (const auto &child : op->children)
+    if (!collectCanonicalLoopIVs(child.get(), ivs))
+      return false;
+  return true;
+}
+
+const Op *additiveDeltaExpr(const Op *store, const std::string &acc) {
+  if (!store || store->kind != OpKind::Store || store->symbol != acc ||
+      store->children.size() != 1)
+    return nullptr;
+  const Op *rhs = store->children[0].get();
+  if (!rhs || rhs->kind != OpKind::Arith || rhs->symbol != "+" ||
+      rhs->children.size() != 2)
+    return nullptr;
+  if (isScalarLoad(rhs->children[0].get(), acc))
+    return rhs->children[1].get();
+  if (isScalarLoad(rhs->children[1].get(), acc))
+    return rhs->children[0].get();
+  return nullptr;
+}
+
+bool repeatBodyLegalImpl(const Op *op, const std::unordered_set<std::string> &loopIVs,
+                         const std::string &repeatIV, std::string &acc,
+                         int &accUpdates) {
+  if (!op)
+    return true;
+
+  switch (op->kind) {
+  case OpKind::Call:
+  case OpKind::Return:
+  case OpKind::Break:
+  case OpKind::Continue:
+  case OpKind::If:
+  case OpKind::For:
+    return false;
+  default:
+    break;
+  }
+
+  if (op->kind == OpKind::Store && op->children.size() > 1) {
+    // Repeating a loop body once is only equivalent when the repeated body is
+    // read-only with respect to arrays. Scalar reductions are handled below.
+    return false;
+  }
+
+  if (op->kind == OpKind::VarDecl && !op->symbol.empty() && op->arrayDims.empty()) {
+    if (!loopIVs.count(op->symbol))
+      return false;
+  }
+
+  if (op->kind == OpKind::Store && op->children.size() == 1 && !op->symbol.empty()) {
+    if (loopIVs.count(op->symbol)) {
+      if (op->symbol == repeatIV && !matchStepStore(const_cast<Op*>(op), repeatIV, 1))
+        return false;
+    } else {
+      const Op *delta = additiveDeltaExpr(op, acc.empty() ? op->symbol : acc);
+      if (!delta)
+        return false;
+      if (!acc.empty() && op->symbol != acc)
+        return false;
+      if (exprUsesScalar(delta, repeatIV))
+        return false;
+      acc = op->symbol;
+      accUpdates++;
+    }
+  }
+
+  for (const auto &child : op->children)
+    if (!repeatBodyLegalImpl(child.get(), loopIVs, repeatIV, acc, accUpdates))
+      return false;
+  return true;
+}
+
+bool repeatBodyLegal(const Op *body, const std::string &repeatIV, std::string &acc) {
+  if (!body || body->kind != OpKind::Block || body->children.empty())
+    return false;
+  std::unordered_set<std::string> loopIVs = {repeatIV};
+  if (!collectCanonicalLoopIVs(body, loopIVs))
+    return false;
+  int accUpdates = 0;
+  if (!repeatBodyLegalImpl(body, loopIVs, repeatIV, acc, accUpdates))
+    return false;
+  return !acc.empty() && accUpdates > 0;
+}
+
+bool blockExceptLastUsesScalar(const Op *block, const std::string &symbol) {
+  if (!block || block->kind != OpKind::Block || block->children.empty())
+    return false;
+  for (size_t i = 0; i + 1 < block->children.size(); i++)
+    if (exprUsesScalar(block->children[i].get(), symbol))
+      return true;
+  return false;
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
@@ -668,6 +781,14 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
       continue;
     }
     if (tryReductionJam(block, i, stats)) {
+      changed = true;
+      i = 0;
+    }
+  }
+
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (block->children[i] && block->children[i]->kind == OpKind::While &&
+        tryRepeatInvariantReduction(block, i, stats)) {
       changed = true;
       i = 0;
     }
@@ -950,6 +1071,71 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   }
 
   stats.fusionApplied++;
+  return true;
+}
+
+bool PolyhedralOptimizer::tryRepeatInvariantReduction(Op *block, size_t idx,
+                                                       PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size() || idx == 0)
+    return false;
+
+  Op *whileOp = block->children[idx].get();
+  CanonicalLoop loop;
+  if (!matchCanonicalWhile(whileOp, loop))
+    return false;
+  if (!matchLoopInit(block->children[idx - 1].get(), loop.iv)) {
+    stats.repeatRejected++;
+    return false;
+  }
+  const Op *start = initValue(block->children[idx - 1].get());
+  if (!isConstIntValue(start, 0)) {
+    stats.repeatRejected++;
+    return false;
+  }
+  if (exprUsesScalar(loop.bound, loop.iv) ||
+      blockExceptLastUsesScalar(loop.body, loop.iv) ||
+      affine::opWritesAnyScalarUsedBy(loop.body, loop.bound)) {
+    stats.repeatRejected++;
+    return false;
+  }
+
+  std::string acc;
+  if (!repeatBodyLegal(loop.body, loop.iv, acc)) {
+    stats.repeatRejected++;
+    return false;
+  }
+
+  auto bodyOnce = cloneBlockWithoutLast(loop.body);
+  if (!bodyOnce) {
+    stats.repeatRejected++;
+    return false;
+  }
+
+  const std::string baseVar = "__hir_repeat_base_" + acc + "_" + std::to_string(uniqueId++);
+  auto thenBlock = makeBlock();
+  thenBlock->children.push_back(std::move(bodyOnce));
+  auto delta = makeArith("-", makeLoad(acc), makeLoad(baseVar));
+  auto scaled = makeArith("*", std::move(delta), cloneOp(loop.bound));
+  thenBlock->children.push_back(makeStore(acc,
+      makeArith("+", makeLoad(baseVar), std::move(scaled))));
+  thenBlock->children.push_back(makeStore(loop.iv, cloneOp(loop.bound)));
+
+  auto ifOp = std::make_unique<Op>(OpKind::If);
+  ifOp->children.push_back(makeCmp("<", makeConstInt(0), cloneOp(loop.bound)));
+  ifOp->children.push_back(std::move(thenBlock));
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 1);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(makeVarDecl(baseVar, makeLoad(acc)));
+      replacement.push_back(std::move(ifOp));
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.repeatReduced++;
   return true;
 }
 

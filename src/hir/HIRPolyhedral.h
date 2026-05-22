@@ -10,6 +10,8 @@ namespace sys::hir {
 struct PolyhedralStats {
   int reductionJammed = 0;
   int reductionInterchanged = 0;
+  int repeatReduced = 0;
+  int repeatRejected = 0;
   int rejected = 0;
   // Loop tiling counters
   int tilingApplied = 0;
@@ -31,6 +33,7 @@ private:
   bool optimizeBlock(Op *block, PolyhedralStats &stats);
   bool tryReductionInterchange(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats);
+  bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);
 
   // Loop tiling: strip-mine 2-level or 3-level perfect nests in HIR.
   bool tryLoopTiling(Op *block, size_t idx, PolyhedralStats &stats);
