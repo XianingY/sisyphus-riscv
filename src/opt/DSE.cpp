@@ -8,10 +8,114 @@ using namespace sys;
 std::map<std::string, int> DSE::stats() {
   return {
     { "removed-stores", elim },
+    { "sunk-stores", sunk },
   };
 }
 
+namespace {
+
+bool sameStoredValueForSink(Op *a, Op *b) {
+  if (a == b)
+    return true;
+  if (!a || !b || a->opid != b->opid)
+    return false;
+  if (isa<IntOp>(a))
+    return V(a) == V(b);
+  if (isa<FloatOp>(a))
+    return F(a) == F(b);
+  return false;
+}
+
+bool sameStoreForSink(StoreOp *a, StoreOp *b) {
+  if (!a || !b)
+    return false;
+  if (!sameStoredValueForSink(a->DEF(0), b->DEF(0)))
+    return false;
+  return a->DEF(1) == b->DEF(1) || mustAlias(a->DEF(1), b->DEF(1));
+}
+
+StoreOp *trailingStoreToJoin(BasicBlock *pred, BasicBlock *join) {
+  if (!pred || pred->getOpCount() == 0)
+    return nullptr;
+  auto term = pred->getLastOp();
+  if (!isa<GotoOp>(term) || !term->has<TargetAttr>() || TARGET(term) != join)
+    return nullptr;
+  auto prev = term->prevOp();
+  if (!prev)
+    return nullptr;
+  return dyn_cast<StoreOp>(prev);
+}
+
+bool valueAvailableAt(Op *value, BasicBlock *bb) {
+  if (!value)
+    return false;
+  if (isa<IntOp>(value) || isa<FloatOp>(value))
+    return true;
+  auto parent = value->getParent();
+  return parent && parent->dominates(bb);
+}
+
+Op *materializeSinkValue(Builder &builder, Op *value) {
+  if (isa<IntOp>(value))
+    return builder.create<IntOp>({ new IntAttr(V(value)) });
+  if (isa<FloatOp>(value))
+    return builder.create<FloatOp>({ new FloatAttr(F(value)) });
+  return value;
+}
+
+void setAfterPhis(Builder &builder, BasicBlock *bb) {
+  auto phis = bb->getPhis();
+  if (phis.empty())
+    builder.setToBlockStart(bb);
+  else
+    builder.setAfterOp(phis.back());
+}
+
+}
+
 void DSE::runImpl(Region *region) {
+  region->updateDoms();
+
+  Builder builder;
+  for (auto bb : region->getBlocks()) {
+    if (!bb || bb->preds.size() < 2)
+      continue;
+
+    std::vector<StoreOp*> stores;
+    bool good = true;
+    for (auto pred : bb->preds) {
+      auto store = trailingStoreToJoin(pred, bb);
+      if (!store) {
+        good = false;
+        break;
+      }
+      stores.push_back(store);
+    }
+    if (!good || stores.empty())
+      continue;
+
+    auto first = stores.front();
+    if (!valueAvailableAt(first->DEF(1), bb) || !valueAvailableAt(first->DEF(0), bb))
+      continue;
+
+    bool same = true;
+    for (auto store : stores) {
+      if (!sameStoreForSink(first, store)) {
+        same = false;
+        break;
+      }
+    }
+    if (!same)
+      continue;
+
+    setAfterPhis(builder, bb);
+    auto value = materializeSinkValue(builder, first->DEF(0));
+    builder.create<StoreOp>({ value, first->DEF(1) });
+    for (auto store : stores)
+      store->erase();
+    sunk += static_cast<int>(stores.size()) - 1;
+  }
+
   used.clear();
   // Use a dataflow approach.
   std::map<BasicBlock*, std::set<Op*>> in, out;

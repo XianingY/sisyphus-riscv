@@ -1,0 +1,12 @@
+int main() {
+  int a[1];
+  int c;
+  c = getint();
+  if (c) {
+    a[0] = 7;
+  } else {
+    a[0] = 7;
+  }
+  putint(a[0]);
+  return 0;
+}

@@ -75,6 +75,7 @@ class DSE : public Pass {
   std::map<Op*, bool> used;
 
   int elim = 0;
+  int sunk = 0;
 
   void dfs(BasicBlock *current, DomTree &dom, std::set<Op*> live);
   void runImpl(Region *region);

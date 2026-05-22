@@ -44,4 +44,15 @@ if grep -q 'non-dominating:' <<<"${runtime_stats}"; then
   exit 1
 fi
 
+sink_stats="$("${COMPILER}" "${CASE_DIR}/branch_common_store_sink.sy" -S \
+  -o "${OUT_DIR}/branch_common_store_sink.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${sink_stats}"
+
+if ! grep -A3 '^dse:$' <<<"${sink_stats}" | grep -Eq 'sunk-stores : [1-9]'; then
+  echo "expected DSE to sink equivalent stores from all branch predecessors" >&2
+  exit 1
+fi
+
 echo "MemorySSA reaching-store load elimination tests passed."
