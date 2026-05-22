@@ -662,6 +662,18 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     return changed;
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    if (tryReductionInterchange(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
+    if (tryReductionJam(block, i, stats)) {
+      changed = true;
+      i = 0;
+    }
+  }
+
+  for (size_t i = 0; i < block->children.size(); i++) {
     // Loop tiling: strip-mine loops that have an inner while.
     // HIR tiling rewrites loop structure before CFG construction. Keep it
     // opt-in until the transform can prove that loop-exit IV values remain
@@ -684,18 +696,6 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
           continue;
         }
       }
-    }
-  }
-
-  for (size_t i = 0; i + 1 < block->children.size(); i++) {
-    if (tryReductionInterchange(block, i, stats)) {
-      changed = true;
-      i = 0;
-      continue;
-    }
-    if (tryReductionJam(block, i, stats)) {
-      changed = true;
-      i = 0;
     }
   }
   return changed;
