@@ -37,6 +37,7 @@ struct PolyhedralStats {
   int fusionRejectControl = 0;
   int fusionRejectScalar = 0;
   int fusionRejectMemory = 0;
+  int forwardedArrayStoreLoads = 0;
   // Stats-only affine nest scanner. These counters do not enable rewrites.
   int affineNestCandidates = 0;
   int affineNestRejectedShape = 0;
@@ -67,6 +68,7 @@ private:
 
   // Loop fusion: merge two adjacent loops with identical bounds over same arrays.
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
+  bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
 };
 
 }  // namespace sys::hir

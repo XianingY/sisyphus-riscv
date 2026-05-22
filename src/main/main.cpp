@@ -369,6 +369,7 @@ int main(int argc, char **argv) {
                       << " fusion-reject-control=" << stats.fusionRejectControl
                       << " fusion-reject-scalar=" << stats.fusionRejectScalar
                       << " fusion-reject-memory=" << stats.fusionRejectMemory
+                      << " forwarded-array-store-load=" << stats.forwardedArrayStoreLoads
                       << " affine-nest-candidates=" << stats.affineNestCandidates
                       << " affine-nest-reject-shape=" << stats.affineNestRejectedShape
                       << " affine-nest-reject-control=" << stats.affineNestRejectedControl

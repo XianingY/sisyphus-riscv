@@ -643,6 +643,35 @@ bool boundsEqual(const Op *a, const Op *b) {
   return true;
 }
 
+bool isArrayStore(const Op *op) {
+  op = unwrapSingleDecl(op);
+  return op && op->kind == OpKind::Store && op->children.size() > 1 &&
+         !op->symbol.empty();
+}
+
+Op *asArrayStore(Op *op) {
+  op = unwrapSingleDecl(op);
+  return isArrayStore(op) ? op : nullptr;
+}
+
+Op *asScalarVarDecl(Op *op) {
+  op = unwrapSingleDecl(op);
+  return op && op->kind == OpKind::VarDecl && op->arrayDims.empty() &&
+         op->children.size() == 1 ? op : nullptr;
+}
+
+bool sameArrayAddress(const Op *store, const Op *load) {
+  if (!store || !load || store->kind != OpKind::Store ||
+      load->kind != OpKind::Load || store->symbol != load->symbol)
+    return false;
+  if (store->children.size() != load->children.size() + 1)
+    return false;
+  for (size_t i = 0; i < load->children.size(); i++)
+    if (!boundsEqual(store->children[i].get(), load->children[i].get()))
+      return false;
+  return true;
+}
+
 // Two loops can be fused when B does not depend on scalars exclusively defined by A.
 bool collectDefinedScalars(const Op *block, std::unordered_set<std::string> &syms) {
   if (!block)
@@ -1284,11 +1313,36 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   }
 
   stats.fusionApplied++;
+  forwardArrayStoreLoads(loopA.body, stats);
   for (size_t nested = 0; loopA.body && nested < loopA.body->children.size(); nested++) {
     if (tryLoopFusion(loopA.body, nested, stats))
       nested = static_cast<size_t>(-1);
   }
   return true;
+}
+
+bool PolyhedralOptimizer::forwardArrayStoreLoads(Op *block, PolyhedralStats &stats) {
+  if (!block || block->kind != OpKind::Block)
+    return false;
+
+  bool changed = false;
+  for (size_t i = 0; i + 1 < block->children.size(); i++) {
+    Op *store = asArrayStore(block->children[i].get());
+    Op *decl = asScalarVarDecl(block->children[i + 1].get());
+    if (!store || !decl)
+      continue;
+    Op *init = decl->children[0].get();
+    if (!init || init->kind != OpKind::Load || init->children.empty())
+      continue;
+    if (!sameArrayAddress(store, init))
+      continue;
+
+    decl->children[0] = cloneOp(store->children.back().get());
+    stats.forwardedArrayStoreLoads++;
+    changed = true;
+  }
+
+  return changed;
 }
 
 bool PolyhedralOptimizer::tryRepeatInvariantReduction(Op *block, size_t idx,
