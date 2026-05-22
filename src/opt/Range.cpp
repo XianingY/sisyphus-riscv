@@ -156,8 +156,7 @@ bool updateConditional(Op *op, bool &changed) {
   bool isTarget = parent == TARGET(term);
 
   auto cond = term->DEF(0);
-  // TODO: more comparison types (also change Range.cpp)
-  if (!isa<LtOp>(cond))
+  if (!isa<LtOp>(cond) && !isa<LeOp>(cond) && !isa<EqOp>(cond) && !isa<NeOp>(cond))
     return false;
 
   if (cond->DEF(0) != x)
@@ -171,9 +170,34 @@ bool updateConditional(Op *op, bool &changed) {
   auto [xlow, xhigh] = RANGE(x);
   auto [ylow, yhigh] = RANGE(y);
 
-  IRange r = isTarget
-    ? IRange { xlow, std::min(xhigh, yhigh - 1) } // x < y
-    : IRange { std::max(xlow, ylow), xhigh };     // x >= y
+  IRange r = RANGE(x);
+  if (isa<LtOp>(cond)) {
+    r = isTarget
+      ? IRange { xlow, std::min(xhigh, yhigh - 1) } // x < y
+      : IRange { std::max(xlow, ylow), xhigh };     // x >= y
+  } else if (isa<LeOp>(cond)) {
+    r = isTarget
+      ? IRange { xlow, std::min(xhigh, yhigh) }     // x <= y
+      : IRange { std::max(xlow, ylow + 1), xhigh }; // x > y
+  } else if (isa<EqOp>(cond)) {
+    if (isTarget) {
+      r = IRange { std::max(xlow, ylow), std::min(xhigh, yhigh) };
+    } else if (ylow == yhigh) {
+      if (xlow == ylow)
+        r.first = std::min<int>(xhigh + 1, INT_MAX);
+      if (xhigh == yhigh)
+        r.second = std::max<int>(xlow - 1, INT_MIN);
+    }
+  } else if (isa<NeOp>(cond)) {
+    if (!isTarget) {
+      r = IRange { std::max(xlow, ylow), std::min(xhigh, yhigh) };
+    } else if (ylow == yhigh) {
+      if (xlow == ylow)
+        r.first = std::min<int>(xhigh + 1, INT_MAX);
+      if (xhigh == yhigh)
+        r.second = std::max<int>(xlow - 1, INT_MIN);
+    }
+  }
   if (!op->has<RangeAttr>()) {
     op->add<RangeAttr>(r);
     changed = true;
@@ -349,7 +373,7 @@ void Range::split(Region *region) {
       continue;
 
     auto cond = term->DEF();
-    if (!isa<LtOp>(cond))
+    if (!isa<LtOp>(cond) && !isa<LeOp>(cond) && !isa<EqOp>(cond) && !isa<NeOp>(cond))
       continue;
 
     auto x = cond->DEF(0);
@@ -439,7 +463,8 @@ void Range::analyze(Region *region) {
       if (!isa<BranchOp>(term) || term->getOperandCount() != 1)
         continue;
       auto cond = term->DEF();
-      if (!isa<LtOp>(cond) || cond->getOperandCount() != 2)
+      if ((!isa<LtOp>(cond) && !isa<LeOp>(cond) && !isa<EqOp>(cond) && !isa<NeOp>(cond)) ||
+          cond->getOperandCount() != 2)
         continue;
       if (cond->DEF(0) != op->DEF(0))
         continue;

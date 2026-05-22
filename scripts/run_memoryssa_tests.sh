@@ -28,4 +28,20 @@ if grep -q 'non-dominating:' <<<"${stats}"; then
   exit 1
 fi
 
+runtime_stats="$("${COMPILER}" "${CASE_DIR}/join_same_runtime_store_load.sy" -S \
+  -o "${OUT_DIR}/join_same_runtime_store_load.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${runtime_stats}"
+
+if ! grep -A2 '^dle:$' <<<"${runtime_stats}" | grep -Eq 'removed-loads : [1-9]'; then
+  echo "expected DLE/MemorySSA to forward a common reaching runtime store value" >&2
+  exit 1
+fi
+
+if grep -q 'non-dominating:' <<<"${runtime_stats}"; then
+  echo "runtime reaching-store forwarding introduced a non-dominating replacement value" >&2
+  exit 1
+fi
+
 echo "MemorySSA reaching-store load elimination tests passed."
