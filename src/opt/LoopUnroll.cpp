@@ -823,3 +823,19 @@ void ConstLoopUnroll::run() {
     } while (changed);
   }
 }
+
+// External function from RegisterPressure.cpp
+extern int calculateAdaptiveUnrollFactor(LoopInfo* loop, int defaultFactor);
+
+namespace {
+
+// Get unroll factor considering register pressure
+int getSmartUnrollFactor(LoopInfo* loop, int baselineFactor) {
+  if (!loop || !envEnabled("SISY_ENABLE_ADAPTIVE_UNROLL", true))
+    return baselineFactor;
+
+  int factor = calculateAdaptiveUnrollFactor(loop, baselineFactor);
+  return std::max(1, std::min(factor, baselineFactor));
+}
+
+}  // namespace
