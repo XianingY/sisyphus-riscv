@@ -1222,7 +1222,7 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
     stats.fusionRejectControl++;
     return false;
   }
-  if (containsWhile(loopA.body) || containsWhile(loopB.body)) {
+  if (containsWhile(loopA.body) != containsWhile(loopB.body)) {
     stats.fusionRejected++;
     stats.fusionRejectControl++;
     return false;
