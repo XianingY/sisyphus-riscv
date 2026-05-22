@@ -42,6 +42,7 @@
 #define OPF(Ty) OPBASE(Value::f32, Ty)
 #define OPL(Ty) OPBASE(Value::i64, Ty)
 #define OPV(Ty) OPBASE(Value::i128, Ty)
+#define OPVF(Ty) OPBASE(Value::f128, Ty)
 
 namespace sys {
 
@@ -113,6 +114,10 @@ OPV(SubVOp);
 OPV(MulVOp);
 
 OPV(BroadcastOp);
+OPVF(AddFVOp);
+OPVF(SubFVOp);
+OPVF(MulFVOp);
+OPVF(BroadcastFOp);
 
 // ====== Multi-threaded ======
 

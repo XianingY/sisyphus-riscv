@@ -41,4 +41,8 @@ if(BUILD_TESTING)
     NAME smoke_compile_dual_target
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_smoke.sh"
   )
+  add_test(
+    NAME rvv_vectorize_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_vectorize_tests.sh"
+  )
 endif()

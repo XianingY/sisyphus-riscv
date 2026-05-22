@@ -1,0 +1,11 @@
+int a[64];
+int b[64];
+
+int main() {
+  int i = 0;
+  while (i < 64) {
+    a[i] = a[i] + b[i];
+    i = i + 1;
+  }
+  return a[0];
+}

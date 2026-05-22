@@ -48,6 +48,9 @@ bool allowed(Op *op) {
     ALLOW(AddVOp)
     ALLOW(SubVOp)
     ALLOW(MulVOp)
+    ALLOW(AddFVOp)
+    ALLOW(SubFVOp)
+    ALLOW(MulFVOp)
     ALLOW(EqOp)
     ALLOW(NeOp)
     ALLOW(LtOp)
@@ -72,6 +75,7 @@ bool allowed(Op *op) {
     ALLOW(SetNotZeroOp)
     ALLOW(GetGlobalOp)
     ALLOW(BroadcastOp)
+    ALLOW(BroadcastFOp)
 
   // RISC-V GVN
     ALLOW(rv::AddOp)

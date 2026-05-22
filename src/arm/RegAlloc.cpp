@@ -742,11 +742,15 @@ skip_prefer_assign:
   LOWER(AddXOp, BINARY);
   LOWER(AddWOp, BINARY);
   LOWER(AddVOp, BINARY);
+  LOWER(AddFVOp, BINARY);
   LOWER(SubWOp, BINARY);
   LOWER(SubXOp, BINARY);
+  LOWER(SubVOp, BINARY);
+  LOWER(SubFVOp, BINARY);
   LOWER(MulWOp, BINARY);
   LOWER(MulXOp, BINARY);
   LOWER(MulVOp, BINARY);
+  LOWER(MulFVOp, BINARY);
   LOWER(SdivWOp, BINARY);
   LOWER(SdivXOp, BINARY);
   LOWER(AndOp, BINARY);
@@ -826,6 +830,7 @@ skip_prefer_assign:
   LOWER(CsetEqFcmpZOp, UNARY);
   LOWER(CsetNeFcmpZOp, UNARY);
   LOWER(DupOp, UNARY);
+  LOWER(DupFOp, UNARY);
 
   // Note that some ops are dealt with later.
   // We can't remove all operands here.

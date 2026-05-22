@@ -1,0 +1,17 @@
+float a[64];
+float b[64];
+float c[64];
+
+int main() {
+  a[0] = getfloat();
+  b[0] = getfloat();
+  int i = 0;
+  while (i < 64) {
+    c[i] = a[i] + b[i];
+    i = i + 1;
+  }
+  if (c[0] > 0.0) {
+    return 1;
+  }
+  return 0;
+}

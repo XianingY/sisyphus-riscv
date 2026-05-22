@@ -96,8 +96,13 @@ void Lower::run() {
   REPLACE(LeFOp, CsetLeFOp);
   REPLACE(SelectOp, CselNeZOp);
   REPLACE(BroadcastOp, DupOp);
+  REPLACE(BroadcastFOp, DupFOp);
   REPLACE(sys::AddVOp, AddVOp);
+  REPLACE(sys::SubVOp, SubVOp);
   REPLACE(sys::MulVOp, MulVOp);
+  REPLACE(sys::AddFVOp, AddFVOp);
+  REPLACE(sys::SubFVOp, SubFVOp);
+  REPLACE(sys::MulFVOp, MulFVOp);
   REPLACE(sys::CloneOp, CloneOp);
   REPLACE(sys::JoinOp, JoinOp);
   REPLACE(sys::WakeOp, WakeOp);
@@ -158,7 +163,7 @@ void Lower::run() {
     auto ty = op->DEF(0)->getResultType();
     int size = op->has<SizeAttr>()
       ? SIZE(op)
-      : (ty == Value::i128 ? 16 : (ty == Value::i64 ? 8 : 4));
+      : ((ty == Value::i128 || ty == Value::f128) ? 16 : (ty == Value::i64 ? 8 : 4));
 
     if (ty == Value::f32) {
       builder.replace<StrFOp>(op, op->getOperands(), { new IntAttr(0) });
@@ -170,7 +175,7 @@ void Lower::run() {
       return false;
     }
 
-    if (ty == Value::i128 && size == 16) {
+    if ((ty == Value::i128 || ty == Value::f128) && size == 16) {
       builder.replace<St1Op>(op, op->getOperands());
       return false;
     }
@@ -183,7 +188,7 @@ void Lower::run() {
     auto ty = op->getResultType();
     int size = op->has<SizeAttr>()
       ? SIZE(op)
-      : (ty == Value::i128 ? 16 : (ty == Value::i64 ? 8 : 4));
+      : ((ty == Value::i128 || ty == Value::f128) ? 16 : (ty == Value::i64 ? 8 : 4));
     
     if (ty == Value::f32) {
       builder.replace<LdrFOp>(op, op->getOperands(), { new IntAttr(0) });
@@ -195,8 +200,8 @@ void Lower::run() {
       return false;
     }
 
-    if (ty == Value::i128 && size == 16) {
-      builder.replace<Ld1Op>(op, op->getOperands());
+    if ((ty == Value::i128 || ty == Value::f128) && size == 16) {
+      builder.replace<Ld1Op>(op, ty, op->getOperands());
       return false;
     }
 

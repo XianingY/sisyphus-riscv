@@ -253,7 +253,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::SimplifyCFG>();
     }
     pm.addPass<sys::AggressiveDCE>();
-    if (opts.arm && opts.enableExperimental)
+    if ((opts.arm || opts.rv) && opts.enableExperimental)
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::GVN>();
 

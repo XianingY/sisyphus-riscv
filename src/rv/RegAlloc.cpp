@@ -70,6 +70,12 @@ void materializeSpAddr(Builder &builder, Reg tmp, int offset) {
 }
 
 void emitStackStore(Builder &builder, Reg src, bool fp, int offset) {
+  if (isVector(src)) {
+    materializeSpAddr(builder, spillReg2, offset);
+    builder.create<Vse32Op>({ RSC(src), RS2C(spillReg2) });
+    return;
+  }
+
   if (fitsImm12(offset)) {
     if (fp)
       builder.create<FsdOp>({ RSC(src), RS2C(Reg::sp), new IntAttr(offset) });
@@ -86,6 +92,12 @@ void emitStackStore(Builder &builder, Reg src, bool fp, int offset) {
 }
 
 void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset, Reg addrTmp) {
+  if (isVector(dst)) {
+    materializeSpAddr(builder, addrTmp, offset);
+    builder.create<Vle32Op>(ty, { RDC(dst), RSC(addrTmp) });
+    return;
+  }
+
   if (fitsImm12(offset)) {
     builder.create<sys::rv::LoadOp>(ty, { RDC(dst), RSC(Reg::sp), new IntAttr(offset), new SizeAttr(8) });
     return;
@@ -138,6 +150,13 @@ ArgPlacement getArgPlacement(const std::vector<Value::Type> &types, int index) {
   }
 
   return { false, -1, -1 };
+}
+
+bool shareRegClass(Value::Type t1, Value::Type t2) {
+  if (vecreg(t1) && vecreg(t2)) return true;
+  if (fpreg(t1) && fpreg(t2)) return true;
+  if (!vecreg(t1) && !fpreg(t1) && !vecreg(t2) && !fpreg(t2)) return true;
+  return false;
 }
 
 }
@@ -213,8 +232,10 @@ struct Event {
 void RegAlloc::runImpl(Region *region, bool isLeaf) {
   const Reg *order = isLeaf ? leafOrder : normalOrder;
   const Reg *orderf = isLeaf ? leafOrderf : normalOrderf;
+  const Reg *orderv = isLeaf ? leafOrderv : normalOrderv;
   const int regcount = isLeaf ? leafRegCnt : normalRegCnt;
   const int regcountf = isLeaf ? leafRegCntf : normalRegCntf;
+  const int regcountv = isLeaf ? leafRegCntv : normalRegCntv;
 
   int opCount = 0;
   for (auto bb : region->getBlocks()) { opCount += bb->getOps().size(); }
@@ -465,10 +486,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
       if (event.start) {
         for (Op* activeOp : active) {
-          // FP and int are using different registers.
+          // Different register classes use different register files.
           // However, they are using the same stack,
           // so that must be taken into account when spilling.
-          if (fpreg(activeOp->getResultType()) ^ fpreg(op->getResultType())) {
+          if (!shareRegClass(activeOp->getResultType(), op->getResultType())) {
             spillInterf[op].insert(activeOp);
             spillInterf[activeOp].insert(op);
             continue;
@@ -574,8 +595,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       continue;
     }
 
-    auto rcnt = !fpreg(op->getResultType()) ? regcount : regcountf;
-    auto rorder = !fpreg(op->getResultType()) ? order : orderf;
+    auto rcnt = vecreg(op->getResultType()) ? regcountv : (!fpreg(op->getResultType()) ? regcount : regcountf);
+    auto rorder = vecreg(op->getResultType()) ? orderv : (!fpreg(op->getResultType()) ? order : orderf);
     auto tryAssign = [&](bool onlyCallee, bool allowUnpreferred) -> bool {
       for (int i = 0; i < rcnt; i++) {
         Reg cand = rorder[i];
@@ -607,6 +628,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     spilled++;
     // Spilled. Try to see all spill offsets of conflicting ops.
     int desired = currentOffset;
+    if (vecreg(op->getResultType())) {
+      if (desired % 16 != 0)
+        desired = (desired / 16 + 1) * 16;
+    }
     std::unordered_set<int> conflict;
 
     // Consider both `interf` (of the same register type)
@@ -625,14 +650,24 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     }
 
     // Try find a space.
-    while (conflict.count(desired))
-      desired += 8;
+    if (vecreg(op->getResultType())) {
+      while (conflict.count(desired) || conflict.count(desired + 8))
+        desired += 16;
+    } else {
+      while (conflict.count(desired))
+        desired += 8;
+    }
 
     spillOffset[op] = desired;
 
     // Update `highest`, which will indicate the size allocated.
+    if (vecreg(op->getResultType())) {
+      if (desired + 8 > highest)
+        highest = desired + 8;
+    } else {
       if (desired > highest)
         highest = desired;
+    }
     }
   } else {
     // Huge-module fast path: avoid O(N^2) interference construction in regalloc.
@@ -644,9 +679,17 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
           continue;
         if (op->getResultType() == Value::unit)
           continue;
-        spillOffset[op] = nextOffset;
-        highest = nextOffset;
-        nextOffset += 8;
+        if (vecreg(op->getResultType())) {
+          if (nextOffset % 16 != 0)
+            nextOffset = (nextOffset / 16 + 1) * 16;
+          spillOffset[op] = nextOffset;
+          highest = nextOffset + 8;
+          nextOffset += 16;
+        } else {
+          spillOffset[op] = nextOffset;
+          highest = nextOffset;
+          nextOffset += 8;
+        }
         spilled++;
       }
     }
@@ -704,7 +747,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   const auto getReg = [&](Op *op) {
     return assignment.count(op) ? assignment[op] :
-      fpreg(op->getResultType()) ? orderf[0] : order[0];
+      vecreg(op->getResultType()) ? orderv[0] : (fpreg(op->getResultType()) ? orderf[0] : order[0]);
   };
 
   // Convert all operands to registers.
@@ -736,6 +779,13 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(FeqOp, BINARY);
   LOWER(FltOp, BINARY);
   LOWER(FleOp, BINARY);
+  LOWER(VaddvvOp, BINARY);
+  LOWER(VsubvvOp, BINARY);
+  LOWER(VmulvvOp, BINARY);
+  LOWER(VfaddvvOp, BINARY);
+  LOWER(VfsubvvOp, BINARY);
+  LOWER(VfmulvvOp, BINARY);
+  LOWER(Vse32Op, BINARY);
   LOWER(SllwOp, BINARY);
   LOWER(SrlwOp, BINARY);
   LOWER(SrawOp, BINARY);
@@ -744,6 +794,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(SrlOp, BINARY);
   
   LOWER(LoadOp, UNARY);
+  LOWER(Vle32Op, UNARY);
+  LOWER(VmvvxOp, UNARY);
+  LOWER(VfmvvfOp, UNARY);
+  LOWER(VsetvliOp, UNARY);
   LOWER(AddiwOp, UNARY);
   LOWER(AddiOp, UNARY);
   LOWER(SlliwOp, UNARY);
@@ -1115,7 +1169,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
         int offset = delta + rd->offset;
         bool fp = rd->fp;
-        auto reg = fp ? fspillReg : spillReg;
+        auto reg = vecreg(rd->ref->getResultType()) ? vspillReg : (fp ? fspillReg : spillReg);
 
         builder.setAfterOp(op);
         if (offset < delta)
@@ -1128,8 +1182,9 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (auto rs = op->find<SpilledRsAttr>()) {
         int offset = delta + rs->offset;
         bool fp = rs->fp;
-        auto reg = fp ? fspillReg : spillReg;
-        auto ldty = fp ? Value::f32 : Value::i64;
+        bool vec = vecreg(rs->ref->getResultType());
+        auto reg = vec ? vspillReg : (fp ? fspillReg : spillReg);
+        auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
         // Rematerialized.
@@ -1148,8 +1203,9 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (auto rs2 = op->find<SpilledRs2Attr>()) {
         int offset = delta + rs2->offset;
         bool fp = rs2->fp;
-        auto reg = fp ? fspillReg2 : spillReg2;
-        auto ldty = fp ? Value::f32 : Value::i64;
+        bool vec = vecreg(rs2->ref->getResultType());
+        auto reg = vec ? vspillReg2 : (fp ? fspillReg2 : spillReg2);
+        auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
         // Rematerialized.

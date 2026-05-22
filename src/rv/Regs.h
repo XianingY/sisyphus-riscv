@@ -10,6 +10,8 @@ const Reg spillReg = Reg::s10;
 const Reg spillReg2 = Reg::s11;
 const Reg fspillReg = Reg::fs10;
 const Reg fspillReg2 = Reg::fs11;
+const Reg vspillReg = Reg::v30;
+const Reg vspillReg2 = Reg::v31;
 
 // Order for leaf functions. Prioritize temporaries.
 const Reg leafOrder[] = {
@@ -54,6 +56,15 @@ const std::set<Reg> callerSaved = {
 
   Reg::fa0, Reg::fa1, Reg::fa2, Reg::fa3,
   Reg::fa4, Reg::fa5, Reg::fa6, Reg::fa7,
+
+  Reg::v0, Reg::v1, Reg::v2, Reg::v3,
+  Reg::v4, Reg::v5, Reg::v6, Reg::v7,
+  Reg::v8, Reg::v9, Reg::v10, Reg::v11,
+  Reg::v12, Reg::v13, Reg::v14, Reg::v15,
+  Reg::v16, Reg::v17, Reg::v18, Reg::v19,
+  Reg::v20, Reg::v21, Reg::v22, Reg::v23,
+  Reg::v24, Reg::v25, Reg::v26, Reg::v27,
+  Reg::v28, Reg::v29, Reg::v30, Reg::v31,
 };
 
 const std::set<Reg> calleeSaved = {
@@ -100,8 +111,35 @@ const Reg fargRegs[] = {
 constexpr int leafRegCntf = 30;
 constexpr int normalRegCntf = 30;
 
+const Reg leafOrderv[] = {
+  Reg::v0, Reg::v1, Reg::v2, Reg::v3,
+  Reg::v4, Reg::v5, Reg::v6, Reg::v7,
+  Reg::v8, Reg::v9, Reg::v10, Reg::v11,
+  Reg::v12, Reg::v13, Reg::v14, Reg::v15,
+  Reg::v16, Reg::v17, Reg::v18, Reg::v19,
+  Reg::v20, Reg::v21, Reg::v22, Reg::v23,
+  Reg::v24, Reg::v25, Reg::v26, Reg::v27,
+  Reg::v28, Reg::v29,
+};
+const Reg normalOrderv[] = {
+  Reg::v0, Reg::v1, Reg::v2, Reg::v3,
+  Reg::v4, Reg::v5, Reg::v6, Reg::v7,
+  Reg::v8, Reg::v9, Reg::v10, Reg::v11,
+  Reg::v12, Reg::v13, Reg::v14, Reg::v15,
+  Reg::v16, Reg::v17, Reg::v18, Reg::v19,
+  Reg::v20, Reg::v21, Reg::v22, Reg::v23,
+  Reg::v24, Reg::v25, Reg::v26, Reg::v27,
+  Reg::v28, Reg::v29,
+};
+constexpr int leafRegCntv = 30;
+constexpr int normalRegCntv = 30;
+
 inline bool fpreg(Value::Type ty) {
   return ty == Value::f32;
+}
+
+inline bool vecreg(Value::Type ty) {
+  return ty == Value::i128 || ty == Value::f128;
 }
 
 }
