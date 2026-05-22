@@ -1,0 +1,17 @@
+int a[32];
+
+int main() {
+  int i = 0;
+  while (i < 16) {
+    a[i] = i;
+    i = 1 + i;
+  }
+
+  int j = 0;
+  while (j < 16) {
+    a[j + 16] = j;
+    j = 1 + j;
+  }
+
+  return a[0] + a[31];
+}

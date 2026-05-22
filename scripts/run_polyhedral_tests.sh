@@ -28,6 +28,17 @@ if grep -q "fusion-reject-memory=[1-9]" <<<"${fusion_stats}"; then
   exit 1
 fi
 
+commuted_step_stats="$("${COMPILER}" "${CASE_DIR}/fusion_commuted_step.sy" -S \
+  -o "${OUT_DIR}/fusion_commuted_step.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${commuted_step_stats}"
+
+if ! grep -q "fusion-applied=1" <<<"${commuted_step_stats}"; then
+  echo "expected HIR fusion to accept commuted induction steps" >&2
+  exit 1
+fi
+
 jam_stats="$("${COMPILER}" "${CASE_DIR}/reduction_unroll_jam.sy" -S \
   -o "${OUT_DIR}/reduction_unroll_jam.rv.s" \
   -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"

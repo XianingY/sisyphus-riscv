@@ -97,8 +97,10 @@ bool matchStepStore(const Op *op, const std::string &iv, int64_t expectedStep) {
   const Op *rhs = op->children[0].get();
   if (!rhs || rhs->kind != OpKind::Arith || rhs->symbol != "+" || rhs->children.size() != 2)
     return false;
-  return isScalarLoad(rhs->children[0].get(), iv) &&
-         isConstIntValue(rhs->children[1].get(), expectedStep);
+  return (isScalarLoad(rhs->children[0].get(), iv) &&
+          isConstIntValue(rhs->children[1].get(), expectedStep)) ||
+         (isConstIntValue(rhs->children[0].get(), expectedStep) &&
+          isScalarLoad(rhs->children[1].get(), iv));
 }
 
 void collectArrayAccessesImpl(const Op *op, std::vector<Access> &out) {
