@@ -272,6 +272,19 @@ bool opWritesAnyScalarUsedBy(const Op *op, const Op *expr) {
   return writesAnyScalar(op, loads);
 }
 
+bool hasAffineArrayAccessUsing(const Op *op, const std::string &symbol, int minRank) {
+  std::vector<Access> accesses = collectArrayAccesses(op);
+  std::unordered_set<std::string> symbols = {symbol};
+  for (const Access &access : accesses) {
+    if ((int) access.indices.size() < minRank)
+      continue;
+    for (const Expr &idx : access.indices)
+      if (exprMentionsAny(idx, symbols))
+        return true;
+  }
+  return false;
+}
+
 bool fusionMemorySafe(const Op *loopAOp, const Op *loopBOp) {
   CanonicalLoop loopA;
   CanonicalLoop loopB;

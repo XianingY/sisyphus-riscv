@@ -38,6 +38,8 @@ std::vector<Access> collectArrayAccesses(const Op *op);
 
 bool exprUsesAny(const Expr &expr, const std::unordered_set<std::string> &symbols);
 bool opWritesAnyScalarUsedBy(const Op *op, const Op *expr);
+bool hasAffineArrayAccessUsing(const Op *op, const std::string &symbol,
+                               int minRank = 1);
 
 bool fusionMemorySafe(const Op *loopA, const Op *loopB);
 

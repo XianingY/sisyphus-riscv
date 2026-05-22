@@ -740,6 +740,10 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
     stats.tilingRejected++;
     return false;
   }
+  if (!affine::hasAffineArrayAccessUsing(outer.body, outer.iv, 2)) {
+    stats.tilingRejected++;
+    return false;
+  }
 
   // Must have at least one inner while loop (otherwise tiling does nothing).
   bool hasInnerWhile = false;
