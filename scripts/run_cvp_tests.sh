@@ -34,4 +34,15 @@ if ! grep -A2 '^range-aware-fold:$' <<<"${eq_stats}" | grep -Eq 'folded-ops : [1
   exit 1
 fi
 
+reversed_stats="$("${COMPILER}" "${CASE_DIR}/reversed_operand_refines.sy" -S \
+  -o "${OUT_DIR}/reversed_operand_refines.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${reversed_stats}"
+
+if ! grep -A2 '^range-aware-fold:$' <<<"${reversed_stats}" | grep -Eq 'folded-ops : [1-9]'; then
+  echo "expected RangeAwareFold to fold a condition with the refined value on RHS" >&2
+  exit 1
+fi
+
 echo "Correlated value propagation range folding tests passed."
