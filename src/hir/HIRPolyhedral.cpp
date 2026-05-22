@@ -600,6 +600,25 @@ bool collectDefinedScalars(const Op *block, std::unordered_set<std::string> &sym
   return true;
 }
 
+void collectTopLevelInitializedScalars(const Op *block, std::unordered_set<std::string> &syms) {
+  if (!block || block->kind != OpKind::Block)
+    return;
+  for (const auto &child : block->children) {
+    const Op *op = unwrapSingleDecl(child.get());
+    if (!op || op->symbol.empty())
+      continue;
+    if (op->kind == OpKind::VarDecl) {
+      if (op->children.empty() || !exprUsesScalar(op->children[0].get(), op->symbol))
+        syms.insert(op->symbol);
+      continue;
+    }
+    if (op->kind == OpKind::Store && op->children.size() == 1) {
+      if (!exprUsesScalar(op->children[0].get(), op->symbol))
+        syms.insert(op->symbol);
+    }
+  }
+}
+
 bool bodyUsesAnyOf(const Op *op, const std::unordered_set<std::string> &syms) {
   if (!op)
     return false;
@@ -658,9 +677,7 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     }
     // Loop fusion: merge adjacent canonical while-loops with equal bounds.
     if (hirEnvEnabled("SISY_HIR_ENABLE_FUSION", true)) {
-      if (i + 1 < block->children.size() &&
-          block->children[i] && block->children[i]->kind == OpKind::While &&
-          block->children[i + 1] && block->children[i + 1]->kind == OpKind::While) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
         if (tryLoopFusion(block, i, stats)) {
           changed = true;
           i = 0;
@@ -826,14 +843,42 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
     return false;
 
   Op *whileA = block->children[idx].get();
-  Op *whileB = block->children[idx + 1].get();
-  if (!whileA || !whileB)
+  if (!whileA || whileA->kind != OpKind::While)
+    return false;
+
+  bool hasBInit = false;
+  size_t bInitIdx = idx + 1;
+  size_t bWhileIdx = idx + 1;
+  if (block->children[bWhileIdx] && block->children[bWhileIdx]->kind != OpKind::While &&
+      idx + 2 < block->children.size() &&
+      block->children[idx + 2] && block->children[idx + 2]->kind == OpKind::While) {
+    hasBInit = true;
+    bWhileIdx = idx + 2;
+  }
+
+  Op *whileB = block->children[bWhileIdx].get();
+  if (!whileB)
     return false;
 
   CanonicalLoop loopA, loopB;
   if (!matchCanonicalWhile(whileA, loopA) || !matchCanonicalWhile(whileB, loopB)) {
     stats.fusionRejected++;
     return false;
+  }
+  if (hasBInit) {
+    if (!matchLoopInit(block->children[bInitIdx].get(), loopB.iv)) {
+      stats.fusionRejected++;
+      return false;
+    }
+    if (idx == 0 || !matchLoopInit(block->children[idx - 1].get(), loopA.iv)) {
+      stats.fusionRejected++;
+      return false;
+    }
+    if (!boundsEqual(initValue(block->children[idx - 1].get()),
+                     initValue(block->children[bInitIdx].get()))) {
+      stats.fusionRejected++;
+      return false;
+    }
   }
 
   // Bounds must be equal.
@@ -854,6 +899,10 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   collectDefinedScalars(loopA.body, aDefinedScalars);
   // Remove loopA's IV — it's fine if B uses it (renamed to A's IV).
   aDefinedScalars.erase(loopA.iv);
+  std::unordered_set<std::string> bInitializedScalars;
+  collectTopLevelInitializedScalars(loopB.body, bInitializedScalars);
+  for (const auto &sym : bInitializedScalars)
+    aDefinedScalars.erase(sym);
 
   if (bodyUsesAnyOf(loopB.body, aDefinedScalars)) {
     stats.fusionRejected++;
@@ -889,12 +938,12 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   for (auto &stmt : bStatements)
     aBodyChildren.insert(aBodyChildren.begin() + insertPos++, std::move(stmt));
 
-  // Remove loop B's while (idx+1) from the block.
-  // Also try to remove loop B's init statement (idx) if it's right before the while.
-  // loopB's while is at idx+1. loopB's init should be at some position before idx+1.
-  // For simplicity, just remove the while at idx+1 (the init becomes dead code,
-  // which DCE will clean up).
-  block->children.erase(block->children.begin() + idx + 1);
+  if (hasBInit) {
+    block->children.erase(block->children.begin() + bInitIdx,
+                          block->children.begin() + bWhileIdx + 1);
+  } else {
+    block->children.erase(block->children.begin() + idx + 1);
+  }
 
   stats.fusionApplied++;
   return true;
