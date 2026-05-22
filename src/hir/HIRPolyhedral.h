@@ -10,6 +10,7 @@ namespace sys::hir {
 struct PolyhedralStats {
   int reductionJammed = 0;
   int reductionInterchanged = 0;
+  int conditionalReductionInterchanged = 0;
   int repeatReduced = 0;
   int repeatRejected = 0;
   int repeatRejectShape = 0;

@@ -206,26 +206,6 @@ bool matchLoopInit(const Op *op, const std::string &iv) {
   return false;
 }
 
-bool hasControlOrCall(const Op *op) {
-  if (!op)
-    return false;
-  switch (op->kind) {
-  case OpKind::If:
-  case OpKind::For:
-  case OpKind::Call:
-  case OpKind::Return:
-  case OpKind::Break:
-  case OpKind::Continue:
-    return true;
-  default:
-    break;
-  }
-  for (const auto &child : op->children)
-    if (hasControlOrCall(child.get()))
-      return true;
-  return false;
-}
-
 bool exprUsesScalar(const Op *op, const std::string &symbol) {
   if (!op)
     return false;
@@ -270,8 +250,9 @@ bool isAdditiveReductionUpdate(const Op *store, const std::string &acc) {
 bool containsArrayAccessTo(const Op *op, const std::string &symbol) {
   if (!op)
     return false;
-  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
-      op->symbol == symbol && !op->children.empty())
+  const bool isArrayLoad = op->kind == OpKind::Load && !op->children.empty();
+  const bool isArrayStore = op->kind == OpKind::Store && op->children.size() > 1;
+  if ((isArrayLoad || isArrayStore) && op->symbol == symbol)
     return true;
   for (const auto &child : op->children)
     if (containsArrayAccessTo(child.get(), symbol))
@@ -282,8 +263,9 @@ bool containsArrayAccessTo(const Op *op, const std::string &symbol) {
 void collectArrayAccessSymbols(const Op *op, std::unordered_set<std::string> &symbols) {
   if (!op)
     return;
-  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
-      !op->symbol.empty() && !op->children.empty())
+  const bool isArrayLoad = op->kind == OpKind::Load && !op->children.empty();
+  const bool isArrayStore = op->kind == OpKind::Store && op->children.size() > 1;
+  if ((isArrayLoad || isArrayStore) && !op->symbol.empty())
     symbols.insert(op->symbol);
   for (const auto &child : op->children)
     collectArrayAccessSymbols(child.get(), symbols);
@@ -362,6 +344,7 @@ struct ReductionPattern {
   const Op *kBound = nullptr;
   Op *kWhile = nullptr;
   Op *kStep = nullptr;
+  Op *kReductionStmt = nullptr;
   Op *accUpdate = nullptr;
   Op *destStore = nullptr;
   Op *jStep = nullptr;
@@ -389,6 +372,50 @@ const Op *initValue(const Op *op) {
   return op->children[0].get();
 }
 
+bool hasUnsafeReductionControl(const Op *op) {
+  if (!op)
+    return false;
+  switch (op->kind) {
+  case OpKind::For:
+  case OpKind::Call:
+  case OpKind::Return:
+  case OpKind::Break:
+  case OpKind::Continue:
+    return true;
+  default:
+    break;
+  }
+  for (const auto &child : op->children)
+    if (hasUnsafeReductionControl(child.get()))
+      return true;
+  return false;
+}
+
+bool containsWhile(const Op *op) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::While)
+    return true;
+  for (const auto &child : op->children)
+    if (containsWhile(child.get()))
+      return true;
+  return false;
+}
+
+Op *findAdditiveReductionUpdate(Op *stmt, const std::string &acc) {
+  stmt = unwrapSingleDecl(stmt);
+  if (!stmt)
+    return nullptr;
+  if (stmt->kind == OpKind::Store)
+    return isAdditiveReductionUpdate(stmt, acc) ? stmt : nullptr;
+  if (stmt->kind != OpKind::If || stmt->children.size() != 2)
+    return nullptr;
+  Op *thenBlock = stmt->children[1].get();
+  if (!thenBlock || thenBlock->kind != OpKind::Block || thenBlock->children.size() != 1)
+    return nullptr;
+  return findAdditiveReductionUpdate(thenBlock->children[0].get(), acc);
+}
+
 bool matchReductionPattern(Op *jWhile, ReductionPattern &pat) {
   CanonicalLoop jLoop;
   if (!matchCanonicalWhile(jWhile, jLoop))
@@ -400,7 +427,7 @@ bool matchReductionPattern(Op *jWhile, ReductionPattern &pat) {
   Op *body = jLoop.body;
   if (!body || body->children.size() != 5)
     return false;
-  if (hasControlOrCall(body))
+  if (hasUnsafeReductionControl(body))
     return false;
 
   std::string kSym;
@@ -417,13 +444,11 @@ bool matchReductionPattern(Op *jWhile, ReductionPattern &pat) {
   if (!kBody || kBody->children.size() != 2)
     return false;
 
-  Op *accUpdate = unwrapSingleDecl(kBody->children[0].get());
-  if (!accUpdate || accUpdate->kind != OpKind::Store || accUpdate->symbol != accSym ||
-      accUpdate->children.size() != 1)
+  Op *reductionStmt = unwrapSingleDecl(kBody->children[0].get());
+  Op *accUpdate = findAdditiveReductionUpdate(reductionStmt, accSym);
+  if (!accUpdate)
     return false;
-  if (!isAdditiveReductionUpdate(accUpdate, accSym))
-    return false;
-  if (!arrayIndexUsesOnlyDirectIV(accUpdate, jLoop.iv))
+  if (!arrayIndexUsesOnlyDirectIV(reductionStmt, jLoop.iv))
     return false;
   if (!matchStepStore(kBody->children[1].get(), kSym, 1))
     return false;
@@ -446,6 +471,7 @@ bool matchReductionPattern(Op *jWhile, ReductionPattern &pat) {
   pat.kBound = kLoop.bound;
   pat.kWhile = body->children[2].get();
   pat.kStep = kLoop.step;
+  pat.kReductionStmt = reductionStmt;
   pat.accUpdate = accUpdate;
   pat.destStore = destStore;
   return true;
@@ -455,7 +481,7 @@ bool strictReductionInterchangeLegal(const ReductionPattern &pat,
                                      const std::unordered_set<std::string> &globalArrays) {
   if (!pat.destStore || pat.destStore->children.size() < 2)
     return false;
-  if (!pat.accUpdate || pat.accUpdate->children.size() != 1)
+  if (!pat.accUpdate || pat.accUpdate->children.size() != 1 || !pat.kReductionStmt)
     return false;
   if (!globalArrays.count(pat.destStore->symbol))
     return false;
@@ -463,11 +489,11 @@ bool strictReductionInterchangeLegal(const ReductionPattern &pat,
   // Strict mode: do not interchange an in-place reduction. If the destination
   // array is read while computing the reduction, swapping k outside j changes
   // the order of visible writes (many_mat_cal has exactly this hazard).
-  if (containsArrayAccessTo(pat.accUpdate->children[0].get(), pat.destStore->symbol))
+  if (containsArrayAccessTo(pat.kReductionStmt, pat.destStore->symbol))
     return false;
 
   std::unordered_set<std::string> rhsArrays;
-  collectArrayAccessSymbols(pat.accUpdate->children[0].get(), rhsArrays);
+  collectArrayAccessSymbols(pat.kReductionStmt, rhsArrays);
   for (const auto &symbol : rhsArrays)
     if (!globalArrays.count(symbol))
       return false;
@@ -509,9 +535,42 @@ std::unique_ptr<Op> makeReductionLmsStore(const ReductionPattern &pat) {
   return makeArrayStoreLike(pat.destStore, std::move(nextValue));
 }
 
+std::unique_ptr<Op> cloneReductionStmtToDestination(const Op *op,
+                                                    const ReductionPattern &pat) {
+  if (!op)
+    return nullptr;
+  if (isScalarLoad(op, pat.acc))
+    return makeLoadFromStoreDestination(pat.destStore);
+  if (op->kind == OpKind::Store && op->symbol == pat.acc && op->children.size() == 1) {
+    auto oldValue = makeLoadFromStoreDestination(pat.destStore);
+    if (!oldValue)
+      return nullptr;
+    auto nextValue = cloneReplacingScalarLoad(op->children[0].get(), pat.acc,
+                                              oldValue.get());
+    if (!nextValue)
+      return nullptr;
+    return makeArrayStoreLike(pat.destStore, std::move(nextValue));
+  }
+
+  auto out = std::make_unique<Op>(op->kind, op->origin);
+  out->type = op->type;
+  out->traits = op->traits;
+  out->symbol = op->symbol;
+  out->hasIntValue = op->hasIntValue;
+  out->intValue = op->intValue;
+  out->hasFloatValue = op->hasFloatValue;
+  out->floatValue = op->floatValue;
+  out->arrayDims = op->arrayDims;
+  for (const auto &child : op->children)
+    out->children.push_back(cloneReductionStmtToDestination(child.get(), pat));
+  return out;
+}
+
 std::unique_ptr<Op> makeReductionLmsJLoop(const ReductionPattern &pat) {
   auto body = makeBlock();
-  auto lms = makeReductionLmsStore(pat);
+  auto lms = (pat.kReductionStmt == pat.accUpdate)
+                 ? makeReductionLmsStore(pat)
+                 : cloneReductionStmtToDestination(pat.kReductionStmt, pat);
   if (!lms)
     return nullptr;
   body->children.push_back(std::move(lms));
@@ -1163,6 +1222,11 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
     stats.fusionRejectControl++;
     return false;
   }
+  if (containsWhile(loopA.body) || containsWhile(loopB.body)) {
+    stats.fusionRejected++;
+    stats.fusionRejectControl++;
+    return false;
+  }
 
   // Check that loop B's body does not depend on scalars exclusively defined
   // by loop A's body (other than the IV itself, which we will rename).
@@ -1332,6 +1396,8 @@ bool PolyhedralOptimizer::tryReductionInterchange(Op *block, size_t initIndex,
 
   block->children = std::move(replacement);
   stats.reductionInterchanged++;
+  if (pat.kReductionStmt != pat.accUpdate)
+    stats.conditionalReductionInterchanged++;
   return true;
 }
 
@@ -1346,6 +1412,10 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
     return false;
   }
   if (!matchLoopInit(block->children[initIndex].get(), pat.j)) {
+    stats.rejected++;
+    return false;
+  }
+  if (pat.kReductionStmt != pat.accUpdate) {
     stats.rejected++;
     return false;
   }
