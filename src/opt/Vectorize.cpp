@@ -131,6 +131,10 @@ bool scalarBinaryToVector(Builder &builder, Op *scalar, Op *lhs, Op *rhs, Op *&o
   }
 }
 
+bool byteRangesOverlap(int aOffset, int aSize, int bOffset, int bSize) {
+  return aOffset < bOffset + bSize && bOffset < aOffset + aSize;
+}
+
 Op *materializeOperandPack(Builder &builder, const OperandPack &pack, Value::Type vectorTy) {
   if (pack.contiguous) {
     assert(isa<LoadOp>(pack.first));
@@ -158,10 +162,6 @@ bool trySLPStorePack(const std::vector<Op*> &ops,
     return false;
 
   Op *firstValue = stores[0]->DEF(0);
-  if (!isa<AddIOp>(firstValue) && !isa<SubIOp>(firstValue) && !isa<MulIOp>(firstValue) &&
-      !isa<AddFOp>(firstValue) && !isa<SubFOp>(firstValue) && !isa<MulFOp>(firstValue))
-    return false;
-
   Value::Type scalarTy = firstValue->getResultType();
   Value::Type vectorTy = vectorTypeForScalar(scalarTy);
   if (vectorTy == Value::unit)
@@ -171,6 +171,8 @@ bool trySLPStorePack(const std::vector<Op*> &ops,
   if (!splitConstAddress(stores[0]->DEF(1), dstBase))
     return false;
 
+  bool isBinaryPack = isa<AddIOp>(firstValue) || isa<SubIOp>(firstValue) || isa<MulIOp>(firstValue) ||
+                      isa<AddFOp>(firstValue) || isa<SubFOp>(firstValue) || isa<MulFOp>(firstValue);
   OperandPack lhsPack, rhsPack;
   int firstRelevant = order.at(stores[0]);
   int lastStore = order.at(stores[3]);
@@ -178,6 +180,48 @@ bool trySLPStorePack(const std::vector<Op*> &ops,
     if (order.count(op))
       firstRelevant = std::min(firstRelevant, order.at(op));
   };
+
+  if (!isBinaryPack) {
+    OperandPack valuePack;
+    for (int lane = 0; lane < 4; lane++) {
+      auto store = stores[lane];
+      auto value = store->DEF(0);
+      if (value->getResultType() != scalarTy ||
+          !sameContiguousAddress(dstBase, store->DEF(1), lane) ||
+          !matchOperandPack(valuePack, value, lane, scalarTy))
+        return false;
+      noteRelevant(value);
+    }
+
+    if ((!valuePack.contiguous && !valuePack.splat) ||
+        (valuePack.splat && order.count(valuePack.first) && order.at(valuePack.first) >= order.at(stores[0])))
+      return false;
+
+    if (valuePack.contiguous && valuePack.base.base == dstBase.base &&
+        valuePack.base.offset < dstBase.offset &&
+        byteRangesOverlap(valuePack.base.offset, 16, dstBase.offset, 16))
+      return false;
+
+    std::unordered_set<Op*> packedStores(stores.begin(), stores.end());
+    for (int i = firstRelevant; i <= lastStore; i++) {
+      auto op = ops[i];
+      if (isa<StoreOp>(op) && !packedStores.count(op))
+        return false;
+      if (isa<CallOp>(op) || isa<BranchOp>(op) || isa<GotoOp>(op) || isa<ReturnOp>(op))
+        return false;
+    }
+
+    Builder builder;
+    builder.setBeforeOp(stores[0]);
+    auto vecValue = materializeOperandPack(builder, valuePack, vectorTy);
+    builder.create<StoreOp>(vecValues({ vecValue, stores[0]->DEF(1) }), { new SizeAttr(16) });
+
+    for (auto store : stores) {
+      removed.insert(store);
+      store->erase();
+    }
+    return true;
+  }
 
   for (int lane = 0; lane < 4; lane++) {
     auto store = stores[lane];

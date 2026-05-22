@@ -70,6 +70,36 @@ for needle in "vsetvli" "vle32.v" "vfadd.vv" "vse32.v"; do
   fi
 done
 
+slp_iadd_asm="${OUT_DIR}/rvv_slp_iadd_straightline.s"
+"${COMPILER}" "${CASE_DIR}/slp_iadd_straightline.sy" -S -o "${slp_iadd_asm}" -O1 --target=riscv --enable-experimental --verify-ir
+
+for needle in "vsetvli" "vle32.v" "vadd.vv" "vse32.v"; do
+  if ! grep -q "${needle}" "${slp_iadd_asm}"; then
+    echo "missing expected RVV SLP int-add instruction '${needle}' in ${slp_iadd_asm}"
+    exit 1
+  fi
+done
+
+slp_copy_asm="${OUT_DIR}/rvv_slp_copy_straightline.s"
+"${COMPILER}" "${CASE_DIR}/slp_copy_straightline.sy" -S -o "${slp_copy_asm}" -O1 --target=riscv --enable-experimental --verify-ir
+
+for needle in "vsetvli" "vle32.v" "vse32.v"; do
+  if ! grep -q "${needle}" "${slp_copy_asm}"; then
+    echo "missing expected RVV SLP copy instruction '${needle}' in ${slp_copy_asm}"
+    exit 1
+  fi
+done
+
+copy_overlap_asm="${OUT_DIR}/rvv_slp_copy_overlap_vector.s"
+"${COMPILER}" "${CASE_DIR}/slp_copy_overlap_vector.sy" -S -o "${copy_overlap_asm}" -O1 --target=riscv --enable-experimental --verify-ir
+
+for needle in "vsetvli" "vle32.v" "vse32.v"; do
+  if ! grep -q "${needle}" "${copy_overlap_asm}"; then
+    echo "missing expected RVV SLP overlap-copy instruction '${needle}' in ${copy_overlap_asm}"
+    exit 1
+  fi
+done
+
 arm_slp_fasm="${OUT_DIR}/arm_slp_fadd_straightline.s"
 "${COMPILER}" "${CASE_DIR}/slp_fadd_straightline.sy" -S -o "${arm_slp_fasm}" -O2 --target=arm --enable-experimental --verify-ir
 
