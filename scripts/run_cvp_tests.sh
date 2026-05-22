@@ -67,4 +67,15 @@ if ! grep -A4 '^range-aware-fold:$' <<<"${value_eq_stats}" | grep -Eq 'path-repl
   exit 1
 fi
 
+jump_thread_stats="$("${COMPILER}" "${CASE_DIR}/jump_thread_lt_chain.sy" -S \
+  -o "${OUT_DIR}/jump_thread_lt_chain.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${jump_thread_stats}"
+
+if ! grep -A5 '^range-aware-fold:$' <<<"${jump_thread_stats}" | grep -Eq 'threaded-edges : [1-9]'; then
+  echo "expected RangeAwareFold to thread an edge whose successor branch is decided by predecessor range" >&2
+  exit 1
+fi
+
 echo "Correlated value propagation range folding tests passed."

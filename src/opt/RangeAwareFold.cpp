@@ -2,9 +2,12 @@
 #include "Analysis.h"
 #include "../utils/Matcher.h"
 
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <set>
+#include <unordered_set>
 #include <vector>
 
 using namespace sys;
@@ -13,11 +16,211 @@ std::map<std::string, int> RangeAwareFold::stats() {
   return {
     { "folded-ops", folded },
     { "path-replacements", pathReplacements },
+    { "threaded-edges", threadedEdges },
   };
 }
 
 // Defined in Specialize.cpp.
 void removeRange(Region *region);
+
+namespace {
+
+std::optional<std::pair<int, int>> intRange(Op *op);
+
+Op *phiIncoming(Op *phi, BasicBlock *pred) {
+  if (!phi || !pred || !isa<PhiOp>(phi))
+    return nullptr;
+  const auto &ops = phi->getOperands();
+  const auto &attrs = phi->getAttrs();
+  size_t count = std::min(ops.size(), attrs.size());
+  for (size_t i = 0; i < count; i++) {
+    if (!isa<FromAttr>(attrs[i]))
+      continue;
+    if (FROM(attrs[i]) == pred)
+      return ops[i].defining;
+  }
+  return nullptr;
+}
+
+void removePhiIncoming(Op *phi, BasicBlock *pred) {
+  auto ops = phi->getOperands();
+  std::vector<Attr*> attrs;
+  for (auto attr : phi->getAttrs())
+    attrs.push_back(attr->clone());
+
+  phi->removeAllOperands();
+  phi->removeAllAttributes();
+
+  size_t count = std::min(ops.size(), attrs.size());
+  for (size_t i = 0; i < count; i++) {
+    if (!isa<FromAttr>(attrs[i]))
+      continue;
+    auto from = FROM(attrs[i]);
+    if (from == pred)
+      continue;
+    phi->pushOperand(ops[i]);
+    phi->add<FromAttr>(from);
+  }
+
+  for (auto attr : attrs)
+    delete attr;
+}
+
+bool isThreadLocalPure(Op *op) {
+  return isa<IntOp>(op) || isa<AddIOp>(op) || isa<SubIOp>(op) ||
+         isa<MulIOp>(op) || isa<DivIOp>(op) || isa<ModIOp>(op) ||
+         isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+         isa<EqOp>(op) || isa<NeOp>(op) || isa<LtOp>(op) ||
+         isa<LeOp>(op) || isa<NotOp>(op) || isa<SetNotZeroOp>(op);
+}
+
+bool decisionBlockCanBeSkipped(BasicBlock *bb) {
+  auto term = bb->getLastOp();
+  for (auto op : bb->getOps()) {
+    if (isa<PhiOp>(op) || op == term)
+      continue;
+    if (!isThreadLocalPure(op))
+      return false;
+    for (auto use : op->getUses()) {
+      if (use->getParent() != bb)
+        return false;
+    }
+  }
+  return true;
+}
+
+Op *edgeValue(Op *op, BasicBlock *pred, BasicBlock *through) {
+  std::unordered_set<Op*> seen;
+  while (op && isa<PhiOp>(op) && op->getParent() == through && !seen.count(op)) {
+    seen.insert(op);
+    auto incoming = phiIncoming(op, pred);
+    if (!incoming)
+      return nullptr;
+    op = incoming;
+  }
+  return op;
+}
+
+Op *refinedValueOnPred(Op *op, BasicBlock *pred, BasicBlock *through) {
+  op = edgeValue(op, pred, through);
+  if (!op || !pred || !op->has<EqClassAttr>())
+    return op;
+
+  auto originalRange = intRange(op);
+  int originalWidth = originalRange ? originalRange->second - originalRange->first : INT_MAX;
+  Op *best = op;
+  for (auto candidate : pred->getOps()) {
+    if (candidate == op || candidate->getResultType() == Value::f32 ||
+        !candidate->has<EqClassAttr>() || EQCLASS(candidate) != EQCLASS(op))
+      continue;
+    auto range = intRange(candidate);
+    if (!range)
+      continue;
+    int width = range->second - range->first;
+    if (width <= originalWidth) {
+      best = candidate;
+      originalWidth = width;
+    }
+  }
+  return best;
+}
+
+std::optional<std::pair<int, int>> intRange(Op *op) {
+  if (!op || op->getResultType() == Value::f32)
+    return std::nullopt;
+  if (isa<IntOp>(op))
+    return std::pair<int, int>{ V(op), V(op) };
+  if (!op->has<RangeAttr>())
+    return std::nullopt;
+  return RANGE(op);
+}
+
+std::optional<int> truthFromRange(Op *op) {
+  auto range = intRange(op);
+  if (!range)
+    return std::nullopt;
+  auto [low, high] = *range;
+  if (low == 0 && high == 0)
+    return 0;
+  if (high < 0 || low > 0)
+    return 1;
+  return std::nullopt;
+}
+
+std::optional<int> evaluateComparisonOnEdge(Op *cond, BasicBlock *pred, BasicBlock *through) {
+  if (!cond || cond->getOperandCount() != 2)
+    return std::nullopt;
+
+  auto lhs = refinedValueOnPred(cond->DEF(0), pred, through);
+  auto rhs = refinedValueOnPred(cond->DEF(1), pred, through);
+  if (!lhs || !rhs)
+    return std::nullopt;
+
+  if (lhs == rhs) {
+    if (isa<EqOp>(cond) || isa<LeOp>(cond))
+      return 1;
+    if (isa<NeOp>(cond) || isa<LtOp>(cond))
+      return 0;
+  }
+
+  auto lr = intRange(lhs);
+  auto rr = intRange(rhs);
+  if (!lr || !rr)
+    return std::nullopt;
+
+  auto [ll, lh] = *lr;
+  auto [rl, rh] = *rr;
+  if (isa<LtOp>(cond)) {
+    if (lh < rl)
+      return 1;
+    if (ll >= rh)
+      return 0;
+  } else if (isa<LeOp>(cond)) {
+    if (lh <= rl)
+      return 1;
+    if (ll > rh)
+      return 0;
+  } else if (isa<EqOp>(cond)) {
+    if (ll == lh && rl == rh && ll == rl)
+      return 1;
+    if (lh < rl || rh < ll)
+      return 0;
+  } else if (isa<NeOp>(cond)) {
+    if (ll == lh && rl == rh && ll == rl)
+      return 0;
+    if (lh < rl || rh < ll)
+      return 1;
+  }
+  return std::nullopt;
+}
+
+std::optional<int> branchTruthOnEdge(Op *cond, BasicBlock *pred, BasicBlock *through) {
+  auto resolved = edgeValue(cond, pred, through);
+  if (!resolved)
+    return std::nullopt;
+  if (auto truth = truthFromRange(resolved))
+    return truth;
+  if (resolved->getParent() != through)
+    return std::nullopt;
+  if (isa<EqOp>(resolved) || isa<NeOp>(resolved) ||
+      isa<LtOp>(resolved) || isa<LeOp>(resolved))
+    return evaluateComparisonOnEdge(resolved, pred, through);
+  if (isa<NotOp>(resolved) && resolved->getOperandCount() == 1) {
+    auto inner = branchTruthOnEdge(resolved->DEF(), pred, through);
+    if (inner)
+      return *inner ? 0 : 1;
+  }
+  return std::nullopt;
+}
+
+bool availableBeforeEdge(Op *op, BasicBlock *pred, BasicBlock *through) {
+  op = edgeValue(op, pred, through);
+  if (!op)
+    return false;
+  return op->getParent() != through;
+}
+
+}
 
 void RangeAwareFold::run() {
   Builder builder;
@@ -199,6 +402,78 @@ void RangeAwareFold::run() {
     op->replaceOperand(op->DEF(), value);
     return false;
   });
+
+  auto threadOneEdge = [&]() -> bool {
+    for (auto func : funcs) {
+      auto region = func->getRegion();
+      region->updatePreds();
+      auto blocks = region->getBlocks();
+      for (auto bb : blocks) {
+        auto term = bb->getLastOp();
+        if (!term || !isa<BranchOp>(term) || bb->preds.size() < 2 ||
+            !decisionBlockCanBeSkipped(bb))
+          continue;
+
+        std::vector<BasicBlock*> preds(bb->preds.begin(), bb->preds.end());
+        for (auto pred : preds) {
+          if (!pred || pred == bb)
+            continue;
+          auto truth = branchTruthOnEdge(term->DEF(), pred, bb);
+          if (!truth)
+            continue;
+
+          auto target = *truth ? TARGET(term) : ELSE(term);
+          if (!target || target == bb || target->preds.count(pred))
+            continue;
+
+          bool ok = true;
+          std::vector<std::pair<Op*, Op*>> targetIncoming;
+          for (auto phi : target->getPhis()) {
+            auto incoming = phiIncoming(phi, bb);
+            if (!incoming || !availableBeforeEdge(incoming, pred, bb)) {
+              ok = false;
+              break;
+            }
+            targetIncoming.push_back({ phi, edgeValue(incoming, pred, bb) });
+          }
+          if (!ok)
+            continue;
+
+          auto predTerm = pred->getLastOp();
+          bool rewired = false;
+          if (isa<GotoOp>(predTerm) && TARGET(predTerm) == bb) {
+            TARGET(predTerm) = target;
+            rewired = true;
+          } else if (isa<BranchOp>(predTerm)) {
+            if (TARGET(predTerm) == bb) {
+              TARGET(predTerm) = target;
+              rewired = true;
+            }
+            if (ELSE(predTerm) == bb) {
+              ELSE(predTerm) = target;
+              rewired = true;
+            }
+          }
+          if (!rewired)
+            continue;
+
+          for (auto [phi, incoming] : targetIncoming) {
+            phi->pushOperand(incoming);
+            phi->add<FromAttr>(pred);
+          }
+          for (auto phi : bb->getPhis())
+            removePhiIncoming(phi, pred);
+
+          region->updatePreds();
+          threadedEdges++;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  while (threadOneEdge()) {}
 
   // Fold left/right shifts early.
   runRewriter([&](DivIOp *op) {
