@@ -1,5 +1,7 @@
 #include "HIRPolyhedral.h"
 
+#include "HIRAffine.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -717,6 +719,10 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
     stats.tilingRejected++;
     return false;
   }
+  if (affine::opWritesAnyScalarUsedBy(outer.body, outer.bound)) {
+    stats.tilingRejected++;
+    return false;
+  }
 
   // Must have at least one inner while loop (otherwise tiling does nothing).
   bool hasInnerWhile = false;
@@ -850,6 +856,10 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   aDefinedScalars.erase(loopA.iv);
 
   if (bodyUsesAnyOf(loopB.body, aDefinedScalars)) {
+    stats.fusionRejected++;
+    return false;
+  }
+  if (!affine::fusionMemorySafe(whileA, whileB)) {
     stats.fusionRejected++;
     return false;
   }
