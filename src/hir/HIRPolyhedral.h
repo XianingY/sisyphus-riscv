@@ -12,13 +12,30 @@ struct PolyhedralStats {
   int reductionInterchanged = 0;
   int repeatReduced = 0;
   int repeatRejected = 0;
+  int repeatRejectShape = 0;
+  int repeatRejectInit = 0;
+  int repeatRejectBound = 0;
+  int repeatRejectLegal = 0;
+  int repeatRejectClone = 0;
   int rejected = 0;
   // Loop tiling counters
   int tilingApplied = 0;
   int tilingRejected = 0;
+  int tilingRejectShape = 0;
+  int tilingRejectControl = 0;
+  int tilingRejectBoundWrite = 0;
+  int tilingRejectAffineAccess = 0;
+  int tilingRejectNoInner = 0;
+  int tilingRejectIdempotent = 0;
   // Loop fusion counters
   int fusionApplied = 0;
   int fusionRejected = 0;
+  int fusionRejectShape = 0;
+  int fusionRejectInit = 0;
+  int fusionRejectBounds = 0;
+  int fusionRejectControl = 0;
+  int fusionRejectScalar = 0;
+  int fusionRejectMemory = 0;
 };
 
 class PolyhedralOptimizer {

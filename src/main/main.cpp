@@ -346,11 +346,28 @@ int main(int argc, char **argv) {
                       << " reduction-interchanged=" << stats.reductionInterchanged
                       << " repeat-reduced=" << stats.repeatReduced
                       << " repeat-rejected=" << stats.repeatRejected
+                      << " repeat-reject-shape=" << stats.repeatRejectShape
+                      << " repeat-reject-init=" << stats.repeatRejectInit
+                      << " repeat-reject-bound=" << stats.repeatRejectBound
+                      << " repeat-reject-legal=" << stats.repeatRejectLegal
+                      << " repeat-reject-clone=" << stats.repeatRejectClone
                       << " rejected=" << stats.rejected
                       << " tiling-applied=" << stats.tilingApplied
                       << " tiling-rejected=" << stats.tilingRejected
+                      << " tiling-reject-shape=" << stats.tilingRejectShape
+                      << " tiling-reject-control=" << stats.tilingRejectControl
+                      << " tiling-reject-bound-write=" << stats.tilingRejectBoundWrite
+                      << " tiling-reject-affine-access=" << stats.tilingRejectAffineAccess
+                      << " tiling-reject-no-inner=" << stats.tilingRejectNoInner
+                      << " tiling-reject-idempotent=" << stats.tilingRejectIdempotent
                       << " fusion-applied=" << stats.fusionApplied
                       << " fusion-rejected=" << stats.fusionRejected
+                      << " fusion-reject-shape=" << stats.fusionRejectShape
+                      << " fusion-reject-init=" << stats.fusionRejectInit
+                      << " fusion-reject-bounds=" << stats.fusionRejectBounds
+                      << " fusion-reject-control=" << stats.fusionRejectControl
+                      << " fusion-reject-scalar=" << stats.fusionRejectScalar
+                      << " fusion-reject-memory=" << stats.fusionRejectMemory
                       << "\n";
           }
         });

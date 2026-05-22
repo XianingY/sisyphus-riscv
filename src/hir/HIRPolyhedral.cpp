@@ -849,20 +849,24 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
   CanonicalLoop outer;
   if (!matchCanonicalWhile(whileOp, outer)) {
     stats.tilingRejected++;
+    stats.tilingRejectShape++;
     return false;
   }
 
   // Body must be tiling-safe (no break/continue/call at any depth).
   if (!tilingSafeBody(outer.body)) {
     stats.tilingRejected++;
+    stats.tilingRejectControl++;
     return false;
   }
   if (affine::opWritesAnyScalarUsedBy(outer.body, outer.bound)) {
     stats.tilingRejected++;
+    stats.tilingRejectBoundWrite++;
     return false;
   }
   if (!affine::hasAffineArrayAccessUsing(outer.body, outer.iv, 2)) {
     stats.tilingRejected++;
+    stats.tilingRejectAffineAccess++;
     return false;
   }
 
@@ -872,12 +876,14 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
     if (child && child->kind == OpKind::While) { hasInnerWhile = true; break; }
   if (!hasInnerWhile) {
     stats.tilingRejected++;
+    stats.tilingRejectNoInner++;
     return false;
   }
 
   // Don't tile if there's already a tile IV variable with our prefix (idempotency guard).
   if (outer.iv.rfind("__hir_tile_", 0) == 0) {
     stats.tilingRejected++;
+    stats.tilingRejectIdempotent++;
     return false;
   }
 
@@ -988,20 +994,24 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   CanonicalLoop loopA, loopB;
   if (!matchCanonicalWhile(whileA, loopA) || !matchCanonicalWhile(whileB, loopB)) {
     stats.fusionRejected++;
+    stats.fusionRejectShape++;
     return false;
   }
   if (hasBInit) {
     if (!matchLoopInit(block->children[bInitIdx].get(), loopB.iv)) {
       stats.fusionRejected++;
+      stats.fusionRejectInit++;
       return false;
     }
     if (idx == 0 || !matchLoopInit(block->children[idx - 1].get(), loopA.iv)) {
       stats.fusionRejected++;
+      stats.fusionRejectInit++;
       return false;
     }
     if (!boundsEqual(initValue(block->children[idx - 1].get()),
                      initValue(block->children[bInitIdx].get()))) {
       stats.fusionRejected++;
+      stats.fusionRejectInit++;
       return false;
     }
   }
@@ -1009,12 +1019,14 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   // Bounds must be equal.
   if (!boundsEqual(loopA.bound, loopB.bound)) {
     stats.fusionRejected++;
+    stats.fusionRejectBounds++;
     return false;
   }
 
   // Safety: no control/call ops in either body.
   if (!tilingSafeBody(loopA.body) || !tilingSafeBody(loopB.body)) {
     stats.fusionRejected++;
+    stats.fusionRejectControl++;
     return false;
   }
 
@@ -1031,10 +1043,12 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
 
   if (bodyUsesAnyOf(loopB.body, aDefinedScalars)) {
     stats.fusionRejected++;
+    stats.fusionRejectScalar++;
     return false;
   }
   if (!affine::fusionMemorySafe(whileA, whileB)) {
     stats.fusionRejected++;
+    stats.fusionRejectMemory++;
     return false;
   }
 
@@ -1081,33 +1095,41 @@ bool PolyhedralOptimizer::tryRepeatInvariantReduction(Op *block, size_t idx,
 
   Op *whileOp = block->children[idx].get();
   CanonicalLoop loop;
-  if (!matchCanonicalWhile(whileOp, loop))
+  if (!matchCanonicalWhile(whileOp, loop)) {
+    stats.repeatRejected++;
+    stats.repeatRejectShape++;
     return false;
+  }
   if (!matchLoopInit(block->children[idx - 1].get(), loop.iv)) {
     stats.repeatRejected++;
+    stats.repeatRejectInit++;
     return false;
   }
   const Op *start = initValue(block->children[idx - 1].get());
   if (!isConstIntValue(start, 0)) {
     stats.repeatRejected++;
+    stats.repeatRejectInit++;
     return false;
   }
   if (exprUsesScalar(loop.bound, loop.iv) ||
       blockExceptLastUsesScalar(loop.body, loop.iv) ||
       affine::opWritesAnyScalarUsedBy(loop.body, loop.bound)) {
     stats.repeatRejected++;
+    stats.repeatRejectBound++;
     return false;
   }
 
   std::string acc;
   if (!repeatBodyLegal(loop.body, loop.iv, acc)) {
     stats.repeatRejected++;
+    stats.repeatRejectLegal++;
     return false;
   }
 
   auto bodyOnce = cloneBlockWithoutLast(loop.body);
   if (!bodyOnce) {
     stats.repeatRejected++;
+    stats.repeatRejectClone++;
     return false;
   }
 
