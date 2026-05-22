@@ -27,7 +27,6 @@ const Reg leafOrder[] = {
 const Reg normalOrder[] = {
   Reg::a0, Reg::a1, Reg::a2, Reg::a3,
   Reg::a4, Reg::a5, Reg::a6, Reg::a7,
-  Reg::ra,
 
   Reg::t0, Reg::t1, Reg::t2, Reg::t3,
   Reg::t4, Reg::t5, Reg::t6,

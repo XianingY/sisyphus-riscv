@@ -81,6 +81,16 @@ bool isPinned(Op *op) {
          isa<PlaceHolderOp>(op);
 }
 
+bool touchesFloat(Op *op) {
+  if (op->getResultType() == Value::f32)
+    return true;
+  for (auto operand : op->getOperands()) {
+    if (operand.defining && operand.defining->getResultType() == Value::f32)
+      return true;
+  }
+  return false;
+}
+
 // May-alias check for RV-level addresses.
 // Leverages AliasAttr if present on the load/store ops themselves.
 // AliasAttr is computed pre-lowering and copied to rv::LoadOp/StoreOp during rv::Lower.
@@ -126,6 +136,14 @@ void Schedule::runImpl(BasicBlock *bb) {
   auto term = bb->getLastOp();
   if (!term)
     return;
+
+  // Keep FP-heavy blocks in source order.  The scheduler is intentionally
+  // conservative here: FP code often carries implicit ABI constraints through
+  // calls and stack argument setup, while integer kernels still get scheduling.
+  for (auto op : bb->getOps()) {
+    if (touchesFloat(op))
+      return;
+  }
 
   // Don't reorder blocks with calls or other pinned non-terminator ops at all.
   // This is the safe-but-conservative choice for the first version.

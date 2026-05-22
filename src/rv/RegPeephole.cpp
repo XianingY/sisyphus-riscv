@@ -248,6 +248,7 @@ int RegAlloc::latePeephole(Op *funcOp) {
     //   mv a1, a0
     auto next = op->nextOp();
     if (isa<LoadOp>(next) &&
+        !isFP(RS(op)) && !isFP(RD(next)) &&
         RS(next) == RS2(op) && V(next) == V(op) && SIZE(next) == SIZE(op)) {
       converted++;
       builder.setBeforeOp(next);
@@ -269,6 +270,7 @@ int RegAlloc::latePeephole(Op *funcOp) {
         if (next && isa<LoadOp>(op) && isa<LoadOp>(next) &&
             op->has<RdAttr>() && op->has<RsAttr>() && op->has<IntAttr>() &&
             next->has<RdAttr>() && next->has<RsAttr>() && next->has<IntAttr>() &&
+            !isFP(RD(op)) && !isFP(RD(next)) &&
             RS(op) == RS(next) && V(op) == V(next) && SIZE(op) == SIZE(next) &&
             op->getResultType() == next->getResultType() &&
             RD(op) != RS(next)) {
@@ -335,6 +337,11 @@ int RegAlloc::latePeephole(Op *funcOp) {
         if (isa<rv::LoadOp>(op) && op->has<RdAttr>() && op->has<RsAttr>() &&
             op->has<IntAttr>()) {
           bool fpLoad = isFP(RD(op));
+          if (fpLoad) {
+            removeReg(available, RD(op));
+            op = next;
+            continue;
+          }
           LoadKey key{fpLoad, RS(op), V(op), (int) SIZE(op), op->getResultType()};
           auto it = available.find(key);
           if (it != available.end() && RD(op) != key.base) {
