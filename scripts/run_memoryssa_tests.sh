@@ -44,6 +44,22 @@ if grep -q 'non-dominating:' <<<"${runtime_stats}"; then
   exit 1
 fi
 
+phi_stats="$("${COMPILER}" "${CASE_DIR}/join_different_store_phi_load.sy" -S \
+  -o "${OUT_DIR}/join_different_store_phi_load.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${phi_stats}"
+
+if ! grep -A2 '^dle:$' <<<"${phi_stats}" | grep -Eq 'removed-loads : [1-9]'; then
+  echo "expected DLE/MemorySSA to replace a merge load with a value phi from different reaching stores" >&2
+  exit 1
+fi
+
+if grep -q 'non-dominating:' <<<"${phi_stats}"; then
+  echo "phi reaching-store forwarding introduced a non-dominating replacement value" >&2
+  exit 1
+fi
+
 sink_stats="$("${COMPILER}" "${CASE_DIR}/branch_common_store_sink.sy" -S \
   -o "${OUT_DIR}/branch_common_store_sink.rv.s" \
   -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"

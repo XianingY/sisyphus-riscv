@@ -223,6 +223,88 @@ Op *materializeDominatingValue(Builder &builder, LoadOp *load, Op *value) {
   return nullptr;
 }
 
+bool valueAvailableOnEdge(Op *value, BasicBlock *pred) {
+  if (!value || !pred)
+    return false;
+  if (isa<IntOp>(value) || isa<FloatOp>(value))
+    return true;
+  auto parent = value->getParent();
+  return parent && parent->dominates(pred);
+}
+
+void setAfterPhis(Builder &builder, BasicBlock *bb) {
+  auto phis = bb->getPhis();
+  if (phis.empty())
+    builder.setToBlockStart(bb);
+  else
+    builder.setAfterOp(phis.back());
+}
+
+StoreOp *findUnambiguousReachingStore(const std::vector<StoreOp*> &stores, LoadOp *load) {
+  StoreOp *matched = nullptr;
+  auto loadAddr = LOAD_ADDR(load);
+  for (auto store : stores) {
+    auto storeAddr = STORE_ADDR(store);
+    if (mustAlias(loadAddr, storeAddr) || loadAddr == storeAddr) {
+      if (store->DEF(0)->getResultType() != load->getResultType())
+        return nullptr;
+      if (store->has<SizeAttr>() && load->has<SizeAttr>() && SIZE(store) != SIZE(load))
+        return nullptr;
+      if (matched && matched != store)
+        return nullptr;
+      matched = store;
+      continue;
+    }
+
+    if (mayAlias(loadAddr, storeAddr))
+      return nullptr;
+  }
+  return matched;
+}
+
+Op *materializeEdgePhi(Builder &builder, BasicBlock *bb,
+                       const std::vector<std::pair<BasicBlock*, StoreOp*>> &incoming) {
+  if (incoming.size() < 2)
+    return nullptr;
+
+  std::vector<Value> values;
+  std::vector<Attr*> from;
+  values.reserve(incoming.size());
+  from.reserve(incoming.size());
+
+  for (auto [pred, store] : incoming) {
+    auto value = store->DEF(0);
+    if (!valueAvailableOnEdge(value, pred))
+      return nullptr;
+    values.push_back(value);
+    from.push_back(new FromAttr(pred));
+  }
+
+  setAfterPhis(builder, bb);
+  return builder.create<PhiOp>(values, from);
+}
+
+Op *tryMaterializeReachingStorePhi(Builder &builder, BasicBlock *bb, LoadOp *load,
+                                   const std::map<BasicBlock*, std::vector<StoreOp*>> &availableOut) {
+  if (!bb || !load || bb->preds.size() < 2)
+    return nullptr;
+
+  std::vector<std::pair<BasicBlock*, StoreOp*>> incoming;
+  incoming.reserve(bb->preds.size());
+
+  for (auto pred : bb->preds) {
+    auto it = availableOut.find(pred);
+    if (it == availableOut.end())
+      return nullptr;
+    auto store = findUnambiguousReachingStore(it->second, load);
+    if (!store)
+      return nullptr;
+    incoming.emplace_back(pred, store);
+  }
+
+  return materializeEdgePhi(builder, bb, incoming);
+}
+
 }
 
 std::map<std::string, int> DLE::stats() {
@@ -324,9 +406,11 @@ void DLE::runImpl(Region *region) {
   for (auto bb : region->getBlocks()) {
     auto liveStore = commonStores(bb->preds, availableOut);
     auto ops = bb->getOps();
+    bool cleanPredPrefix = true;
 
     for (auto op : ops) {
       if (auto store = dyn_cast<StoreOp>(op)) {
+        cleanPredPrefix = false;
         std::vector<StoreOp*> next { store };
         for (auto x : liveStore) {
           if (neverAlias(STORE_ADDR(x), STORE_ADDR(store)))
@@ -341,11 +425,13 @@ void DLE::runImpl(Region *region) {
           readonlyCallsRetained++;
           continue;
         }
+        cleanPredPrefix = false;
         retainStoresNotClobberedByCall(liveStore, call);
         continue;
       }
 
       if (auto load = dyn_cast<LoadOp>(op)) {
+        bool replaced = false;
         for (auto store : liveStore) {
           if (mustAlias(LOAD_ADDR(load), STORE_ADDR(store)) || LOAD_ADDR(load) == STORE_ADDR(store)) {
             auto replacement = materializeDominatingValue(builder, load, store->DEF(0));
@@ -354,7 +440,17 @@ void DLE::runImpl(Region *region) {
             load->replaceAllUsesWith(replacement);
             load->erase();
             elim++;
+            replaced = true;
             break;
+          }
+        }
+
+        if (!replaced && cleanPredPrefix) {
+          auto replacement = tryMaterializeReachingStorePhi(builder, bb, load, availableOut);
+          if (replacement) {
+            load->replaceAllUsesWith(replacement);
+            load->erase();
+            elim++;
           }
         }
       }

@@ -1,0 +1,11 @@
+int main() {
+  int a[1];
+  int c;
+  c = getint();
+  if (c) {
+    a[0] = 11;
+  } else {
+    a[0] = 23;
+  }
+  return a[0];
+}
