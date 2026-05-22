@@ -296,11 +296,6 @@ ReorderedDep solveDifferenceEqualities(const std::vector<std::vector<int>> &equa
     return ReorderedDep::Unknown;
   }
 
-  if (fixedA && *fixedA < 0)
-    return ReorderedDep::No;
-  if (fixedB && *fixedB < 0)
-    return ReorderedDep::No;
-
   if (fixedA && fixedB) {
     const int64_t actualDiff = *fixedA - *fixedB;
     if (fixedDiff && *fixedDiff != actualDiff)
@@ -311,17 +306,9 @@ ReorderedDep solveDifferenceEqualities(const std::vector<std::vector<int>> &equa
   if (fixedDiff) {
     if (*fixedDiff < 1)
       return ReorderedDep::No;
-    if (fixedA)
-      return *fixedA - *fixedDiff >= 0 ? ReorderedDep::May : ReorderedDep::No;
-    if (fixedB)
-      return *fixedB + *fixedDiff >= 0 ? ReorderedDep::May : ReorderedDep::No;
     return ReorderedDep::May;
   }
 
-  if (fixedA)
-    return *fixedA >= 1 ? ReorderedDep::May : ReorderedDep::No;
-  if (fixedB)
-    return *fixedB >= 0 ? ReorderedDep::May : ReorderedDep::No;
   return ReorderedDep::May;
 }
 
@@ -334,10 +321,6 @@ ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
     return ReorderedDep::May;
 
   pres::BasicSet set;
-  // BasicSet uses non-negative variables. Add explicit lower-bound rows too so
-  // the constructed relation is self-documenting: a_iter >= 0, b_iter >= 0.
-  set.addConstraint({1, 0, 0});
-  set.addConstraint({0, 1, 0});
 
   std::vector<std::vector<int>> equalityRows;
   for (size_t i = 0; i < a.indices.size(); i++) {
