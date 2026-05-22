@@ -824,8 +824,9 @@ int countArrayAccessOps(const Op *op) {
   if (!op)
     return 0;
   int count = 0;
-  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
-      !op->symbol.empty() && !op->children.empty())
+  const bool isArrayLoad = op->kind == OpKind::Load && !op->children.empty();
+  const bool isArrayStore = op->kind == OpKind::Store && op->children.size() > 1;
+  if ((isArrayLoad || isArrayStore) && !op->symbol.empty())
     count++;
   for (const auto &child : op->children)
     count += countArrayAccessOps(child.get());

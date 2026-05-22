@@ -94,8 +94,9 @@ void collectArrayAccessesImpl(const Op *op, std::vector<Access> &out) {
   if (!op)
     return;
 
-  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
-      !op->symbol.empty() && !op->children.empty()) {
+  const bool isArrayLoad = op->kind == OpKind::Load && !op->children.empty();
+  const bool isArrayStore = op->kind == OpKind::Store && op->children.size() > 1;
+  if ((isArrayLoad || isArrayStore) && !op->symbol.empty()) {
     const bool isStore = op->kind == OpKind::Store;
     const size_t indexCount = isStore ? op->children.size() - 1 : op->children.size();
     Access access;
