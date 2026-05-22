@@ -5,12 +5,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <vector>
 
 using namespace sys;
 
 std::map<std::string, int> RangeAwareFold::stats() {
   return {
-    { "folded-ops", folded }
+    { "folded-ops", folded },
+    { "path-replacements", pathReplacements },
   };
 }
 
@@ -22,6 +24,122 @@ void RangeAwareFold::run() {
   auto sameEqClass = [](Op *a, Op *b) -> bool {
     return a && b && a->has<EqClassAttr>() && b->has<EqClassAttr>() && EQCLASS(a) == EQCLASS(b);
   };
+  auto sameValueOrEqClass = [&](Op *a, Op *b) -> bool {
+    return a && b && (a == b || sameEqClass(a, b));
+  };
+
+  auto singletonRange = [](Op *op) -> std::optional<int> {
+    if (!op || op->getResultType() == Value::f32 || !op->has<RangeAttr>())
+      return std::nullopt;
+    auto [low, high] = RANGE(op);
+    if (low != high)
+      return std::nullopt;
+    return low;
+  };
+
+  auto setAfterPhis = [&](BasicBlock *bb) {
+    auto phis = bb->getPhis();
+    if (phis.empty())
+      builder.setToBlockStart(bb);
+    else
+      builder.setAfterOp(phis.back());
+  };
+
+  auto replacePhiUsesWith = [&](PhiOp *phi, Op *replacement) -> bool {
+    if (!phi || !replacement || phi == replacement)
+      return false;
+    if (!replacement->getParent()->dominates(phi->getParent()))
+      return false;
+    phi->replaceAllUsesWith(replacement);
+    phi->erase();
+    pathReplacements++;
+    return true;
+  };
+
+  auto branchEqualityReplacement = [&](PhiOp *phi) -> Op* {
+    if (!phi || phi->getOperandCount() != 1)
+      return nullptr;
+
+    FromAttr *from = nullptr;
+    for (auto attr : phi->getAttrs()) {
+      if (!isa<FromAttr>(attr))
+        continue;
+      if (from)
+        return nullptr;
+      from = cast<FromAttr>(attr);
+    }
+    if (!from)
+      return nullptr;
+
+    auto pred = from->bb;
+    if (!pred || !pred->getLastOp() || !isa<BranchOp>(pred->getLastOp()))
+      return nullptr;
+
+    auto branch = cast<BranchOp>(pred->getLastOp());
+    bool onTrueEdge = TARGET(branch) == phi->getParent();
+    bool onFalseEdge = ELSE(branch) == phi->getParent();
+    if (!onTrueEdge && !onFalseEdge)
+      return nullptr;
+
+    auto cond = branch->DEF();
+    bool equalityHolds = (onTrueEdge && isa<EqOp>(cond)) || (onFalseEdge && isa<NeOp>(cond));
+    if (!equalityHolds)
+      return nullptr;
+
+    auto lhs = cond->DEF(0);
+    auto rhs = cond->DEF(1);
+    auto original = phi->DEF();
+
+    // Canonicalize non-constant x == y paths by substituting the LHS split
+    // value with RHS.  Replacing both split operands would just swap them and
+    // hide x-x/y-y folds from later rewriters.
+    if (original == lhs)
+      return rhs;
+
+    // Constants are safe and profitable whichever side they appear on.
+    if (original == rhs && isa<IntOp>(lhs))
+      return lhs;
+
+    return nullptr;
+  };
+
+  auto funcs = collectFuncs();
+  for (auto func : funcs)
+    func->getRegion()->updateDoms();
+
+  auto phis = module->findAll<PhiOp>();
+  for (auto op : phis) {
+    auto phi = cast<PhiOp>(op);
+    if (auto replacement = branchEqualityReplacement(phi)) {
+      replacePhiUsesWith(phi, replacement);
+      continue;
+    }
+
+    // SCCP-like constant propagation for edge phis narrowed to a singleton by
+    // path-sensitive range splitting.  Restrict this to single-predecessor
+    // blocks so the materialized constant dominates all non-phi uses without
+    // pretending to be available on unrelated incoming edges.
+    auto cst = singletonRange(phi);
+    if (!cst || phi->getOperandCount() != 1 || phi->getParent()->preds.size() != 1)
+      continue;
+
+    bool usedByPhiInSameBlock = false;
+    for (auto use : phi->getUses()) {
+      if (isa<PhiOp>(use) && use->getParent() == phi->getParent()) {
+        usedByPhiInSameBlock = true;
+        break;
+      }
+    }
+    if (usedByPhiInSameBlock)
+      continue;
+
+    setAfterPhis(phi->getParent());
+    auto value = builder.create<IntOp>({ new IntAttr(*cst) });
+    phi->replaceAllUsesWith(value);
+    phi->erase();
+    pathReplacements++;
+  }
+
   bool enableEqFold = true;
   if (const char *env = std::getenv("SISY_ENABLE_EQCLASS_FOLD"))
     enableEqFold = env[0] && std::strcmp(env, "0") != 0;
@@ -150,7 +268,7 @@ void RangeAwareFold::run() {
     runRewriter([&](EqOp *op) {
       auto l = op->DEF(0);
       auto r = op->DEF(1);
-      if (!sameEqClass(l, r))
+      if (!sameValueOrEqClass(l, r))
         return false;
       folded++;
       builder.replace<IntOp>(op, { new IntAttr(1) });
@@ -160,7 +278,7 @@ void RangeAwareFold::run() {
     runRewriter([&](NeOp *op) {
       auto l = op->DEF(0);
       auto r = op->DEF(1);
-      if (!sameEqClass(l, r))
+      if (!sameValueOrEqClass(l, r))
         return false;
       folded++;
       builder.replace<IntOp>(op, { new IntAttr(0) });
@@ -170,7 +288,7 @@ void RangeAwareFold::run() {
     runRewriter([&](LtOp *op) {
       auto l = op->DEF(0);
       auto r = op->DEF(1);
-      if (!sameEqClass(l, r))
+      if (!sameValueOrEqClass(l, r))
         return false;
       folded++;
       builder.replace<IntOp>(op, { new IntAttr(0) });
@@ -180,7 +298,7 @@ void RangeAwareFold::run() {
     runRewriter([&](LeOp *op) {
       auto l = op->DEF(0);
       auto r = op->DEF(1);
-      if (!sameEqClass(l, r))
+      if (!sameValueOrEqClass(l, r))
         return false;
       folded++;
       builder.replace<IntOp>(op, { new IntAttr(1) });
@@ -190,7 +308,7 @@ void RangeAwareFold::run() {
     runRewriter([&](SubIOp *op) {
       auto l = op->DEF(0);
       auto r = op->DEF(1);
-      if (!sameEqClass(l, r))
+      if (!sameValueOrEqClass(l, r))
         return false;
       folded++;
       builder.replace<IntOp>(op, { new IntAttr(0) });
@@ -198,8 +316,6 @@ void RangeAwareFold::run() {
     });
   }
   
-  auto funcs = collectFuncs();
-
   for (auto func : funcs) {
     auto region = func->getRegion();
     removeRange(region);

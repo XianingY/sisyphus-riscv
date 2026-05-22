@@ -56,4 +56,15 @@ if ! grep -A2 '^range-aware-fold:$' <<<"${nonzero_stats}" | grep -Eq 'folded-ops
   exit 1
 fi
 
+value_eq_stats="$("${COMPILER}" "${CASE_DIR}/eq_value_refines_sub.sy" -S \
+  -o "${OUT_DIR}/eq_value_refines_sub.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${value_eq_stats}"
+
+if ! grep -A4 '^range-aware-fold:$' <<<"${value_eq_stats}" | grep -Eq 'path-replacements : [1-9]'; then
+  echo "expected RangeAwareFold to substitute a value using path-sensitive x == y equality" >&2
+  exit 1
+fi
+
 echo "Correlated value propagation range folding tests passed."

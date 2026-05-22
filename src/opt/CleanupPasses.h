@@ -104,6 +104,7 @@ public:
 
 class RangeAwareFold : public Pass {
   int folded = 0;
+  int pathReplacements = 0;
 public:
   RangeAwareFold(ModuleOp *module): Pass(module) {}
 
