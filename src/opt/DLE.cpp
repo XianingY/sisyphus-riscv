@@ -5,6 +5,113 @@ using namespace sys;
 #define STORE_ADDR(op) op->DEF(1)
 #define LOAD_ADDR(op)  op->DEF()
 
+namespace {
+
+bool sameStoredValue(Op *a, Op *b) {
+  if (a == b)
+    return true;
+  if (!a || !b || a->opid != b->opid)
+    return false;
+  if (isa<IntOp>(a))
+    return V(a) == V(b);
+  if (isa<FloatOp>(a))
+    return F(a) == F(b);
+  return false;
+}
+
+bool sameMemoryValue(StoreOp *a, StoreOp *b) {
+  if (!a || !b)
+    return false;
+  if (!sameStoredValue(a->DEF(0), b->DEF(0)))
+    return false;
+  return mustAlias(STORE_ADDR(a), STORE_ADDR(b)) || STORE_ADDR(a) == STORE_ADDR(b);
+}
+
+std::vector<StoreOp*> commonStores(const std::set<BasicBlock*> &preds,
+                                   const std::map<BasicBlock*, std::vector<StoreOp*>> &out) {
+  std::vector<StoreOp*> common;
+  bool first = true;
+  for (auto pred : preds) {
+    auto it = out.find(pred);
+    const std::vector<StoreOp*> empty;
+    const auto &stores = it == out.end() ? empty : it->second;
+    if (first) {
+      common = stores;
+      first = false;
+      continue;
+    }
+
+    std::vector<StoreOp*> next;
+    for (auto candidate : common) {
+      bool found = false;
+      for (auto store : stores) {
+        if (sameMemoryValue(candidate, store)) {
+          found = true;
+          break;
+        }
+      }
+      if (found)
+        next.push_back(candidate);
+    }
+    common = std::move(next);
+  }
+  return common;
+}
+
+void retainStoresNotClobberedByCall(std::vector<StoreOp*> &stores, CallOp *call) {
+  std::set<Op*> toclear;
+  for (auto operand : call->getOperands()) {
+    auto def = operand.defining;
+    if (!def->has<AliasAttr>())
+      continue;
+    auto alias = ALIAS(def);
+    if (alias->unknown) {
+      stores.clear();
+      return;
+    }
+
+    for (auto [base, _] : alias->location)
+      toclear.insert(base);
+  }
+
+  std::vector<StoreOp*> remaining;
+  for (auto store : stores) {
+    auto x = STORE_ADDR(store);
+    if (!x->has<AliasAttr>())
+      continue;
+
+    bool good = true;
+    for (auto [base, _] : ALIAS(x)->location) {
+      if (toclear.count(base) || isa<GetGlobalOp>(base) || isa<GlobalOp>(base)) {
+        good = false;
+        break;
+      }
+    }
+    if (good)
+      remaining.push_back(store);
+  }
+  stores = std::move(remaining);
+}
+
+Op *materializeDominatingValue(Builder &builder, LoadOp *load, Op *value) {
+  if (!load || !value)
+    return nullptr;
+
+  builder.setBeforeOp(load);
+  if (isa<IntOp>(value))
+    return builder.create<IntOp>({ new IntAttr(V(value)) });
+  if (isa<FloatOp>(value))
+    return builder.create<FloatOp>({ new FloatAttr(F(value)) });
+
+  auto valueBlock = value->getParent();
+  auto loadBlock = load->getParent();
+  if (valueBlock && loadBlock && valueBlock->dominates(loadBlock))
+    return value;
+  return nullptr;
+}
+
+}
+
 std::map<std::string, int> DLE::stats() {
   return {
     { "removed-loads", elim }
@@ -14,6 +121,7 @@ std::map<std::string, int> DLE::stats() {
 void DLE::runImpl(Region *region) {
   // First have a simple, context-insensitive approach to deal with load-after-store.
   std::map<Op*, Op*> replacement;
+  Builder builder;
 
   for (auto bb : region->getBlocks()) {
     std::vector<Op*> liveStore;
@@ -81,6 +189,76 @@ void DLE::runImpl(Region *region) {
           if (mustAlias(LOAD_ADDR(op), STORE_ADDR(x)) || storeAddr == loadAddr) {
             op->replaceAllUsesWith(init);
             op->erase();
+            elim++;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  region->updateDoms();
+  std::map<BasicBlock*, std::vector<StoreOp*>> availableOut;
+  std::vector<BasicBlock*> storeWorklist(region->getBlocks().begin(), region->getBlocks().end());
+
+  while (!storeWorklist.empty()) {
+    BasicBlock *bb = storeWorklist.back();
+    storeWorklist.pop_back();
+
+    auto liveStore = commonStores(bb->preds, availableOut);
+
+    for (auto op : bb->getOps()) {
+      if (auto store = dyn_cast<StoreOp>(op)) {
+        std::vector<StoreOp*> next { store };
+        for (auto x : liveStore) {
+          if (neverAlias(STORE_ADDR(x), STORE_ADDR(store)))
+            next.push_back(x);
+        }
+        liveStore = std::move(next);
+        continue;
+      }
+
+      if (auto call = dyn_cast<CallOp>(op); call && call->has<ImpureAttr>()) {
+        retainStoresNotClobberedByCall(liveStore, call);
+        continue;
+      }
+    }
+
+    if (liveStore != availableOut[bb]) {
+      availableOut[bb] = liveStore;
+      for (auto succ : bb->succs)
+        storeWorklist.push_back(succ);
+    }
+  }
+
+  for (auto bb : region->getBlocks()) {
+    auto liveStore = commonStores(bb->preds, availableOut);
+    auto ops = bb->getOps();
+
+    for (auto op : ops) {
+      if (auto store = dyn_cast<StoreOp>(op)) {
+        std::vector<StoreOp*> next { store };
+        for (auto x : liveStore) {
+          if (neverAlias(STORE_ADDR(x), STORE_ADDR(store)))
+            next.push_back(x);
+        }
+        liveStore = std::move(next);
+        continue;
+      }
+
+      if (auto call = dyn_cast<CallOp>(op); call && call->has<ImpureAttr>()) {
+        retainStoresNotClobberedByCall(liveStore, call);
+        continue;
+      }
+
+      if (auto load = dyn_cast<LoadOp>(op)) {
+        for (auto store : liveStore) {
+          if (mustAlias(LOAD_ADDR(load), STORE_ADDR(store)) || LOAD_ADDR(load) == STORE_ADDR(store)) {
+            auto replacement = materializeDominatingValue(builder, load, store->DEF(0));
+            if (!replacement)
+              continue;
+            load->replaceAllUsesWith(replacement);
+            load->erase();
             elim++;
             break;
           }

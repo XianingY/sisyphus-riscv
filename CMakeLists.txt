@@ -49,4 +49,16 @@ if(BUILD_TESTING)
     NAME hir_polyhedral_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_polyhedral_tests.sh"
   )
+  add_test(
+    NAME cvp_range_fold_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_cvp_tests.sh"
+  )
+  add_test(
+    NAME memoryssa_reaching_store_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_memoryssa_tests.sh"
+  )
+  add_test(
+    NAME regalloc_hotness_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_regalloc_hotness_tests.sh"
+  )
 endif()

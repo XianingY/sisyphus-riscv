@@ -25,6 +25,22 @@ void RangeAwareFold::run() {
   if (const char *env = std::getenv("SISY_ENABLE_EQCLASS_FOLD"))
     enableEqFold = env[0] && std::strcmp(env, "0") != 0;
 
+  auto foldKnownBool = [&](Op *op) {
+    if (!op->has<RangeAttr>())
+      return false;
+    auto [low, high] = RANGE(op);
+    if (low != high || (low != 0 && low != 1))
+      return false;
+    folded++;
+    builder.replace<IntOp>(op, { new IntAttr(low) });
+    return true;
+  };
+
+  runRewriter([&](EqOp *op) { return foldKnownBool(op); });
+  runRewriter([&](NeOp *op) { return foldKnownBool(op); });
+  runRewriter([&](LtOp *op) { return foldKnownBool(op); });
+  runRewriter([&](LeOp *op) { return foldKnownBool(op); });
+
   // Fold left/right shifts early.
   runRewriter([&](DivIOp *op) {
     auto x = op->DEF(0);

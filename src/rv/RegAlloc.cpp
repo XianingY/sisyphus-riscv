@@ -165,6 +165,7 @@ std::map<std::string, int> RegAlloc::stats() {
   return {
     { "spilled", spilled },
     { "peepholed", convertedTotal },
+    { "max-block-hotness", maxBlockHotness },
   };
 }
 
@@ -348,6 +349,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   auto bbWeight = sys::backend::shared::computeBlockHotness(region, [](Op *op) {
     return isa<CallOp>(op);
   });
+  for (auto &[_, weight] : bbWeight)
+    maxBlockHotness = std::max(maxBlockHotness, weight);
 
   std::unordered_map<Op*, int> spillOffset;
   int currentOffset = STACKOFF(funcOp);
