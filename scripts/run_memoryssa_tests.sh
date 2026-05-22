@@ -55,4 +55,21 @@ if ! grep -A3 '^dse:$' <<<"${sink_stats}" | grep -Eq 'sunk-stores : [1-9]'; then
   exit 1
 fi
 
+readonly_stats="$("${COMPILER}" "${CASE_DIR}/readonly_call_preserves_store.sy" -S \
+  -o "${OUT_DIR}/readonly_call_preserves_store.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats \
+  --inline-threshold=1 2>&1 >/dev/null)"
+
+echo "${readonly_stats}"
+
+if ! grep -A3 '^dle:$' <<<"${readonly_stats}" | grep -Eq 'readonly-calls-retained : [1-9]'; then
+  echo "expected DLE to preserve reaching stores across readonly internal calls" >&2
+  exit 1
+fi
+
+if ! grep -A3 '^dle:$' <<<"${readonly_stats}" | grep -Eq 'removed-loads : [1-9]'; then
+  echo "expected DLE to forward a load after a readonly internal call" >&2
+  exit 1
+fi
+
 echo "MemorySSA reaching-store load elimination tests passed."

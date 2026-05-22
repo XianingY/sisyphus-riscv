@@ -1,0 +1,18 @@
+int sum_prefix(int a[], int n) {
+  if (n <= 0) {
+    return 0;
+  }
+  return a[n - 1] + sum_prefix(a, n - 1);
+}
+
+int main() {
+  int a[2];
+  int v;
+  int x;
+  v = getint();
+  a[0] = v;
+  a[1] = getint();
+  x = sum_prefix(a, 2);
+  putint(a[0] + x);
+  return 0;
+}

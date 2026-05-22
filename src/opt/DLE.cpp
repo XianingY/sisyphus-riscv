@@ -93,6 +93,119 @@ void retainStoresNotClobberedByCall(std::vector<StoreOp*> &stores, CallOp *call)
   stores = std::move(remaining);
 }
 
+void retainStoresNotClobberedByCall(std::vector<Op*> &stores, CallOp *call) {
+  std::set<Op*> toclear;
+  for (auto operand : call->getOperands()) {
+    auto def = operand.defining;
+    if (!def->has<AliasAttr>())
+      continue;
+    auto alias = ALIAS(def);
+    if (alias->unknown) {
+      stores.clear();
+      return;
+    }
+
+    for (auto [base, _] : alias->location)
+      toclear.insert(base);
+  }
+
+  std::vector<Op*> remaining;
+  for (auto store : stores) {
+    auto x = STORE_ADDR(store);
+    if (!x->has<AliasAttr>())
+      continue;
+
+    bool good = true;
+    for (auto [base, _] : ALIAS(x)->location) {
+      if (toclear.count(base) || isa<GetGlobalOp>(base) || isa<GlobalOp>(base)) {
+        good = false;
+        break;
+      }
+    }
+    if (good)
+      remaining.push_back(store);
+  }
+  stores = std::move(remaining);
+}
+
+bool storeMayWriteExternally(FuncOp *func, StoreOp *store);
+
+bool functionMayWriteMemory(FuncOp *func, const std::map<std::string, FuncOp*> &fnMap,
+                            std::set<FuncOp*> &visiting,
+                            std::map<FuncOp*, bool> &memo) {
+  if (!func)
+    return true;
+  if (memo.count(func))
+    return memo[func];
+  if (visiting.count(func))
+    return false;
+  visiting.insert(func);
+
+  bool mayWrite = false;
+  for (auto bb : func->getRegion()->getBlocks()) {
+    for (auto op : bb->getOps()) {
+      if (auto store = dyn_cast<StoreOp>(op); store && storeMayWriteExternally(func, store)) {
+        mayWrite = true;
+        break;
+      }
+      if (isa<CloneOp>(op) || isa<JoinOp>(op) || isa<WakeOp>(op)) {
+        mayWrite = true;
+        break;
+      }
+      if (auto call = dyn_cast<CallOp>(op)) {
+        const auto &name = NAME(call);
+        if (isExtern(name)) {
+          mayWrite = true;
+          break;
+        }
+        auto it = fnMap.find(name);
+        if (it == fnMap.end() || functionMayWriteMemory(it->second, fnMap, visiting, memo)) {
+          mayWrite = true;
+          break;
+        }
+      }
+    }
+    if (mayWrite)
+      break;
+  }
+
+  visiting.erase(func);
+  memo[func] = mayWrite;
+  return mayWrite;
+}
+
+bool callMayWriteMemory(CallOp *call, const std::map<std::string, FuncOp*> &fnMap,
+                        std::map<FuncOp*, bool> &memo) {
+  if (!call)
+    return true;
+  const auto &name = NAME(call);
+  if (isExtern(name))
+    return true;
+  auto it = fnMap.find(name);
+  if (it == fnMap.end())
+    return true;
+  std::set<FuncOp*> visiting;
+  return functionMayWriteMemory(it->second, fnMap, visiting, memo);
+}
+
+bool storeMayWriteExternally(FuncOp *func, StoreOp *store) {
+  if (!func || !store)
+    return true;
+  auto addr = STORE_ADDR(store);
+  if (!addr || !addr->has<AliasAttr>())
+    return true;
+  auto alias = ALIAS(addr);
+  if (alias->unknown)
+    return true;
+  for (auto &[base, _] : alias->location) {
+    if (!isa<AllocaOp>(base))
+      return true;
+    if (base->getParentOp<FuncOp>() != func)
+      return true;
+  }
+  return false;
+}
+
 Op *materializeDominatingValue(Builder &builder, LoadOp *load, Op *value) {
   if (!load || !value)
     return nullptr;
@@ -114,7 +227,8 @@ Op *materializeDominatingValue(Builder &builder, LoadOp *load, Op *value) {
 
 std::map<std::string, int> DLE::stats() {
   return {
-    { "removed-loads", elim }
+    { "removed-loads", elim },
+    { "readonly-calls-retained", readonlyCallsRetained },
   };
 }
 
@@ -122,6 +236,7 @@ void DLE::runImpl(Region *region) {
   // First have a simple, context-insensitive approach to deal with load-after-store.
   std::map<Op*, Op*> replacement;
   Builder builder;
+  std::map<FuncOp*, bool> memoryWriteMemo;
 
   for (auto bb : region->getBlocks()) {
     std::vector<Op*> liveStore;
@@ -142,41 +257,12 @@ void DLE::runImpl(Region *region) {
       // Check its arguments to see what's been passed into it,
       // and clear the store of those things.
       // Moreover, clear the stores of globals.
-      if (isa<CallOp>(op) && op->has<ImpureAttr>()) {
-        std::set<Op*> toclear;
-        for (auto operand : op->getOperands()) {
-          auto def = operand.defining;
-          if (!def->has<AliasAttr>())
-            continue;
-          auto alias = ALIAS(def);
-          if (alias->unknown) {
-            liveStore.clear();
-            break;
-          }
-
-          for (auto [base, _] : alias->location)
-            toclear.insert(base);
+      if (auto call = dyn_cast<CallOp>(op); call && call->has<ImpureAttr>()) {
+        if (!callMayWriteMemory(call, fnMap, memoryWriteMemo)) {
+          readonlyCallsRetained++;
+          continue;
         }
-        std::vector<Op*> remaining;
-        for (auto store : liveStore) {
-          auto x = store->DEF(1);
-          if (!x->has<AliasAttr>())
-            continue;
-
-          bool good = true;
-          for (auto [base, _] : ALIAS(x)->location) {
-            // Also invalidate globals.
-            if (toclear.count(base) || isa<GetGlobalOp>(base) || isa<GlobalOp>(base)) {
-              good = false;
-              break;
-            }
-          }
-          if (!good)
-            continue;
-
-          remaining.push_back(store);
-        }
-        liveStore = std::move(remaining);
+        retainStoresNotClobberedByCall(liveStore, call);
         continue;
       }
 
@@ -219,6 +305,10 @@ void DLE::runImpl(Region *region) {
       }
 
       if (auto call = dyn_cast<CallOp>(op); call && call->has<ImpureAttr>()) {
+        if (!callMayWriteMemory(call, fnMap, memoryWriteMemo)) {
+          readonlyCallsRetained++;
+          continue;
+        }
         retainStoresNotClobberedByCall(liveStore, call);
         continue;
       }
@@ -247,6 +337,10 @@ void DLE::runImpl(Region *region) {
       }
 
       if (auto call = dyn_cast<CallOp>(op); call && call->has<ImpureAttr>()) {
+        if (!callMayWriteMemory(call, fnMap, memoryWriteMemo)) {
+          readonlyCallsRetained++;
+          continue;
+        }
         retainStoresNotClobberedByCall(liveStore, call);
         continue;
       }
@@ -352,6 +446,7 @@ void DLE::runImpl(Region *region) {
 
 void DLE::run() {
   auto funcs = collectFuncs();
+  fnMap = getFunctionMap();
 
   for (auto func : funcs)
     runImpl(func->getRegion());
