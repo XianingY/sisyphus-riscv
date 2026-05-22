@@ -222,6 +222,21 @@ bool setFixedValue(std::optional<int64_t> &slot, int64_t value) {
   return true;
 }
 
+int64_t abs64(int64_t value) {
+  return value < 0 ? -value : value;
+}
+
+int64_t gcd64(int64_t a, int64_t b) {
+  a = abs64(a);
+  b = abs64(b);
+  while (b != 0) {
+    int64_t next = a % b;
+    a = b;
+    b = next;
+  }
+  return a;
+}
+
 ReorderedDep solveDifferenceEqualities(const std::vector<std::vector<int>> &equalities) {
   std::optional<int64_t> fixedA;
   std::optional<int64_t> fixedB;
@@ -230,9 +245,18 @@ ReorderedDep solveDifferenceEqualities(const std::vector<std::vector<int>> &equa
   for (const auto &row : equalities) {
     if (row.size() != 3)
       return ReorderedDep::Unknown;
-    const int64_t ca = row[0];
-    const int64_t cb = row[1];
-    const int64_t c = row[2];
+    int64_t ca = row[0];
+    int64_t cb = row[1];
+    int64_t c = row[2];
+
+    const int64_t coeffGcd = gcd64(ca, cb);
+    if (coeffGcd > 1) {
+      if (c % coeffGcd != 0)
+        return ReorderedDep::No;
+      ca /= coeffGcd;
+      cb /= coeffGcd;
+      c /= coeffGcd;
+    }
 
     if (ca == 0 && cb == 0) {
       if (c != 0)
