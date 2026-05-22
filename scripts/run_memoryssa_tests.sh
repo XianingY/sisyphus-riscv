@@ -71,6 +71,22 @@ if ! grep -A3 '^dse:$' <<<"${sink_stats}" | grep -Eq 'sunk-stores : [1-9]'; then
   exit 1
 fi
 
+phi_sink_stats="$("${COMPILER}" "${CASE_DIR}/branch_different_store_phi_sink.sy" -S \
+  -o "${OUT_DIR}/branch_different_store_phi_sink.rv.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${phi_sink_stats}"
+
+if ! grep -A3 '^dse:$' <<<"${phi_sink_stats}" | grep -Eq 'sunk-stores : [1-9]'; then
+  echo "expected DSE to sink branch stores with different values through a value phi" >&2
+  exit 1
+fi
+
+if grep -q 'non-dominating:' <<<"${phi_sink_stats}"; then
+  echo "DSE phi store sinking introduced a non-dominating value" >&2
+  exit 1
+fi
+
 readonly_stats="$("${COMPILER}" "${CASE_DIR}/readonly_call_preserves_store.sy" -S \
   -o "${OUT_DIR}/readonly_call_preserves_store.rv.s" \
   -O1 --target=riscv --use-legacy-codegen --verify-ir --stats \

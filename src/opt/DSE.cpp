@@ -26,10 +26,10 @@ bool sameStoredValueForSink(Op *a, Op *b) {
   return false;
 }
 
-bool sameStoreForSink(StoreOp *a, StoreOp *b) {
+bool sameStoreAddressForSink(StoreOp *a, StoreOp *b) {
   if (!a || !b)
     return false;
-  if (!sameStoredValueForSink(a->DEF(0), b->DEF(0)))
+  if (a->has<SizeAttr>() && b->has<SizeAttr>() && SIZE(a) != SIZE(b))
     return false;
   return a->DEF(1) == b->DEF(1) || mustAlias(a->DEF(1), b->DEF(1));
 }
@@ -55,6 +55,15 @@ bool valueAvailableAt(Op *value, BasicBlock *bb) {
   return parent && parent->dominates(bb);
 }
 
+bool valueAvailableOnEdge(Op *value, BasicBlock *pred) {
+  if (!value || !pred)
+    return false;
+  if (isa<IntOp>(value) || isa<FloatOp>(value))
+    return true;
+  auto parent = value->getParent();
+  return parent && parent->dominates(pred);
+}
+
 Op *materializeSinkValue(Builder &builder, Op *value) {
   if (isa<IntOp>(value))
     return builder.create<IntOp>({ new IntAttr(V(value)) });
@@ -69,6 +78,52 @@ void setAfterPhis(Builder &builder, BasicBlock *bb) {
     builder.setToBlockStart(bb);
   else
     builder.setAfterOp(phis.back());
+}
+
+Op *materializeStoreSinkValue(Builder &builder, BasicBlock *bb,
+                              const std::vector<StoreOp*> &stores) {
+  auto firstValue = stores.front()->DEF(0);
+  bool sameValue = true;
+  for (auto store : stores) {
+    if (!sameStoredValueForSink(firstValue, store->DEF(0))) {
+      sameValue = false;
+      break;
+    }
+  }
+
+  if (sameValue) {
+    if (!valueAvailableAt(firstValue, bb))
+      return nullptr;
+    return materializeSinkValue(builder, firstValue);
+  }
+
+  std::vector<Value> values;
+  std::vector<Attr*> from;
+  values.reserve(stores.size());
+  from.reserve(stores.size());
+
+  for (auto pred : bb->preds) {
+    StoreOp *storeForPred = nullptr;
+    for (auto store : stores) {
+      auto term = store->nextOp();
+      if (term && isa<GotoOp>(term) && term->has<TargetAttr>() &&
+          TARGET(term) == bb && store->getParent() == pred) {
+        storeForPred = store;
+        break;
+      }
+    }
+    if (!storeForPred)
+      return nullptr;
+    auto value = storeForPred->DEF(0);
+    if (value->getResultType() != firstValue->getResultType())
+      return nullptr;
+    if (!valueAvailableOnEdge(value, pred))
+      return nullptr;
+    values.push_back(value);
+    from.push_back(new FromAttr(pred));
+  }
+
+  return builder.create<PhiOp>(values, from);
 }
 
 }
@@ -95,22 +150,27 @@ void DSE::runImpl(Region *region) {
       continue;
 
     auto first = stores.front();
-    if (!valueAvailableAt(first->DEF(1), bb) || !valueAvailableAt(first->DEF(0), bb))
+    if (!valueAvailableAt(first->DEF(1), bb))
       continue;
 
-    bool same = true;
+    bool sameAddress = true;
     for (auto store : stores) {
-      if (!sameStoreForSink(first, store)) {
-        same = false;
+      if (!sameStoreAddressForSink(first, store)) {
+        sameAddress = false;
         break;
       }
     }
-    if (!same)
+    if (!sameAddress)
       continue;
 
     setAfterPhis(builder, bb);
-    auto value = materializeSinkValue(builder, first->DEF(0));
-    builder.create<StoreOp>({ value, first->DEF(1) });
+    auto value = materializeStoreSinkValue(builder, bb, stores);
+    if (!value)
+      continue;
+    std::vector<Attr*> storeAttrs;
+    if (first->has<SizeAttr>())
+      storeAttrs.push_back(new SizeAttr(SIZE(first)));
+    builder.create<StoreOp>({ value, first->DEF(1) }, storeAttrs);
     for (auto store : stores)
       store->erase();
     sunk += static_cast<int>(stores.size()) - 1;
