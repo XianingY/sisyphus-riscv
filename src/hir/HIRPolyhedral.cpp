@@ -1283,6 +1283,10 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   }
 
   stats.fusionApplied++;
+  for (size_t nested = 0; loopA.body && nested < loopA.body->children.size(); nested++) {
+    if (tryLoopFusion(loopA.body, nested, stats))
+      nested = static_cast<size_t>(-1);
+  }
   return true;
 }
 
