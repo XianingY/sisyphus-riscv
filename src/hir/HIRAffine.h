@@ -25,6 +25,14 @@ struct Access {
   bool isStore = false;
 };
 
+struct PresburgerFusionResult {
+  bool safe = false;
+  int queries = 0;
+  int noReorderedDependence = 0;
+  int mayReorderedDependence = 0;
+  int unknown = 0;
+};
+
 struct CanonicalLoop {
   std::string iv;
   const Op *bound = nullptr;
@@ -42,6 +50,7 @@ bool hasAffineArrayAccessUsing(const Op *op, const std::string &symbol,
                                int minRank = 1);
 
 bool fusionMemorySafe(const Op *loopA, const Op *loopB);
+PresburgerFusionResult fusionMemorySafePresburger(const Op *loopA, const Op *loopB);
 
 }  // namespace sys::hir::affine
 

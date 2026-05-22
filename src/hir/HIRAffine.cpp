@@ -1,6 +1,9 @@
 #include "HIRAffine.h"
 
+#include "../utils/presburger/BasicSet.h"
+
 #include <algorithm>
+#include <optional>
 
 namespace sys::hir::affine {
 
@@ -176,6 +179,167 @@ bool accessPairProvablyDisjoint(const Access &a, const Access &b,
   return false;
 }
 
+enum class ReorderedDep {
+  No,
+  May,
+  Unknown,
+};
+
+using CoeffMap = std::map<std::string, int64_t>;
+
+void addSeparatedExpr(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
+                      int64_t sign, const std::string &iv,
+                      const std::string &separatedIV) {
+  constant += sign * expr.constant;
+  for (const auto &[sym, coeff] : expr.coeffs) {
+    const std::string &target = sym == iv ? separatedIV : sym;
+    coeffs[target] += sign * coeff;
+  }
+}
+
+bool makePresburgerRow(const CoeffMap &coeffs, int64_t constant,
+                       std::vector<int> &row) {
+  row.assign(3, 0);
+  for (const auto &[sym, coeff] : coeffs) {
+    if (coeff == 0)
+      continue;
+    if (sym == "__a_iter") {
+      row[0] += static_cast<int>(coeff);
+    } else if (sym == "__b_iter") {
+      row[1] += static_cast<int>(coeff);
+    } else {
+      return false;
+    }
+  }
+  row[2] = static_cast<int>(constant);
+  return true;
+}
+
+bool setFixedValue(std::optional<int64_t> &slot, int64_t value) {
+  if (slot.has_value())
+    return *slot == value;
+  slot = value;
+  return true;
+}
+
+ReorderedDep solveDifferenceEqualities(const std::vector<std::vector<int>> &equalities) {
+  std::optional<int64_t> fixedA;
+  std::optional<int64_t> fixedB;
+  std::optional<int64_t> fixedDiff;
+
+  for (const auto &row : equalities) {
+    if (row.size() != 3)
+      return ReorderedDep::Unknown;
+    const int64_t ca = row[0];
+    const int64_t cb = row[1];
+    const int64_t c = row[2];
+
+    if (ca == 0 && cb == 0) {
+      if (c != 0)
+        return ReorderedDep::No;
+      continue;
+    }
+    if (ca == 1 && cb == -1) {
+      if (!setFixedValue(fixedDiff, -c))
+        return ReorderedDep::No;
+      continue;
+    }
+    if (ca == -1 && cb == 1) {
+      if (!setFixedValue(fixedDiff, c))
+        return ReorderedDep::No;
+      continue;
+    }
+    if (ca == 1 && cb == 0) {
+      if (!setFixedValue(fixedA, -c))
+        return ReorderedDep::No;
+      continue;
+    }
+    if (ca == -1 && cb == 0) {
+      if (!setFixedValue(fixedA, c))
+        return ReorderedDep::No;
+      continue;
+    }
+    if (ca == 0 && cb == 1) {
+      if (!setFixedValue(fixedB, -c))
+        return ReorderedDep::No;
+      continue;
+    }
+    if (ca == 0 && cb == -1) {
+      if (!setFixedValue(fixedB, c))
+        return ReorderedDep::No;
+      continue;
+    }
+    return ReorderedDep::Unknown;
+  }
+
+  if (fixedA && *fixedA < 0)
+    return ReorderedDep::No;
+  if (fixedB && *fixedB < 0)
+    return ReorderedDep::No;
+
+  if (fixedA && fixedB) {
+    const int64_t actualDiff = *fixedA - *fixedB;
+    if (fixedDiff && *fixedDiff != actualDiff)
+      return ReorderedDep::No;
+    return actualDiff >= 1 ? ReorderedDep::May : ReorderedDep::No;
+  }
+
+  if (fixedDiff) {
+    if (*fixedDiff < 1)
+      return ReorderedDep::No;
+    if (fixedA)
+      return *fixedA - *fixedDiff >= 0 ? ReorderedDep::May : ReorderedDep::No;
+    if (fixedB)
+      return *fixedB + *fixedDiff >= 0 ? ReorderedDep::May : ReorderedDep::No;
+    return ReorderedDep::May;
+  }
+
+  if (fixedA)
+    return *fixedA >= 1 ? ReorderedDep::May : ReorderedDep::No;
+  if (fixedB)
+    return *fixedB >= 0 ? ReorderedDep::May : ReorderedDep::No;
+  return ReorderedDep::May;
+}
+
+ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
+                                              const std::string &aIV,
+                                              const std::string &bIV,
+                                              bool &queried) {
+  queried = false;
+  if (a.indices.size() != b.indices.size())
+    return ReorderedDep::May;
+
+  pres::BasicSet set;
+  // BasicSet uses non-negative variables. Add explicit lower-bound rows too so
+  // the constructed relation is self-documenting: a_iter >= 0, b_iter >= 0.
+  set.addConstraint({1, 0, 0});
+  set.addConstraint({0, 1, 0});
+
+  std::vector<std::vector<int>> equalityRows;
+  for (size_t i = 0; i < a.indices.size(); i++) {
+    CoeffMap coeffs;
+    int64_t constant = 0;
+    addSeparatedExpr(coeffs, constant, a.indices[i], 1, aIV, "__a_iter");
+    addSeparatedExpr(coeffs, constant, b.indices[i], -1, bIV, "__b_iter");
+
+    std::vector<int> row;
+    if (!makePresburgerRow(coeffs, constant, row))
+      return ReorderedDep::Unknown;
+    equalityRows.push_back(row);
+    set.addConstraint(row);
+    for (int &value : row)
+      value = -value;
+    set.addConstraint(row);
+  }
+
+  // Fusion changes the relative order only for B(iter_b) before A(iter_a)
+  // when iter_a > iter_b. If no overlapping access pair exists under this
+  // constraint, the fusion cannot reverse a real memory dependence.
+  set.addConstraint({1, -1, -1});
+  queried = true;
+  return solveDifferenceEqualities(equalityRows);
+}
+
 void collectScalarLoads(const Op *op, std::unordered_set<std::string> &loads) {
   if (!op)
     return;
@@ -287,10 +451,15 @@ bool hasAffineArrayAccessUsing(const Op *op, const std::string &symbol, int minR
 }
 
 bool fusionMemorySafe(const Op *loopAOp, const Op *loopBOp) {
+  return fusionMemorySafePresburger(loopAOp, loopBOp).safe;
+}
+
+PresburgerFusionResult fusionMemorySafePresburger(const Op *loopAOp, const Op *loopBOp) {
+  PresburgerFusionResult result;
   CanonicalLoop loopA;
   CanonicalLoop loopB;
   if (!matchCanonicalLoop(loopAOp, loopA) || !matchCanonicalLoop(loopBOp, loopB))
-    return false;
+    return result;
 
   std::vector<Access> aAccesses = collectArrayAccesses(loopA.body);
   std::vector<Access> bAccesses = collectArrayAccesses(loopB.body);
@@ -303,19 +472,35 @@ bool fusionMemorySafe(const Op *loopAOp, const Op *loopBOp) {
         continue;
       if (!a.isStore && !b.isStore)
         continue;
-      if (a.indices.size() != b.indices.size())
-        return false;
 
+      bool queried = false;
+      ReorderedDep dep =
+          reorderedDependenceViaPresburger(a, b, loopA.iv, loopB.iv, queried);
+      if (queried)
+        result.queries++;
+      if (dep == ReorderedDep::No) {
+        result.noReorderedDependence++;
+        continue;
+      }
+      if (dep == ReorderedDep::May) {
+        result.mayReorderedDependence++;
+        return result;
+      }
+
+      result.unknown++;
+      if (a.indices.size() != b.indices.size())
+        return result;
       if (accessPairSameIteration(a, b, renameBToA))
         continue;
       if (accessPairProvablyDisjoint(a, b, loopIVs))
         continue;
 
-      return false;
+      return result;
     }
   }
 
-  return true;
+  result.safe = true;
+  return result;
 }
 
 }  // namespace sys::hir::affine

@@ -38,6 +38,10 @@ struct PolyhedralStats {
   int fusionRejectScalar = 0;
   int fusionRejectMemory = 0;
   int forwardedArrayStoreLoads = 0;
+  int presburgerFusionQueries = 0;
+  int presburgerFusionNoDeps = 0;
+  int presburgerFusionMayDeps = 0;
+  int presburgerFusionUnknown = 0;
   // Stats-only affine nest scanner. These counters do not enable rewrites.
   int affineNestCandidates = 0;
   int affineNestRejectedShape = 0;

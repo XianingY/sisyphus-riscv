@@ -370,6 +370,10 @@ int main(int argc, char **argv) {
                       << " fusion-reject-scalar=" << stats.fusionRejectScalar
                       << " fusion-reject-memory=" << stats.fusionRejectMemory
                       << " forwarded-array-store-load=" << stats.forwardedArrayStoreLoads
+                      << " presburger-fusion-queries=" << stats.presburgerFusionQueries
+                      << " presburger-fusion-no-deps=" << stats.presburgerFusionNoDeps
+                      << " presburger-fusion-may-deps=" << stats.presburgerFusionMayDeps
+                      << " presburger-fusion-unknown=" << stats.presburgerFusionUnknown
                       << " affine-nest-candidates=" << stats.affineNestCandidates
                       << " affine-nest-reject-shape=" << stats.affineNestRejectedShape
                       << " affine-nest-reject-control=" << stats.affineNestRejectedControl
