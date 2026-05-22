@@ -3,6 +3,7 @@
 #include "Attrs.h"
 #include "OpBase.h"
 #include "Ops.h"
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -25,6 +26,13 @@ bool valueIsFloat(Value v) {
 
 bool preferFloat(Type *astTy, Value v) {
   return astIsFloat(astTy) || valueIsFloat(v);
+}
+
+Value makeByteOffset(Builder &builder, Value index, int strideBytes, long long objectBytes) {
+  auto strideVal = builder.create<IntOp>({ new IntAttr(strideBytes) });
+  if (objectBytes > INT_MAX)
+    return builder.create<MulLOp>({ index, strideVal });
+  return builder.create<MulIOp>({ index, strideVal });
 }
 
 } // namespace
@@ -303,7 +311,8 @@ Value CodeGen::emitExpr(ASTNode *node) {
 
     // Calculate a series of stride.
     std::vector<int> sizes;
-    auto size = getSize(arrTy->base) * arrTy->getSize();
+    long long totalBytes = (long long) getSize(arrTy->base) * arrTy->getSize();
+    auto size = totalBytes;
     for (int i = 0; i < arrTy->dims.size(); i++)
       sizes.push_back(size /= arrTy->dims[i]);
     
@@ -322,8 +331,7 @@ Value CodeGen::emitExpr(ASTNode *node) {
     }
     for (int i = 0; i < access->indices.size(); i++) {
       auto index = emitExpr(access->indices[i]);
-      auto strideVal = builder.create<IntOp>({ new IntAttr(sizes[i]) });
-      auto stride = builder.create<MulLOp>({ index, strideVal });
+      auto stride = makeByteOffset(builder, index, sizes[i], totalBytes);
       addr = builder.create<AddLOp>({ addr, stride });
     }
     // This is not a value, but just an address.
@@ -532,7 +540,6 @@ void CodeGen::emit(ASTNode *node) {
           auto zero = isa<FloatType>(base)
               ? (Value) builder.create<FloatOp>({ new FloatAttr(0) })
               : (Value) builder.create<IntOp>({ new IntAttr(0) });
-          auto stride = builder.create<IntOp>({ new IntAttr(baseSize) });
           auto incr = builder.create<IntOp>({ new IntAttr(1) });
 
           auto loop = builder.create<ForOp>({ start, end, incr, iv });
@@ -541,7 +548,7 @@ void CodeGen::emit(ASTNode *node) {
           
           builder.setToRegionStart(body);
 
-          auto offset = builder.create<MulLOp>({ loop, stride });
+          auto offset = makeByteOffset(builder, loop, baseSize, arrSize);
           auto place = builder.create<AddLOp>({ addr, offset });
           builder.create<StoreOp>({ zero, place });
         }
@@ -655,7 +662,8 @@ void CodeGen::emit(ASTNode *node) {
 
     // Calculate a series of stride.
     std::vector<int> sizes;
-    auto size = getSize(arrTy->base) * arrTy->getSize();
+    long long totalBytes = (long long) getSize(arrTy->base) * arrTy->getSize();
+    auto size = totalBytes;
     for (int i = 0; i < write->indices.size(); i++)
       sizes.push_back(size /= arrTy->dims[i]);
     
@@ -674,8 +682,7 @@ void CodeGen::emit(ASTNode *node) {
     }
     for (int i = 0; i < write->indices.size(); i++) {
       auto index = emitExpr(write->indices[i]);
-      auto strideVal = builder.create<IntOp>({ new IntAttr(sizes[i]) });
-      auto stride = builder.create<MulLOp>({ index, strideVal });
+      auto stride = makeByteOffset(builder, index, sizes[i], totalBytes);
       addr = builder.create<AddLOp>({ addr, stride });
     }
     // Store the value in addr.
