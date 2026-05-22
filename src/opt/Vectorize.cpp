@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <deque>
+#include <initializer_list>
 
 using namespace sys;
 
@@ -10,6 +11,10 @@ using namespace sys;
 #define VECREJECT(msg) do { VECDEBUG(msg); return; } while (0)
 
 namespace {
+
+std::vector<Value> vecValues(std::initializer_list<Value> values) {
+  return std::vector<Value>(values);
+}
 
 bool isConstInt(Op *op, int value) {
   return isa<IntOp>(op) && V(op) == value;
@@ -104,22 +109,22 @@ bool matchOperandPack(OperandPack &pack, Op *operand, int lane, Value::Type scal
 bool scalarBinaryToVector(Builder &builder, Op *scalar, Op *lhs, Op *rhs, Op *&out) {
   switch (scalar->opid) {
   case AddIOp::id:
-    out = builder.create<AddVOp>({ lhs, rhs });
+    out = builder.create<AddVOp>(vecValues({ lhs, rhs }));
     return true;
   case SubIOp::id:
-    out = builder.create<SubVOp>({ lhs, rhs });
+    out = builder.create<SubVOp>(vecValues({ lhs, rhs }));
     return true;
   case MulIOp::id:
-    out = builder.create<MulVOp>({ lhs, rhs });
+    out = builder.create<MulVOp>(vecValues({ lhs, rhs }));
     return true;
   case AddFOp::id:
-    out = builder.create<AddFVOp>({ lhs, rhs });
+    out = builder.create<AddFVOp>(vecValues({ lhs, rhs }));
     return true;
   case SubFOp::id:
-    out = builder.create<SubFVOp>({ lhs, rhs });
+    out = builder.create<SubFVOp>(vecValues({ lhs, rhs }));
     return true;
   case MulFOp::id:
-    out = builder.create<MulFVOp>({ lhs, rhs });
+    out = builder.create<MulFVOp>(vecValues({ lhs, rhs }));
     return true;
   default:
     return false;
@@ -129,13 +134,13 @@ bool scalarBinaryToVector(Builder &builder, Op *scalar, Op *lhs, Op *rhs, Op *&o
 Op *materializeOperandPack(Builder &builder, const OperandPack &pack, Value::Type vectorTy) {
   if (pack.contiguous) {
     assert(isa<LoadOp>(pack.first));
-    return builder.create<LoadOp>(vectorTy, { pack.first->DEF(0) }, { new SizeAttr(16) });
+    return builder.create<LoadOp>(vectorTy, vecValues({ pack.first->DEF(0) }), { new SizeAttr(16) });
   }
 
   assert(pack.splat);
   if (vectorTy == Value::f128)
-    return builder.create<BroadcastFOp>({ pack.first });
-  return builder.create<BroadcastOp>({ pack.first });
+    return builder.create<BroadcastFOp>(vecValues({ pack.first }));
+  return builder.create<BroadcastOp>(vecValues({ pack.first }));
 }
 
 bool trySLPStorePack(const std::vector<Op*> &ops,
@@ -215,7 +220,7 @@ bool trySLPStorePack(const std::vector<Op*> &ops,
   Op *vecValue = nullptr;
   if (!scalarBinaryToVector(builder, firstValue, lhsVec, rhsVec, vecValue))
     return false;
-  builder.create<StoreOp>({ vecValue, stores[0]->DEF(1) }, { new SizeAttr(16) });
+  builder.create<StoreOp>(vecValues({ vecValue, stores[0]->DEF(1) }), { new SizeAttr(16) });
 
   for (auto store : stores) {
     removed.insert(store);
@@ -548,13 +553,13 @@ void Vectorize::runImpl(LoopInfo *info) {
     switch (x->opid) {
     case IntOp::id: {
       BAD(vectorTy != Value::i128);
-      auto b = builder.create<BroadcastOp>({ x });
+      auto b = builder.create<BroadcastOp>(vecValues({ x }));
       created.push_back(b);
       break;
     }
     case FloatOp::id: {
       BAD(vectorTy != Value::f128);
-      auto b = builder.create<BroadcastFOp>({ x });
+      auto b = builder.create<BroadcastFOp>(vecValues({ x }));
       created.push_back(b);
       break;
     }
@@ -573,16 +578,16 @@ void Vectorize::runImpl(LoopInfo *info) {
       // Optimize memset-like operations.
       if (isa<IntOp>(value) || isa<FloatOp>(value) || !info->contains(value->getParent())) {
         auto b = vectorTy == Value::f128
-          ? (Op*) builder.create<BroadcastFOp>({ value })
-          : (Op*) builder.create<BroadcastOp>({ value });
+          ? (Op*) builder.create<BroadcastFOp>(vecValues({ value }))
+          : (Op*) builder.create<BroadcastOp>(vecValues({ value }));
         created.push_back(b);
-        auto st = builder.create<StoreOp>({ b, x->DEF(1) }, { new SizeAttr(16) });
+        auto st = builder.create<StoreOp>(vecValues({ b, x->DEF(1) }), { new SizeAttr(16) });
         replace(x, st);
         break;
       }
 
       BAD(!opmap.count(value) || opmap[value]->getResultType() != vectorTy);
-      auto st = builder.create<StoreOp>({ opmap[value], x->DEF(1) }, { new SizeAttr(16) });
+      auto st = builder.create<StoreOp>(vecValues({ opmap[value], x->DEF(1) }), { new SizeAttr(16) });
       replace(x, st);
       break;
     }
@@ -592,7 +597,7 @@ void Vectorize::runImpl(LoopInfo *info) {
         auto aty = opmap[a]->getResultType();
         auto bty = opmap[b]->getResultType();
         if (aty == bty && aty == Value::i128) {
-          auto vop = builder.create<AddVOp>({ opmap[a]->getResult(), opmap[b] });
+          auto vop = builder.create<AddVOp>(vecValues({ opmap[a]->getResult(), opmap[b] }));
           replace(x, vop);
           break;
         }
@@ -608,14 +613,14 @@ void Vectorize::runImpl(LoopInfo *info) {
         BAD(info->contains(b->getParent()));
 
         if (aty == Value::i128 && bty == Value::i32) {
-          auto broadcast = builder.create<BroadcastOp>({ b });
+          auto broadcast = builder.create<BroadcastOp>(vecValues({ b }));
           created.push_back(broadcast);
-          auto viop = builder.create<AddVOp>({ opmap[a]->getResult(), broadcast });
+          auto viop = builder.create<AddVOp>(vecValues({ opmap[a]->getResult(), broadcast }));
           replace(x, viop);
           break;
         }
         if (aty == Value::i32 && bty == Value::i32) {
-          auto add = builder.create<AddIOp>({ opmap[a]->getResult(), b });
+          auto add = builder.create<AddIOp>(vecValues({ opmap[a]->getResult(), b }));
           replace(x, add);
           break;
         }
@@ -629,7 +634,7 @@ void Vectorize::runImpl(LoopInfo *info) {
         auto aty = opmap[a]->getResultType();
         auto bty = opmap[b]->getResultType();
         if (aty == bty && aty == Value::i128) {
-          auto vop = builder.create<SubVOp>({ opmap[a]->getResult(), opmap[b] });
+          auto vop = builder.create<SubVOp>(vecValues({ opmap[a]->getResult(), opmap[b] }));
           replace(x, vop);
           break;
         }
@@ -637,9 +642,9 @@ void Vectorize::runImpl(LoopInfo *info) {
       if (opmap.count(a) && !opmap.count(b)) {
         BAD(info->contains(b->getParent()));
         if (opmap[a]->getResultType() == Value::i128 && b->getResultType() == Value::i32) {
-          auto broadcast = builder.create<BroadcastOp>({ b });
+          auto broadcast = builder.create<BroadcastOp>(vecValues({ b }));
           created.push_back(broadcast);
-          auto viop = builder.create<SubVOp>({ opmap[a]->getResult(), broadcast });
+          auto viop = builder.create<SubVOp>(vecValues({ opmap[a]->getResult(), broadcast }));
           replace(x, viop);
           break;
         }
@@ -647,9 +652,9 @@ void Vectorize::runImpl(LoopInfo *info) {
       if (!opmap.count(a) && opmap.count(b)) {
         BAD(info->contains(a->getParent()));
         if (a->getResultType() == Value::i32 && opmap[b]->getResultType() == Value::i128) {
-          auto broadcast = builder.create<BroadcastOp>({ a });
+          auto broadcast = builder.create<BroadcastOp>(vecValues({ a }));
           created.push_back(broadcast);
-          auto viop = builder.create<SubVOp>({ broadcast, opmap[b]->getResult() });
+          auto viop = builder.create<SubVOp>(vecValues({ broadcast, opmap[b]->getResult() }));
           replace(x, viop);
           break;
         }
@@ -663,7 +668,7 @@ void Vectorize::runImpl(LoopInfo *info) {
         auto aty = opmap[a]->getResultType();
         auto bty = opmap[b]->getResultType();
         if (aty == bty && aty == Value::f128) {
-          auto vop = builder.create<AddFVOp>({ opmap[a]->getResult(), opmap[b] });
+          auto vop = builder.create<AddFVOp>(vecValues({ opmap[a]->getResult(), opmap[b] }));
           replace(x, vop);
           break;
         }
@@ -677,9 +682,9 @@ void Vectorize::runImpl(LoopInfo *info) {
         BAD(info->contains(b->getParent()));
 
         if (aty == Value::f128 && bty == Value::f32) {
-          auto broadcast = builder.create<BroadcastFOp>({ b });
+          auto broadcast = builder.create<BroadcastFOp>(vecValues({ b }));
           created.push_back(broadcast);
-          auto vfop = builder.create<AddFVOp>({ opmap[a]->getResult(), broadcast });
+          auto vfop = builder.create<AddFVOp>(vecValues({ opmap[a]->getResult(), broadcast }));
           replace(x, vfop);
           break;
         }
@@ -693,7 +698,7 @@ void Vectorize::runImpl(LoopInfo *info) {
         auto aty = opmap[a]->getResultType();
         auto bty = opmap[b]->getResultType();
         if (aty == bty && aty == Value::f128) {
-          auto vop = builder.create<SubFVOp>({ opmap[a]->getResult(), opmap[b] });
+          auto vop = builder.create<SubFVOp>(vecValues({ opmap[a]->getResult(), opmap[b] }));
           replace(x, vop);
           break;
         }
@@ -701,9 +706,9 @@ void Vectorize::runImpl(LoopInfo *info) {
       if (opmap.count(a) && !opmap.count(b)) {
         BAD(info->contains(b->getParent()));
         if (opmap[a]->getResultType() == Value::f128 && b->getResultType() == Value::f32) {
-          auto broadcast = builder.create<BroadcastFOp>({ b });
+          auto broadcast = builder.create<BroadcastFOp>(vecValues({ b }));
           created.push_back(broadcast);
-          auto vfop = builder.create<SubFVOp>({ opmap[a]->getResult(), broadcast });
+          auto vfop = builder.create<SubFVOp>(vecValues({ opmap[a]->getResult(), broadcast }));
           replace(x, vfop);
           break;
         }
@@ -711,9 +716,9 @@ void Vectorize::runImpl(LoopInfo *info) {
       if (!opmap.count(a) && opmap.count(b)) {
         BAD(info->contains(a->getParent()));
         if (a->getResultType() == Value::f32 && opmap[b]->getResultType() == Value::f128) {
-          auto broadcast = builder.create<BroadcastFOp>({ a });
+          auto broadcast = builder.create<BroadcastFOp>(vecValues({ a }));
           created.push_back(broadcast);
-          auto vfop = builder.create<SubFVOp>({ broadcast, opmap[b]->getResult() });
+          auto vfop = builder.create<SubFVOp>(vecValues({ broadcast, opmap[b]->getResult() }));
           replace(x, vfop);
           break;
         }
@@ -727,7 +732,7 @@ void Vectorize::runImpl(LoopInfo *info) {
         auto aty = opmap[a]->getResultType();
         auto bty = opmap[b]->getResultType();
         if (aty == bty && aty == Value::i128) {
-          auto vop = builder.create<MulVOp>({ opmap[a]->getResult(), opmap[b] });
+          auto vop = builder.create<MulVOp>(vecValues({ opmap[a]->getResult(), opmap[b] }));
           replace(x, vop);
           break;
         }
@@ -743,14 +748,14 @@ void Vectorize::runImpl(LoopInfo *info) {
         BAD(info->contains(b->getParent()));
 
         if (aty == Value::i128 && bty == Value::i32) {
-          auto broadcast = builder.create<BroadcastOp>({ b });
+          auto broadcast = builder.create<BroadcastOp>(vecValues({ b }));
           created.push_back(broadcast);
-          auto viop = builder.create<MulVOp>({ opmap[a]->getResult(), broadcast });
+          auto viop = builder.create<MulVOp>(vecValues({ opmap[a]->getResult(), broadcast }));
           replace(x, viop);
           break;
         }
         if (aty == Value::i32 && bty == Value::i32) {
-          auto add = builder.create<MulIOp>({ opmap[a]->getResult(), b });
+          auto add = builder.create<MulIOp>(vecValues({ opmap[a]->getResult(), b }));
           replace(x, add);
           break;
         }
@@ -764,7 +769,7 @@ void Vectorize::runImpl(LoopInfo *info) {
         auto aty = opmap[a]->getResultType();
         auto bty = opmap[b]->getResultType();
         if (aty == bty && aty == Value::f128) {
-          auto vop = builder.create<MulFVOp>({ opmap[a]->getResult(), opmap[b] });
+          auto vop = builder.create<MulFVOp>(vecValues({ opmap[a]->getResult(), opmap[b] }));
           replace(x, vop);
           break;
         }
@@ -778,9 +783,9 @@ void Vectorize::runImpl(LoopInfo *info) {
         BAD(info->contains(b->getParent()));
 
         if (aty == Value::f128 && bty == Value::f32) {
-          auto broadcast = builder.create<BroadcastFOp>({ b });
+          auto broadcast = builder.create<BroadcastFOp>(vecValues({ b }));
           created.push_back(broadcast);
-          auto vfop = builder.create<MulFVOp>({ opmap[a]->getResult(), broadcast });
+          auto vfop = builder.create<MulFVOp>(vecValues({ opmap[a]->getResult(), broadcast }));
           replace(x, vfop);
           break;
         }
@@ -879,9 +884,9 @@ void Vectorize::runImpl(LoopInfo *info) {
     step = builder.create<IntOp>({ new IntAttr(V(step)) });
   
   Value four = builder.create<IntOp>({ new IntAttr(4) });
-  Value mul = builder.create<MulIOp>({ four, step });
-  Value lim = builder.create<SubLOp>({ stop, mul });
-  builder.replace<LtOp>(cond, { Op::getPhiFrom(info->induction, latch), lim });
+  Value mul = builder.create<MulIOp>(vecValues({ four, step }));
+  Value lim = builder.create<SubLOp>(vecValues({ stop, mul }));
+  builder.replace<LtOp>(cond, vecValues({ Op::getPhiFrom(info->induction, latch), lim }));
 
   // For the new header, everything comes from the new latch (`tail`).
   auto headerPhis = rewireMap[header]->getPhis();
