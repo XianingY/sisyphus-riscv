@@ -1,0 +1,18 @@
+int a[16][16];
+int c[16];
+
+int main() {
+  int j = 0;
+  while (j < 16) {
+    int k = 0;
+    int acc = 0;
+    while (k < 16) {
+      acc = acc + (a[j][k] + c[j]);
+      k = k + 1;
+    }
+    c[j] = acc;
+    j = j + 1;
+  }
+
+  return c[0];
+}

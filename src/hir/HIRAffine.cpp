@@ -65,6 +65,13 @@ bool isConstInt(const Op *op, int64_t &value) {
   return true;
 }
 
+std::optional<int64_t> constIntValue(const Op *op) {
+  int64_t value = 0;
+  if (!isConstInt(op, value))
+    return std::nullopt;
+  return value;
+}
+
 const Op *unwrapSingleDecl(const Op *op) {
   if (!op)
     return nullptr;
@@ -315,6 +322,10 @@ ReorderedDep solveDifferenceEqualities(const std::vector<std::vector<int>> &equa
 ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
                                               const std::string &aIV,
                                               const std::string &bIV,
+                                              std::optional<int64_t> aBegin,
+                                              std::optional<int64_t> aEnd,
+                                              std::optional<int64_t> bBegin,
+                                              std::optional<int64_t> bEnd,
                                               bool &queried) {
   queried = false;
   if (a.indices.size() != b.indices.size())
@@ -343,8 +354,21 @@ ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
   // when iter_a > iter_b. If no overlapping access pair exists under this
   // constraint, the fusion cannot reverse a real memory dependence.
   set.addConstraint({1, -1, -1});
+  if (aBegin)
+    set.addConstraint({1, 0, static_cast<int>(-*aBegin)});
+  if (aEnd)
+    set.addConstraint({-1, 0, static_cast<int>(*aEnd - 1)});
+  if (bBegin)
+    set.addConstraint({0, 1, static_cast<int>(-*bBegin)});
+  if (bEnd)
+    set.addConstraint({0, -1, static_cast<int>(*bEnd - 1)});
+
   queried = true;
-  return solveDifferenceEqualities(equalityRows);
+  if (solveDifferenceEqualities(equalityRows) == ReorderedDep::No)
+    return ReorderedDep::No;
+  if (set.empty())
+    return ReorderedDep::No;
+  return ReorderedDep::May;
 }
 
 void collectScalarLoads(const Op *op, std::unordered_set<std::string> &loads) {
@@ -462,12 +486,21 @@ bool fusionMemorySafe(const Op *loopAOp, const Op *loopBOp) {
 }
 
 PresburgerFusionResult fusionMemorySafePresburger(const Op *loopAOp, const Op *loopBOp) {
+  return fusionMemorySafePresburger(loopAOp, loopBOp, nullptr, nullptr);
+}
+
+PresburgerFusionResult fusionMemorySafePresburger(const Op *loopAOp, const Op *loopBOp,
+                                                  const Op *initAOp, const Op *initBOp) {
   PresburgerFusionResult result;
   CanonicalLoop loopA;
   CanonicalLoop loopB;
   if (!matchCanonicalLoop(loopAOp, loopA) || !matchCanonicalLoop(loopBOp, loopB))
     return result;
 
+  std::optional<int64_t> initA = constIntValue(initAOp);
+  std::optional<int64_t> initB = constIntValue(initBOp);
+  std::optional<int64_t> boundA = constIntValue(loopA.bound);
+  std::optional<int64_t> boundB = constIntValue(loopB.bound);
   std::vector<Access> aAccesses = collectArrayAccesses(loopA.body);
   std::vector<Access> bAccesses = collectArrayAccesses(loopB.body);
   std::unordered_map<std::string, std::string> renameBToA = {{loopB.iv, loopA.iv}};
@@ -482,7 +515,8 @@ PresburgerFusionResult fusionMemorySafePresburger(const Op *loopAOp, const Op *l
 
       bool queried = false;
       ReorderedDep dep =
-          reorderedDependenceViaPresburger(a, b, loopA.iv, loopB.iv, queried);
+          reorderedDependenceViaPresburger(a, b, loopA.iv, loopB.iv,
+                                           initA, boundA, initB, boundB, queried);
       if (queried)
         result.queries++;
       if (dep == ReorderedDep::No) {

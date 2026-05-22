@@ -51,6 +51,8 @@ bool hasAffineArrayAccessUsing(const Op *op, const std::string &symbol,
 
 bool fusionMemorySafe(const Op *loopA, const Op *loopB);
 PresburgerFusionResult fusionMemorySafePresburger(const Op *loopA, const Op *loopB);
+PresburgerFusionResult fusionMemorySafePresburger(const Op *loopA, const Op *loopB,
+                                                  const Op *initA, const Op *initB);
 
 }  // namespace sys::hir::affine
 

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPILER="${ROOT_DIR}/build/compiler"
+CASE_DIR="${ROOT_DIR}/tests/polyhedral"
+OUT_DIR="${ROOT_DIR}/tests/.out/polyhedral"
+mkdir -p "${OUT_DIR}"
+
+if [[ ! -x "${COMPILER}" ]]; then
+  echo "compiler not found at ${COMPILER}; run cmake --build build -j first"
+  exit 1
+fi
+
+fusion_stats="$("${COMPILER}" "${CASE_DIR}/fusion_disjoint_domains.sy" -S \
+  -o "${OUT_DIR}/fusion_disjoint_domains.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${fusion_stats}"
+
+if ! grep -q "fusion-applied=1" <<<"${fusion_stats}"; then
+  echo "expected HIR Presburger fusion to prove disjoint shifted domains" >&2
+  exit 1
+fi
+
+if grep -q "fusion-reject-memory=[1-9]" <<<"${fusion_stats}"; then
+  echo "unexpected HIR fusion memory rejection for disjoint shifted domains" >&2
+  exit 1
+fi
+
+jam_stats="$("${COMPILER}" "${CASE_DIR}/reduction_unroll_jam.sy" -S \
+  -o "${OUT_DIR}/reduction_unroll_jam.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${jam_stats}"
+
+if ! grep -q "reduction-jammed=1" <<<"${jam_stats}"; then
+  echo "expected HIR reduction unroll-and-jam to fire" >&2
+  exit 1
+fi
+
+if grep -q "reduction-interchanged=[1-9]" <<<"${jam_stats}"; then
+  echo "expected in-place reduction to use jam, not interchange" >&2
+  exit 1
+fi
+
+echo "HIR polyhedral Presburger fusion and unroll-and-jam tests passed."

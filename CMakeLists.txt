@@ -45,4 +45,8 @@ if(BUILD_TESTING)
     NAME rvv_vectorize_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_vectorize_tests.sh"
   )
+  add_test(
+    NAME hir_polyhedral_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_polyhedral_tests.sh"
+  )
 endif()
