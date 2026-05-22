@@ -368,6 +368,13 @@ int main(int argc, char **argv) {
                       << " fusion-reject-control=" << stats.fusionRejectControl
                       << " fusion-reject-scalar=" << stats.fusionRejectScalar
                       << " fusion-reject-memory=" << stats.fusionRejectMemory
+                      << " affine-nest-candidates=" << stats.affineNestCandidates
+                      << " affine-nest-reject-shape=" << stats.affineNestRejectedShape
+                      << " affine-nest-reject-control=" << stats.affineNestRejectedControl
+                      << " affine-nest-reject-access=" << stats.affineNestRejectedAccess
+                      << " affine-nest-perfect-2d=" << stats.affineNestPerfect2D
+                      << " affine-nest-perfect-3d=" << stats.affineNestPerfect3D
+                      << " matmul-like-candidates=" << stats.matmulLikeCandidates
                       << "\n";
           }
         });

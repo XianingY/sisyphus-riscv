@@ -36,6 +36,14 @@ struct PolyhedralStats {
   int fusionRejectControl = 0;
   int fusionRejectScalar = 0;
   int fusionRejectMemory = 0;
+  // Stats-only affine nest scanner. These counters do not enable rewrites.
+  int affineNestCandidates = 0;
+  int affineNestRejectedShape = 0;
+  int affineNestRejectedControl = 0;
+  int affineNestRejectedAccess = 0;
+  int affineNestPerfect2D = 0;
+  int affineNestPerfect3D = 0;
+  int matmulLikeCandidates = 0;
 };
 
 class PolyhedralOptimizer {
@@ -48,6 +56,7 @@ private:
   std::unordered_set<std::string> globalArrays;
 
   bool optimizeBlock(Op *block, PolyhedralStats &stats);
+  void scanAffineNest(Op *op, PolyhedralStats &stats);
   bool tryReductionInterchange(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);

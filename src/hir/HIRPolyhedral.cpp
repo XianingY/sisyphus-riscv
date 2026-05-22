@@ -743,6 +743,92 @@ bool blockExceptLastUsesScalar(const Op *block, const std::string &symbol) {
   return false;
 }
 
+bool hasUnsafeAffineScanControl(const Op *op) {
+  if (!op)
+    return false;
+  switch (op->kind) {
+  case OpKind::Call:
+  case OpKind::Return:
+  case OpKind::Break:
+  case OpKind::Continue:
+    return true;
+  default:
+    break;
+  }
+  for (const auto &child : op->children)
+    if (hasUnsafeAffineScanControl(child.get()))
+      return true;
+  return false;
+}
+
+int countArrayAccessOps(const Op *op) {
+  if (!op)
+    return 0;
+  int count = 0;
+  if ((op->kind == OpKind::Load || op->kind == OpKind::Store) &&
+      !op->symbol.empty() && !op->children.empty())
+    count++;
+  for (const auto &child : op->children)
+    count += countArrayAccessOps(child.get());
+  return count;
+}
+
+Op *findSingleDirectInnerWhile(Op *body) {
+  if (!body || body->kind != OpKind::Block || body->children.size() < 2)
+    return nullptr;
+  Op *inner = nullptr;
+  for (size_t i = 0; i + 1 < body->children.size(); i++) {
+    Op *candidate = unwrapSingleDecl(body->children[i].get());
+    if (!candidate || candidate->kind != OpKind::While)
+      continue;
+    if (inner)
+      return nullptr;
+    inner = candidate;
+  }
+  return inner;
+}
+
+bool accessMentions(const affine::Access &access, const std::string &symbol) {
+  for (const auto &idx : access.indices)
+    if (idx.coeffs.count(symbol))
+      return true;
+  return false;
+}
+
+bool accessMentionsPair(const affine::Access &access, const std::string &a,
+                        const std::string &b) {
+  bool hasA = false;
+  bool hasB = false;
+  for (const auto &idx : access.indices) {
+    hasA = hasA || idx.coeffs.count(a);
+    hasB = hasB || idx.coeffs.count(b);
+  }
+  return hasA && hasB;
+}
+
+bool isMatmulLikeNest(const std::vector<CanonicalLoop> &loops,
+                      const std::vector<affine::Access> &accesses) {
+  if (loops.size() < 3)
+    return false;
+  const std::string &i = loops[0].iv;
+  const std::string &j = loops[1].iv;
+  const std::string &k = loops[2].iv;
+  bool hasDestStore = false;
+  bool hasIKLoad = false;
+  bool hasKJLoad = false;
+  for (const auto &access : accesses) {
+    if (access.indices.size() < 2)
+      continue;
+    if (access.isStore && accessMentionsPair(access, i, j) && !accessMentions(access, k))
+      hasDestStore = true;
+    if (!access.isStore && accessMentionsPair(access, i, k))
+      hasIKLoad = true;
+    if (!access.isStore && accessMentionsPair(access, k, j))
+      hasKJLoad = true;
+  }
+  return hasDestStore && hasIKLoad && hasKJLoad;
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
@@ -773,6 +859,10 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
 
   if (block->kind != OpKind::Block && block->kind != OpKind::Module)
     return changed;
+
+  for (auto &child : block->children)
+    if (child && child->kind == OpKind::While)
+      scanAffineNest(child.get(), stats);
 
   for (size_t i = 0; i < block->children.size(); i++) {
     if (tryReductionInterchange(block, i, stats)) {
@@ -820,6 +910,50 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     }
   }
   return changed;
+}
+
+void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
+  stats.affineNestCandidates++;
+
+  std::vector<CanonicalLoop> loops;
+  Op *current = op;
+  for (int depth = 0; depth < 3; depth++) {
+    CanonicalLoop loop;
+    if (!matchCanonicalWhile(current, loop)) {
+      if (depth == 0) {
+        stats.affineNestRejectedShape++;
+        return;
+      }
+      break;
+    }
+    loops.push_back(loop);
+    current = findSingleDirectInnerWhile(loop.body);
+    if (!current)
+      break;
+  }
+
+  if (loops.size() < 2) {
+    stats.affineNestRejectedShape++;
+    return;
+  }
+  if (hasUnsafeAffineScanControl(op)) {
+    stats.affineNestRejectedControl++;
+    return;
+  }
+
+  int rawAccesses = countArrayAccessOps(op);
+  std::vector<affine::Access> accesses = affine::collectArrayAccesses(op);
+  if (rawAccesses != (int) accesses.size()) {
+    stats.affineNestRejectedAccess++;
+    return;
+  }
+
+  if (loops.size() >= 2)
+    stats.affineNestPerfect2D++;
+  if (loops.size() >= 3)
+    stats.affineNestPerfect3D++;
+  if (isMatmulLikeNest(loops, accesses))
+    stats.matmulLikeCandidates++;
 }
 
 // ===========================================================================
