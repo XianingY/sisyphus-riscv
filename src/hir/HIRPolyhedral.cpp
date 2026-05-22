@@ -503,8 +503,8 @@ bool strictReductionInterchangeLegal(const ReductionPattern &pat,
   return true;
 }
 
-std::unique_ptr<Op> makeJamStep(const std::string &iv) {
-  return makeStore(iv, makeArith("+", makeLoad(iv), makeConstInt(kJamFactor)));
+std::unique_ptr<Op> makeJamStep(const std::string &iv, int factor) {
+  return makeStore(iv, makeArith("+", makeLoad(iv), makeConstInt(factor)));
 }
 
 std::unique_ptr<Op> makeReductionInitLoop(const ReductionPattern &pat) {
@@ -718,6 +718,28 @@ bool bodyUsesAnyOf(const Op *op, const std::unordered_set<std::string> &syms) {
   return false;
 }
 
+bool bodyWritesScalar(const Op *op, const std::string &symbol) {
+  if (!op)
+    return false;
+  if ((op->kind == OpKind::VarDecl ||
+       (op->kind == OpKind::Store && op->children.size() == 1)) &&
+      op->symbol == symbol)
+    return true;
+  for (const auto &child : op->children)
+    if (bodyWritesScalar(child.get(), symbol))
+      return true;
+  return false;
+}
+
+bool blockExceptLastWritesScalar(const Op *block, const std::string &symbol) {
+  if (!block || block->kind != OpKind::Block || block->children.empty())
+    return false;
+  for (size_t i = 0; i + 1 < block->children.size(); i++)
+    if (bodyWritesScalar(block->children[i].get(), symbol))
+      return true;
+  return false;
+}
+
 std::unique_ptr<Op> cloneBlockWithoutLast(const Op *block) {
   if (!block || block->kind != OpKind::Block || block->children.empty())
     return nullptr;
@@ -927,6 +949,11 @@ PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   hirTileSize = hirEnvInt("SISY_HIR_TILE_SIZE", kDefaultHirTileSize);
   if (hirTileSize < 4)
     hirTileSize = 4;
+  hirJamFactor = hirEnvInt("SISY_HIR_JAM_FACTOR", kJamFactor);
+  if (hirJamFactor < 2)
+    hirJamFactor = 2;
+  if (hirJamFactor > 16)
+    hirJamFactor = 16;
   globalArrays.clear();
   for (const auto &child : module.root->children) {
     const Op *decl = unwrapSingleDecl(child.get());
@@ -974,6 +1001,24 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   }
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    if (hirEnvEnabled("SISY_HIR_ENABLE_INTERCHANGE", true)) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryLoopInterchange(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
+    if (hirEnvEnabled("SISY_HIR_ENABLE_UNROLL_JAM", true)) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryLoopUnrollJam(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
     // Loop tiling: strip-mine loops that have an inner while.
     // HIR tiling rewrites loop structure before CFG construction. Keep it
     // opt-in until the transform can prove that loop-exit IV values remain
@@ -1043,6 +1088,308 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
     stats.affineNestPerfect3D++;
   if (isMatmulLikeNest(loops, accesses))
     stats.matmulLikeCandidates++;
+}
+
+// ===========================================================================
+// Loop Interchange / Unroll-and-Jam (Presburger-based)
+// ===========================================================================
+
+bool PolyhedralOptimizer::tryLoopInterchange(Op *block, size_t idx,
+                                             PolyhedralStats &stats) {
+  if (!block || idx == 0 || idx >= block->children.size())
+    return false;
+
+  Op *outerWhile = block->children[idx].get();
+  CanonicalLoop outer;
+  if (!matchCanonicalWhile(outerWhile, outer)) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectShape++;
+    return false;
+  }
+
+  Op *outerInitOp = block->children[idx - 1].get();
+  if (!matchLoopInit(outerInitOp, outer.iv)) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectInit++;
+    return false;
+  }
+
+  if (!outer.body || outer.body->kind != OpKind::Block || outer.body->children.size() != 3) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectShape++;
+    return false;
+  }
+
+  Op *innerWhile = unwrapSingleDecl(outer.body->children[1].get());
+  if (!innerWhile || innerWhile->kind != OpKind::While) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectShape++;
+    return false;
+  }
+
+  CanonicalLoop inner;
+  if (!matchCanonicalWhile(innerWhile, inner)) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectShape++;
+    return false;
+  }
+
+  Op *innerInitOp = outer.body->children[0].get();
+  if (!matchLoopInit(innerInitOp, inner.iv)) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectInit++;
+    return false;
+  }
+
+  if (!tilingSafeBody(inner.body) || containsWhile(inner.body) ||
+      blockExceptLastWritesScalar(inner.body, inner.iv) ||
+      bodyWritesScalar(inner.body, outer.iv)) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectControl++;
+    return false;
+  }
+  std::unordered_set<std::string> definedScalars;
+  collectDefinedScalars(inner.body, definedScalars);
+  definedScalars.erase(inner.iv);
+  definedScalars.erase(outer.iv);
+  if (!definedScalars.empty()) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectControl++;
+    return false;
+  }
+
+  int rawAccesses = countArrayAccessOps(inner.body);
+  std::vector<affine::Access> accesses = affine::collectArrayAccesses(inner.body);
+  if (rawAccesses != (int) accesses.size()) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectAccess++;
+    return false;
+  }
+
+  const Op *outerInitVal = initValue(outerInitOp);
+  const Op *innerInitVal = initValue(innerInitOp);
+  if (!outerInitVal || !innerInitVal) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectInit++;
+    return false;
+  }
+
+  affine::Expr outerInitExpr = affine::analyzeExpr(outerInitVal);
+  affine::Expr innerInitExpr = affine::analyzeExpr(innerInitVal);
+  affine::Expr outerBoundExpr = affine::analyzeExpr(outer.bound);
+  affine::Expr innerBoundExpr = affine::analyzeExpr(inner.bound);
+  if (!outerInitExpr.valid || !innerInitExpr.valid ||
+      !outerBoundExpr.valid || !innerBoundExpr.valid) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectBounds++;
+    return false;
+  }
+
+  std::unordered_set<std::string> loopIVs = {outer.iv, inner.iv};
+  if (affine::exprUsesAny(outerInitExpr, loopIVs) ||
+      affine::exprUsesAny(innerInitExpr, loopIVs) ||
+      affine::exprUsesAny(outerBoundExpr, loopIVs) ||
+      affine::exprUsesAny(innerBoundExpr, loopIVs)) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectBounds++;
+    return false;
+  }
+
+  affine::PresburgerInterchangeResult dep =
+      affine::interchangeMemorySafePresburger(outerWhile, innerWhile,
+                                              outerInitOp, innerInitOp);
+  stats.presburgerInterchangeQueries += dep.queries;
+  stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
+  stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
+  stats.presburgerInterchangeUnknown += dep.unknown;
+  if (!dep.safe) {
+    stats.interchangeRejected++;
+    stats.interchangeRejectMemory++;
+    return false;
+  }
+
+  auto newInnerBody = makeBlock();
+  for (size_t i = 0; i + 1 < inner.body->children.size(); i++)
+    newInnerBody->children.push_back(cloneOp(inner.body->children[i].get()));
+  newInnerBody->children.push_back(cloneOp(outer.step));
+  auto newInnerWhile =
+      makeWhile(cloneOp(outerWhile->children[0].get()), std::move(newInnerBody));
+
+  auto newOuterBody = makeBlock();
+  newOuterBody->children.push_back(makeStore(outer.iv, cloneOp(outerInitVal)));
+  newOuterBody->children.push_back(std::move(newInnerWhile));
+  newOuterBody->children.push_back(cloneOp(inner.step));
+  auto newOuterWhile =
+      makeWhile(cloneOp(innerWhile->children[0].get()), std::move(newOuterBody));
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 1);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(cloneOp(innerInitOp));
+      replacement.push_back(std::move(newOuterWhile));
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.interchangeApplied++;
+  return true;
+}
+
+bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
+                                           PolyhedralStats &stats) {
+  if (!block || idx == 0 || idx >= block->children.size())
+    return false;
+
+  Op *outerWhile = block->children[idx].get();
+  CanonicalLoop outer;
+  if (!matchCanonicalWhile(outerWhile, outer)) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectShape++;
+    return false;
+  }
+
+  Op *outerInitOp = block->children[idx - 1].get();
+  if (!matchLoopInit(outerInitOp, outer.iv)) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectInit++;
+    return false;
+  }
+
+  if (!outer.body || outer.body->kind != OpKind::Block || outer.body->children.size() != 3) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectShape++;
+    return false;
+  }
+
+  Op *innerWhile = unwrapSingleDecl(outer.body->children[1].get());
+  if (!innerWhile || innerWhile->kind != OpKind::While) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectShape++;
+    return false;
+  }
+
+  CanonicalLoop inner;
+  if (!matchCanonicalWhile(innerWhile, inner)) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectShape++;
+    return false;
+  }
+
+  Op *innerInitOp = outer.body->children[0].get();
+  if (!matchLoopInit(innerInitOp, inner.iv)) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectInit++;
+    return false;
+  }
+
+  if (!tilingSafeBody(inner.body) || containsWhile(inner.body) ||
+      blockExceptLastWritesScalar(inner.body, inner.iv) ||
+      bodyWritesScalar(inner.body, outer.iv)) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectControl++;
+    return false;
+  }
+  std::unordered_set<std::string> definedScalars;
+  collectDefinedScalars(inner.body, definedScalars);
+  definedScalars.erase(inner.iv);
+  definedScalars.erase(outer.iv);
+  if (!definedScalars.empty()) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectControl++;
+    return false;
+  }
+
+  int rawAccesses = countArrayAccessOps(inner.body);
+  std::vector<affine::Access> accesses = affine::collectArrayAccesses(inner.body);
+  if (rawAccesses != (int) accesses.size()) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectAccess++;
+    return false;
+  }
+
+  const Op *outerInitVal = initValue(outerInitOp);
+  const Op *innerInitVal = initValue(innerInitOp);
+  if (!outerInitVal || !innerInitVal) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectInit++;
+    return false;
+  }
+
+  affine::Expr outerInitExpr = affine::analyzeExpr(outerInitVal);
+  affine::Expr innerInitExpr = affine::analyzeExpr(innerInitVal);
+  affine::Expr outerBoundExpr = affine::analyzeExpr(outer.bound);
+  affine::Expr innerBoundExpr = affine::analyzeExpr(inner.bound);
+  if (!outerInitExpr.valid || !innerInitExpr.valid ||
+      !outerBoundExpr.valid || !innerBoundExpr.valid) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectBounds++;
+    return false;
+  }
+
+  std::unordered_set<std::string> loopIVs = {outer.iv, inner.iv};
+  if (affine::exprUsesAny(outerInitExpr, loopIVs) ||
+      affine::exprUsesAny(innerInitExpr, loopIVs) ||
+      affine::exprUsesAny(outerBoundExpr, loopIVs) ||
+      affine::exprUsesAny(innerBoundExpr, loopIVs)) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectBounds++;
+    return false;
+  }
+
+  affine::PresburgerInterchangeResult dep =
+      affine::interchangeMemorySafePresburger(outerWhile, innerWhile,
+                                              outerInitOp, innerInitOp);
+  stats.presburgerInterchangeQueries += dep.queries;
+  stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
+  stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
+  stats.presburgerInterchangeUnknown += dep.unknown;
+  if (!dep.safe) {
+    stats.unrollJamRejected++;
+    stats.unrollJamRejectMemory++;
+    return false;
+  }
+
+  auto jamInnerBody = makeBlock();
+  for (int lane = 0; lane < hirJamFactor; lane++) {
+    std::unordered_map<std::string, std::string> scalarRenames;
+    std::unordered_map<std::string, int> ivOffsets = { { outer.iv, lane } };
+    for (size_t i = 0; i + 1 < inner.body->children.size(); i++) {
+      jamInnerBody->children.push_back(
+          cloneReplacing(inner.body->children[i].get(), scalarRenames, ivOffsets));
+    }
+  }
+  jamInnerBody->children.push_back(cloneOp(inner.step));
+
+  auto jamInnerWhile =
+      makeWhile(cloneOp(innerWhile->children[0].get()), std::move(jamInnerBody));
+
+  auto jamOuterBody = makeBlock();
+  jamOuterBody->children.push_back(cloneOp(innerInitOp));
+  jamOuterBody->children.push_back(std::move(jamInnerWhile));
+  jamOuterBody->children.push_back(makeJamStep(outer.iv, hirJamFactor));
+
+  auto jamCond = makeCmp("<",
+                         makeArith("+", makeLoad(outer.iv),
+                                   makeConstInt(hirJamFactor - 1)),
+                         cloneOp(outer.bound));
+  auto jamOuterWhile = makeWhile(std::move(jamCond), std::move(jamOuterBody));
+  auto tailWhile = cloneOp(outerWhile);
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 1);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(std::move(jamOuterWhile));
+      replacement.push_back(std::move(tailWhile));
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.unrollJammed++;
+  return true;
 }
 
 // ===========================================================================
@@ -1489,12 +1836,12 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
 
   const std::string prefix = "__poly_" + pat.acc + "_" + std::to_string(uniqueId++);
   std::vector<std::string> accNames;
-  accNames.reserve(kJamFactor);
-  for (int lane = 0; lane < kJamFactor; lane++)
+  accNames.reserve(hirJamFactor);
+  for (int lane = 0; lane < hirJamFactor; lane++)
     accNames.push_back(prefix + "_" + std::to_string(lane));
 
   auto vecBody = makeBlock();
-  for (int lane = 0; lane < kJamFactor; lane++) {
+  for (int lane = 0; lane < hirJamFactor; lane++) {
     vecBody->children.push_back(makeVarDecl(accNames[lane], cloneOp(initValue(pat.accInit))));
   }
 
@@ -1505,7 +1852,7 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
     return false;
 
   auto kBody = makeBlock();
-  for (int lane = 0; lane < kJamFactor; lane++) {
+  for (int lane = 0; lane < hirJamFactor; lane++) {
     std::unordered_map<std::string, std::string> scalarRenames = { { pat.acc, accNames[lane] } };
     std::unordered_map<std::string, int> ivOffsets = { { pat.j, lane } };
     auto laneUpdate = cloneReplacing(pat.accUpdate, scalarRenames, ivOffsets);
@@ -1519,15 +1866,15 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
   auto kWhile = makeWhile(cloneOp(pat.kWhile->children[0].get()), std::move(kBody));
   vecBody->children.push_back(std::move(kWhile));
 
-  for (int lane = 0; lane < kJamFactor; lane++) {
+  for (int lane = 0; lane < hirJamFactor; lane++) {
     std::unordered_map<std::string, std::string> scalarRenames = { { pat.acc, accNames[lane] } };
     std::unordered_map<std::string, int> ivOffsets = { { pat.j, lane } };
     vecBody->children.push_back(cloneReplacing(pat.destStore, scalarRenames, ivOffsets));
   }
-  vecBody->children.push_back(makeJamStep(pat.j));
+  vecBody->children.push_back(makeJamStep(pat.j, hirJamFactor));
 
   auto vecCond = makeCmp("<",
-                         makeArith("+", makeLoad(pat.j), makeConstInt(kJamFactor - 1)),
+                         makeArith("+", makeLoad(pat.j), makeConstInt(hirJamFactor - 1)),
                          cloneOp(pat.jBound));
   auto vecWhile = makeWhile(std::move(vecCond), std::move(vecBody));
   auto tailWhile = cloneOp(whileOp);

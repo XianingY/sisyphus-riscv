@@ -33,6 +33,14 @@ struct PresburgerFusionResult {
   int unknown = 0;
 };
 
+struct PresburgerInterchangeResult {
+  bool safe = false;
+  int queries = 0;
+  int noViolatingDependence = 0;
+  int mayViolatingDependence = 0;
+  int unknown = 0;
+};
+
 struct CanonicalLoop {
   std::string iv;
   const Op *bound = nullptr;
@@ -53,6 +61,10 @@ bool fusionMemorySafe(const Op *loopA, const Op *loopB);
 PresburgerFusionResult fusionMemorySafePresburger(const Op *loopA, const Op *loopB);
 PresburgerFusionResult fusionMemorySafePresburger(const Op *loopA, const Op *loopB,
                                                   const Op *initA, const Op *initB);
+PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoop,
+                                                            const Op *innerLoop,
+                                                            const Op *outerInit,
+                                                            const Op *innerInit);
 
 }  // namespace sys::hir::affine
 

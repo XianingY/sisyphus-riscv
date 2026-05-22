@@ -28,6 +28,24 @@ struct PolyhedralStats {
   int tilingRejectAffineAccess = 0;
   int tilingRejectNoInner = 0;
   int tilingRejectIdempotent = 0;
+  // Loop interchange counters
+  int interchangeApplied = 0;
+  int interchangeRejected = 0;
+  int interchangeRejectShape = 0;
+  int interchangeRejectInit = 0;
+  int interchangeRejectBounds = 0;
+  int interchangeRejectControl = 0;
+  int interchangeRejectAccess = 0;
+  int interchangeRejectMemory = 0;
+  // Unroll-and-jam counters
+  int unrollJammed = 0;
+  int unrollJamRejected = 0;
+  int unrollJamRejectShape = 0;
+  int unrollJamRejectInit = 0;
+  int unrollJamRejectBounds = 0;
+  int unrollJamRejectControl = 0;
+  int unrollJamRejectAccess = 0;
+  int unrollJamRejectMemory = 0;
   // Loop fusion counters
   int fusionApplied = 0;
   int fusionRejected = 0;
@@ -42,6 +60,10 @@ struct PolyhedralStats {
   int presburgerFusionNoDeps = 0;
   int presburgerFusionMayDeps = 0;
   int presburgerFusionUnknown = 0;
+  int presburgerInterchangeQueries = 0;
+  int presburgerInterchangeNoDeps = 0;
+  int presburgerInterchangeMayDeps = 0;
+  int presburgerInterchangeUnknown = 0;
   // Stats-only affine nest scanner. These counters do not enable rewrites.
   int affineNestCandidates = 0;
   int affineNestRejectedShape = 0;
@@ -59,12 +81,15 @@ public:
 private:
   int uniqueId = 0;
   int hirTileSize = 32;
+  int hirJamFactor = 4;
   std::unordered_set<std::string> globalArrays;
 
   bool optimizeBlock(Op *block, PolyhedralStats &stats);
   void scanAffineNest(Op *op, PolyhedralStats &stats);
   bool tryReductionInterchange(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats);
+  bool tryLoopInterchange(Op *block, size_t idx, PolyhedralStats &stats);
+  bool tryLoopUnrollJam(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);
 
   // Loop tiling: strip-mine 2-level or 3-level perfect nests in HIR.

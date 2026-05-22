@@ -3,6 +3,7 @@
 #include "../utils/presburger/BasicSet.h"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 
 namespace sys::hir::affine {
@@ -393,6 +394,157 @@ bool writesAnyScalar(const Op *op, const std::unordered_set<std::string> &symbol
   return false;
 }
 
+const Op *initValue(const Op *op) {
+  op = unwrapSingleDecl(op);
+  if (!op || op->children.empty())
+    return nullptr;
+  return op->children[0].get();
+}
+
+struct VarOrder {
+  std::vector<std::string> names;
+  std::unordered_map<std::string, int> index;
+
+  int add(const std::string &name) {
+    auto it = index.find(name);
+    if (it != index.end())
+      return it->second;
+    int next = static_cast<int>(names.size());
+    names.push_back(name);
+    index[name] = next;
+    return next;
+  }
+
+  int size() const { return static_cast<int>(names.size()); }
+};
+
+bool appendRowFromCoeffs(const CoeffMap &coeffs, int64_t constant,
+                         const VarOrder &vars, std::vector<int> &row) {
+  if (constant < std::numeric_limits<int>::min() ||
+      constant > std::numeric_limits<int>::max())
+    return false;
+  row.assign(vars.size() + 1, 0);
+  for (const auto &[sym, coeff] : coeffs) {
+    if (coeff == 0)
+      continue;
+    if (coeff < std::numeric_limits<int>::min() ||
+        coeff > std::numeric_limits<int>::max())
+      return false;
+    auto it = vars.index.find(sym);
+    if (it == vars.index.end())
+      return false;
+    int idx = it->second;
+    int64_t next = static_cast<int64_t>(row[idx]) + coeff;
+    if (next < std::numeric_limits<int>::min() ||
+        next > std::numeric_limits<int>::max())
+      return false;
+    row[idx] = static_cast<int>(next);
+  }
+  row.back() = static_cast<int>(constant);
+  return true;
+}
+
+bool addConstraint(pres::BasicSet &set, const VarOrder &vars,
+                   const CoeffMap &coeffs, int64_t constant) {
+  std::vector<int> row;
+  if (!appendRowFromCoeffs(coeffs, constant, vars, row))
+    return false;
+  set.addConstraint(row);
+  return true;
+}
+
+void collectExprSymbols(const Expr &expr, std::unordered_set<std::string> &out) {
+  if (!expr.valid)
+    return;
+  for (const auto &[sym, _] : expr.coeffs)
+    out.insert(sym);
+}
+
+void addExprToCoeffs(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
+                     int64_t sign, const std::string &outerIV,
+                     const std::string &innerIV, const std::string &outerVar,
+                     const std::string &innerVar,
+                     const std::unordered_map<std::string, std::string> &paramRenames) {
+  constant += sign * expr.constant;
+  for (const auto &[sym, coeff] : expr.coeffs) {
+    std::string mapped;
+    if (sym == outerIV)
+      mapped = outerVar;
+    else if (sym == innerIV)
+      mapped = innerVar;
+    else {
+      auto it = paramRenames.find(sym);
+      mapped = (it == paramRenames.end()) ? sym : it->second;
+    }
+    coeffs[mapped] += sign * coeff;
+  }
+}
+
+bool makeOrderRow(const VarOrder &vars,
+                  const std::string &i1, const std::string &j1,
+                  const std::string &i2, const std::string &j2,
+                  int coeffI1, int coeffJ1, int coeffI2, int coeffJ2,
+                  int constant, std::vector<int> &row) {
+  row.assign(vars.size() + 1, 0);
+  row[vars.index.at(i1)] = coeffI1;
+  row[vars.index.at(j1)] = coeffJ1;
+  row[vars.index.at(i2)] = coeffI2;
+  row[vars.index.at(j2)] = coeffJ2;
+  row.back() = constant;
+  return true;
+}
+
+bool hasInterchangeViolation(const pres::BasicSet &base, const VarOrder &vars,
+                             const std::string &i1, const std::string &j1,
+                             const std::string &i2, const std::string &j2) {
+  std::vector<int> row;
+  std::vector<std::vector<int>> origA;
+  std::vector<std::vector<int>> origB;
+  std::vector<std::vector<int>> violC;
+  std::vector<std::vector<int>> violD;
+
+  // Original order case A: i1 < i2  -> -i1 + i2 - 1 >= 0
+  makeOrderRow(vars, i1, j1, i2, j2, -1, 0, 1, 0, -1, row);
+  origA.push_back(row);
+
+  // Original order case B: i1 == i2, j1 <= j2
+  makeOrderRow(vars, i1, j1, i2, j2, 1, 0, -1, 0, 0, row);
+  origB.push_back(row);
+  makeOrderRow(vars, i1, j1, i2, j2, -1, 0, 1, 0, 0, row);
+  origB.push_back(row);
+  makeOrderRow(vars, i1, j1, i2, j2, 0, -1, 0, 1, 0, row);
+  origB.push_back(row);
+
+  // Violation case C: j1 > j2 -> j1 - j2 - 1 >= 0
+  makeOrderRow(vars, i1, j1, i2, j2, 0, 1, 0, -1, -1, row);
+  violC.push_back(row);
+
+  // Violation case D: j1 == j2, i1 > i2
+  makeOrderRow(vars, i1, j1, i2, j2, 0, 1, 0, -1, 0, row);
+  violD.push_back(row);
+  makeOrderRow(vars, i1, j1, i2, j2, 0, -1, 0, 1, 0, row);
+  violD.push_back(row);
+  makeOrderRow(vars, i1, j1, i2, j2, 1, 0, -1, 0, -1, row);
+  violD.push_back(row);
+
+  auto hasSolution = [&](const std::vector<std::vector<int>> &rows) {
+    pres::BasicSet test = base;
+    for (const auto &constraint : rows)
+      test.addConstraint(constraint);
+    return !test.empty();
+  };
+
+  for (const auto &orig : {origA, origB}) {
+    for (const auto &viol : {violC, violD}) {
+      std::vector<std::vector<int>> combined = orig;
+      combined.insert(combined.end(), viol.begin(), viol.end());
+      if (hasSolution(combined))
+        return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 Expr analyzeExpr(const Op *op) {
@@ -537,6 +689,164 @@ PresburgerFusionResult fusionMemorySafePresburger(const Op *loopAOp, const Op *l
         continue;
 
       return result;
+    }
+  }
+
+  result.safe = true;
+  return result;
+}
+
+PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoopOp,
+                                                            const Op *innerLoopOp,
+                                                            const Op *outerInitOp,
+                                                            const Op *innerInitOp) {
+  PresburgerInterchangeResult result;
+  CanonicalLoop outer;
+  CanonicalLoop inner;
+  if (!matchCanonicalLoop(outerLoopOp, outer) || !matchCanonicalLoop(innerLoopOp, inner))
+    return result;
+
+  const Op *outerInitExpr = initValue(outerInitOp);
+  const Op *innerInitExpr = initValue(innerInitOp);
+  if (!outerInitExpr || !innerInitExpr) {
+    result.unknown++;
+    return result;
+  }
+
+  Expr outerInit = analyzeExpr(outerInitExpr);
+  Expr innerInit = analyzeExpr(innerInitExpr);
+  Expr outerBound = analyzeExpr(outer.bound);
+  Expr innerBound = analyzeExpr(inner.bound);
+  if (!outerInit.valid || !innerInit.valid || !outerBound.valid || !innerBound.valid) {
+    result.unknown++;
+    return result;
+  }
+
+  std::unordered_set<std::string> ivs = {outer.iv, inner.iv};
+  if (exprUsesAny(outerInit, ivs) || exprUsesAny(innerInit, ivs) ||
+      exprUsesAny(outerBound, ivs) || exprUsesAny(innerBound, ivs)) {
+    result.unknown++;
+    return result;
+  }
+
+  std::vector<Access> accesses = collectArrayAccesses(inner.body);
+  if (accesses.empty()) {
+    result.safe = true;
+    return result;
+  }
+
+  std::unordered_set<std::string> params;
+  collectExprSymbols(outerInit, params);
+  collectExprSymbols(innerInit, params);
+  collectExprSymbols(outerBound, params);
+  collectExprSymbols(innerBound, params);
+  for (const auto &access : accesses)
+    for (const auto &idx : access.indices)
+      collectExprSymbols(idx, params);
+  params.erase(outer.iv);
+  params.erase(inner.iv);
+
+  std::unordered_map<std::string, std::string> paramRenames;
+  std::vector<std::string> paramList(params.begin(), params.end());
+  std::sort(paramList.begin(), paramList.end());
+  for (const auto &sym : paramList)
+    paramRenames.emplace(sym, "__p_" + sym);
+
+  const std::string kI1 = "__i1";
+  const std::string kJ1 = "__j1";
+  const std::string kI2 = "__i2";
+  const std::string kJ2 = "__j2";
+  VarOrder vars;
+  vars.add(kI1);
+  vars.add(kJ1);
+  vars.add(kI2);
+  vars.add(kJ2);
+  for (const auto &sym : paramList)
+    vars.add(paramRenames.at(sym));
+
+  auto addBounds = [&](pres::BasicSet &set,
+                       const std::string &iVar, const std::string &jVar,
+                       const std::string &outerVar, const std::string &innerVar) -> bool {
+    // i >= init, i <= bound - 1
+    CoeffMap coeffs;
+    int64_t constant = 0;
+    coeffs[iVar] = 1;
+    addExprToCoeffs(coeffs, constant, outerInit, -1,
+                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addConstraint(set, vars, coeffs, constant))
+      return false;
+    coeffs.clear();
+    constant = -1;
+    coeffs[iVar] = -1;
+    addExprToCoeffs(coeffs, constant, outerBound, 1,
+                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addConstraint(set, vars, coeffs, constant))
+      return false;
+
+    // j >= init, j <= bound - 1
+    coeffs.clear();
+    constant = 0;
+    coeffs[jVar] = 1;
+    addExprToCoeffs(coeffs, constant, innerInit, -1,
+                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addConstraint(set, vars, coeffs, constant))
+      return false;
+    coeffs.clear();
+    constant = -1;
+    coeffs[jVar] = -1;
+    addExprToCoeffs(coeffs, constant, innerBound, 1,
+                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addConstraint(set, vars, coeffs, constant))
+      return false;
+
+    return true;
+  };
+
+  for (size_t i = 0; i < accesses.size(); i++) {
+    for (size_t j = i + 1; j < accesses.size(); j++) {
+      const Access &a = accesses[i];
+      const Access &b = accesses[j];
+      if (a.base != b.base)
+        continue;
+      if (!a.isStore && !b.isStore)
+        continue;
+      if (a.indices.size() != b.indices.size()) {
+        result.unknown++;
+        return result;
+      }
+
+      pres::BasicSet base;
+      if (!addBounds(base, kI1, kJ1, kI1, kJ1) ||
+          !addBounds(base, kI2, kJ2, kI2, kJ2)) {
+        result.unknown++;
+        return result;
+      }
+
+      for (size_t dim = 0; dim < a.indices.size(); dim++) {
+        CoeffMap coeffs;
+        int64_t constant = 0;
+        addExprToCoeffs(coeffs, constant, a.indices[dim], 1,
+                        outer.iv, inner.iv, kI1, kJ1, paramRenames);
+        addExprToCoeffs(coeffs, constant, b.indices[dim], -1,
+                        outer.iv, inner.iv, kI2, kJ2, paramRenames);
+        if (!addConstraint(base, vars, coeffs, constant)) {
+          result.unknown++;
+          return result;
+        }
+        for (auto &entry : coeffs)
+          entry.second = -entry.second;
+        if (!addConstraint(base, vars, coeffs, -constant)) {
+          result.unknown++;
+          return result;
+        }
+      }
+
+      result.queries++;
+      if (hasInterchangeViolation(base, vars, kI1, kJ1, kI2, kJ2)) {
+        result.mayViolatingDependence++;
+        return result;
+      }
+      result.noViolatingDependence++;
     }
   }
 

@@ -165,62 +165,14 @@ def link_libraries(lib_files, output_binary):
     proc.check_call([COMPILER] + LDFLAGS + ["-o", str(output_binary)] + ["-Wl,--start-group"] + [str(lib) for lib in lib_files] + ["-Wl,--end-group"])
 
 def build():
-  global include_cache, include_hashes
-  include_cache_data = load_include_cache()
-  include_cache = include_cache_data.get("cache", {})
-  include_hashes = include_cache_data.get("hashes", {})
-
-  cpp_files, _ = find_files()
-  cache = load_cache()
-
-  # Step 1: Compile .cpp to .o
-  obj_files: list[tuple[Path, Path]] = []
-  folder_changed: dict[Path, bool] = {}
-  tasks: list[tuple[Path, Path]] = []
-  for cpp in cpp_files:
-    rel_dir = cpp.relative_to(SRC_DIR).parent
-    obj_dir = BUILD_DIR / rel_dir
-    obj_path = obj_dir / (cpp.stem + ".o")
-
-    dependencies = get_all_includes(cpp)
-    if needs_recompile(cpp, obj_path, cache, dependencies):
-      tasks.append((cpp, obj_path))
-      cache[str(cpp)] = {
-        'src_hash': hash_file(cpp),
-        'dep_hashes': {str(dep): hash_file(dep) for dep in dependencies},
-      }
-      folder_changed[rel_dir] = True
-    obj_files.append((rel_dir, obj_path))
-
-  total = len(tasks)
-  file_prompt = "file" if total == 1 else "files"
-  if total > 0:
-    print(f"Compiling {total} {file_prompt}")
-  with mp.Pool() as pool:
-    pool.starmap(compile_cpp, tasks)
+  print("Building via CMake...")
+  proc.check_call(["cmake", "-S", ".", "-B", "build", "-DDEFAULT_TARGET=riscv"])
+  proc.check_call(["cmake", "--build", "build", "-j", "2"])
   
-  save_cache(cache)
+  import shutil
+  shutil.copy2("build/compiler", "build/sysc")
+  print("Build and copy successful.")
 
-  # Step 2: Archive .o's in same folder into .a
-  folder_objs = {}
-  for rel_dir, obj in obj_files:
-    folder_objs.setdefault(rel_dir, []).append(obj)
-
-  lib_files = []
-  for folder, objs in folder_objs.items():
-    lib_path = BUILD_DIR / folder / (folder.name + ".a")
-    need_archive = folder_changed.get(folder, False) or not lib_path.exists()
-    if need_archive:
-      archive_objects(objs, lib_path)
-    lib_files.append(lib_path)
-
-  # Step 3: Link all .a's into final binary
-  link_libraries(lib_files, FINAL_BINARY)
-
-  save_include_cache({
-    "cache": include_cache,
-    "hashes": include_hashes
-  })
 
 
 def run_asm(file: str):
@@ -319,12 +271,12 @@ def run_test_case(sy_path: Path, in_path: Path, out_path: Path):
         timeout=args.timeout
       )
     except proc.CalledProcessError as e:
-      return (sy_path, f"Compile failed: {e.output.decode().strip()}")
+      return (sy_path, f"Compile failed: {e.output.decode().strip()}", -1)
     except proc.TimeoutExpired:
-      return (sy_path, f"Compiler timeout ({args.timeout:.2f}s)")
+      return (sy_path, f"Compiler timeout ({args.timeout:.2f}s)", -1)
       
     if not asm_path.exists():
-      return (sy_path, "No assembly output generated")
+      return (sy_path, "No assembly output generated", -1)
     
     try:
       proc.run(
@@ -334,10 +286,10 @@ def run_test_case(sy_path: Path, in_path: Path, out_path: Path):
         stderr=proc.STDOUT
       )
     except proc.CalledProcessError as e:
-      return (sy_path, f"Linking failed: {e.output.decode().strip()}")
+      return (sy_path, f"Linking failed: {e.output.decode().strip()}", -1)
       
     if not exe_path.exists():
-      return (sy_path, "No executable generated after linking")
+      return (sy_path, "No executable generated after linking", -1)
       
     # Step 3: Run with QEMU
     input_data = None
