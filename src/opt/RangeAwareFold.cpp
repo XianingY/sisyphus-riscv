@@ -75,6 +75,9 @@ bool isThreadLocalPure(Op *op) {
 }
 
 bool decisionBlockCanBeSkipped(BasicBlock *bb) {
+  if (!bb->getPhis().empty())
+    return false;
+
   auto term = bb->getLastOp();
   for (auto op : bb->getOps()) {
     if (isa<PhiOp>(op) || op == term)
