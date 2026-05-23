@@ -2,6 +2,7 @@
 
 #include <deque>
 #include <limits>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
