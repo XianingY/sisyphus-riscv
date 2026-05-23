@@ -23,4 +23,15 @@ if ! grep -A4 '^rv-regalloc:$' <<<"${stats}" | grep -Eq 'max-block-hotness : ([6
   exit 1
 fi
 
+split_stats="$("${COMPILER}" "${CASE_DIR}/hot_loop_no_call_split.sy" -S \
+  -o "${OUT_DIR}/hot_loop_no_call_split.rv.s" \
+  -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${split_stats}"
+
+if ! grep -A5 '^rv-regalloc:$' <<<"${split_stats}" | grep -Eq 'live-range-splits : [1-9]'; then
+  echo "expected RV regalloc to split live-in values for hot loops without calls" >&2
+  exit 1
+fi
+
 echo "RV register-allocation loop hotness tests passed."

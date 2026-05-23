@@ -256,7 +256,7 @@ int splitHotLiveRanges(Region *region,
     int weight = weightIt == bbWeight.end() ? 1 : weightIt->second;
     if (weight < threshold || bb->getOpCount() == 0)
       continue;
-    if (envEnabled("SISY_RV_LIVE_RANGE_SPLIT_REQUIRE_CALL", true) &&
+    if (envEnabled("SISY_RV_LIVE_RANGE_SPLIT_REQUIRE_CALL", false) &&
         !blockHasCall(bb))
       continue;
 
