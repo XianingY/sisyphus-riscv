@@ -169,7 +169,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DCE>();
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
       pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
-    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", false)) {
       pm.addPass<sys::StructuralBitwise>();
       pm.addPass<sys::DCE>();
     }
@@ -211,7 +211,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DSE>();
     pm.addPass<sys::DLE>();
     pm.addPass<sys::GVN>();
-    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", false)) {
       pm.addPass<sys::StructuralModMul>();
       pm.addPass<sys::RegularFold>();
       pm.addPass<sys::DCE>();
@@ -224,7 +224,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", false))
       pm.addPass<sys::RowScratchMatmul>();
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
       pm.addPass<sys::ModularAffineLoop>();
@@ -319,9 +319,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DCE>();
     pm.addPass<sys::InlineStore>();
     if (enableO2Experimental && plan.enableO2Heavy &&
-        getenvEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", true))
+        getenvEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", false))
       pm.addPass<sys::Cached>();
-    if (enableO2Experimental && plan.enableO2Heavy)
+    if (enableO2Experimental && plan.enableO2Heavy &&
+        getenvEnabled("SISY_ENABLE_SYNTH_CONST_ARRAY", false))
       pm.addPass<sys::SynthConstArray>();
     pm.addPass<sys::RegularFold>();
     pm.addPass<sys::DCE>();

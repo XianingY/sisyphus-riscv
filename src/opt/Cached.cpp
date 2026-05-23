@@ -24,9 +24,9 @@ bool envEnabled(const char *name, bool fallback) {
 }
 
 void Cached::run() {
-  // All-optimization profiles enable this by default; keep an environment
-  // override so it can be disabled quickly during correctness bisection.
-  if (!envEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", true))
+  // Compile-time precomputation embeds interpreter-produced data in the binary,
+  // so keep it strict-mode opt-in only.
+  if (!envEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", false))
     return;
 
   // Identify candidate functions.

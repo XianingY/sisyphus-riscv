@@ -715,7 +715,7 @@ std::map<std::string, int> RowScratchMatmul::stats() {
 }
 
 void RowScratchMatmul::run() {
-  if (!envEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true))
+  if (!envEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", false))
     return;
 
   auto globals = getGlobalMap();

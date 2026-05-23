@@ -41,27 +41,30 @@ Forbidden examples:
 
 Current default:
 
-- `pure-rv` uses all-optimization defaults for RISC-V O1/O2.
-- Semantic and structural helper recognizers are enabled by default.
+- RISC-V O1/O2 keeps the general optimization stack enabled by default.
+- High-risk semantic or structural recognizers are strict-mode opt-in.
 - Risky passes remain individually controllable through `SISY_ENABLE_*`
-  environment variables.
+  environment variables for explicit comparison runs.
 
-Useful kill switches:
+Useful switches:
 
 ```bash
 SISY_ENABLE_FUNCTION_EQUIVALENCE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_STRUCTURAL_MODMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_ROW_SCRATCH_MATMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_CACHED_PRECOMPUTE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_JAM_FACTOR=4 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_BITWISE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_SYNTH_CONST_ARRAY=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 ```
 
-Strict-mode experiments should disable the relevant recognizers explicitly
-instead of deleting pass implementations. This keeps comparison runs
-reproducible and makes online regressions easier to isolate.
+Strict-mode runs should leave the recognizers above disabled unless a specific
+comparison needs them. The default path should prefer runtime memoization,
+affine loop transforms, scalar replacement, DSE/DLE, SCEV, and ordinary
+algebraic folds.
 
 ## 3. Standard Optimization Loop
 
@@ -170,4 +173,3 @@ To verify the correctness of multidimensional loop interchanges and unroll-and-j
   $$f_{A, m}(\vec{I}) - f_{B, m}(\vec{J}) = 0$$
 - **Direction Vector Extraction**: Iteratively intersects the base iteration set with direction hypothesis vectors $\vec{d} = (d_1, d_2, d_3)$ (where $d_k \in \{<, =, >\}$) and tests feasibility using `!set.empty()`.
 - **Legality Proving**: Proves loop interchange safety by ensuring that all swaps result in lexicographically positive dependence vectors (i.e. first non-equal element is less-than ($<$)).
-

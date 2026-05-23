@@ -306,7 +306,7 @@ std::map<std::string, int> StructuralModMul::stats() {
 }
 
 void StructuralModMul::run() {
-  if (!envEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", true))
+  if (!envEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", false))
     return;
 
   CallGraph(module).run();

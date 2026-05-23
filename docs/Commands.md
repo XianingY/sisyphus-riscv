@@ -113,12 +113,16 @@ done
 
 ## Optimization Switches
 
-The current `pure-rv` profile defaults to the all-optimization mode. Risky
-passes still have environment kill switches for bisection. Examples:
+The default RISC-V profile keeps general optimizations enabled. High-risk
+semantic or structural recognizers are strict-mode opt-in, while ordinary
+generic passes keep bisection kill switches. Examples:
 
 ```bash
 SISY_ENABLE_FUNCTION_EQUIVALENCE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_STRUCTURAL_MODMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_ROW_SCRATCH_MATMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_CACHED_PRECOMPUTE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_STRUCTURAL_BITWISE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_SYNTH_CONST_ARRAY=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 ```

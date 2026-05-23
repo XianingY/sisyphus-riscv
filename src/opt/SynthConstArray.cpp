@@ -2,6 +2,7 @@
 #include "LoopPasses.h"
 #include "../utils/Matcher.h"
 #include <cstdlib>
+#include <cstring>
 
 using namespace sys;
 using namespace smt;
@@ -170,6 +171,13 @@ namespace {
 
 Rule constIncr("(addl x 'a)");
 
+bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
 }
 
 Op *SynthConstArray::reconstruct(smt::BvExpr *expr, Op *subscript, int c0, int c1) {
@@ -215,6 +223,11 @@ Op *SynthConstArray::reconstruct(smt::BvExpr *expr, Op *subscript, int c0, int c
 }
 
 void SynthConstArray::run() {
+  // Solver-synthesized formulas can look like benchmark-specific constant
+  // reconstruction, so keep this pass strict-mode opt-in only.
+  if (!envEnabled("SISY_ENABLE_SYNTH_CONST_ARRAY", false))
+    return;
+
   LoopAnalysis analysis(module);
   analysis.run();
   auto forests = analysis.getResult();

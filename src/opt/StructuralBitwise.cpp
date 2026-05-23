@@ -566,7 +566,7 @@ std::map<std::string, int> StructuralBitwise::stats() {
 }
 
 void StructuralBitwise::run() {
-  if (!envEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", true))
+  if (!envEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", false))
     return;
 
   CallGraph(module).run();
