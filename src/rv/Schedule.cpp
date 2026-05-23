@@ -38,6 +38,16 @@ bool envEnabled(const char *name, bool fallback) {
   return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
 }
 
+int envInt(const char *name, int fallback, int minValue, int maxValue) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0]) return fallback;
+  char *end = nullptr;
+  long parsed = std::strtol(raw, &end, 10);
+  if ((end && *end) || parsed < minValue || parsed > maxValue)
+    return fallback;
+  return (int) parsed;
+}
+
 // Latency model for RV ops (cycles until result is available)
 int latency(Op *op) {
   if (isa<rv::LoadOp>(op) || isa<FldOp>(op))
@@ -128,6 +138,7 @@ std::map<std::string, int> Schedule::stats() {
     { "reordered", reordered },
     { "critical-path-nodes", criticalPathNodes },
     { "critical-path-max-height", criticalPathMaxHeight },
+    { "height-weight", heightWeight },
   };
 }
 
@@ -287,7 +298,7 @@ void Schedule::runImpl(BasicBlock *bb) {
     }
 
     // Critical-path height priority.
-    score += height[op] * 3;
+    score += height[op] * heightWeight;
 
     // Bonus: starting a high-latency op early benefits the schedule.
     int lat = latency(op);
@@ -361,6 +372,8 @@ void Schedule::runImpl(BasicBlock *bb) {
 void Schedule::run() {
   if (!envEnabled("SISY_RV_ENABLE_SCHEDULE", true))
     return;
+
+  heightWeight = envInt("SISY_RV_SCHEDULE_HEIGHT_WEIGHT", 3, 0, 100);
 
   for (auto func : collectFuncs()) {
     auto region = func->getRegion();

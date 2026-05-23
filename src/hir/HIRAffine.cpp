@@ -209,20 +209,19 @@ void addSeparatedExpr(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
 }
 
 bool makePresburgerRow(const CoeffMap &coeffs, int64_t constant,
+                       const std::unordered_map<std::string, int> &varIndex,
+                       int varCount,
                        std::vector<int> &row) {
-  row.assign(3, 0);
+  row.assign(varCount + 1, 0);
   for (const auto &[sym, coeff] : coeffs) {
     if (coeff == 0)
       continue;
-    if (sym == "__a_iter") {
-      row[0] += static_cast<int>(coeff);
-    } else if (sym == "__b_iter") {
-      row[1] += static_cast<int>(coeff);
-    } else {
+    auto it = varIndex.find(sym);
+    if (it == varIndex.end())
       return false;
-    }
+    row[it->second] += static_cast<int>(coeff);
   }
-  row[2] = static_cast<int>(constant);
+  row[varCount] = static_cast<int>(constant);
   return true;
 }
 
@@ -336,6 +335,11 @@ ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
     return ReorderedDep::May;
 
   pres::BasicSet set;
+  const std::unordered_map<std::string, int> iterVars = {
+      {"__a_iter", 0},
+      {"__b_iter", 1},
+  };
+  constexpr int iterVarCount = 2;
 
   std::vector<std::vector<int>> equalityRows;
   for (size_t i = 0; i < a.indices.size(); i++) {
@@ -345,7 +349,7 @@ ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
     addSeparatedExpr(coeffs, constant, b.indices[i], -1, bIV, "__b_iter");
 
     std::vector<int> row;
-    if (!makePresburgerRow(coeffs, constant, row))
+    if (!makePresburgerRow(coeffs, constant, iterVars, iterVarCount, row))
       return ReorderedDep::Unknown;
     equalityRows.push_back(row);
     set.addConstraint(row);
@@ -737,6 +741,8 @@ enum class DependenceDirection {
   Greater,
 };
 
+using DirectionVector = std::vector<DependenceDirection>;
+
 bool lexicographicallyPositiveOrEqual(const std::vector<DependenceDirection> &dirs) {
   for (DependenceDirection dir : dirs) {
     if (dir == DependenceDirection::Less)
@@ -794,48 +800,70 @@ bool addDirectionConstraints(pres::BasicSet &set, const VarOrder &vars,
   return false;
 }
 
-bool hasPermutationViolationByDirections(const pres::BasicSet &base,
-                                         const VarOrder &vars,
-                                         const std::vector<std::string> &xVars,
-                                         const std::vector<std::string> &yVars,
-                                         const std::vector<int> &permutation,
-                                         bool &unknown) {
+std::vector<DirectionVector> extract3DDependencies(const pres::BasicSet &base,
+                                                   const VarOrder &vars,
+                                                   const std::vector<std::string> &xVars,
+                                                   const std::vector<std::string> &yVars,
+                                                   bool &unknown) {
   const size_t depth = xVars.size();
-  std::vector<DependenceDirection> dirs(depth, DependenceDirection::Equal);
+  DirectionVector dirs(depth, DependenceDirection::Equal);
+  std::vector<DirectionVector> witnesses;
   const DependenceDirection choices[] = {
       DependenceDirection::Less,
       DependenceDirection::Equal,
       DependenceDirection::Greater,
   };
 
-  std::function<bool(size_t)> search = [&](size_t dim) -> bool {
+  // Extract3DDependencies is depth-generic: at depth 3 this enumerates the
+  // expected 27 (<,=,>) direction hypotheses and keeps those with a Presburger
+  // witness. Higher-dimensional perfect nests use the same 3^D search.
+  std::function<void(size_t)> search = [&](size_t dim) {
+    if (unknown)
+      return;
     if (dim == depth) {
       if (!lexicographicallyPositiveOrEqual(dirs))
-        return false;
-      if (!lexicographicallyNegative(permuteDirections(dirs, permutation)))
-        return false;
+        return;
 
       pres::BasicSet test = base;
       for (size_t i = 0; i < depth; i++) {
         if (!addDirectionConstraints(test, vars, xVars[i], yVars[i], dirs[i])) {
           unknown = true;
-          return false;
+          return;
         }
       }
-      return !test.empty();
+      if (!test.empty())
+        witnesses.push_back(dirs);
+      return;
     }
 
     for (DependenceDirection choice : choices) {
       dirs[dim] = choice;
-      if (search(dim + 1))
-        return true;
+      search(dim + 1);
       if (unknown)
-        return false;
+        return;
     }
-    return false;
   };
 
-  return search(0);
+  search(0);
+  return witnesses;
+}
+
+bool hasPermutationViolationByDirections(const pres::BasicSet &base,
+                                         const VarOrder &vars,
+                                         const std::vector<std::string> &xVars,
+                                         const std::vector<std::string> &yVars,
+                                         const std::vector<int> &permutation,
+                                         bool &unknown) {
+  std::vector<DirectionVector> witnesses =
+      extract3DDependencies(base, vars, xVars, yVars, unknown);
+  if (unknown)
+    return false;
+
+  for (const auto &dirs : witnesses) {
+    if (lexicographicallyNegative(permuteDirections(dirs, permutation)))
+      return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -1333,12 +1361,7 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
         result.unknown++;
         return result;
       }
-      // Cross-dimensional overlapping dependences are rare in the target
-      // matmul-like nests. If the Presburger set proves overlap but no
-      // violating vector through the lightweight direction probe, stay
-      // conservative rather than risking an illegal permutation.
-      result.mayViolatingDependence++;
-      return result;
+      result.noViolatingDependence++;
     }
   }
 

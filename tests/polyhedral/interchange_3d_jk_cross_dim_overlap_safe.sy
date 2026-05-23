@@ -1,0 +1,20 @@
+int a[8][8];
+int b[8][8];
+int c[9][8];
+
+int main() {
+  int i = 0;
+  while (i < 8) {
+    int j = 0;
+    while (j < 8) {
+      int k = 0;
+      while (k < 8) {
+        c[i + 1][j] = c[i][k] + a[i][k] * b[k][j];
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return c[1][0];
+}

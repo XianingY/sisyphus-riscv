@@ -198,6 +198,13 @@ bool blockHasCall(BasicBlock *bb) {
   return false;
 }
 
+Op *firstCall(BasicBlock *bb) {
+  for (auto *op : bb->getOps())
+    if (isa<sys::rv::CallOp>(op))
+      return op;
+  return nullptr;
+}
+
 Op *firstNonPhi(BasicBlock *bb) {
   for (auto op : bb->getOps())
     if (!isa<PhiOp>(op))
@@ -205,10 +212,12 @@ Op *firstNonPhi(BasicBlock *bb) {
   return nullptr;
 }
 
-int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue) {
+int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue, Op *stopBefore) {
   int replaced = 0;
   (void) bb;
   for (auto op = copy->nextOp(); op; op = op->nextOp()) {
+    if (op == stopBefore)
+      break;
     for (int i = 0; i < op->getOperandCount(); i++) {
       if (op->getOperand(i).defining != oldValue)
         continue;
@@ -244,37 +253,73 @@ int splitHotLiveRanges(Region *region,
     Op *insertBefore = firstNonPhi(bb);
     if (!insertBefore || isa<JOp>(insertBefore) || isa<RetOp>(insertBefore))
       continue;
+    Op *stopBefore = firstCall(bb);
+    int splitLimit = maxSplitsPerBlock;
+    if (stopBefore)
+      splitLimit = std::min(splitLimit, 1);
 
-    std::vector<Op*> liveIns;
+    struct LiveInInfo {
+      Op *value;
+      bool splitAfterCall;
+    };
+    std::vector<LiveInInfo> liveIns;
     liveIns.reserve(bb->getLiveIn().size());
+    Op *afterCall = stopBefore ? stopBefore->nextOp() : nullptr;
+    auto usedAfterCall = [&](Op *use) -> bool {
+      for (auto op = afterCall; op; op = op->nextOp())
+        if (op == use)
+          return true;
+      return false;
+    };
+
     for (auto value : bb->getLiveIn()) {
       if (!splitCandidateValue(value))
         continue;
       if (value->getParent() == bb)
         continue;
-      liveIns.push_back(value);
+      if (stopBefore) {
+        bool usedOutside = false;
+        bool seenAfterCall = false;
+        for (auto use : value->getUses()) {
+          if (use->getParent() != bb) {
+            usedOutside = true;
+            break;
+          }
+          if (afterCall && usedAfterCall(use))
+            seenAfterCall = true;
+        }
+        if (usedOutside || !seenAfterCall)
+          continue;
+        liveIns.push_back({ value, true });
+      } else {
+        liveIns.push_back({ value, false });
+      }
     }
 
-    std::sort(liveIns.begin(), liveIns.end(), [&](Op *a, Op *b) {
-      if (a->getUses().size() != b->getUses().size())
-        return a->getUses().size() > b->getUses().size();
-      return a < b;
+    std::sort(liveIns.begin(), liveIns.end(), [&](const LiveInInfo &a, const LiveInInfo &b) {
+      if (a.value->getUses().size() != b.value->getUses().size())
+        return a.value->getUses().size() > b.value->getUses().size();
+      return a.value < b.value;
     });
 
     int blockSplits = 0;
-    for (auto value : liveIns) {
-      if (blockSplits >= maxSplitsPerBlock)
+    for (auto info : liveIns) {
+      if (blockSplits >= splitLimit)
         break;
 
-      builder.setBeforeOp(insertBefore);
-      Op *copy = nullptr;
-      if (value->getResultType() == Value::f32)
-        copy = builder.create<FmvOp>({ value });
+      if (info.splitAfterCall)
+        builder.setAfterOp(stopBefore);
       else
-        copy = builder.create<MvOp>({ value });
-      copy->setResultType(value->getResultType());
+        builder.setBeforeOp(insertBefore);
+      Op *copy = nullptr;
+      if (info.value->getResultType() == Value::f32)
+        copy = builder.create<FmvOp>({ info.value });
+      else
+        copy = builder.create<MvOp>({ info.value });
+      copy->setResultType(info.value->getResultType());
 
-      int replaced = replaceUsesAfterCopy(bb, copy, value);
+      int replaced = replaceUsesAfterCopy(bb, copy, info.value,
+                                          info.splitAfterCall ? nullptr : stopBefore);
       if (replaced == 0) {
         copy->removeAllOperands();
         copy->erase();
@@ -753,13 +798,18 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     };
 
     bool preferCallee = !isLeaf && callSpan[op] > 0;
-    if (!(preferCallee && tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ false)))
-      tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ false);
+    bool assigned = false;
+    if (preferCallee)
+      assigned = tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ false);
+    else
+      assigned = tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ false);
 
     // We have excluded too much. Try it again.
-    if (!assignment.count(op) && unpreferred.size()) {
-      if (!(preferCallee && tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ true)))
-        tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ true);
+    if (!assigned && unpreferred.size()) {
+      if (preferCallee)
+        assigned = tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ true);
+      else
+        assigned = tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ true);
     }
 
     if (assignment.count(op))
@@ -847,7 +897,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   if (!localFastMode && highest == currentOffset + 8) {
     for (auto [op, offset] : spillOffset) {
       auto fp = fpreg(op->getResultType());
-      assignment[op] = offset ? (fp ? fspillReg2 : spillReg2) : (fp ? fspillReg : spillReg);
+      assignment[op] = (offset == currentOffset) ? (fp ? fspillReg : spillReg)
+                                                 : (fp ? fspillReg2 : spillReg2);
     }
     spillOffset.clear();
   }

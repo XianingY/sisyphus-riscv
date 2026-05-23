@@ -212,6 +212,13 @@ bool updateConditional(Op *op, bool &changed) {
         r.second = std::max<int>(xlow - 1, INT_MIN);
     }
   }
+  if (r.first > r.second) {
+    if (op->has<RangeAttr>()) {
+      op->remove<RangeAttr>();
+      changed = true;
+    }
+    return true;
+  }
   if (!op->has<RangeAttr>()) {
     op->add<RangeAttr>(r);
     changed = true;

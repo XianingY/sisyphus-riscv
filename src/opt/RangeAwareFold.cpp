@@ -135,7 +135,10 @@ std::optional<std::pair<int, int>> intRange(Op *op) {
     return std::pair<int, int>{ V(op), V(op) };
   if (!op->has<RangeAttr>())
     return std::nullopt;
-  return RANGE(op);
+  auto range = RANGE(op);
+  if (range.first > range.second)
+    return std::nullopt;
+  return range;
 }
 
 std::optional<int> truthFromRange(Op *op) {
@@ -235,9 +238,10 @@ void RangeAwareFold::run() {
   };
 
   auto singletonRange = [](Op *op) -> std::optional<int> {
-    if (!op || op->getResultType() == Value::f32 || !op->has<RangeAttr>())
+    auto range = intRange(op);
+    if (!range)
       return std::nullopt;
-    auto [low, high] = RANGE(op);
+    auto [low, high] = *range;
     if (low != high)
       return std::nullopt;
     return low;
@@ -362,9 +366,10 @@ void RangeAwareFold::run() {
   };
 
   auto knownTruthyValue = [](Op *op) -> std::optional<int> {
-    if (!op || op->getResultType() == Value::f32 || !op->has<RangeAttr>())
+    auto range = intRange(op);
+    if (!range)
       return std::nullopt;
-    auto [low, high] = RANGE(op);
+    auto [low, high] = *range;
     if (low == 0 && high == 0)
       return 0;
     if (high < 0 || low > 0)
@@ -486,6 +491,8 @@ void RangeAwareFold::run() {
       return false;
 
     auto [low, high] = RANGE(x);
+    if (low > high)
+      return false;
     if (low < 0)
       return false;
 
@@ -510,6 +517,8 @@ void RangeAwareFold::run() {
       V(y) = -V(y);
 
     auto [low, high] = RANGE(x);
+    if (low > high)
+      return false;
     if (low < 0)
       return false;
 

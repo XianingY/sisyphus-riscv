@@ -50,6 +50,7 @@ class Schedule : public Pass {
   int reordered = 0;
   int criticalPathNodes = 0;
   int criticalPathMaxHeight = 0;
+  int heightWeight = 3;
 
   void runImpl(BasicBlock *bb);
 public:

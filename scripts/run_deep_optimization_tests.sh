@@ -56,6 +56,13 @@ require_stat "${sccp_stats}" "sccp" "replaced-values : [1-9]" \
 require_stat "${sccp_stats}" "sccp" "folded-branches : [1-9]" \
   "expected SCCP to fold a branch controlled by a discovered constant"
 
+SISY_COMPARE_STEP_LIMIT=2000000000 "${COMPILER}" \
+  "${ROOT_DIR}/tests/regression/nussinov_o1_signed_mod.sy" -S \
+  -o "${OUT_DIR}/nussinov_o1_signed_mod.rv.s" \
+  -O1 --target=riscv \
+  --compare "${ROOT_DIR}/tests/regression/nussinov_o1_signed_mod.out" \
+  -i "${ROOT_DIR}/tests/regression/nussinov_o1_signed_mod.in"
+
 "${ROOT_DIR}/scripts/run_polyhedral_tests.sh" >/tmp/sisyphus-polyhedral-deep.log 2>&1
 cat /tmp/sisyphus-polyhedral-deep.log
 
