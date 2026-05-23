@@ -487,7 +487,11 @@ void RangeAwareFold::run() {
   runRewriter([&](DivIOp *op) {
     auto x = op->DEF(0);
     auto y = op->DEF(1);
-    if (!isa<IntOp>(y) || V(y) < 0 || !x->has<RangeAttr>())
+    if (!isa<IntOp>(y) || !x->has<RangeAttr>())
+      return false;
+
+    int divisor = V(y);
+    if (divisor <= 0)
       return false;
 
     auto [low, high] = RANGE(x);
@@ -496,13 +500,13 @@ void RangeAwareFold::run() {
     if (low < 0)
       return false;
 
-    if (__builtin_popcount(V(y)) != 1)
+    if (__builtin_popcount((unsigned)divisor) != 1)
       return false;
 
     // This can be replaced to an ordinary right-shift.
     folded++;
     builder.setBeforeOp(op);
-    auto vi = builder.create<IntOp>({ new IntAttr(__builtin_ctz(V(y))) });
+    auto vi = builder.create<IntOp>({ new IntAttr(__builtin_ctz((unsigned)divisor)) });
     builder.replace<RShiftOp>(op, { x, vi });
     return false;
   });
@@ -513,8 +517,11 @@ void RangeAwareFold::run() {
     if (!isa<IntOp>(y) || !x->has<RangeAttr>())
       return false;
 
-    if (V(y) < 0)
-      V(y) = -V(y);
+    int divisor = V(y);
+    if (divisor == 0)
+      return false;
+    if (divisor < 0)
+      divisor = -divisor;
 
     auto [low, high] = RANGE(x);
     if (low > high)
@@ -522,13 +529,13 @@ void RangeAwareFold::run() {
     if (low < 0)
       return false;
 
-    if (__builtin_popcount(V(y)) != 1)
+    if (__builtin_popcount((unsigned)divisor) != 1)
       return false;
 
     // Replace with bit-and.
     folded++;
     builder.setBeforeOp(op);
-    auto vi = builder.create<IntOp>({ new IntAttr(V(y) - 1) });
+    auto vi = builder.create<IntOp>({ new IntAttr(divisor - 1) });
     builder.replace<AndIOp>(op, { x, vi });
     return false;
   });
