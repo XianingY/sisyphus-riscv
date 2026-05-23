@@ -1,12 +1,28 @@
 #include "LowerPasses.h"
 #include "Analysis.h"
 #include <climits>
+#include <cstdlib>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 using namespace sys;
+
+namespace {
+
+int instScheduleMaxOps() {
+  const char *raw = std::getenv("SISY_INST_SCHEDULE_MAX_OPS");
+  if (!raw || !raw[0])
+    return 256;
+  char *end = nullptr;
+  long parsed = std::strtol(raw, &end, 10);
+  if (!end || *end || parsed < 0 || parsed > 100000)
+    return 256;
+  return (int) parsed;
+}
+
+}
 
 void InstSchedule::runImpl(BasicBlock *bb) {
   if (!bb || bb->getOpCount() == 0)
@@ -35,6 +51,9 @@ void InstSchedule::runImpl(BasicBlock *bb) {
     allowed.insert(op);
   }
   if (allowedOrder.empty())
+    return;
+  int maxOps = instScheduleMaxOps();
+  if (maxOps > 0 && (int) allowedOrder.size() > maxOps)
     return;
 
   // First, we need to build a dependence graph between loads/stores.

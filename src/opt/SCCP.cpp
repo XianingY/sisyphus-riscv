@@ -1,6 +1,8 @@
 #include "CleanupPasses.h"
 
 #include <deque>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <set>
@@ -11,6 +13,13 @@
 using namespace sys;
 
 namespace {
+
+bool envEnabled(const char *name, bool defaultValue) {
+  const char *value = std::getenv(name);
+  if (!value)
+    return defaultValue;
+  return value[0] && std::strcmp(value, "0") != 0;
+}
 
 struct Lattice {
   enum Kind {
@@ -400,6 +409,9 @@ public:
   }
 
   int threadConstantEdges() {
+    if (!envEnabled("SISY_ENABLE_SCCP_THREADING", false))
+      return 0;
+
     int threaded = 0;
     region->updatePreds();
     for (auto *bb : region->getBlocks()) {
