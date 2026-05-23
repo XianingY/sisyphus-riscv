@@ -143,7 +143,7 @@ public:
   bool dominatedBy(const BasicBlock *bb) const;
   bool dominates(const BasicBlock *bb) const { return bb->dominatedBy(this); }
   bool postDominatedBy(const BasicBlock *bb) const { return pdoms.count(const_cast<BasicBlock*>(bb)); }
-  bool postDominates(const BasicBlock *bb) const { return bb->pdoms.count(const_cast<BasicBlock*>(bb)); }
+  bool postDominates(const BasicBlock *bb) const { return bb->pdoms.count(const_cast<BasicBlock*>(this)); }
 
   // Inserts before `at`.
   void insert(iterator at, Op *op);

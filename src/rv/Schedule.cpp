@@ -151,20 +151,13 @@ void Schedule::runImpl(BasicBlock *bb) {
   if (!term)
     return;
 
-  // Keep FP-heavy blocks in source order.  The scheduler is intentionally
-  // conservative here: FP code often carries implicit ABI constraints through
-  // calls and stack argument setup, while integer kernels still get scheduling.
-  for (auto op : bb->getOps()) {
-    if (touchesFloat(op))
-      return;
-  }
-
   // Don't reorder blocks with calls or other pinned non-terminator ops at all.
-  // This is the safe-but-conservative choice for the first version.
+  // This also covers FP calls and implicit ABI constraints without needing a
+  // separate whole-block FP bailout.
   for (auto op : bb->getOps()) {
     if (op == term) continue;
     if (isa<PhiOp>(op)) continue;
-    if (isPinned(op)) return; // bail out on calls etc.
+    if (isPinned(op)) return;
   }
 
   // Build dependence DAG.

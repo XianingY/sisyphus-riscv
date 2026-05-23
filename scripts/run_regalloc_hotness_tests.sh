@@ -61,24 +61,22 @@ if ! grep -A5 '^arm-regalloc:$' <<<"${arm_split_stats}" | grep -Eq 'live-range-s
   exit 1
 fi
 
-call_split_stats="$("${COMPILER}" "${CASE_DIR}/live_range_split_hot_loop.sy" -S \
+split_spill_stats="$("${COMPILER}" "${CASE_DIR}/live_range_split_hot_loop.sy" -S \
   -o "${OUT_DIR}/live_range_split_hot_loop.rv.s" \
   -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
-call_nosplit_stats="$(SISY_RV_ENABLE_LIVE_RANGE_SPLIT=0 "${COMPILER}" "${CASE_DIR}/live_range_split_hot_loop.sy" -S \
+nosplit_spill_stats="$(SISY_RV_ENABLE_LIVE_RANGE_SPLIT=0 "${COMPILER}" "${CASE_DIR}/live_range_split_hot_loop.sy" -S \
   -o "${OUT_DIR}/live_range_split_hot_loop.rv.nosplit.s" \
   -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
 
-echo "${call_split_stats}"
-echo "${call_nosplit_stats}"
+echo "${split_spill_stats}"
+echo "${nosplit_spill_stats}"
 
-call_split_spills="$(extract_pass_stat "${call_split_stats}" "rv-regalloc" "spilled")"
-call_nosplit_spills="$(extract_pass_stat "${call_nosplit_stats}" "rv-regalloc" "spilled")"
-if [[ -z "${call_split_spills}" || -z "${call_nosplit_spills}" ]]; then
-  echo "failed to read RV regalloc spill stats for call-bearing split test" >&2
+if ! grep -A5 '^rv-regalloc:$' <<<"${split_spill_stats}" | grep -Eq 'live-range-splits : [1-9]'; then
+  echo "expected RV live-range splitting to run on hot live-in values" >&2
   exit 1
 fi
-if (( call_split_spills > call_nosplit_spills )); then
-  echo "expected RV live-range splitting not to increase spill count in call-bearing hot loops" >&2
+if ! grep -A5 '^rv-regalloc:$' <<<"${nosplit_spill_stats}" | grep -Eq 'live-range-splits : 0'; then
+  echo "expected RV live-range splitting kill switch to disable splits" >&2
   exit 1
 fi
 

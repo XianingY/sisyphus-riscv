@@ -1,0 +1,13 @@
+int main() {
+  int x = getint();
+  int y;
+  if (x) {
+    y = 0;
+  } else {
+    y = 1;
+  }
+  if (y) {
+    return 7;
+  }
+  return 3;
+}

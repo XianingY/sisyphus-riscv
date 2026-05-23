@@ -111,6 +111,33 @@ void removePhiIncomingFrom(BasicBlock *bb, BasicBlock *from) {
   }
 }
 
+Op *phiIncoming(Op *phi, BasicBlock *pred) {
+  if (!phi || !pred || !isa<PhiOp>(phi))
+    return nullptr;
+  const auto &ops = phi->getOperands();
+  const auto &attrs = phi->getAttrs();
+  size_t count = std::min(ops.size(), attrs.size());
+  for (size_t i = 0; i < count; i++) {
+    if (!isa<FromAttr>(attrs[i]))
+      continue;
+    if (FROM(attrs[i]) == pred)
+      return ops[i].defining;
+  }
+  return nullptr;
+}
+
+Op *edgeValue(Op *op, BasicBlock *pred, BasicBlock *through) {
+  std::unordered_set<Op*> seen;
+  while (op && isa<PhiOp>(op) && op->getParent() == through && !seen.count(op)) {
+    seen.insert(op);
+    auto incoming = phiIncoming(op, pred);
+    if (!incoming)
+      return nullptr;
+    op = incoming;
+  }
+  return op;
+}
+
 bool replaceableValueOp(Op *op) {
   if (!op || op->getResultType() != Value::i32)
     return false;
@@ -174,6 +201,16 @@ class SCCPEngine {
 
   bool isExecutableEdge(BasicBlock *from, BasicBlock *to) const {
     return executableEdges.count({from, to});
+  }
+
+  std::optional<int> constantOnEdge(Op *op, BasicBlock *pred, BasicBlock *through) {
+    op = edgeValue(op, pred, through);
+    if (!op)
+      return std::nullopt;
+    Lattice v = getValue(op);
+    if (v.kind == Lattice::Constant)
+      return v.value;
+    return std::nullopt;
   }
 
   Lattice evalPhi(Op *op) {
@@ -360,6 +397,93 @@ public:
       region->updatePreds();
     return folded;
   }
+
+  int threadConstantEdges() {
+    int threaded = 0;
+    region->updatePreds();
+    for (auto *bb : region->getBlocks()) {
+      if (!bb || !executableBlocks.count(bb))
+        continue;
+      auto *br = dyn_cast<BranchOp>(bb->getLastOp());
+      if (!br)
+        continue;
+      bool phiOnly = true;
+      for (auto *op : bb->getOps()) {
+        if (op == br)
+          break;
+        if (!isa<PhiOp>(op)) {
+          phiOnly = false;
+          break;
+        }
+      }
+      if (!phiOnly)
+        continue;
+
+      std::vector<BasicBlock*> preds(bb->preds.begin(), bb->preds.end());
+      for (auto *pred : preds) {
+        if (!pred || !isExecutableEdge(pred, bb))
+          continue;
+        auto cond = constantOnEdge(br->DEF(0), pred, bb);
+        if (!cond)
+          continue;
+        BasicBlock *target = (*cond != 0) ? TARGET(br) : ELSE(br);
+        if (!target || target == bb || target->preds.count(pred))
+          continue;
+
+        bool ok = true;
+        std::vector<std::pair<Op*, Op*>> incoming;
+        for (auto *phi : target->getPhis()) {
+          Op *fromBB = phiIncoming(phi, bb);
+          if (!fromBB) {
+            ok = false;
+            break;
+          }
+          Op *mapped = edgeValue(fromBB, pred, bb);
+          if (!mapped) {
+            ok = false;
+            break;
+          }
+          if (mapped->getParent() == bb && !isa<PhiOp>(mapped)) {
+            ok = false;
+            break;
+          }
+          incoming.push_back({phi, mapped});
+        }
+        if (!ok)
+          continue;
+
+        auto *predTerm = pred->getLastOp();
+        bool rewired = false;
+        if (auto *go = dyn_cast<GotoOp>(predTerm)) {
+          if (TARGET(go) == bb) {
+            TARGET(go) = target;
+            rewired = true;
+          }
+        } else if (auto *pbr = dyn_cast<BranchOp>(predTerm)) {
+          if (TARGET(pbr) == bb) {
+            TARGET(pbr) = target;
+            rewired = true;
+          }
+          if (ELSE(pbr) == bb) {
+            ELSE(pbr) = target;
+            rewired = true;
+          }
+        }
+        if (!rewired)
+          continue;
+
+        for (auto &[phi, value] : incoming) {
+          phi->pushOperand(value);
+          phi->add<FromAttr>(pred);
+        }
+        removePhiIncomingFrom(bb, pred);
+        threaded++;
+      }
+    }
+    if (threaded)
+      region->updatePreds();
+    return threaded;
+  }
 };
 
 }  // namespace
@@ -368,6 +492,7 @@ std::map<std::string, int> SCCP::stats() {
   return {
     {"replaced-values", replacedValues},
     {"folded-branches", foldedBranches},
+    {"threaded-edges", threadedEdges},
     {"executable-blocks", executableBlocks},
   };
 }
@@ -378,6 +503,7 @@ void SCCP::run() {
     engine.solve();
     executableBlocks += engine.executableBlockCount();
     foldedBranches += engine.rewriteBranches();
+    threadedEdges += engine.threadConstantEdges();
     replacedValues += engine.rewriteConstants();
   }
 }

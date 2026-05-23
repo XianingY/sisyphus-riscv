@@ -120,6 +120,7 @@ public:
 class SCCP : public Pass {
   int replacedValues = 0;
   int foldedBranches = 0;
+  int threadedEdges = 0;
   int executableBlocks = 0;
 public:
   SCCP(ModuleOp *module): Pass(module) {}

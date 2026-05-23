@@ -215,6 +215,7 @@ public:
 // Folds a wide range of expressions.
 class RegularFold : public Pass {
   int foldedTotal = 0;
+  int currentRound = 0;
 
   int runImpl(Region *region);
 public:

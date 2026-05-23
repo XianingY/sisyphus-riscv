@@ -4,18 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Sisyphus is a SysY compiler for ARM64 (AArch64) and RISC-V (rv64gc) used in the 2026 compiler contest. It uses a unified frontend/IR pipeline with architecture-specific backends.
+Sisyphus is a SysY compiler for the 2026 compiler contest. It has a unified frontend/IR pipeline and two architecture-specific backends: RISC-V `rv64gc` and ARM64/AArch64.
 
 ## Build
 
 ```bash
-# Default (RISC-V)
+# Default native build; DEFAULT_TARGET defaults to riscv
 scripts/build.sh
 
-# ARM target
+# ARM default-target build
 DEFAULT_TARGET=arm scripts/build.sh
 
-# Manual CMake
+# Manual CMake build
 cmake -S . -B build -DDEFAULT_TARGET=riscv
 cmake --build build -j
 
@@ -26,86 +26,117 @@ docker run --rm --user "$(id -u):$(id -g)" \
   bash -lc 'cmake -S . -B build-linux -G "Unix Makefiles" && cmake --build build-linux -j 8'
 ```
 
-Output: `build/compiler`
+Build output is `build/compiler`. `scripts/build.sh` accepts `JOBS=<N>` and `BUILD_TYPE=<type>` through the environment.
 
-## Common Commands
+There is no dedicated lint/format target in CMake or `package.json`; use `git diff --check` for whitespace checks before committing.
+
+## Test and Verification Commands
 
 ```bash
-# Smoke test (compiles all tests/smoke/*.sy for both targets with -O0)
+# Smoke test: compile tests/smoke/*.sy for both targets at -O0 with IR verification
 scripts/run_smoke.sh
 
-# Regression on a test suite
+# CTest wrappers for registered smoke suites
+ctest --test-dir build --output-on-failure
+ctest --test-dir build -R smoke_compile_dual_target --output-on-failure
+
+# Compile-only regression over any case directory
 scripts/regression.sh tests/smoke riscv O0
 scripts/regression.sh tests/smoke arm O0
+scripts/regression.sh tests/polyhedral riscv O1 --verify-ir
 
-# Runtime evaluation
+# Single-case compile via helper
+scripts/compile_case.sh tests/smoke/basic.sy tests/.out/basic.rv.s riscv O1
+scripts/compile_case.sh tests/smoke/basic.sy tests/.out/basic.arm.s arm O1
+
+# Direct single-case compiler invocation with diagnostics
+./build/compiler tests/smoke/basic.sy -S -o tests/.out/basic.s --target=riscv -O1 --verify-ir --dump-pass-timing
+```
+
+Runtime evaluation uses Docker/QEMU and the SysY runtime in `runtime/`:
+
+```bash
 scripts/eval-runtime.sh official-functional riscv O1
 
-# Runtime evaluation with Docker-built Linux compiler
+# On macOS, prefer the Docker-built Linux compiler for runtime execution
 SISY_COMPILER_PATH="$PWD/build-linux/compiler" \
 RUNTIME_SYLIB_C="$PWD/runtime/sylib.c" \
 scripts/eval-runtime.sh official-functional riscv O1
+
+# Single-case runtime probe within a suite
+RUNTIME_CASE_FILTER=fft0 RUNTIME_CASE_LIMIT=1 \
+RUNTIME_SOFT_PERF=1 RUNTIME_PERF_TIMEOUT_SEC=30 \
+scripts/eval-runtime.sh official-riscv-perf riscv O1
 ```
+
+Generated artifacts should stay under ignored directories such as `build/`, `build-linux/`, `tests/.out/`, and `output/`.
 
 ## Compiler Usage
 
 ```bash
 ./build/compiler testcase.sy -S -o testcase.s -O1
 ./build/compiler testcase.sy -S -o testcase.s -O2 --target=arm
+./build/compiler testcase.sy -S -o testcase.s -O1 --emit-ir --verify-ir
+./build/compiler testcase.sy -S -o testcase.s -O1 --dump-hir --dump-cfg --verify-hir --verify-cfg
 ```
 
-Key flags:
-- `--target=riscv|arm` (default from CMake `DEFAULT_TARGET`)
-- `-O0`, `-O1`, `-O2`
-- `--emit-ir`, `--verify-ir`, `--dump-pass-timing`
-- `--dump-cfg`, `--verify-cfg`
-- `--use-legacy-codegen` (fallback frontend path)
-- `--force-dialect-codegen` (no fallback, fail fast)
+Useful flags:
+
+- `--target=riscv|arm` selects the backend target.
+- `-O0`, `-O1`, `-O2` select optimization profiles.
+- `--emit-ir`, `--verify-ir`, `--dump-pass-timing`, `--stats` help inspect the legacy IR pipeline.
+- `--dump-hir`, `--verify-hir`, `--dump-cfg`, `--verify-cfg` help inspect the dialect frontend pipeline.
+- `--use-legacy-codegen` forces the legacy AST-to-IR frontend path.
+- `--force-dialect-codegen` disables frontend fallback and fails fast on unsupported dialect lowering.
+- `SISY_COMPILER_EXTRA_ARGS="..."` forwards extra compiler flags through regression/runtime scripts.
 
 ## Architecture
 
+The default frontend path is the dialect pipeline:
+
+`AST -> HIR build -> HIR verify/canonicalize -> CFG -> CFG verify -> legacy ModuleOp adapter -> existing optimization/backend pipeline`
+
+The legacy frontend path (`AST -> CodeGen -> ModuleOp`) is still available with `--use-legacy-codegen`. Backend and O1/O2 pipelines operate on the existing legacy `ModuleOp` representation after the CFG adapter.
+
+High-level source layout:
+
+- `src/main/`: CLI parsing, default target selection, and optimization pipeline profile construction.
+- `src/parse/`: SysY lexer/parser/type-system pieces that produce the AST.
+- `src/frontend/`: frontend facade; new top-level integration should include this facade instead of raw parse/codegen internals.
+- `src/hir/`: structured high-level IR, builder, verifier, canonicalization, affine/polyhedral utilities, and migration lowering.
+- `src/cfg/`: explicit control-flow dialect between HIR and legacy IR, including CFG verification and the CFG-to-legacy adapter.
+- `src/codegen/`: legacy IR data model (`ModuleOp`/ops/attrs) and legacy AST-to-IR lowering.
+- `src/pre-opt/`: early structured/CFG cleanup passes such as alloca movement, const folding, loop raising, CFG flattening, and mem2reg.
+- `src/opt/`: mid-level optimization passes such as alias analysis, DSE/DLE, GVN, LICM, inlining, loop transforms, range folding, vectorization, and pass management.
+- `src/pass/`: pass registry and pipeline-facing pass APIs; keep pass ordering centralized in pipeline profile code.
+- `src/rv/` and `src/arm/`: current RISC-V and ARM backend lowering, scheduling, register allocation, and assembly dumping.
+- `src/backend/`: shared and newer backend organization for target-specific code.
+- `src/utils/`: common utilities, including Presburger/SMT helpers used by loop and affine analyses.
+- `runtime/`: SysY runtime library used by runtime evaluation scripts.
+
+## Optimization Profiles and Bisection
+
+- **O0**: early cleanup and canonicalization sufficient for straightforward code generation.
+- **O1**: O0 plus structured CFG optimization, alias analysis, DSE/DLE, GVN, LICM, and inlining.
+- **O2**: O1 plus more aggressive loop, range, splice, vectorization, and tail optimization rounds.
+
+Before changing pipeline defaults, read `docs/Commands.md` and `docs/Optimization.md`. Optimizations must be general compiler transformations over IR and must not depend on benchmark names, source filenames, public test identity, expected output formats, or magic constants unique to a case.
+
+Common bisection switches:
+
+```bash
+SISY_ENABLE_FUNCTION_EQUIVALENCE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_MODMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_ROW_SCRATCH_MATMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_CACHED_PRECOMPUTE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
-src/
-├── main/          # Entry point, CLI options, pipeline profiles
-├── parse/         # Lexer + Parser (SysY -> AST)
-├── frontend/      # AST -> HIR lowering
-├── hir/          # High-level IR (HIRBuilder, HIRCanonicalize, HIRVerifier)
-├── cfg/          # Control Flow Graph representation
-├── codegen/      # CFG -> legacy ModuleOp lowering
-├── pre-opt/      # Early optimization (MoveAlloca, EarlyConstFold, RaiseToFor, FlattenCFG, Mem2Reg)
-├── opt/          # Optimization passes (O1/O2): Alias, DSE, DLE, GVN, LICM, Inline, LateInline, etc.
-├── ir/           # Core IR types
-├── pass/         # Pass registry
-├── backend/
-│   ├── riscv/    # RISC-V backend (lowering, combine, regalloc, asm dump)
-│   ├── arm/      # ARM64 backend
-│   └── shared/   # Shared backend utilities
-├── utils/        # Common utilities (Arena, Bitstream, etc.)
-└── rt/           # Runtime support
-```
-
-### Dialect Pipeline (default)
-
-`AST -> HIR Build -> HIR Verify -> HIR Canonicalize -> HIR->CFG -> CFG Verify -> CFG->Legacy ModuleOp`
-
-### Optimization Levels
-
-- **O0**: MoveAlloca, EarlyConstFold, RaiseToFor, FlattenCFG, Mem2Reg, RegularFold
-- **O1**: O0 + structured CFG optimization, alias analysis, DSE, DLE, GVN, LICM, inlining
-- **O2**: O1 + Fusion, Unswitch, Reassociate, Range+Splice, additional tail optimization rounds
-
-The current `pure-rv` branch defaults to all-optimization mode for RISC-V.
-Riskier passes keep `SISY_ENABLE_*` environment kill switches for bisection.
-See `docs/Commands.md` and `docs/Optimization.md` before changing pipeline
-defaults.
-
-### Key Optimization Passes
-
-`src/opt/`: Alias.cpp, DSE.cpp, DLE.cpp, GVN.cpp, LICM.cpp, Inline.cpp, LateInline.cpp, CanonicalizeLoop.cpp, FlattenCFG.cpp, GCM.cpp (Globalize.cpp, AggressiveDCE.cpp)
 
 ## Dual-Target Submission
 
-- **RISC-V track**: submit `master` branch
-- **ARM track**: create `arm` branch, set `SISYPHUS_DEFAULT_TARGET_ARM=1` in `src/main/DefaultTarget.h`
+- **RISC-V track**: submit the `master` branch.
+- **ARM track**: create/use an `arm` branch and set `SISYPHUS_DEFAULT_TARGET_ARM=1` in `src/main/DefaultTarget.h`.
 
-Contest evaluators compile `src/*.cpp` directly without CMake, so the `DefaultTarget.h` source-level define controls the default target.
+Contest evaluators may compile `src/*.cpp` directly without CMake and may not pass `--target`, so the source-level default target in `src/main/DefaultTarget.h` controls submitted branch behavior.

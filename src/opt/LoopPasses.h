@@ -11,6 +11,8 @@
 // The whole content of this file should be run after Mem2Reg.
 namespace sys {
 
+class MemorySSA;
+
 // We will take the LLVM terminology:
 //   _Header_ is the only block of loop entry;
 //   _Preheader_ is the only block in header.preds;
@@ -189,6 +191,7 @@ class LICM : public Pass {
   std::vector<Op*> stores;
   // Whether the current function has an impure call.
   bool impure;
+  MemorySSA *mssa = nullptr;
 
   // A store is hoistable when no branch or load has been met.
   void hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable);

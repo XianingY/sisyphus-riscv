@@ -198,13 +198,6 @@ bool blockHasCall(BasicBlock *bb) {
   return false;
 }
 
-Op *firstCall(BasicBlock *bb) {
-  for (auto *op : bb->getOps())
-    if (isa<sys::rv::CallOp>(op))
-      return op;
-  return nullptr;
-}
-
 Op *firstNonPhi(BasicBlock *bb) {
   for (auto op : bb->getOps())
     if (!isa<PhiOp>(op))
@@ -241,6 +234,20 @@ int splitHotLiveRanges(Region *region,
   Builder builder;
   int splits = 0;
 
+  auto usedInBlockBody = [](Op *value, BasicBlock *bb) -> bool {
+    if (!value || !bb)
+      return false;
+    for (auto op : bb->getOps()) {
+      if (isa<PhiOp>(op))
+        continue;
+      for (auto operand : op->getOperands()) {
+        if (operand.defining == value)
+          return true;
+      }
+    }
+    return false;
+  };
+
   for (auto bb : region->getBlocks()) {
     auto weightIt = bbWeight.find(bb);
     int weight = weightIt == bbWeight.end() ? 1 : weightIt->second;
@@ -253,73 +260,40 @@ int splitHotLiveRanges(Region *region,
     Op *insertBefore = firstNonPhi(bb);
     if (!insertBefore || isa<JOp>(insertBefore) || isa<RetOp>(insertBefore))
       continue;
-    Op *stopBefore = firstCall(bb);
-    int splitLimit = maxSplitsPerBlock;
-    if (stopBefore)
-      splitLimit = std::min(splitLimit, 1);
 
-    struct LiveInInfo {
-      Op *value;
-      bool splitAfterCall;
-    };
-    std::vector<LiveInInfo> liveIns;
+    std::vector<Op*> liveIns;
     liveIns.reserve(bb->getLiveIn().size());
-    Op *afterCall = stopBefore ? stopBefore->nextOp() : nullptr;
-    auto usedAfterCall = [&](Op *use) -> bool {
-      for (auto op = afterCall; op; op = op->nextOp())
-        if (op == use)
-          return true;
-      return false;
-    };
 
     for (auto value : bb->getLiveIn()) {
       if (!splitCandidateValue(value))
         continue;
       if (value->getParent() == bb)
         continue;
-      if (stopBefore) {
-        bool usedOutside = false;
-        bool seenAfterCall = false;
-        for (auto use : value->getUses()) {
-          if (use->getParent() != bb) {
-            usedOutside = true;
-            break;
-          }
-          if (afterCall && usedAfterCall(use))
-            seenAfterCall = true;
-        }
-        if (usedOutside || !seenAfterCall)
-          continue;
-        liveIns.push_back({ value, true });
-      } else {
-        liveIns.push_back({ value, false });
-      }
+      if (!usedInBlockBody(value, bb))
+        continue;
+      liveIns.push_back(value);
     }
 
-    std::sort(liveIns.begin(), liveIns.end(), [&](const LiveInInfo &a, const LiveInInfo &b) {
-      if (a.value->getUses().size() != b.value->getUses().size())
-        return a.value->getUses().size() > b.value->getUses().size();
-      return a.value < b.value;
+    std::sort(liveIns.begin(), liveIns.end(), [&](Op *a, Op *b) {
+      if (a->getUses().size() != b->getUses().size())
+        return a->getUses().size() > b->getUses().size();
+      return a < b;
     });
 
     int blockSplits = 0;
-    for (auto info : liveIns) {
-      if (blockSplits >= splitLimit)
+    for (auto value : liveIns) {
+      if (blockSplits >= maxSplitsPerBlock)
         break;
 
-      if (info.splitAfterCall)
-        builder.setAfterOp(stopBefore);
-      else
-        builder.setBeforeOp(insertBefore);
+      builder.setBeforeOp(insertBefore);
       Op *copy = nullptr;
-      if (info.value->getResultType() == Value::f32)
-        copy = builder.create<FmvOp>({ info.value });
+      if (value->getResultType() == Value::f32)
+        copy = builder.create<FmvOp>({ value });
       else
-        copy = builder.create<MvOp>({ info.value });
-      copy->setResultType(info.value->getResultType());
+        copy = builder.create<MvOp>({ value });
+      copy->setResultType(value->getResultType());
 
-      int replaced = replaceUsesAfterCopy(bb, copy, info.value,
-                                          info.splitAfterCall ? nullptr : stopBefore);
+      int replaced = replaceUsesAfterCopy(bb, copy, value, nullptr);
       if (replaced == 0) {
         copy->removeAllOperands();
         copy->erase();

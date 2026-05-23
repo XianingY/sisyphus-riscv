@@ -163,7 +163,7 @@ static Rule rules[] = {
   "(change (sub (sub x 'a) 'b) (sub x (!add 'a 'b)))",
   "(change (sub x (minus y)) (add x y))",
   "(change (sub (mul x 'a) (mul x 'b)) (mul x (!sub 'a 'b)))",
-  "(change (add (mul x 'a) x) (mul (!sub 'a 1) x))",
+  "(change (sub (mul x 'a) x) (mul (!sub 'a 1) x))",
   "(change (sub (mul x 'a) (mul y 'a)) (mul (sub x y) 'a))",
   "(change (sub (div 'a x) (div 'b x)) (div (!sub 'a 'b) x))",
   "(change (sub (div x 'a) (div y 'a)) (div (sub x y) 'a))",
@@ -454,7 +454,13 @@ void RegularFold::run() {
   // We use this to resolve loads from scalar const globals (e.g. `const int base = 16`).
   auto gMap = getGlobalMap();
 
+  int rounds = 0;
   do {
+    currentRound = rounds;
+    if (rounds++ > 1000) {
+      std::cerr << "[RegularFold] warning: algebraic folding did not converge after 1000 rounds! Breaking to prevent infinite loop." << std::endl;
+      break;
+    }
     folded = 0;
     for (auto func : funcs) {
       auto region = func->getRegion();

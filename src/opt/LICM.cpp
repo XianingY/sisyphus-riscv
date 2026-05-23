@@ -1,4 +1,5 @@
 #include "LoopPasses.h"
+#include "MemorySSA.h"
 
 using namespace sys;
 
@@ -41,6 +42,24 @@ bool noAlias(Op *load, const std::vector<Op*> &stores) {
     if (mayAlias(addr, store))
       return false;
   }
+  return true;
+}
+
+bool noAliasWithMemorySSA(Op *load, LoopInfo *loop, MemorySSA *mssa, const std::vector<Op*> &stores, bool impure) {
+  (void)impure;
+  if (!mssa)
+    return noAlias(load, stores);
+
+  auto clobbers = mssa->getClobberingDefs(load);
+  if (clobbers.empty())
+    return true;
+
+  for (auto *access : clobbers) {
+    auto *def = access->op;
+    if (def && loop->contains(def->getParent()))
+      return false;
+  }
+
   return true;
 }
 
@@ -92,7 +111,7 @@ void LICM::hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
     if (op->has<VariantAttr>())
       continue;
 
-    if (pinned(op) || isa<PhiOp>(op) || (isa<LoadOp>(op) && (!noAlias(op, stores) || impure))
+    if (pinned(op) || isa<PhiOp>(op) || (isa<LoadOp>(op) && (!noAliasWithMemorySSA(op, info, this->mssa, stores, impure) || impure))
         // When a store only writes a loop-invariant value to loop-invariant address,
         // and it doesn't follow any load, then it's safe to hoist it out.
         || (isa<StoreOp>(op) && (!hoistable || impure || op->DEF(0)->has<VariantAttr>() || op->DEF(1)->has<VariantAttr>())))
@@ -129,7 +148,7 @@ void LICM::markVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
     if (op->has<VariantAttr>())
       continue;
 
-    if (pinned(op) || (isa<LoadOp>(op) && (!noAlias(op, stores) || impure))
+    if (pinned(op) || (isa<LoadOp>(op) && (!noAliasWithMemorySSA(op, info, this->mssa, stores, impure) || impure))
         || (isa<StoreOp>(op) && (!hoistable || impure || op->DEF(0)->has<VariantAttr>() || op->DEF(1)->has<VariantAttr>())))
       op->add<VariantAttr>();
     else for (auto operand : op->getOperands()) {
@@ -314,6 +333,10 @@ void LICM::run() {
     auto region = func->getRegion();
     domtree = getDomTree(region);
 
+    MemorySSA mssaInstance(region);
+    mssaInstance.build();
+    this->mssa = &mssaInstance;
+
     const auto &forest = forests[func];
     for (auto info : forest.getLoops()) {
       // Only call for top-level loops.
@@ -333,8 +356,13 @@ void LICM::run() {
     auto region = func->getRegion();
     domtree = getDomTree(region);
 
+    MemorySSA mssaInstance(region);
+    mssaInstance.build();
+    this->mssa = &mssaInstance;
+
     auto forest = forests[func];
     bool changed;
+    int loopCount = 0;
     do {
       changed = false;
       for (auto info : forest.getLoops()) {
@@ -342,6 +370,7 @@ void LICM::run() {
         if (!info->getParent() && hoistSubloop(info)) {
           forest = loop.runImpl(region);
           domtree = getDomTree(region);
+          mssaInstance.build();
           changed = true;
           break;
         }
@@ -350,6 +379,11 @@ void LICM::run() {
       for (auto bb : region->getBlocks()) {
         for (auto op : bb->getOps())
           op->remove<VariantAttr>();
+      }
+
+      if (loopCount++ > 100) {
+        std::cerr << "LICM: Loop threshold exceeded (100) in subloop hoisting in " << func->getName() << ". Breaking to prevent infinite loop!" << std::endl;
+        break;
       }
     } while (changed);
   }

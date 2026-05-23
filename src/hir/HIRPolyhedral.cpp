@@ -1,6 +1,7 @@
 #include "HIRPolyhedral.h"
 
 #include "HIRAffine.h"
+#include "../backend/riscv/RiscvParams.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -15,6 +16,95 @@
 namespace sys::hir {
 
 namespace {
+
+struct LoopBodyMetrics {
+  int scalarIntDefs = 0;
+  int scalarFloatDefs = 0;
+  std::unordered_set<std::string> arrayReadStreams;
+  std::unordered_set<std::string> arrayWriteStreams;
+};
+
+void analyzeLoopBody(const Op *op, LoopBodyMetrics &metrics) {
+  if (!op) return;
+
+  if (op->kind == OpKind::VarDecl && op->arrayDims.empty()) {
+    if (op->type == TypeKind::Float) {
+      metrics.scalarFloatDefs++;
+    } else {
+      metrics.scalarIntDefs++;
+    }
+  }
+
+  const bool isArrayLoad = (op->kind == OpKind::Load && !op->children.empty());
+  const bool isArrayStore = (op->kind == OpKind::Store && op->children.size() > 1);
+  if (isArrayLoad && !op->symbol.empty()) {
+    metrics.arrayReadStreams.insert(op->symbol);
+  }
+  if (isArrayStore && !op->symbol.empty()) {
+    metrics.arrayWriteStreams.insert(op->symbol);
+  }
+
+  for (const auto &child : op->children) {
+    analyzeLoopBody(child.get(), metrics);
+  }
+}
+
+TypeKind detectMainType(const Op *op) {
+  if (!op) return TypeKind::Int;
+  if (op->type == TypeKind::Float) return TypeKind::Float;
+  if (op->kind == OpKind::ConstFloat) return TypeKind::Float;
+  for (const auto &child : op->children) {
+    if (detectMainType(child.get()) == TypeKind::Float)
+      return TypeKind::Float;
+  }
+  return TypeKind::Int;
+}
+
+int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
+  const char *envRaw = std::getenv("SISY_HIR_JAM_FACTOR");
+  if (envRaw && envRaw[0]) {
+    int val = std::atoi(envRaw);
+    if (val >= 2 && val <= 16) {
+      return val;
+    }
+  }
+  using namespace sys::backend::riscv;
+
+  LoopBodyMetrics metrics;
+  analyzeLoopBody(innerBody, metrics);
+
+  int activeStreams = metrics.arrayReadStreams.size() + metrics.arrayWriteStreams.size();
+  if (activeStreams == 0) activeStreams = 1;
+
+  int usableRegs = (mainType == TypeKind::Float) ? kUsableFPRs : kUsableGPRs;
+  int activeScalars = (mainType == TypeKind::Float) ? metrics.scalarFloatDefs : metrics.scalarIntDefs;
+
+  int bestFactor = 4;
+  for (int factor : {8, 4, 2}) {
+    int estimatedPressure = (factor * activeStreams) + activeScalars;
+    if (estimatedPressure <= usableRegs) {
+      bestFactor = factor;
+      break;
+    }
+  }
+  return bestFactor;
+}
+
+int computeOptimalTileSize(TypeKind mainType) {
+  const char *envRaw = std::getenv("SISY_HIR_TILE_SIZE");
+  if (envRaw && envRaw[0]) {
+    int val = std::atoi(envRaw);
+    if (val >= 4) {
+      return val;
+    }
+  }
+  using namespace sys::backend::riscv;
+
+  int elementSize = (mainType == TypeKind::Float || mainType == TypeKind::Int) ? 4 : 8;
+  int elementsPerCacheLine = kCacheLineSize / elementSize;
+  
+  return elementsPerCacheLine * 2;
+}
 
 constexpr int kJamFactor = 4;
 constexpr int kDefaultHirTileSize = 32;
@@ -955,6 +1045,25 @@ bool isMatmulLikeNest(const std::vector<CanonicalLoop> &loops,
   return hasDestStore && hasIKLoad && hasKJLoad;
 }
 
+bool fusionWithinCacheBudget(const Op *bodyA, const Op *bodyB) {
+  using namespace sys::backend::riscv;
+
+  std::unordered_set<std::string> arraysA, arraysB;
+  collectArrayAccessSymbols(bodyA, arraysA);
+  collectArrayAccessSymbols(bodyB, arraysB);
+
+  std::unordered_set<std::string> allArrays;
+  for (const auto &s : arraysA) allArrays.insert(s);
+  for (const auto &s : arraysB) allArrays.insert(s);
+
+  // Each active array stream needs cache-line residency.  Conservatively
+  // assume 3 cache lines per stream at steady state.
+  int activeStreams = (int)allArrays.size();
+  int estimatedFootprint = activeStreams * kCacheLineSize * 3;
+
+  return estimatedFootprint <= kL1DataCacheSize;
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
@@ -1555,8 +1664,10 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
     return false;
   }
 
+  int dynamicJamFactor = computeOptimalJamFactor(inner.body, detectMainType(inner.body));
+
   auto jamInnerBody = makeBlock();
-  for (int lane = 0; lane < hirJamFactor; lane++) {
+  for (int lane = 0; lane < dynamicJamFactor; lane++) {
     std::unordered_map<std::string, std::string> scalarRenames;
     std::unordered_map<std::string, int> ivOffsets = { { outer.iv, lane } };
     for (size_t i = 0; i + 1 < inner.body->children.size(); i++) {
@@ -1572,11 +1683,11 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
   auto jamOuterBody = makeBlock();
   jamOuterBody->children.push_back(cloneOp(innerInitOp));
   jamOuterBody->children.push_back(std::move(jamInnerWhile));
-  jamOuterBody->children.push_back(makeJamStep(outer.iv, hirJamFactor));
+  jamOuterBody->children.push_back(makeJamStep(outer.iv, dynamicJamFactor));
 
   auto jamCond = makeCmp("<",
                          makeArith("+", makeLoad(outer.iv),
-                                   makeConstInt(hirJamFactor - 1)),
+                                   makeConstInt(dynamicJamFactor - 1)),
                          cloneOp(outer.bound));
   auto jamOuterWhile = makeWhile(std::move(jamCond), std::move(jamOuterBody));
   auto tailWhile = cloneOp(outerWhile);
@@ -1661,6 +1772,8 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
     return false;
   }
 
+  int dynamicTileSize = computeOptimalTileSize(detectMainType(outer.body));
+
   const std::string tileIV = "__hir_tile_" + outer.iv + "_" + std::to_string(uniqueId);
   const std::string stopVar = "__hir_tile_stop_" + outer.iv + "_" + std::to_string(uniqueId);
   uniqueId++;
@@ -1675,7 +1788,7 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
 
   // stopVar = tileIV + T
   tileBody->children.push_back(
-    makeVarDecl(stopVar, makeArith("+", makeLoad(tileIV), makeConstInt(hirTileSize))));
+    makeVarDecl(stopVar, makeArith("+", makeLoad(tileIV), makeConstInt(dynamicTileSize))));
 
   // if (bound < stopVar) { stopVar = bound; }
   {
@@ -1698,7 +1811,7 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
 
   // tileIV += T
   tileBody->children.push_back(
-    makeStore(tileIV, makeArith("+", makeLoad(tileIV), makeConstInt(hirTileSize))));
+    makeStore(tileIV, makeArith("+", makeLoad(tileIV), makeConstInt(dynamicTileSize))));
 
   // --- Build the tile while ---
   auto tileCond = makeCmp("<", makeLoad(tileIV), cloneOp(outer.bound));
@@ -1834,6 +1947,13 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   stats.presburgerFusionMayDeps += fusionDep.mayReorderedDependence;
   stats.presburgerFusionUnknown += fusionDep.unknown;
   if (!fusionDep.safe) {
+    stats.fusionRejected++;
+    stats.fusionRejectMemory++;
+    return false;
+  }
+
+  // Cache-line budget gate: avoid fusion if combined working set exceeds L1.
+  if (!fusionWithinCacheBudget(loopA.body, loopB.body)) {
     stats.fusionRejected++;
     stats.fusionRejectMemory++;
     return false;
@@ -2038,14 +2158,16 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
     return false;
   }
 
+  int dynamicJamFactor = computeOptimalJamFactor(pat.kWhile, detectMainType(pat.kWhile));
+
   const std::string prefix = "__poly_" + pat.acc + "_" + std::to_string(uniqueId++);
   std::vector<std::string> accNames;
-  accNames.reserve(hirJamFactor);
-  for (int lane = 0; lane < hirJamFactor; lane++)
+  accNames.reserve(dynamicJamFactor);
+  for (int lane = 0; lane < dynamicJamFactor; lane++)
     accNames.push_back(prefix + "_" + std::to_string(lane));
 
   auto vecBody = makeBlock();
-  for (int lane = 0; lane < hirJamFactor; lane++) {
+  for (int lane = 0; lane < dynamicJamFactor; lane++) {
     vecBody->children.push_back(makeVarDecl(accNames[lane], cloneOp(initValue(pat.accInit))));
   }
 
@@ -2056,7 +2178,7 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
     return false;
 
   auto kBody = makeBlock();
-  for (int lane = 0; lane < hirJamFactor; lane++) {
+  for (int lane = 0; lane < dynamicJamFactor; lane++) {
     std::unordered_map<std::string, std::string> scalarRenames = { { pat.acc, accNames[lane] } };
     std::unordered_map<std::string, int> ivOffsets = { { pat.j, lane } };
     auto laneUpdate = cloneReplacing(pat.accUpdate, scalarRenames, ivOffsets);
@@ -2070,15 +2192,15 @@ bool PolyhedralOptimizer::tryReductionJam(Op *block, size_t initIndex, Polyhedra
   auto kWhile = makeWhile(cloneOp(pat.kWhile->children[0].get()), std::move(kBody));
   vecBody->children.push_back(std::move(kWhile));
 
-  for (int lane = 0; lane < hirJamFactor; lane++) {
+  for (int lane = 0; lane < dynamicJamFactor; lane++) {
     std::unordered_map<std::string, std::string> scalarRenames = { { pat.acc, accNames[lane] } };
     std::unordered_map<std::string, int> ivOffsets = { { pat.j, lane } };
     vecBody->children.push_back(cloneReplacing(pat.destStore, scalarRenames, ivOffsets));
   }
-  vecBody->children.push_back(makeJamStep(pat.j, hirJamFactor));
+  vecBody->children.push_back(makeJamStep(pat.j, dynamicJamFactor));
 
   auto vecCond = makeCmp("<",
-                         makeArith("+", makeLoad(pat.j), makeConstInt(hirJamFactor - 1)),
+                         makeArith("+", makeLoad(pat.j), makeConstInt(dynamicJamFactor - 1)),
                          cloneOp(pat.jBound));
   auto vecWhile = makeWhile(std::move(vecCond), std::move(vecBody));
   auto tailWhile = cloneOp(whileOp);

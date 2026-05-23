@@ -102,6 +102,60 @@ bool valueEscapesArray(Op *value, Op *base) {
     return constantOffsetFromBase(value, base, ignored);
 }
 
+bool arrayEscapes(Op *base) {
+    if (!base)
+        return true;
+    std::unordered_set<Op*> seen;
+    std::vector<Op*> worklist;
+    worklist.push_back(base);
+    while (!worklist.empty()) {
+        Op *addr = worklist.back();
+        worklist.pop_back();
+        if (!seen.insert(addr).second)
+            continue;
+
+        for (auto *use : addr->getUses()) {
+            if (!use)
+                return true;
+
+            if (isa<AddLOp>(use) || isa<AddIOp>(use)) {
+                int offset = 0;
+                if (!constantOffsetFromBase(use, base, offset))
+                    return true;
+                worklist.push_back(use);
+                continue;
+            }
+
+            if (auto *load = dyn_cast<LoadOp>(use)) {
+                if (load->getOperandCount() != 1 || load->DEF(0) != addr)
+                    return true;
+                if (load->getResultType() == Value::i64)
+                    return true;
+                continue;
+            }
+
+            if (auto *store = dyn_cast<StoreOp>(use)) {
+                if (store->getOperandCount() < 2)
+                    return true;
+                if (store->DEF(1) == addr) {
+                    if (store->DEF(0) == addr || valueEscapesArray(store->DEF(0), base))
+                        return true;
+                    continue;
+                }
+                if (store->DEF(0) == addr || valueEscapesArray(store->DEF(0), base))
+                    return true;
+                return true;
+            }
+
+            if (isa<CallOp>(use) || isa<ReturnOp>(use))
+                return true;
+
+            return true;
+        }
+    }
+    return false;
+}
+
 bool collectArrayElementAccesses(Op *addr, Op *base,
                                  std::vector<ArrayElementAccess> &accesses,
                                  std::unordered_set<Op*> &seen) {
@@ -478,7 +532,7 @@ void promoteCandidate(const ScalarCandidate &candidate, LoopInfo *info) {
 
 void ScalarReplace::runArrayScalarization(FuncOp *func) {
     const int maxBytes =
-        getenvInt("SISY_SCALAR_REPLACE_MAX_ARRAY_BYTES", 64, 4, 4096);
+        getenvInt("SISY_SCALAR_REPLACE_MAX_ARRAY_BYTES", 512, 4, 4096);
     auto *region = func->getRegion();
     Builder builder;
 
@@ -488,6 +542,8 @@ void ScalarReplace::runArrayScalarization(FuncOp *func) {
             continue;
         int bytes = (int) SIZE(alloca);
         if (bytes <= 0 || bytes > maxBytes || bytes % 4 != 0)
+            continue;
+        if (arrayEscapes(alloca))
             continue;
 
         std::vector<ArrayElementAccess> accesses;
