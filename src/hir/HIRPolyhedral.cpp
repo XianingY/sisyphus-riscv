@@ -733,6 +733,19 @@ bool bodyWritesScalar(const Op *op, const std::string &symbol) {
   return false;
 }
 
+bool bodyWritesNonLoopScalar(const Op *op, const std::unordered_set<std::string> &loopIVs) {
+  if (!op)
+    return false;
+  const bool scalarDecl = op->kind == OpKind::VarDecl && op->arrayDims.empty();
+  const bool scalarStore = op->kind == OpKind::Store && op->children.size() == 1;
+  if ((scalarDecl || scalarStore) && !op->symbol.empty() && !loopIVs.count(op->symbol))
+    return true;
+  for (const auto &child : op->children)
+    if (bodyWritesNonLoopScalar(child.get(), loopIVs))
+      return true;
+  return false;
+}
+
 bool blockExceptLastWritesScalar(const Op *block, const std::string &symbol) {
   if (!block || block->kind != OpKind::Block || block->children.empty())
     return false;
@@ -972,15 +985,32 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     return false;
 
   bool changed = false;
+  const bool isBlockLike = block->kind == OpKind::Block || block->kind == OpKind::Module;
+  if (isBlockLike) {
+    for (auto &child : block->children)
+      if (child && child->kind == OpKind::While)
+        scanAffineNest(child.get(), stats);
+
+    // Try fully affine 3D interchange before visiting nested blocks. Some
+    // lower-level reduction rewrites intentionally change matrix-like nests
+    // into a different shape, which would otherwise hide the original
+    // dependence directions from the generic permutation legality check.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_INTERCHANGE", true)) {
+      for (size_t i = 0; i < block->children.size(); i++) {
+        if (block->children[i] && block->children[i]->kind == OpKind::While &&
+            tryLoopInterchange3D(block, i, stats)) {
+          changed = true;
+          i = 0;
+        }
+      }
+    }
+  }
+
   for (auto &child : block->children)
     changed = optimizeBlock(child.get(), stats) || changed;
 
   if (block->kind != OpKind::Block && block->kind != OpKind::Module)
     return changed;
-
-  for (auto &child : block->children)
-    if (child && child->kind == OpKind::While)
-      scanAffineNest(child.get(), stats);
 
   for (size_t i = 0; i < block->children.size(); i++) {
     if (tryReductionInterchange(block, i, stats)) {
@@ -1095,6 +1125,178 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
 // ===========================================================================
 // Loop Interchange / Unroll-and-Jam (Presburger-based)
 // ===========================================================================
+
+bool PolyhedralOptimizer::tryLoopInterchange3D(Op *block, size_t idx,
+                                               PolyhedralStats &stats) {
+  if (!block || idx == 0 || idx >= block->children.size())
+    return false;
+
+  Op *outerWhile = block->children[idx].get();
+  CanonicalLoop outer;
+  if (!matchCanonicalWhile(outerWhile, outer)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+
+  Op *outerInitOp = block->children[idx - 1].get();
+  if (!matchLoopInit(outerInitOp, outer.iv)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectInit++;
+    return false;
+  }
+
+  if (!outer.body || outer.body->kind != OpKind::Block || outer.body->children.size() != 3) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+
+  Op *middleInitOp = outer.body->children[0].get();
+  Op *middleWhile = unwrapSingleDecl(outer.body->children[1].get());
+  if (!middleWhile || middleWhile->kind != OpKind::While) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+
+  CanonicalLoop middle;
+  if (!matchCanonicalWhile(middleWhile, middle)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+  if (!matchLoopInit(middleInitOp, middle.iv)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectInit++;
+    return false;
+  }
+
+  if (!middle.body || middle.body->kind != OpKind::Block || middle.body->children.size() != 3) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+
+  Op *innerInitOp = middle.body->children[0].get();
+  Op *innerWhile = unwrapSingleDecl(middle.body->children[1].get());
+  if (!innerWhile || innerWhile->kind != OpKind::While) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+
+  CanonicalLoop inner;
+  if (!matchCanonicalWhile(innerWhile, inner)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+  if (!matchLoopInit(innerInitOp, inner.iv)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectInit++;
+    return false;
+  }
+
+  if (!tilingSafeBody(inner.body) || containsWhile(inner.body) ||
+      blockExceptLastWritesScalar(inner.body, inner.iv) ||
+      bodyWritesScalar(inner.body, middle.iv) ||
+      bodyWritesScalar(inner.body, outer.iv)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectControl++;
+    return false;
+  }
+
+  std::unordered_set<std::string> loopIVs = {outer.iv, middle.iv, inner.iv};
+  if (bodyWritesNonLoopScalar(inner.body, loopIVs)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectControl++;
+    return false;
+  }
+
+  int rawAccesses = countArrayAccessOps(inner.body);
+  std::vector<affine::Access> accesses = affine::collectArrayAccesses(inner.body);
+  if (rawAccesses != (int) accesses.size()) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectAccess++;
+    return false;
+  }
+  if (!isMatmulLikeNest({outer, middle, inner}, accesses)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectShape++;
+    return false;
+  }
+
+  const Op *outerInitVal = initValue(outerInitOp);
+  const Op *middleInitVal = initValue(middleInitOp);
+  const Op *innerInitVal = initValue(innerInitOp);
+  if (!outerInitVal || !middleInitVal || !innerInitVal) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectInit++;
+    return false;
+  }
+
+  affine::Expr outerInitExpr = affine::analyzeExpr(outerInitVal);
+  affine::Expr middleInitExpr = affine::analyzeExpr(middleInitVal);
+  affine::Expr innerInitExpr = affine::analyzeExpr(innerInitVal);
+  affine::Expr outerBoundExpr = affine::analyzeExpr(outer.bound);
+  affine::Expr middleBoundExpr = affine::analyzeExpr(middle.bound);
+  affine::Expr innerBoundExpr = affine::analyzeExpr(inner.bound);
+  if (!outerInitExpr.valid || !middleInitExpr.valid || !innerInitExpr.valid ||
+      !outerBoundExpr.valid || !middleBoundExpr.valid || !innerBoundExpr.valid) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectBounds++;
+    return false;
+  }
+
+  if (affine::exprUsesAny(outerInitExpr, loopIVs) ||
+      affine::exprUsesAny(middleInitExpr, loopIVs) ||
+      affine::exprUsesAny(innerInitExpr, loopIVs) ||
+      affine::exprUsesAny(outerBoundExpr, loopIVs) ||
+      affine::exprUsesAny(middleBoundExpr, loopIVs) ||
+      affine::exprUsesAny(innerBoundExpr, loopIVs)) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectBounds++;
+    return false;
+  }
+
+  affine::PresburgerInterchangeResult dep =
+      affine::permutationMemorySafePresburger(
+          {outerWhile, middleWhile, innerWhile},
+          {outerInitOp, middleInitOp, innerInitOp},
+          {0, 2, 1});
+  stats.presburgerInterchangeQueries += dep.queries;
+  stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
+  stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
+  stats.presburgerInterchangeUnknown += dep.unknown;
+  if (!dep.safe) {
+    stats.interchange3DRejected++;
+    stats.interchange3DRejectMemory++;
+    return false;
+  }
+
+  auto newJBody = makeBlock();
+  for (size_t i = 0; i + 1 < inner.body->children.size(); i++)
+    newJBody->children.push_back(cloneOp(inner.body->children[i].get()));
+  newJBody->children.push_back(cloneOp(middle.step));
+  auto newJWhile = makeWhile(cloneOp(middleWhile->children[0].get()), std::move(newJBody));
+
+  auto newKBody = makeBlock();
+  newKBody->children.push_back(cloneOp(middleInitOp));
+  newKBody->children.push_back(std::move(newJWhile));
+  newKBody->children.push_back(cloneOp(inner.step));
+  auto newKWhile = makeWhile(cloneOp(innerWhile->children[0].get()), std::move(newKBody));
+
+  auto newOuterBody = makeBlock();
+  newOuterBody->children.push_back(cloneOp(innerInitOp));
+  newOuterBody->children.push_back(std::move(newKWhile));
+  newOuterBody->children.push_back(cloneOp(outer.step));
+  auto newOuterWhile = makeWhile(cloneOp(outerWhile->children[0].get()), std::move(newOuterBody));
+
+  block->children[idx] = std::move(newOuterWhile);
+  stats.interchange3DApplied++;
+  return true;
+}
 
 bool PolyhedralOptimizer::tryLoopInterchange(Op *block, size_t idx,
                                              PolyhedralStats &stats) {

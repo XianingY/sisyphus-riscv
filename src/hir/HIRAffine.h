@@ -65,6 +65,10 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoop,
                                                             const Op *innerLoop,
                                                             const Op *outerInit,
                                                             const Op *innerInit);
+PresburgerInterchangeResult permutationMemorySafePresburger(
+    const std::vector<const Op*> &loopOps,
+    const std::vector<const Op*> &initOps,
+    const std::vector<int> &permutation);
 
 }  // namespace sys::hir::affine
 

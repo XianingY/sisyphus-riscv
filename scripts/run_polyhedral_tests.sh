@@ -55,4 +55,31 @@ if grep -q "reduction-interchanged=[1-9]" <<<"${jam_stats}"; then
   exit 1
 fi
 
+interchange_3d_stats="$("${COMPILER}" "${CASE_DIR}/interchange_3d_jk_safe.sy" -S \
+  -o "${OUT_DIR}/interchange_3d_jk_safe.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${interchange_3d_stats}"
+
+if ! grep -q "interchange-3d-applied=1" <<<"${interchange_3d_stats}"; then
+  echo "expected HIR 3D Presburger direction analysis to interchange j/k" >&2
+  exit 1
+fi
+
+unsafe_3d_stats="$("${COMPILER}" "${CASE_DIR}/interchange_3d_jk_unsafe.sy" -S \
+  -o "${OUT_DIR}/interchange_3d_jk_unsafe.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${unsafe_3d_stats}"
+
+if grep -q "interchange-3d-applied=[1-9]" <<<"${unsafe_3d_stats}"; then
+  echo "unexpected HIR 3D interchange across loop-carried dependence" >&2
+  exit 1
+fi
+
+if ! grep -q "interchange-3d-reject-memory=[1-9]" <<<"${unsafe_3d_stats}"; then
+  echo "expected HIR 3D interchange to reject the unsafe case by memory dependence" >&2
+  exit 1
+fi
+
 echo "HIR polyhedral Presburger fusion and unroll-and-jam tests passed."

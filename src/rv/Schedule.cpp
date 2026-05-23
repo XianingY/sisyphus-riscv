@@ -7,6 +7,7 @@
 #include <vector>
 #include <list>
 #include <climits>
+#include <functional>
 
 using namespace sys;
 using namespace sys::rv;
@@ -213,6 +214,31 @@ void Schedule::runImpl(BasicBlock *bb) {
     }
   }
 
+  // Compute the critical-path height of each node.
+  // height[U] = latency(U) + max( { height[V] for all users V of U } )
+  std::unordered_map<Op*, int> height;
+  std::function<int(Op*)> computeHeight = [&](Op *op) -> int {
+    auto it = height.find(op);
+    if (it != height.end())
+      return it->second;
+
+    int maxUserHeight = 0;
+    auto userIt = users.find(op);
+    if (userIt != users.end()) {
+      for (auto user : userIt->second) {
+        maxUserHeight = std::max(maxUserHeight, computeHeight(user));
+      }
+    }
+
+    int h = latency(op) + maxUserHeight;
+    height[op] = h;
+    return h;
+  };
+
+  for (auto op : orderedSchedulable) {
+    computeHeight(op);
+  }
+
   // Initialize ready list with degree-0 ops.
   std::list<Op*> ready;
   for (auto op : orderedSchedulable) {
@@ -254,6 +280,9 @@ void Schedule::runImpl(BasicBlock *bb) {
         }
       }
     }
+
+    // Critical-path height priority.
+    score += height[op] * 3;
 
     // Bonus: starting a high-latency op early benefits the schedule.
     int lat = latency(op);

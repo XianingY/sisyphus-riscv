@@ -482,6 +482,27 @@ void addExprToCoeffs(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
   }
 }
 
+void addExprToCoeffsND(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
+                       int64_t sign, const std::vector<std::string> &ivs,
+                       const std::vector<std::string> &iterVars,
+                       const std::unordered_map<std::string, std::string> &paramRenames) {
+  constant += sign * expr.constant;
+  for (const auto &[sym, coeff] : expr.coeffs) {
+    std::string mapped;
+    for (size_t i = 0; i < ivs.size(); i++) {
+      if (sym == ivs[i]) {
+        mapped = iterVars[i];
+        break;
+      }
+    }
+    if (mapped.empty()) {
+      auto it = paramRenames.find(sym);
+      mapped = (it == paramRenames.end()) ? sym : it->second;
+    }
+    coeffs[mapped] += sign * coeff;
+  }
+}
+
 bool makeOrderRow(const VarOrder &vars,
                   const std::string &i1, const std::string &j1,
                   const std::string &i2, const std::string &j2,
@@ -541,6 +562,150 @@ bool hasInterchangeViolation(const pres::BasicSet &base, const VarOrder &vars,
       std::vector<std::vector<int>> combined = orig;
       combined.insert(combined.end(), viol.begin(), viol.end());
       if (hasSolution(combined))
+        return true;
+    }
+  }
+  return false;
+}
+
+enum class DeltaConstraintResult {
+  NoSolution,
+  Applied,
+  Unknown,
+};
+
+bool setDelta(std::vector<std::optional<int64_t>> &deltas, size_t dim, int64_t value) {
+  if (deltas[dim])
+    return *deltas[dim] == value;
+  deltas[dim] = value;
+  return true;
+}
+
+DeltaConstraintResult applySameDimDeltaEquality(
+    const CoeffMap &coeffs, int64_t constant,
+    const std::vector<std::string> &xVars,
+    const std::vector<std::string> &yVars,
+    std::vector<std::optional<int64_t>> &deltas) {
+  std::vector<std::pair<std::string, int64_t>> nonzero;
+  for (const auto &[sym, coeff] : coeffs) {
+    if (coeff != 0)
+      nonzero.push_back({sym, coeff});
+  }
+
+  if (nonzero.empty())
+    return constant == 0 ? DeltaConstraintResult::Applied
+                         : DeltaConstraintResult::NoSolution;
+  if (nonzero.size() != 2)
+    return DeltaConstraintResult::Unknown;
+
+  auto findDim = [&](const std::string &sym,
+                     const std::vector<std::string> &vars) -> std::optional<size_t> {
+    for (size_t i = 0; i < vars.size(); i++)
+      if (vars[i] == sym)
+        return i;
+    return std::nullopt;
+  };
+
+  std::optional<size_t> xDim;
+  std::optional<size_t> yDim;
+  int64_t xCoeff = 0;
+  int64_t yCoeff = 0;
+  for (const auto &[sym, coeff] : nonzero) {
+    if (auto dim = findDim(sym, xVars)) {
+      if (xDim)
+        return DeltaConstraintResult::Unknown;
+      xDim = *dim;
+      xCoeff = coeff;
+      continue;
+    }
+    if (auto dim = findDim(sym, yVars)) {
+      if (yDim)
+        return DeltaConstraintResult::Unknown;
+      yDim = *dim;
+      yCoeff = coeff;
+      continue;
+    }
+    return DeltaConstraintResult::Unknown;
+  }
+
+  if (!xDim || !yDim || *xDim != *yDim)
+    return DeltaConstraintResult::Unknown;
+
+  std::optional<int64_t> delta;
+  if (xCoeff == 1 && yCoeff == -1)
+    delta = -constant;
+  else if (xCoeff == -1 && yCoeff == 1)
+    delta = constant;
+  else
+    return DeltaConstraintResult::Unknown;
+
+  if (!setDelta(deltas, *xDim, *delta))
+    return DeltaConstraintResult::NoSolution;
+  return DeltaConstraintResult::Applied;
+}
+
+enum class DeltaRequirement {
+  Any,
+  Eq,
+  Neg,
+  Pos,
+};
+
+bool mergeRequirement(std::vector<DeltaRequirement> &requirements, size_t dim,
+                      DeltaRequirement requirement) {
+  DeltaRequirement &slot = requirements[dim];
+  if (slot == requirement)
+    return true;
+  if (slot == DeltaRequirement::Any) {
+    slot = requirement;
+    return true;
+  }
+  if (requirement == DeltaRequirement::Any)
+    return true;
+  return false;
+}
+
+bool deltaCanSatisfy(const std::optional<int64_t> &delta,
+                     DeltaRequirement requirement) {
+  if (!delta)
+    return true;
+  switch (requirement) {
+  case DeltaRequirement::Any:
+    return true;
+  case DeltaRequirement::Eq:
+    return *delta == 0;
+  case DeltaRequirement::Neg:
+    return *delta < 0;
+  case DeltaRequirement::Pos:
+    return *delta > 0;
+  }
+  return false;
+}
+
+bool hasPermutationViolationFromDeltas(const std::vector<std::optional<int64_t>> &deltas,
+                                       const std::vector<int> &permutation) {
+  const size_t depth = deltas.size();
+  for (size_t oldDiff = 0; oldDiff < depth; oldDiff++) {
+    for (size_t newDiff = 0; newDiff < depth; newDiff++) {
+      std::vector<DeltaRequirement> requirements(depth, DeltaRequirement::Any);
+      bool ok = true;
+      for (size_t d = 0; d < oldDiff; d++)
+        ok = ok && mergeRequirement(requirements, d, DeltaRequirement::Eq);
+      ok = ok && mergeRequirement(requirements, oldDiff, DeltaRequirement::Neg);
+      for (size_t p = 0; p < newDiff; p++)
+        ok = ok && mergeRequirement(requirements, permutation[p], DeltaRequirement::Eq);
+      ok = ok && mergeRequirement(requirements, permutation[newDiff], DeltaRequirement::Pos);
+      if (!ok)
+        continue;
+
+      bool satisfiable = true;
+      for (size_t d = 0; d < depth; d++) {
+        if (!deltaCanSatisfy(deltas[d], requirements[d])) {
+          satisfiable = false;
+          break;
+        }
+      }
+      if (satisfiable)
         return true;
     }
   }
@@ -845,6 +1010,146 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoopO
 
       result.queries++;
       if (hasInterchangeViolation(base, vars, kI1, kJ1, kI2, kJ2)) {
+        result.mayViolatingDependence++;
+        return result;
+      }
+      result.noViolatingDependence++;
+    }
+  }
+
+  result.safe = true;
+  return result;
+}
+
+PresburgerInterchangeResult permutationMemorySafePresburger(
+    const std::vector<const Op*> &loopOps,
+    const std::vector<const Op*> &initOps,
+    const std::vector<int> &permutation) {
+  PresburgerInterchangeResult result;
+  const size_t depth = loopOps.size();
+  if (depth == 0 || depth != initOps.size() || depth != permutation.size()) {
+    result.unknown++;
+    return result;
+  }
+
+  std::vector<CanonicalLoop> loops(depth);
+  std::vector<std::string> ivs;
+  std::vector<Expr> initExprs;
+  std::vector<Expr> boundExprs;
+  ivs.reserve(depth);
+  initExprs.reserve(depth);
+  boundExprs.reserve(depth);
+
+  for (size_t i = 0; i < depth; i++) {
+    if (!matchCanonicalLoop(loopOps[i], loops[i])) {
+      result.unknown++;
+      return result;
+    }
+    const Op *initExprOp = initValue(initOps[i]);
+    if (!initExprOp) {
+      result.unknown++;
+      return result;
+    }
+    ivs.push_back(loops[i].iv);
+    initExprs.push_back(analyzeExpr(initExprOp));
+    boundExprs.push_back(analyzeExpr(loops[i].bound));
+    if (!initExprs.back().valid || !boundExprs.back().valid) {
+      result.unknown++;
+      return result;
+    }
+  }
+
+  std::unordered_set<std::string> ivSet(ivs.begin(), ivs.end());
+  for (size_t i = 0; i < depth; i++) {
+    if (exprUsesAny(initExprs[i], ivSet) || exprUsesAny(boundExprs[i], ivSet)) {
+      result.unknown++;
+      return result;
+    }
+  }
+
+  std::vector<int> sortedPerm = permutation;
+  std::sort(sortedPerm.begin(), sortedPerm.end());
+  for (size_t i = 0; i < depth; i++) {
+    if (sortedPerm[i] != (int) i) {
+      result.unknown++;
+      return result;
+    }
+  }
+
+  std::vector<Access> accesses = collectArrayAccesses(loops.back().body);
+  if (accesses.empty()) {
+    result.safe = true;
+    return result;
+  }
+
+  std::unordered_set<std::string> params;
+  for (size_t i = 0; i < depth; i++) {
+    collectExprSymbols(initExprs[i], params);
+    collectExprSymbols(boundExprs[i], params);
+  }
+  for (const auto &access : accesses)
+    for (const auto &idx : access.indices)
+      collectExprSymbols(idx, params);
+  for (const std::string &iv : ivs)
+    params.erase(iv);
+
+  std::unordered_map<std::string, std::string> paramRenames;
+  std::vector<std::string> paramList(params.begin(), params.end());
+  std::sort(paramList.begin(), paramList.end());
+  for (const auto &sym : paramList)
+    paramRenames.emplace(sym, "__p_" + sym);
+
+  std::vector<std::string> xVars;
+  std::vector<std::string> yVars;
+  xVars.reserve(depth);
+  yVars.reserve(depth);
+  for (size_t i = 0; i < depth; i++) {
+    xVars.push_back("__x" + std::to_string(i));
+    yVars.push_back("__y" + std::to_string(i));
+  }
+
+  for (const Access &a : accesses) {
+    for (const Access &b : accesses) {
+      if (a.base != b.base)
+        continue;
+      if (!a.isStore && !b.isStore)
+        continue;
+      if (a.indices.size() != b.indices.size()) {
+        result.unknown++;
+        return result;
+      }
+
+      // First use a same-dimension dependence direction solver. It covers the
+      // common affine loop-nest cases (`A[i][j][k+c]`) without invoking the
+      // heavier feasibility engine for every access pair.
+      std::vector<std::optional<int64_t>> deltas(depth);
+      bool noSolution = false;
+
+      for (size_t dim = 0; dim < a.indices.size(); dim++) {
+        CoeffMap coeffs;
+        int64_t constant = 0;
+        addExprToCoeffsND(coeffs, constant, a.indices[dim], 1,
+                          ivs, xVars, paramRenames);
+        addExprToCoeffsND(coeffs, constant, b.indices[dim], -1,
+                          ivs, yVars, paramRenames);
+        DeltaConstraintResult applied =
+            applySameDimDeltaEquality(coeffs, constant, xVars, yVars, deltas);
+        if (applied == DeltaConstraintResult::NoSolution) {
+          noSolution = true;
+          break;
+        }
+        if (applied == DeltaConstraintResult::Unknown) {
+          result.unknown++;
+          return result;
+        }
+      }
+      if (noSolution) {
+        result.noViolatingDependence++;
+        continue;
+      }
+
+      result.queries++;
+      if (hasPermutationViolationFromDeltas(deltas, permutation)) {
         result.mayViolatingDependence++;
         return result;
       }

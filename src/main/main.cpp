@@ -369,6 +369,14 @@ int main(int argc, char **argv) {
                       << " interchange-reject-control=" << stats.interchangeRejectControl
                       << " interchange-reject-access=" << stats.interchangeRejectAccess
                       << " interchange-reject-memory=" << stats.interchangeRejectMemory
+                      << " interchange-3d-applied=" << stats.interchange3DApplied
+                      << " interchange-3d-rejected=" << stats.interchange3DRejected
+                      << " interchange-3d-reject-shape=" << stats.interchange3DRejectShape
+                      << " interchange-3d-reject-init=" << stats.interchange3DRejectInit
+                      << " interchange-3d-reject-bounds=" << stats.interchange3DRejectBounds
+                      << " interchange-3d-reject-control=" << stats.interchange3DRejectControl
+                      << " interchange-3d-reject-access=" << stats.interchange3DRejectAccess
+                      << " interchange-3d-reject-memory=" << stats.interchange3DRejectMemory
                       << " unroll-jammed=" << stats.unrollJammed
                       << " unroll-jam-rejected=" << stats.unrollJamRejected
                       << " unroll-jam-reject-shape=" << stats.unrollJamRejectShape

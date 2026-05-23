@@ -37,6 +37,15 @@ struct PolyhedralStats {
   int interchangeRejectControl = 0;
   int interchangeRejectAccess = 0;
   int interchangeRejectMemory = 0;
+  // 3D j/k loop interchange counters.
+  int interchange3DApplied = 0;
+  int interchange3DRejected = 0;
+  int interchange3DRejectShape = 0;
+  int interchange3DRejectInit = 0;
+  int interchange3DRejectBounds = 0;
+  int interchange3DRejectControl = 0;
+  int interchange3DRejectAccess = 0;
+  int interchange3DRejectMemory = 0;
   // Unroll-and-jam counters
   int unrollJammed = 0;
   int unrollJamRejected = 0;
@@ -88,6 +97,7 @@ private:
   void scanAffineNest(Op *op, PolyhedralStats &stats);
   bool tryReductionInterchange(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats);
+  bool tryLoopInterchange3D(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryLoopInterchange(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryLoopUnrollJam(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);
