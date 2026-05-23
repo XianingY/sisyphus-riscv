@@ -20,6 +20,30 @@ bool isConstInt(Op *op, int value) {
   return isa<IntOp>(op) && V(op) == value;
 }
 
+Op *stripSinglePhi(Op *op) {
+  while (op && isa<PhiOp>(op) && op->getOperandCount() == 1)
+    op = op->DEF();
+  return op;
+}
+
+int fixedTripCount(LoopInfo *info) {
+  auto lower = stripSinglePhi(info->start);
+  auto upper = stripSinglePhi(info->stop);
+  auto step = stripSinglePhi(info->step);
+  if (!lower || !upper || !step ||
+      !isa<IntOp>(lower) || !isa<IntOp>(upper) || !isa<IntOp>(step))
+    return -1;
+
+  int stepValue = V(step);
+  if (stepValue <= 0)
+    return -1;
+
+  int span = V(upper) - V(lower);
+  if (span <= 0 || span % stepValue != 0)
+    return -1;
+  return span / stepValue;
+}
+
 bool isScaleByFour(Op *op, Op *iv) {
   if (!isa<MulIOp>(op) && !isa<MulLOp>(op))
     return false;
@@ -408,6 +432,13 @@ void Vectorize::runImpl(LoopInfo *info) {
   if (!info->step || !isConstInt(info->step, 1))
     VECREJECT("non-unit loop step");
 
+  // A fixed tiny loop does not amortize RVV/NEON setup and can be handled
+  // better by scalar unrolling or straight scalar code.
+  constexpr int kMinFixedTripCount = 16;
+  int fixedTrip = fixedTripCount(info);
+  if (fixedTrip > 0 && fixedTrip < kMinFixedTripCount)
+    VECREJECT("fixed trip count too small");
+
   // Ensure no branching except for the latch.
   for (auto bb : info->getBlocks()) {
     auto term = bb->getLastOp();
@@ -490,6 +521,12 @@ void Vectorize::runImpl(LoopInfo *info) {
   // Accessed unknown places.
   if (stored.count(nullptr) || loaded.count(nullptr))
     VECREJECT("unknown memory base");
+
+  // Keep the loop vectorizer from creating more live vector loads than the
+  // current backends are prepared to schedule cheaply.
+  constexpr int kMaxVectorLoadStreams = 4;
+  if ((int) loads.size() > kMaxVectorLoadStreams)
+    VECREJECT("too many vector load streams");
 
   for (auto load : loads) {
     auto loadBase = findBase(load->DEF(0));

@@ -66,6 +66,22 @@ if ! grep -q "interchange-3d-applied=1" <<<"${interchange_3d_stats}"; then
   exit 1
 fi
 
+cross_dim_3d_stats="$("${COMPILER}" "${CASE_DIR}/interchange_3d_jk_cross_dim_disjoint.sy" -S \
+  -o "${OUT_DIR}/interchange_3d_jk_cross_dim_disjoint.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${cross_dim_3d_stats}"
+
+if ! grep -q "interchange-3d-applied=1" <<<"${cross_dim_3d_stats}"; then
+  echo "expected HIR 3D Presburger analysis to prove cross-dimensional disjointness" >&2
+  exit 1
+fi
+
+if grep -q "interchange-3d-reject-memory=[1-9]" <<<"${cross_dim_3d_stats}"; then
+  echo "unexpected HIR 3D memory rejection for cross-dimensional disjoint access" >&2
+  exit 1
+fi
+
 unsafe_3d_stats="$("${COMPILER}" "${CASE_DIR}/interchange_3d_jk_unsafe.sy" -S \
   -o "${OUT_DIR}/interchange_3d_jk_unsafe.rv.s" \
   -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"

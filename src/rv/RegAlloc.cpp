@@ -219,25 +219,6 @@ int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue) {
   return replaced;
 }
 
-int replaceSuccessorPhiInputs(BasicBlock *bb, Op *oldValue, Op *copy) {
-  int replaced = 0;
-  for (auto succ : bb->succs) {
-    for (auto phi : succ->getPhis()) {
-      for (int i = 0; i < phi->getOperandCount(); i++) {
-        if (phi->getOperand(i).defining != oldValue)
-          continue;
-        if (i >= (int) phi->getAttrs().size() || !isa<FromAttr>(phi->getAttrs()[i]))
-          continue;
-        if (FROM(phi->getAttrs()[i]) != bb)
-          continue;
-        phi->setOperand(i, copy);
-        replaced++;
-      }
-    }
-  }
-  return replaced;
-}
-
 int splitHotLiveRanges(Region *region,
                        const std::unordered_map<BasicBlock*, int> &bbWeight) {
   if (!envEnabled("SISY_RV_ENABLE_LIVE_RANGE_SPLIT", true))
@@ -246,7 +227,7 @@ int splitHotLiveRanges(Region *region,
   const int threshold =
       envInt("SISY_RV_LIVE_RANGE_SPLIT_HOT_THRESHOLD", 64, 1, 1000000000);
   const int maxSplitsPerBlock =
-      envInt("SISY_RV_LIVE_RANGE_SPLIT_MAX_PER_BLOCK", 1, 1, 256);
+      envInt("SISY_RV_LIVE_RANGE_SPLIT_MAX_PER_BLOCK", 256, 1, 256);
 
   Builder builder;
   int splits = 0;
@@ -294,7 +275,6 @@ int splitHotLiveRanges(Region *region,
       copy->setResultType(value->getResultType());
 
       int replaced = replaceUsesAfterCopy(bb, copy, value);
-      replaced += replaceSuccessorPhiInputs(bb, value, copy);
       if (replaced == 0) {
         copy->removeAllOperands();
         copy->erase();

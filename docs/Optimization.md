@@ -154,3 +154,20 @@ test-identity agnostic and should retain kill switches.
 Do not reintroduce benchmark constants, output behavior assumptions, or case
 names. When in doubt, keep the transform disabled by default or guard it with a
 clear environment switch until the legality argument is written down.
+
+## 7. Next-Gen Optimization Specifications
+
+### 7.1 Register Allocator Live-Range Splitting
+To dramatically reduce stack spilling in compute-intensive loops (e.g., matrix multiplication, transpose), Sisyphus supports backend **Live-Range Splitting (LRS)** inside `RegAlloc::runImpl`. 
+LRS isolates a long active live range spanning multiple loop boundaries by inserting copy operations at the entrances of hot basic blocks (hotness weight >= 64):
+- **Candidate Variable Selection**: Targets scalar registers (`i32`, `i64`, `f32`) that are live-in to a hot basic block, are non-constants (`!isa<LiOp>`, `!isa<LaOp>`), and are actively used inside the block.
+- **Copy Insertion & Operand Re-linking**: Inserts `MvOp` (integer) or `FmvOp` (float) copies immediately after the block's Phi nodes. All local instruction uses within the block are rewritten to reference the new copy.
+- **Liveness Recalculation**: Immediately triggers `region->updateLiveness()` post-splitting to update liveness intervals, letting downstream regalloc allocate local registers for loop copies and spill original variables strictly outside the loops.
+
+### 7.2 Presburger-based 3D Loop Dependence Direction Solver
+To verify the correctness of multidimensional loop interchanges and unroll-and-jam factor selections, Sisyphus utilizes a generalized, multi-dimensional Presburger Set analysis inside `HIRAffine.cpp`:
+- **Domain Modeling**: Builds a generalized 2D-dimensional (e.g., 6-dimensional for 3D loops) Presburger tableau mapping loop bounds and multidimensional array index equality constraints:
+  $$f_{A, m}(\vec{I}) - f_{B, m}(\vec{J}) = 0$$
+- **Direction Vector Extraction**: Iteratively intersects the base iteration set with direction hypothesis vectors $\vec{d} = (d_1, d_2, d_3)$ (where $d_k \in \{<, =, >\}$) and tests feasibility using `!set.empty()`.
+- **Legality Proving**: Proves loop interchange safety by ensuring that all swaps result in lexicographically positive dependence vectors (i.e. first non-equal element is less-than ($<$)).
+

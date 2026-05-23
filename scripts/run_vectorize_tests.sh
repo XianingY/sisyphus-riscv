@@ -40,6 +40,24 @@ if grep -q "vadd.vv" "${same_base_fasm}"; then
   exit 1
 fi
 
+tiny_trip_asm="${OUT_DIR}/rvv_loop_tiny_trip_no_vector.s"
+"${COMPILER}" "${CASE_DIR}/loop_tiny_trip_no_vector.sy" -S -o "${tiny_trip_asm}" -O1 \
+  --target=riscv --enable-experimental --disable-const-unroll --enable-loop-rotate --verify-ir
+
+if grep -q "vadd.vv" "${tiny_trip_asm}"; then
+  echo "unexpected RVV loop vectorization for tiny fixed trip count in ${tiny_trip_asm}"
+  exit 1
+fi
+
+many_live_asm="${OUT_DIR}/rvv_loop_many_live_vectors_no_vector.s"
+"${COMPILER}" "${CASE_DIR}/loop_many_live_vectors_no_vector.sy" -S \
+  -o "${many_live_asm}" -O1 --target=riscv --enable-experimental --enable-loop-rotate --verify-ir
+
+if grep -q "vadd.vv" "${many_live_asm}"; then
+  echo "unexpected RVV loop vectorization for excessive live vector pressure in ${many_live_asm}"
+  exit 1
+fi
+
 fasm="${OUT_DIR}/rvv_fadd_loop.s"
 "${COMPILER}" "${CASE_DIR}/rvv_fadd_loop.sy" -S -o "${fasm}" -O1 --target=riscv --enable-experimental --verify-ir
 

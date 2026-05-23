@@ -34,4 +34,9 @@ if ! grep -A5 '^rv-regalloc:$' <<<"${split_stats}" | grep -Eq 'live-range-splits
   exit 1
 fi
 
+if ! grep -A5 '^rv-regalloc:$' <<<"${split_stats}" | grep -Eq 'live-range-splits : ([3-9]|[1-9][0-9]+)'; then
+  echo "expected RV regalloc to split all hot live-in scalar values, not only one per block" >&2
+  exit 1
+fi
+
 echo "RV register-allocation loop hotness tests passed."

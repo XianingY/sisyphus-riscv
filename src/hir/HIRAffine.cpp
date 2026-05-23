@@ -3,6 +3,7 @@
 #include "../utils/presburger/BasicSet.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -455,6 +456,24 @@ bool addConstraint(pres::BasicSet &set, const VarOrder &vars,
   return true;
 }
 
+bool addAffineGeZeroConstraint(pres::BasicSet &set, const VarOrder &vars,
+                               const CoeffMap &coeffs, int64_t constant) {
+  CoeffMap negated;
+  for (const auto &[sym, coeff] : coeffs)
+    negated[sym] = -coeff;
+  return addConstraint(set, vars, negated, constant);
+}
+
+bool addAffineEqZeroConstraint(pres::BasicSet &set, const VarOrder &vars,
+                               const CoeffMap &coeffs, int64_t constant) {
+  if (!addConstraint(set, vars, coeffs, -constant))
+    return false;
+  CoeffMap negated;
+  for (const auto &[sym, coeff] : coeffs)
+    negated[sym] = -coeff;
+  return addConstraint(set, vars, negated, constant);
+}
+
 void collectExprSymbols(const Expr &expr, std::unordered_set<std::string> &out) {
   if (!expr.valid)
     return;
@@ -710,6 +729,113 @@ bool hasPermutationViolationFromDeltas(const std::vector<std::optional<int64_t>>
     }
   }
   return false;
+}
+
+enum class DependenceDirection {
+  Less,
+  Equal,
+  Greater,
+};
+
+bool lexicographicallyPositiveOrEqual(const std::vector<DependenceDirection> &dirs) {
+  for (DependenceDirection dir : dirs) {
+    if (dir == DependenceDirection::Less)
+      return true;
+    if (dir == DependenceDirection::Greater)
+      return false;
+  }
+  return true;
+}
+
+bool lexicographicallyNegative(const std::vector<DependenceDirection> &dirs) {
+  for (DependenceDirection dir : dirs) {
+    if (dir == DependenceDirection::Greater)
+      return true;
+    if (dir == DependenceDirection::Less)
+      return false;
+  }
+  return false;
+}
+
+std::vector<DependenceDirection> permuteDirections(
+    const std::vector<DependenceDirection> &dirs,
+    const std::vector<int> &permutation) {
+  std::vector<DependenceDirection> mapped;
+  mapped.reserve(permutation.size());
+  for (int oldDim : permutation)
+    mapped.push_back(dirs[oldDim]);
+  return mapped;
+}
+
+bool addDirectionConstraints(pres::BasicSet &set, const VarOrder &vars,
+                             const std::string &xVar,
+                             const std::string &yVar,
+                             DependenceDirection dir) {
+  CoeffMap coeffs;
+  switch (dir) {
+  case DependenceDirection::Less:
+    coeffs[xVar] = 1;
+    coeffs[yVar] = -1;
+    return addConstraint(set, vars, coeffs, -1);
+  case DependenceDirection::Equal:
+    coeffs[xVar] = 1;
+    coeffs[yVar] = -1;
+    if (!addConstraint(set, vars, coeffs, 0))
+      return false;
+    coeffs.clear();
+    coeffs[xVar] = -1;
+    coeffs[yVar] = 1;
+    return addConstraint(set, vars, coeffs, 0);
+  case DependenceDirection::Greater:
+    coeffs[xVar] = -1;
+    coeffs[yVar] = 1;
+    return addConstraint(set, vars, coeffs, -1);
+  }
+  return false;
+}
+
+bool hasPermutationViolationByDirections(const pres::BasicSet &base,
+                                         const VarOrder &vars,
+                                         const std::vector<std::string> &xVars,
+                                         const std::vector<std::string> &yVars,
+                                         const std::vector<int> &permutation,
+                                         bool &unknown) {
+  const size_t depth = xVars.size();
+  std::vector<DependenceDirection> dirs(depth, DependenceDirection::Equal);
+  const DependenceDirection choices[] = {
+      DependenceDirection::Less,
+      DependenceDirection::Equal,
+      DependenceDirection::Greater,
+  };
+
+  std::function<bool(size_t)> search = [&](size_t dim) -> bool {
+    if (dim == depth) {
+      if (!lexicographicallyPositiveOrEqual(dirs))
+        return false;
+      if (!lexicographicallyNegative(permuteDirections(dirs, permutation)))
+        return false;
+
+      pres::BasicSet test = base;
+      for (size_t i = 0; i < depth; i++) {
+        if (!addDirectionConstraints(test, vars, xVars[i], yVars[i], dirs[i])) {
+          unknown = true;
+          return false;
+        }
+      }
+      return !test.empty();
+    }
+
+    for (DependenceDirection choice : choices) {
+      dirs[dim] = choice;
+      if (search(dim + 1))
+        return true;
+      if (unknown)
+        return false;
+    }
+    return false;
+  };
+
+  return search(0);
 }
 
 }  // namespace
@@ -1108,6 +1234,32 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
     yVars.push_back("__y" + std::to_string(i));
   }
 
+  VarOrder vars;
+  for (const std::string &var : xVars)
+    vars.add(var);
+  for (const std::string &var : yVars)
+    vars.add(var);
+  for (const auto &sym : paramList)
+    vars.add(paramRenames.at(sym));
+
+  auto addBounds = [&](pres::BasicSet &set, size_t dim,
+                       const std::vector<std::string> &iterVars) -> bool {
+    CoeffMap coeffs;
+    int64_t constant = 0;
+    coeffs[iterVars[dim]] = 1;
+    addExprToCoeffsND(coeffs, constant, initExprs[dim], -1,
+                      ivs, iterVars, paramRenames);
+    if (!addAffineGeZeroConstraint(set, vars, coeffs, constant))
+      return false;
+
+    coeffs.clear();
+    constant = -1;
+    coeffs[iterVars[dim]] = -1;
+    addExprToCoeffsND(coeffs, constant, boundExprs[dim], 1,
+                      ivs, iterVars, paramRenames);
+    return addAffineGeZeroConstraint(set, vars, coeffs, constant);
+  };
+
   for (const Access &a : accesses) {
     for (const Access &b : accesses) {
       if (a.base != b.base)
@@ -1119,12 +1271,17 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
         return result;
       }
 
-      // First use a same-dimension dependence direction solver. It covers the
-      // common affine loop-nest cases (`A[i][j][k+c]`) without invoking the
-      // heavier feasibility engine for every access pair.
+      pres::BasicSet base;
+      for (size_t dim = 0; dim < depth; dim++) {
+        if (!addBounds(base, dim, xVars) || !addBounds(base, dim, yVars)) {
+          result.unknown++;
+          return result;
+        }
+      }
+
       std::vector<std::optional<int64_t>> deltas(depth);
       bool noSolution = false;
-
+      bool deltaUnknown = false;
       for (size_t dim = 0; dim < a.indices.size(); dim++) {
         CoeffMap coeffs;
         int64_t constant = 0;
@@ -1138,7 +1295,9 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
           noSolution = true;
           break;
         }
-        if (applied == DeltaConstraintResult::Unknown) {
+        if (applied == DeltaConstraintResult::Unknown)
+          deltaUnknown = true;
+        if (!addAffineEqZeroConstraint(base, vars, coeffs, constant)) {
           result.unknown++;
           return result;
         }
@@ -1149,11 +1308,37 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
       }
 
       result.queries++;
-      if (hasPermutationViolationFromDeltas(deltas, permutation)) {
+      if (!deltaUnknown) {
+        if (hasPermutationViolationFromDeltas(deltas, permutation)) {
+          result.mayViolatingDependence++;
+          return result;
+        }
+        result.noViolatingDependence++;
+        continue;
+      }
+
+      pres::BasicSet overlap = base;
+      if (overlap.empty()) {
+        result.noViolatingDependence++;
+        continue;
+      }
+
+      bool unknown = false;
+      if (hasPermutationViolationByDirections(base, vars, xVars, yVars,
+                                              permutation, unknown)) {
         result.mayViolatingDependence++;
         return result;
       }
-      result.noViolatingDependence++;
+      if (unknown) {
+        result.unknown++;
+        return result;
+      }
+      // Cross-dimensional overlapping dependences are rare in the target
+      // matmul-like nests. If the Presburger set proves overlap but no
+      // violating vector through the lightweight direction probe, stay
+      // conservative rather than risking an illegal permutation.
+      result.mayViolatingDependence++;
+      return result;
     }
   }
 
