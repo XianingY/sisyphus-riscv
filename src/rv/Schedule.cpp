@@ -126,6 +126,8 @@ namespace sys { namespace rv {
 std::map<std::string, int> Schedule::stats() {
   return {
     { "reordered", reordered },
+    { "critical-path-nodes", criticalPathNodes },
+    { "critical-path-max-height", criticalPathMaxHeight },
   };
 }
 
@@ -238,6 +240,9 @@ void Schedule::runImpl(BasicBlock *bb) {
   for (auto op : orderedSchedulable) {
     computeHeight(op);
   }
+  criticalPathNodes += (int) height.size();
+  for (auto &[_, h] : height)
+    criticalPathMaxHeight = std::max(criticalPathMaxHeight, h);
 
   // Initialize ready list with degree-0 ops.
   std::list<Op*> ready;

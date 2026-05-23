@@ -1,0 +1,19 @@
+int a[8];
+
+int main() {
+  int i;
+  int sum;
+  int x;
+  int y;
+  int z;
+  i = 0;
+  sum = 0;
+  while (i < 8) {
+    x = a[i];
+    y = x * x;
+    z = y / 3;
+    sum = sum + z;
+    i = i + 1;
+  }
+  return sum;
+}

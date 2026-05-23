@@ -48,6 +48,8 @@ public:
 // while respecting register-pressure constraints.
 class Schedule : public Pass {
   int reordered = 0;
+  int criticalPathNodes = 0;
+  int criticalPathMaxHeight = 0;
 
   void runImpl(BasicBlock *bb);
 public:
