@@ -114,6 +114,21 @@ public:
   void run() override;
 };
 
+// Sparse conditional constant propagation over SSA values and executable CFG
+// edges. It folds integer constants and branches before cleanup removes the
+// now-unreachable blocks.
+class SCCP : public Pass {
+  int replacedValues = 0;
+  int foldedBranches = 0;
+  int executableBlocks = 0;
+public:
+  SCCP(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "sccp"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class Reassociate : public Pass {
   void runImpl(Region *region);
 public:

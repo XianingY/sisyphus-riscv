@@ -61,4 +61,8 @@ if(BUILD_TESTING)
     NAME regalloc_hotness_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_regalloc_hotness_tests.sh"
   )
+  add_test(
+    NAME deep_optimization_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_deep_optimization_tests.sh"
+  )
 endif()

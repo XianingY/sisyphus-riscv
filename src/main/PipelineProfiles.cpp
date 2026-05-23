@@ -96,6 +96,11 @@ void appendCoreO0(sys::PassManager &pm) {
 
   pm.addPass<sys::FlattenCFG>();
   pm.addPass<sys::Mem2Reg>();
+  if (getenvEnabled("SISY_ENABLE_SCCP", true)) {
+    pm.addPass<sys::SCCP>();
+    pm.addPass<sys::DCE>();
+    pm.addPass<sys::SimplifyCFG>();
+  }
   pm.addPass<sys::RegularFold>();
   pm.addPass<sys::DCE>();
   pm.addPass<sys::SimplifyCFG>();
@@ -183,6 +188,11 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
 
     pm.addPass<sys::Mem2Reg>();
+    if (getenvEnabled("SISY_ENABLE_SCCP", true)) {
+      pm.addPass<sys::SCCP>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
