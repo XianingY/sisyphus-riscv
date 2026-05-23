@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using namespace sys;
 using namespace sys::rv;
@@ -18,6 +20,17 @@ bool envEnabled(const char *name, bool fallback = true) {
   if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
     return false;
   return true;
+}
+
+int envInt(const char *name, int fallback, int minValue, int maxValue) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  char *end = nullptr;
+  long parsed = std::strtol(v, &end, 10);
+  if ((end && *end) || parsed < minValue || parsed > maxValue)
+    return fallback;
+  return (int) parsed;
 }
 
 class SpilledRdAttr : public AttrImpl<SpilledRdAttr, RVLINE + 2097152> {
@@ -159,6 +172,143 @@ bool shareRegClass(Value::Type t1, Value::Type t2) {
   return false;
 }
 
+bool splitCandidateType(Value::Type ty) {
+  return ty == Value::i32 || ty == Value::i64 || ty == Value::f32;
+}
+
+bool splitCandidateValue(Op *op) {
+  if (!op)
+    return false;
+  if (!splitCandidateType(op->getResultType()))
+    return false;
+  if (isa<PlaceHolderOp>(op) || isa<JOp>(op) || isa<RetOp>(op) ||
+      isa<BranchOp>(op) || isa<WriteRegOp>(op) || isa<sys::rv::CallOp>(op))
+    return false;
+  // Constants and labels are cheap to rematerialize at their use sites; splitting
+  // them only creates extra copy pressure.
+  if (isa<LiOp>(op) || isa<LaOp>(op))
+    return false;
+  return true;
+}
+
+bool blockHasCall(BasicBlock *bb) {
+  for (auto *op : bb->getOps())
+    if (isa<sys::rv::CallOp>(op))
+      return true;
+  return false;
+}
+
+Op *firstNonPhi(BasicBlock *bb) {
+  for (auto op : bb->getOps())
+    if (!isa<PhiOp>(op))
+      return op;
+  return nullptr;
+}
+
+int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue) {
+  int replaced = 0;
+  (void) bb;
+  for (auto op = copy->nextOp(); op; op = op->nextOp()) {
+    for (int i = 0; i < op->getOperandCount(); i++) {
+      if (op->getOperand(i).defining != oldValue)
+        continue;
+      op->setOperand(i, copy);
+      replaced++;
+    }
+  }
+  return replaced;
+}
+
+int replaceSuccessorPhiInputs(BasicBlock *bb, Op *oldValue, Op *copy) {
+  int replaced = 0;
+  for (auto succ : bb->succs) {
+    for (auto phi : succ->getPhis()) {
+      for (int i = 0; i < phi->getOperandCount(); i++) {
+        if (phi->getOperand(i).defining != oldValue)
+          continue;
+        if (i >= (int) phi->getAttrs().size() || !isa<FromAttr>(phi->getAttrs()[i]))
+          continue;
+        if (FROM(phi->getAttrs()[i]) != bb)
+          continue;
+        phi->setOperand(i, copy);
+        replaced++;
+      }
+    }
+  }
+  return replaced;
+}
+
+int splitHotLiveRanges(Region *region,
+                       const std::unordered_map<BasicBlock*, int> &bbWeight) {
+  if (!envEnabled("SISY_RV_ENABLE_LIVE_RANGE_SPLIT", true))
+    return 0;
+
+  const int threshold =
+      envInt("SISY_RV_LIVE_RANGE_SPLIT_HOT_THRESHOLD", 64, 1, 1000000000);
+  const int maxSplitsPerBlock =
+      envInt("SISY_RV_LIVE_RANGE_SPLIT_MAX_PER_BLOCK", 1, 1, 256);
+
+  Builder builder;
+  int splits = 0;
+
+  for (auto bb : region->getBlocks()) {
+    auto weightIt = bbWeight.find(bb);
+    int weight = weightIt == bbWeight.end() ? 1 : weightIt->second;
+    if (weight < threshold || bb->getOpCount() == 0)
+      continue;
+    if (envEnabled("SISY_RV_LIVE_RANGE_SPLIT_REQUIRE_CALL", true) &&
+        !blockHasCall(bb))
+      continue;
+
+    Op *insertBefore = firstNonPhi(bb);
+    if (!insertBefore || isa<JOp>(insertBefore) || isa<RetOp>(insertBefore))
+      continue;
+
+    std::vector<Op*> liveIns;
+    liveIns.reserve(bb->getLiveIn().size());
+    for (auto value : bb->getLiveIn()) {
+      if (!splitCandidateValue(value))
+        continue;
+      if (value->getParent() == bb)
+        continue;
+      liveIns.push_back(value);
+    }
+
+    std::sort(liveIns.begin(), liveIns.end(), [&](Op *a, Op *b) {
+      if (a->getUses().size() != b->getUses().size())
+        return a->getUses().size() > b->getUses().size();
+      return a < b;
+    });
+
+    int blockSplits = 0;
+    for (auto value : liveIns) {
+      if (blockSplits >= maxSplitsPerBlock)
+        break;
+
+      builder.setBeforeOp(insertBefore);
+      Op *copy = nullptr;
+      if (value->getResultType() == Value::f32)
+        copy = builder.create<FmvOp>({ value });
+      else
+        copy = builder.create<MvOp>({ value });
+      copy->setResultType(value->getResultType());
+
+      int replaced = replaceUsesAfterCopy(bb, copy, value);
+      replaced += replaceSuccessorPhiInputs(bb, value, copy);
+      if (replaced == 0) {
+        copy->removeAllOperands();
+        copy->erase();
+        continue;
+      }
+
+      splits++;
+      blockSplits++;
+    }
+  }
+
+  return splits;
+}
+
 }
 
 std::map<std::string, int> RegAlloc::stats() {
@@ -166,6 +316,7 @@ std::map<std::string, int> RegAlloc::stats() {
     { "spilled", spilled },
     { "peepholed", convertedTotal },
     { "max-block-hotness", maxBlockHotness },
+    { "live-range-splits", liveRangeSplits },
   };
 }
 
@@ -351,6 +502,12 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   });
   for (auto &[_, weight] : bbWeight)
     maxBlockHotness = std::max(maxBlockHotness, weight);
+
+  int splits = localFastMode ? 0 : splitHotLiveRanges(region, bbWeight);
+  if (splits) {
+    liveRangeSplits += splits;
+    region->updateLiveness();
+  }
 
   std::unordered_map<Op*, int> spillOffset;
   int currentOffset = STACKOFF(funcOp);
@@ -818,6 +975,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(FcvtswOp, UNARY);
   LOWER(FcvtwsRtzOp, UNARY);
   LOWER(FmvwxOp, UNARY);
+  LOWER(MvOp, UNARY);
+  LOWER(FmvOp, UNARY);
 
   // Note that some ops are dealt with later.
   // We can't remove all operands here.
