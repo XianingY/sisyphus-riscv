@@ -1,4 +1,6 @@
 #include "LoopPasses.h"
+#include "Passes.h"
+#include "CleanupPasses.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -18,7 +20,10 @@ using namespace sys;
 std::map<std::string, int> ScalarReplace::stats() {
     return {
         {"detected", detected},
-        {"promoted", promoted}
+        {"promoted", promoted},
+        {"arrays-scalarized", arraysScalarized},
+        {"array-elements", arrayElements},
+        {"array-accesses", arrayAccesses}
     };
 }
 
@@ -31,6 +36,124 @@ struct ScalarCandidate {
     std::vector<Op*> loads;      // All LoadOps using this address in the loop
     std::vector<Op*> stores;     // All StoreOps to this address in the loop
 };
+
+struct ArrayElementAccess {
+    Op *op = nullptr;
+    bool store = false;
+    int offset = 0;
+    size_t size = 4;
+};
+
+int getenvInt(const char *name, int fallback, int minValue, int maxValue) {
+    const char *raw = std::getenv(name);
+    if (!raw || !raw[0])
+        return fallback;
+    char *end = nullptr;
+    long value = std::strtol(raw, &end, 10);
+    if ((end && *end) || value < minValue || value > maxValue)
+        return fallback;
+    return (int) value;
+}
+
+size_t memSize(Op *op) {
+    auto *size = op->find<SizeAttr>();
+    return size ? size->value : 4;
+}
+
+bool constantOffsetFromBase(Op *addr, Op *base, int &offset,
+                            std::unordered_set<Op*> &visiting) {
+    if (!addr || !base)
+        return false;
+    if (addr == base) {
+        offset = 0;
+        return true;
+    }
+    if (visiting.count(addr))
+        return false;
+    visiting.insert(addr);
+
+    auto tryAdd = [&](Op *lhs, Op *rhs) -> bool {
+        if (!isa<IntOp>(lhs))
+            return false;
+        int rhsOffset = 0;
+        if (!constantOffsetFromBase(rhs, base, rhsOffset, visiting))
+            return false;
+        offset = rhsOffset + V(lhs);
+        return true;
+    };
+
+    bool ok = false;
+    if ((isa<AddLOp>(addr) || isa<AddIOp>(addr)) && addr->getOperandCount() == 2) {
+        ok = tryAdd(addr->DEF(0), addr->DEF(1)) ||
+             tryAdd(addr->DEF(1), addr->DEF(0));
+    }
+
+    visiting.erase(addr);
+    return ok;
+}
+
+bool constantOffsetFromBase(Op *addr, Op *base, int &offset) {
+    std::unordered_set<Op*> visiting;
+    return constantOffsetFromBase(addr, base, offset, visiting);
+}
+
+bool valueEscapesArray(Op *value, Op *base) {
+    int ignored = 0;
+    return constantOffsetFromBase(value, base, ignored);
+}
+
+bool collectArrayElementAccesses(Op *addr, Op *base,
+                                 std::vector<ArrayElementAccess> &accesses,
+                                 std::unordered_set<Op*> &seen) {
+    if (!seen.insert(addr).second)
+        return true;
+
+    int offset = 0;
+    if (!constantOffsetFromBase(addr, base, offset))
+        return false;
+
+    for (auto *use : addr->getUses()) {
+        if (isa<AddLOp>(use) || isa<AddIOp>(use)) {
+            int childOffset = 0;
+            if (!constantOffsetFromBase(use, base, childOffset))
+                return false;
+            if (!collectArrayElementAccesses(use, base, accesses, seen))
+                return false;
+            continue;
+        }
+
+        if (auto *load = dyn_cast<LoadOp>(use)) {
+            if (load->getOperandCount() != 1 || load->DEF(0) != addr)
+                return false;
+            // A pointer-typed load means a partial array address escaped.
+            if (load->getResultType() == Value::i64)
+                return false;
+            size_t size = memSize(load);
+            if (size == 0 || size > 4)
+                return false;
+            accesses.push_back({load, false, offset, size});
+            continue;
+        }
+
+        if (auto *store = dyn_cast<StoreOp>(use)) {
+            if (store->getOperandCount() < 2)
+                return false;
+            if (store->DEF(0) == addr || valueEscapesArray(store->DEF(0), base))
+                return false;
+            if (store->DEF(1) != addr)
+                return false;
+            size_t size = memSize(store);
+            if (size == 0 || size > 4)
+                return false;
+            accesses.push_back({store, true, offset, size});
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
 
 // Check if an operation is loop-invariant with respect to the given loop.
 // An op is loop-invariant if:
@@ -353,6 +476,61 @@ void promoteCandidate(const ScalarCandidate &candidate, LoopInfo *info) {
 
 } // anonymous namespace
 
+void ScalarReplace::runArrayScalarization(FuncOp *func) {
+    const int maxBytes =
+        getenvInt("SISY_SCALAR_REPLACE_MAX_ARRAY_BYTES", 64, 4, 4096);
+    auto *region = func->getRegion();
+    Builder builder;
+
+    auto allocas = func->findAll<AllocaOp>();
+    for (auto *alloca : allocas) {
+        if (!alloca->has<DimensionAttr>())
+            continue;
+        int bytes = (int) SIZE(alloca);
+        if (bytes <= 0 || bytes > maxBytes || bytes % 4 != 0)
+            continue;
+
+        std::vector<ArrayElementAccess> accesses;
+        std::unordered_set<Op*> seen;
+        if (!collectArrayElementAccesses(alloca, alloca, accesses, seen))
+            continue;
+        if (accesses.empty())
+            continue;
+
+        bool valid = true;
+        for (const auto &access : accesses) {
+            if (access.offset < 0 || access.offset + (int) access.size > bytes ||
+                access.offset % 4 != 0) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+            continue;
+
+        const int elems = bytes / 4;
+        std::vector<Op*> scalarSlots(elems, nullptr);
+        builder.setBeforeOp(alloca);
+        for (int i = 0; i < elems; i++) {
+            auto *slot = builder.create<AllocaOp>({ new SizeAttr(4) });
+            if (alloca->has<FPAttr>())
+                slot->add<FPAttr>();
+            scalarSlots[i] = slot;
+        }
+
+        for (const auto &access : accesses) {
+            Op *slot = scalarSlots[access.offset / 4];
+            access.op->setOperand(access.store ? 1 : 0, slot);
+            arrayAccesses++;
+        }
+
+        arraysScalarized++;
+        arrayElements += elems;
+    }
+
+    region->updatePreds();
+}
+
 void ScalarReplace::runImpl(LoopInfo *info) {
     // Process subloops first (innermost-first order).
     for (auto *sub : info->subloops)
@@ -391,6 +569,16 @@ void ScalarReplace::run() {
     const char *env = std::getenv("SISY_ENABLE_SCALAR_REPLACE");
     if (env && env[0] && (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0))
         return;
+
+    int arraysBefore = arraysScalarized;
+    for (auto func : collectFuncs())
+        runArrayScalarization(func);
+    if (arraysScalarized != arraysBefore) {
+        Mem2Reg promote(module);
+        promote.run();
+        DCE cleanup(module);
+        cleanup.run();
+    }
 
     LoopAnalysis analysis(module);
     analysis.run();

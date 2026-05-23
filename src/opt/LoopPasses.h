@@ -261,8 +261,12 @@ public:
 class ScalarReplace : public Pass {
   int detected = 0;
   int promoted = 0;
+  int arraysScalarized = 0;
+  int arrayElements = 0;
+  int arrayAccesses = 0;
 
   void runImpl(LoopInfo *info);
+  void runArrayScalarization(FuncOp *func);
 public:
   ScalarReplace(ModuleOp *module): Pass(module) {}
 
