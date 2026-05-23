@@ -1,6 +1,10 @@
 #include "LowerPasses.h"
 #include "Analysis.h"
+#include <climits>
+#include <list>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using namespace sys;
 
@@ -20,29 +24,47 @@ void InstSchedule::runImpl(BasicBlock *bb) {
       return;
   }
 
-  // First, we need to build a dependence graph between loads/stores.
-  std::vector<Op*> stores, loads;
+  auto term = bb->getLastOp();
+
+  std::vector<Op*> allowedOrder;
+  std::unordered_set<Op*> allowed;
   for (auto op : bb->getOps()) {
+    if (op == term || isa<PhiOp>(op))
+      continue;
+    allowedOrder.push_back(op);
+    allowed.insert(op);
+  }
+  if (allowedOrder.empty())
+    return;
+
+  // First, we need to build a dependence graph between loads/stores.
+  // Keep memory dependencies in a side table. Mutating load/store operands for
+  // scheduling is fragile: if the scheduler cannot order a block, the IR is
+  // left with artificial operands and later passes see malformed SSA.
+  std::vector<Op*> stores, loads;
+  std::unordered_map<Op*, std::vector<Op*>> memDeps;
+  for (auto op : allowedOrder) {
     // Check against store, but no need to check loads.
     if (isa<LoadOp>(op)) {
       for (auto store : stores) {
         if (mayAlias(op->DEF(), store->DEF(1)))
-          op->pushOperand(store);
+          memDeps[op].push_back(store);
       }
 
       loads.push_back(op);
+      continue;
     }
 
     // Check both stores and loads.
     if (isa<StoreOp>(op)) {
       for (auto store : stores) {
         if (mayAlias(op->DEF(1), store->DEF(1)))
-          op->pushOperand(store);
+          memDeps[op].push_back(store);
       }
 
       for (auto load : loads) {
         if (mayAlias(op->DEF(1), load->DEF()))
-          op->pushOperand(load);
+          memDeps[op].push_back(load);
       }
 
       stores.push_back(op);
@@ -53,6 +75,7 @@ void InstSchedule::runImpl(BasicBlock *bb) {
 
   // The amount of ops that this one is waiting for.
   std::unordered_map<Op*, int> degree;
+  std::unordered_map<Op*, std::vector<Op*>> users;
   std::unordered_map<Op*, int> time;
   int index = 0;
 
@@ -78,22 +101,17 @@ void InstSchedule::runImpl(BasicBlock *bb) {
     for (int i = 0; i < op->getOperandCount(); i++) {
       auto def = op->DEF(i);
 
-      // In case the operation itself is a load/store, they're added with some extra operands.
-      // We don't need to take them into account.
-      if (isa<LoadOp>(op) && i >= 1)
-        break;
-      if (isa<StoreOp>(op) && i >= 2)
-        break;
-      
       // Wait 2 instructions for load.
-      if (isa<LoadOp>(def) && index - time[def] <= 2) {
+      auto defTime = time.find(def);
+      if (defTime != time.end() && isa<LoadOp>(def) && index - defTime->second <= 2) {
         result--;
       }
 
       // Keep a small gap after integer multiplies when another ready op can
       // fill it. This is a scheduling heuristic only; dependencies still
       // control correctness.
-      if ((isa<MulIOp>(def) || isa<MulLOp>(def)) && index - time[def] <= 3) {
+      if (defTime != time.end() && (isa<MulIOp>(def) || isa<MulLOp>(def)) &&
+          index - defTime->second <= 3) {
         result--;
       }
     }
@@ -110,32 +128,35 @@ void InstSchedule::runImpl(BasicBlock *bb) {
     for (auto operand : op->getOperands()) {
       auto def = operand.defining;
       // If the operand is live-in, then no need.
-      if (time[def])
-        result = std::max(result, (index - time[def]) / 3);
+      auto defTime = time.find(def);
+      if (defTime != time.end())
+        result = std::max(result, (index - defTime->second) / 3);
     }
     return result;
   };
   // The priority queue pops the LARGEST element by default.
   std::list<Op*> ready;
-  std::unordered_set<Op*> allowed;
 
-  for (auto op : bb->getOps()) {
+  for (auto op : allowedOrder) {
+    std::unordered_set<Op*> preds;
     for (auto operand : op->getOperands()) {
       auto def = operand.defining;
-      if (!bb->getLiveIn().count(def))
-        ++degree[op];
+      if (def && allowed.count(def))
+        preds.insert(def);
     }
+    for (auto pred : memDeps[op]) {
+      if (pred && allowed.count(pred))
+        preds.insert(pred);
+    }
+    degree[op] = (int) preds.size();
+    for (auto pred : preds)
+      users[pred].push_back(op);
+    if (!degree[op])
+      ready.push_back(op);
   }
 
-  auto term = bb->getLastOp();
-  for (auto op : bb->getOps()) {
-    if (op != term && !isa<PhiOp>(op)) {
-      allowed.insert(op);
-      if (!degree[op])
-        ready.push_back(op);
-    }
-  }
-
+  std::vector<Op*> newOrder;
+  newOrder.reserve(allowedOrder.size());
   while (!ready.empty()) {
     // Find the best element.
     decltype(ready)::iterator it;
@@ -150,36 +171,30 @@ void InstSchedule::runImpl(BasicBlock *bb) {
     Op *op = *it;
     ready.erase(it);
 
-    op->moveBefore(term);
+    newOrder.push_back(op);
     time[op] = index++;
 
-    for (auto use : op->getUses()) {
-      // It's possible that a single operation refers to the same op more than once.
-      for (auto operand : use->getOperands()) {
-        if (operand.defining == op)
-          --degree[use];
-      }
-      
-      if (!degree[use] && allowed.count(use))
+    for (auto use : users[op]) {
+      if (--degree[use] == 0)
         ready.push_back(use);
     }
   }
-  assert(index == allowed.size());
 
-  // Don't forget to erase the introduced operands.
-  for (auto load : loads) {
-    auto addr = load->getOperand();
-    load->removeAllOperands();
-    load->pushOperand(addr);
-  }
+  if (newOrder.size() != allowedOrder.size())
+    return;
 
-  for (auto store : stores) {
-    auto value = store->getOperand(0);
-    auto addr = store->getOperand(1);
-    store->removeAllOperands();
-    store->pushOperand(value);
-    store->pushOperand(addr);
+  bool changed = false;
+  for (size_t i = 0; i < newOrder.size(); i++) {
+    if (newOrder[i] != allowedOrder[i]) {
+      changed = true;
+      break;
+    }
   }
+  if (!changed)
+    return;
+
+  for (auto op : newOrder)
+    op->moveBefore(term);
 }
 
 void InstSchedule::run() {
