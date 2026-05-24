@@ -110,6 +110,30 @@ bool pureHoistable(Op *op) {
          isa<XorIOp>(op) || isa<LoadOp>(op);
 }
 
+bool pureConditionHoistable(Op *op) {
+  return isa<IntOp>(op) || isa<AddIOp>(op) || isa<SubIOp>(op) ||
+         isa<MulIOp>(op) || isa<DivIOp>(op) || isa<ModIOp>(op) ||
+         isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+         isa<EqOp>(op) || isa<NeOp>(op) || isa<LtOp>(op) ||
+         isa<LeOp>(op);
+}
+
+bool collectConditionDeps(Op *op, BasicBlock *bb, std::vector<Op*> &out,
+                          std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return true;
+  seen.insert(op);
+  if (op->getParent() != bb)
+    return true;
+  if (!pureConditionHoistable(op))
+    return false;
+  for (auto operand : op->getOperands())
+    if (!collectConditionDeps(operand.defining, bb, out, seen))
+      return false;
+  out.push_back(op);
+  return true;
+}
+
 bool shortPureBlock(BasicBlock *bb) {
   if (!bb || !isa<GotoOp>(bb->getLastOp()))
     return false;
@@ -353,7 +377,16 @@ bool convertNestedShortCircuit(BranchOp *branch) {
   if (moving.empty() || moving.size() > 12)
     return false;
 
+  std::vector<Op*> condMoving;
+  std::set<Op*> condSeen;
+  if (!collectConditionDeps(innerCond, testBlock, condMoving, condSeen))
+    return false;
+  if (moving.size() + condMoving.size() > 20)
+    return false;
+
   for (auto op : moving)
+    op->moveBefore(branch);
+  for (auto op : condMoving)
     op->moveBefore(branch);
 
   Builder builder;
