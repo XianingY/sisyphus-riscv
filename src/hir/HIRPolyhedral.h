@@ -81,6 +81,12 @@ struct PolyhedralStats {
   int affineNestPerfect2D = 0;
   int affineNestPerfect3D = 0;
   int matmulLikeCandidates = 0;
+  // Stencil/conv-like boundary dispatch. This keeps the original boundary
+  // guarded body as fallback and exposes an unchecked interior body.
+  int stencilInteriorDispatched = 0;
+  int stencilInteriorRejected = 0;
+  int stencilInteriorRejectShape = 0;
+  int stencilInteriorRejectBounds = 0;
 };
 
 class PolyhedralOptimizer {
@@ -108,6 +114,7 @@ private:
   // Loop fusion: merge two adjacent loops with identical bounds over same arrays.
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
+  bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
 };
 
 }  // namespace sys::hir

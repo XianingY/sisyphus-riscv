@@ -219,6 +219,22 @@ std::unique_ptr<Op> makeWhile(std::unique_ptr<Op> cond, std::unique_ptr<Op> body
   return op;
 }
 
+std::unique_ptr<Op> makeIf(std::unique_ptr<Op> cond,
+                           std::unique_ptr<Op> thenBlock,
+                           std::unique_ptr<Op> elseBlock) {
+  auto op = std::make_unique<Op>(OpKind::If);
+  op->children.push_back(std::move(cond));
+  op->children.push_back(std::move(thenBlock));
+  if (elseBlock)
+    op->children.push_back(std::move(elseBlock));
+  return op;
+}
+
+std::unique_ptr<Op> makeLogicalAnd(std::unique_ptr<Op> lhs,
+                                   std::unique_ptr<Op> rhs) {
+  return makeArith("&&", std::move(lhs), std::move(rhs));
+}
+
 std::unique_ptr<Op> makeIndexWithOffset(const std::string &iv, int offset) {
   if (offset == 0)
     return makeLoad(iv);
@@ -231,6 +247,13 @@ bool isScalarLoad(const Op *op, const std::string &symbol) {
 
 bool isConstIntValue(const Op *op, long long value) {
   return op && op->kind == OpKind::ConstInt && op->hasIntValue && op->intValue == value;
+}
+
+bool isScalarLoadAny(const Op *op, std::string &symbol) {
+  if (!op || op->kind != OpKind::Load || !op->children.empty() || op->symbol.empty())
+    return false;
+  symbol = op->symbol;
+  return true;
 }
 
 const Op *unwrapSingleDecl(const Op *op) {
@@ -735,6 +758,178 @@ bool boundsEqual(const Op *a, const Op *b) {
   return true;
 }
 
+void collectScalarInitializers(const Op *op,
+                               std::unordered_map<std::string, const Op*> &inits) {
+  if (!op)
+    return;
+  const Op *unwrapped = unwrapSingleDecl(op);
+  if (unwrapped && (unwrapped->kind == OpKind::VarDecl ||
+                    unwrapped->kind == OpKind::Store) &&
+      !unwrapped->symbol.empty() && unwrapped->children.size() == 1) {
+    inits[unwrapped->symbol] = unwrapped->children[0].get();
+  }
+  for (const auto &child : op->children)
+    collectScalarInitializers(child.get(), inits);
+}
+
+bool matchSpatialKernelMinusPad(const Op *expr, std::string &spatial,
+                                std::string &kernel, std::string &pad) {
+  if (!expr || expr->kind != OpKind::Arith || expr->symbol != "-" ||
+      expr->children.size() != 2)
+    return false;
+  if (!isScalarLoadAny(expr->children[1].get(), pad))
+    return false;
+  const Op *sum = expr->children[0].get();
+  if (!sum || sum->kind != OpKind::Arith || sum->symbol != "+" ||
+      sum->children.size() != 2)
+    return false;
+  std::string a, b;
+  if (!isScalarLoadAny(sum->children[0].get(), a) ||
+      !isScalarLoadAny(sum->children[1].get(), b))
+    return false;
+  spatial = a;
+  kernel = b;
+  return true;
+}
+
+bool flattenAndTerms(const Op *expr, std::vector<const Op*> &terms) {
+  if (!expr)
+    return false;
+  if (expr->kind == OpKind::Arith && expr->symbol == "&&" &&
+      expr->children.size() == 2) {
+    return flattenAndTerms(expr->children[0].get(), terms) &&
+           flattenAndTerms(expr->children[1].get(), terms);
+  }
+  terms.push_back(expr);
+  return true;
+}
+
+struct StencilBounds {
+  std::string rowSpatial;
+  std::string colSpatial;
+  std::string rowKernel;
+  std::string colKernel;
+  std::string pad;
+  const Op *bound = nullptr;
+  const Op *guardedIf = nullptr;
+};
+
+bool matchStencilBoundsIf(const Op *ifOp,
+                          const std::unordered_map<std::string, const Op*> &inits,
+                          const std::string &colIv,
+                          StencilBounds &out) {
+  if (!ifOp || ifOp->kind != OpKind::If || ifOp->children.size() < 2)
+    return false;
+
+  std::vector<const Op*> terms;
+  if (!flattenAndTerms(ifOp->children[0].get(), terms) || terms.size() < 4)
+    return false;
+
+  std::vector<std::string> boundedSyms;
+  std::unordered_map<std::string, const Op*> upperBounds;
+  for (const Op *term : terms) {
+    if (!term || term->kind != OpKind::Cmp)
+      continue;
+    std::string candidate;
+    const Op *bound = nullptr;
+    if (term->symbol == "<=" && term->children.size() == 2 &&
+        isConstIntValue(term->children[0].get(), 0) &&
+        isScalarLoadAny(term->children[1].get(), candidate)) {
+      boundedSyms.push_back(candidate);
+      continue;
+    }
+    if (term->symbol == "<" && term->children.size() == 2 &&
+        isScalarLoadAny(term->children[0].get(), candidate)) {
+      bound = term->children[1].get();
+      upperBounds[candidate] = bound;
+    }
+  }
+
+  for (const std::string &a : boundedSyms) {
+    if (!upperBounds.count(a) || !inits.count(a))
+      continue;
+    std::string aSpatial, aKernel, aPad;
+    if (!matchSpatialKernelMinusPad(inits.at(a), aSpatial, aKernel, aPad))
+      continue;
+    for (const std::string &b : boundedSyms) {
+      if (a == b || !upperBounds.count(b) || !inits.count(b))
+        continue;
+      std::string bSpatial, bKernel, bPad;
+      if (!matchSpatialKernelMinusPad(inits.at(b), bSpatial, bKernel, bPad))
+        continue;
+      if (aPad != bPad || !boundsEqual(upperBounds[a], upperBounds[b]))
+        continue;
+
+      const bool aIsCol = aSpatial == colIv;
+      const bool bIsCol = bSpatial == colIv;
+      if (aIsCol == bIsCol)
+        continue;
+
+      out.guardedIf = ifOp;
+      out.pad = aPad;
+      out.bound = upperBounds[a];
+      if (aIsCol) {
+        out.colSpatial = aSpatial;
+        out.colKernel = aKernel;
+        out.rowSpatial = bSpatial;
+        out.rowKernel = bKernel;
+      } else {
+        out.rowSpatial = aSpatial;
+        out.rowKernel = aKernel;
+        out.colSpatial = bSpatial;
+        out.colKernel = bKernel;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool findStencilBoundsIf(const Op *op,
+                         const std::unordered_map<std::string, const Op*> &inits,
+                         const std::string &colIv,
+                         StencilBounds &out) {
+  if (!op)
+    return false;
+  if (matchStencilBoundsIf(op, inits, colIv, out))
+    return true;
+  for (const auto &child : op->children)
+    if (findStencilBoundsIf(child.get(), inits, colIv, out))
+      return true;
+  return false;
+}
+
+std::unique_ptr<Op> cloneDroppingStencilGuard(const Op *op, const Op *guardedIf) {
+  if (!op)
+    return nullptr;
+  if (op == guardedIf && op->kind == OpKind::If && op->children.size() >= 2)
+    return cloneOp(op->children[1].get());
+  auto out = std::make_unique<Op>(op->kind, op->origin);
+  out->type = op->type;
+  out->traits = op->traits;
+  out->symbol = op->symbol;
+  out->hasIntValue = op->hasIntValue;
+  out->intValue = op->intValue;
+  out->hasFloatValue = op->hasFloatValue;
+  out->floatValue = op->floatValue;
+  out->arrayDims = op->arrayDims;
+  for (const auto &child : op->children)
+    out->children.push_back(cloneDroppingStencilGuard(child.get(), guardedIf));
+  return out;
+}
+
+std::unique_ptr<Op> makeInteriorCond(const StencilBounds &bounds) {
+  auto rowLower = makeCmp("<=", makeLoad(bounds.pad), makeLoad(bounds.rowSpatial));
+  auto rowUpper = makeCmp("<", makeLoad(bounds.rowSpatial),
+                          makeArith("-", cloneOp(bounds.bound), makeLoad(bounds.pad)));
+  auto colLower = makeCmp("<=", makeLoad(bounds.pad), makeLoad(bounds.colSpatial));
+  auto colUpper = makeCmp("<", makeLoad(bounds.colSpatial),
+                          makeArith("-", cloneOp(bounds.bound), makeLoad(bounds.pad)));
+  return makeLogicalAnd(
+      makeLogicalAnd(std::move(rowLower), std::move(rowUpper)),
+      makeLogicalAnd(std::move(colLower), std::move(colUpper)));
+}
+
 bool isArrayStore(const Op *op) {
   op = unwrapSingleDecl(op);
   return op && op->kind == OpKind::Store && op->children.size() > 1 &&
@@ -1142,6 +1337,19 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   }
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    // The interior/boundary dispatcher is a general stencil transform, but the
+    // current clone-based lowering can increase register pressure after kernel
+    // unrolling. Keep it opt-in until a spill-aware outline/peeling lowering is
+    // available.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_STENCIL_INTERIOR", false)) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryStencilInteriorDispatch(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
     if (hirEnvEnabled("SISY_HIR_ENABLE_INTERCHANGE", true)) {
       if (block->children[i] && block->children[i]->kind == OpKind::While) {
         if (tryLoopInterchange(block, i, stats)) {
@@ -1185,6 +1393,77 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     }
   }
   return changed;
+}
+
+bool PolyhedralOptimizer::tryStencilInteriorDispatch(Op *block, size_t idx,
+                                                     PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size()) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectShape++;
+    return false;
+  }
+
+  Op *whileOp = block->children[idx].get();
+  CanonicalLoop colLoop;
+  if (!matchCanonicalWhile(whileOp, colLoop) || !colLoop.body ||
+      colLoop.body->kind != OpKind::Block || colLoop.body->children.size() < 2) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectShape++;
+    return false;
+  }
+
+  // Idempotency guard: after dispatch the loop body is a single if whose
+  // branches contain the original step.
+  if (colLoop.body->children.size() == 1 &&
+      colLoop.body->children[0] &&
+      colLoop.body->children[0]->kind == OpKind::If) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectShape++;
+    return false;
+  }
+
+  std::unordered_map<std::string, const Op*> scalarInits;
+  collectScalarInitializers(colLoop.body, scalarInits);
+
+  StencilBounds bounds;
+  if (!findStencilBoundsIf(colLoop.body, scalarInits, colLoop.iv, bounds)) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectBounds++;
+    return false;
+  }
+
+  if (bounds.rowSpatial.empty() || bounds.colSpatial != colLoop.iv ||
+      bounds.pad.empty() || !bounds.bound || !bounds.guardedIf) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectBounds++;
+    return false;
+  }
+
+  // The fast path is valid only if the spatial row is invariant within this
+  // column loop. Otherwise the interior guard would not cover every cloned use.
+  if (bodyWritesScalar(colLoop.body, bounds.rowSpatial) ||
+      bodyWritesScalar(colLoop.body, bounds.pad)) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectBounds++;
+    return false;
+  }
+
+  auto fastBody = cloneDroppingStencilGuard(colLoop.body, bounds.guardedIf);
+  auto slowBody = cloneOp(colLoop.body);
+  if (!fastBody || !slowBody) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectShape++;
+    return false;
+  }
+
+  auto dispatchedBody = makeBlock();
+  dispatchedBody->children.push_back(
+      makeIf(makeInteriorCond(bounds), std::move(fastBody), std::move(slowBody)));
+
+  auto newWhile = makeWhile(cloneOp(whileOp->children[0].get()), std::move(dispatchedBody));
+  block->children[idx] = std::move(newWhile);
+  stats.stencilInteriorDispatched++;
+  return true;
 }
 
 void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {

@@ -409,6 +409,10 @@ int main(int argc, char **argv) {
                       << " affine-nest-perfect-2d=" << stats.affineNestPerfect2D
                       << " affine-nest-perfect-3d=" << stats.affineNestPerfect3D
                       << " matmul-like-candidates=" << stats.matmulLikeCandidates
+                      << " stencil-interior-dispatched=" << stats.stencilInteriorDispatched
+                      << " stencil-interior-rejected=" << stats.stencilInteriorRejected
+                      << " stencil-interior-reject-shape=" << stats.stencilInteriorRejectShape
+                      << " stencil-interior-reject-bounds=" << stats.stencilInteriorRejectBounds
                       << "\n";
           }
         });
