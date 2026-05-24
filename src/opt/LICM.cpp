@@ -1,6 +1,8 @@
 #include "LoopPasses.h"
 #include "MemorySSA.h"
 
+#include <optional>
+
 using namespace sys;
 
 std::map<std::string, int> LICM::stats() {
@@ -52,14 +54,118 @@ bool noAliasWithMemorySSA(Op *load, LoopInfo *loop, MemorySSA *mssa, const std::
 
   auto clobbers = mssa->getClobberingDefs(load);
   if (clobbers.empty())
-    return true;
+    return noAlias(load, stores);
 
+  auto addr = load->DEF();
   for (auto *access : clobbers) {
     auto *def = access->op;
+    if (!def || !loop->contains(def->getParent()))
+      continue;
+    if (isa<StoreOp>(def) && addr && !mayAlias(addr, def->DEF(1)))
+      continue;
     if (def && loop->contains(def->getParent()))
       return false;
   }
 
+  return noAlias(load, stores);
+}
+
+std::optional<long long> evalAtLoopEntry(Op *op, LoopInfo *info, std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return std::nullopt;
+  seen.insert(op);
+
+  if (isa<IntOp>(op))
+    return V(op);
+
+  if (isa<PhiOp>(op) && op->getParent() == info->header && info->preheader)
+    return evalAtLoopEntry(Op::getPhiFrom(op, info->preheader), info, seen);
+
+  if (isa<MinusOp>(op)) {
+    auto value = evalAtLoopEntry(op->DEF(), info, seen);
+    if (value)
+      return -*value;
+    return std::nullopt;
+  }
+
+  if (op->getOperandCount() != 2)
+    return std::nullopt;
+
+  auto lhs = evalAtLoopEntry(op->DEF(0), info, seen);
+  auto rhs = evalAtLoopEntry(op->DEF(1), info, seen);
+  if (!lhs || !rhs)
+    return std::nullopt;
+
+  if (isa<AddIOp>(op) || isa<AddLOp>(op))
+    return *lhs + *rhs;
+  if (isa<SubIOp>(op) || isa<SubLOp>(op))
+    return *lhs - *rhs;
+  if (isa<MulIOp>(op) || isa<MulLOp>(op))
+    return *lhs * *rhs;
+  return std::nullopt;
+}
+
+std::optional<bool> evalCondAtLoopEntry(Op *op, LoopInfo *info) {
+  if (!op || op->getOperandCount() != 2)
+    return std::nullopt;
+  std::set<Op*> seenLhs;
+  std::set<Op*> seenRhs;
+  auto lhs = evalAtLoopEntry(op->DEF(0), info, seenLhs);
+  auto rhs = evalAtLoopEntry(op->DEF(1), info, seenRhs);
+  if (!lhs || !rhs)
+    return std::nullopt;
+
+  if (isa<LtOp>(op))
+    return *lhs < *rhs;
+  if (isa<LeOp>(op))
+    return *lhs <= *rhs;
+  if (isa<EqOp>(op))
+    return *lhs == *rhs;
+  if (isa<NeOp>(op))
+    return *lhs != *rhs;
+  return std::nullopt;
+}
+
+bool loopKnownToRunOnce(LoopInfo *info) {
+  if (!info || !info->header || !info->preheader)
+    return false;
+
+  if (info->start && info->stop && info->step &&
+      isa<IntOp>(info->start) && isa<IntOp>(info->stop) && isa<IntOp>(info->step)) {
+    int step = V(info->step);
+    if (step > 0 && V(info->start) < V(info->stop))
+      return true;
+    if (step < 0 && V(info->start) > V(info->stop))
+      return true;
+  }
+
+  auto branch = dyn_cast<BranchOp>(info->header->getLastOp());
+  if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||
+      !branch->has<ElseAttr>())
+    return false;
+  auto cond = evalCondAtLoopEntry(branch->DEF(0), info);
+  if (!cond)
+    return false;
+  auto taken = *cond ? TARGET(branch) : ELSE(branch);
+  return info->contains(taken);
+}
+
+bool canSpeculateLoadFromBlock(LoopInfo *info, BasicBlock *bb, bool speculativeLoads) {
+  if (speculativeLoads)
+    return true;
+
+  // Non-rotated loops may skip the body entirely.  Hoisting a load from such a
+  // body is only safe when the canonical loop is known to execute once and has
+  // no side exits that could bypass the load in the first iteration.
+  if (!loopKnownToRunOnce(info))
+    return false;
+  if (info->exitings.size() != 1 || *info->exitings.begin() != info->header)
+    return false;
+  if (bb == info->header)
+    return true;
+  for (auto latch : info->latches)
+    if (!bb->dominates(latch))
+      return false;
   return true;
 }
 
@@ -101,7 +207,7 @@ bool variant(Op *op, LoopInfo *info, LoopInfo *outer, std::set<Op*> &visited) {
 }
 
 // This also hoists ops besides giving variant.
-void LICM::hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
+void LICM::hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable, bool speculativeLoads) {
   std::vector<Op*> invariant;
 
   for (auto op : bb->getOps()) {
@@ -111,7 +217,9 @@ void LICM::hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
     if (op->has<VariantAttr>())
       continue;
 
-    if (pinned(op) || isa<PhiOp>(op) || (isa<LoadOp>(op) && (!noAliasWithMemorySSA(op, info, this->mssa, stores, impure) || impure))
+    if (pinned(op) || isa<PhiOp>(op) ||
+        (isa<LoadOp>(op) && (!canSpeculateLoadFromBlock(info, bb, speculativeLoads) ||
+                             !noAliasWithMemorySSA(op, info, this->mssa, stores, impure) || impure))
         // When a store only writes a loop-invariant value to loop-invariant address,
         // and it doesn't follow any load, then it's safe to hoist it out.
         || (isa<StoreOp>(op) && (!hoistable || impure || op->DEF(0)->has<VariantAttr>() || op->DEF(1)->has<VariantAttr>())))
@@ -136,7 +244,7 @@ void LICM::hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
 
   for (auto child : domtree[bb]) {
     if (info->contains(child))
-      hoistVariant(info, child, hoistable);
+      hoistVariant(info, child, hoistable, speculativeLoads);
   }
 }
 
@@ -166,17 +274,19 @@ void LICM::markVariant(LoopInfo *info, BasicBlock *bb, bool hoistable) {
   }
 }
 
-bool LICM::updateStores(LoopInfo *info) {
-  // Check rotated loops.
+bool LICM::updateStores(LoopInfo *info, bool *storeHoistable) {
   auto preheader = info->preheader;
   if (!preheader)
     return false;
 
+  bool rotated = true;
   for (auto latch : info->latches) {
     auto term = latch->getLastOp();
     if (!isa<BranchOp>(term))
-      return false;
+      rotated = false;
   }
+  if (storeHoistable)
+    *storeHoistable = rotated;
 
   // Record all stores in the loop.
   stores.clear();
@@ -198,17 +308,19 @@ void LICM::runImpl(LoopInfo *info) {
   for (auto subloop : info->subloops)
     runImpl(subloop);
 
-  if (!updateStores(info))
+  bool storeHoistable = false;
+  if (!updateStores(info, &storeHoistable))
     return;
 
   // Mark invariants inside the loop, and try hoisting it out.
   // We must traverse through domtree to preserve def-use chain.
   auto header = info->header;
-  hoistVariant(info, header, /*hoistable=*/true);
+  hoistVariant(info, header, storeHoistable, storeHoistable);
 }
 
 bool LICM::hoistSubloop(LoopInfo *outer) {
-  if (!updateStores(outer))
+  bool storeHoistable = false;
+  if (!updateStores(outer, &storeHoistable) || !storeHoistable)
     return false;
 
   for (auto bb : outer->getBlocks()) {

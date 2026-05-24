@@ -194,14 +194,14 @@ class LICM : public Pass {
   MemorySSA *mssa = nullptr;
 
   // A store is hoistable when no branch or load has been met.
-  void hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable);
+  void hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable, bool speculativeLoads);
   void markVariant(LoopInfo *info, BasicBlock *bb, bool hoistable);
   void runImpl(LoopInfo *info);
   bool hoistSubloop(LoopInfo *outer);
 
   // Find out all stores in the loop and update `stores`.
-  // Returns false when finds out unsuitable to hoist.
-  bool updateStores(LoopInfo *info);
+  // `storeHoistable` is false for non-rotated loops where stores may not run.
+  bool updateStores(LoopInfo *info, bool *storeHoistable = nullptr);
 public:
   LICM(ModuleOp *module): Pass(module) {}
 
