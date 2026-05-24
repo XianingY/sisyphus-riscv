@@ -235,6 +235,15 @@ bool applyStripMine(LoopInfo *loop, int tileSize) {
     return false;
   }
 
+  // This CFG strip-mining rewrite changes the original loop-exit edge
+  // from `exitBranchOp -> exit` into `exitBranchOp -> tileLatch -> tileHeader -> exit`.
+  // If the exit block has phi/LCSSA values, their incoming block/value pairs must
+  // be rebuilt through the tile loop.  The current transform only rewires control
+  // edges, so conservatively avoid these loops instead of leaving stale `from`
+  // attributes that later cleanup turns into empty phis.
+  if (!exit->getPhis().empty())
+    return false;
+
   // The preheader must end with a GotoOp to header.
   auto preTerm = preheader->getLastOp();
   if (!preTerm || !isa<GotoOp>(preTerm) || TARGET(preTerm) != header)
