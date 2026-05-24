@@ -301,15 +301,19 @@ bool convertNestedShortCircuit(BranchOp *branch) {
       return false;
     if (!isParityCondition(inner->DEF(0)))
       return false;
-    if (empty->preds.size() != 1 || *empty->preds.begin() != test)
-      return false;
     if (!calc->preds.count(test))
       return false;
     if (buildOr) {
+      if (empty->preds.size() != 1 || *empty->preds.begin() != test)
+        return false;
       if (calc->preds.size() != 2 || !calc->preds.count(outer))
         return false;
-    } else if (calc->preds.size() != 1) {
-      return false;
+    } else {
+      if (calc->preds.size() != 1)
+        return false;
+      if (empty->preds.size() != 2 || !empty->preds.count(outer) ||
+          !empty->preds.count(test))
+        return false;
     }
 
     innerCond = inner->DEF(0);
