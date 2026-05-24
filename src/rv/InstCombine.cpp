@@ -29,6 +29,18 @@ bool inShamt64(int x) {
   return x >= 0 && x < 64;
 }
 
+int combineAndImm(int a, int b) {
+  return a & b;
+}
+
+int combineOrImm(int a, int b) {
+  return a | b;
+}
+
+int combineXorImm(int a, int b) {
+  return a ^ b;
+}
+
 static bool getenvEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
   if (!raw || !raw[0])
@@ -315,6 +327,160 @@ void InstCombine::run() {
       }
     }
     return false;
+  });
+
+  runRewriter([&](AddiOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_IMM_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<AddiOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inRange(value))
+      return false;
+    combined++;
+    builder.replace<AddiOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](AddiwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_IMM_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<AddiwOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inRange(value))
+      return false;
+    combined++;
+    builder.replace<AddiwOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](AndiOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_IMM_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<AndiOp>(base))
+      return false;
+    int value = combineAndImm(V(base), V(op));
+    if (!inRange(value))
+      return false;
+    combined++;
+    builder.replace<AndiOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](OriOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_IMM_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<OriOp>(base))
+      return false;
+    int value = combineOrImm(V(base), V(op));
+    if (!inRange(value))
+      return false;
+    combined++;
+    builder.replace<OriOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](XoriOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_IMM_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<XoriOp>(base))
+      return false;
+    int value = combineXorImm(V(base), V(op));
+    if (!inRange(value))
+      return false;
+    combined++;
+    builder.replace<XoriOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](SlliOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_SHIFT_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<SlliOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inShamt64(value))
+      return false;
+    combined++;
+    builder.replace<SlliOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](SrliOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_SHIFT_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<SrliOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inShamt64(value))
+      return false;
+    combined++;
+    builder.replace<SrliOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](SraiOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_SHIFT_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<SraiOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inShamt64(value))
+      return false;
+    combined++;
+    builder.replace<SraiOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](SlliwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_SHIFT_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<SlliwOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inShamt32(value))
+      return false;
+    combined++;
+    builder.replace<SlliwOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](SrliwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_SHIFT_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<SrliwOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inShamt32(value))
+      return false;
+    combined++;
+    builder.replace<SrliwOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
+  });
+
+  runRewriter([&](SraiwOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_CHAIN_SHIFT_COMBINE", true))
+      return false;
+    auto base = op->getOperand(0).defining;
+    if (!isa<SraiwOp>(base))
+      return false;
+    int value = V(base) + V(op);
+    if (!inShamt32(value))
+      return false;
+    combined++;
+    builder.replace<SraiwOp>(op, { base->getOperand() }, { new IntAttr(value) });
+    return true;
   });
 
   RvDCE(module).run();
