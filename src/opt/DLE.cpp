@@ -58,8 +58,19 @@ std::vector<StoreOp*> commonStores(const std::set<BasicBlock*> &preds,
   return common;
 }
 
+bool callCanTouchUnpassedGlobals(CallOp *call) {
+  if (!call)
+    return true;
+  // SysY runtime calls can only touch user arrays through pointer arguments.
+  // If no pointer to a global is passed, keeping reaching global stores across
+  // timer/input/output calls enables ordinary store-to-load forwarding without
+  // pretending that the runtime has hidden access to compiler globals.
+  return !isExtern(NAME(call));
+}
+
 void retainStoresNotClobberedByCall(std::vector<StoreOp*> &stores, CallOp *call) {
   std::set<Op*> toclear;
+  bool clearUnpassedGlobals = callCanTouchUnpassedGlobals(call);
   for (auto operand : call->getOperands()) {
     auto def = operand.defining;
     if (!def->has<AliasAttr>())
@@ -82,7 +93,8 @@ void retainStoresNotClobberedByCall(std::vector<StoreOp*> &stores, CallOp *call)
 
     bool good = true;
     for (auto [base, _] : ALIAS(x)->location) {
-      if (toclear.count(base) || isa<GetGlobalOp>(base) || isa<GlobalOp>(base)) {
+      if (toclear.count(base) ||
+          (clearUnpassedGlobals && (isa<GetGlobalOp>(base) || isa<GlobalOp>(base)))) {
         good = false;
         break;
       }
@@ -95,6 +107,7 @@ void retainStoresNotClobberedByCall(std::vector<StoreOp*> &stores, CallOp *call)
 
 void retainStoresNotClobberedByCall(std::vector<Op*> &stores, CallOp *call) {
   std::set<Op*> toclear;
+  bool clearUnpassedGlobals = callCanTouchUnpassedGlobals(call);
   for (auto operand : call->getOperands()) {
     auto def = operand.defining;
     if (!def->has<AliasAttr>())
@@ -117,7 +130,8 @@ void retainStoresNotClobberedByCall(std::vector<Op*> &stores, CallOp *call) {
 
     bool good = true;
     for (auto [base, _] : ALIAS(x)->location) {
-      if (toclear.count(base) || isa<GetGlobalOp>(base) || isa<GlobalOp>(base)) {
+      if (toclear.count(base) ||
+          (clearUnpassedGlobals && (isa<GetGlobalOp>(base) || isa<GlobalOp>(base)))) {
         good = false;
         break;
       }

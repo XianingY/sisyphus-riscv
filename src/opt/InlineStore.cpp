@@ -92,6 +92,121 @@ bool exactConstOffset(Op *addr, GlobalOp *glob, int &offset) {
   return true;
 }
 
+bool blockOrderBefore(Op *a, Op *b) {
+  if (!a || !b || a->getParent() != b->getParent())
+    return false;
+  for (auto runner = a; runner; runner = runner->nextOp()) {
+    if (runner == b)
+      return true;
+  }
+  return false;
+}
+
+bool opDominatesUse(Op *def, Op *use) {
+  if (!def || !use)
+    return false;
+  auto defBlock = def->getParent();
+  auto useBlock = use->getParent();
+  if (!defBlock || !useBlock)
+    return false;
+  if (defBlock == useBlock)
+    return blockOrderBefore(def, use);
+  return defBlock->dominates(useBlock);
+}
+
+bool sameConstValue(Op *a, Op *b) {
+  if (!a || !b || a->opid != b->opid)
+    return false;
+  if (isa<IntOp>(a))
+    return V(a) == V(b);
+  if (isa<FloatOp>(a))
+    return F(a) == F(b);
+  return false;
+}
+
+Op *cloneConstValue(Builder &builder, Op *value) {
+  if (isa<IntOp>(value))
+    return builder.create<IntOp>({ new IntAttr(V(value)) });
+  if (isa<FloatOp>(value))
+    return builder.create<FloatOp>({ new FloatAttr(F(value)) });
+  return nullptr;
+}
+
+bool inlineInitializedGlobalLoads(GlobalOp *glob, ModuleOp *module,
+                                  int maxElems, Builder &builder,
+                                  int &constLoads) {
+  if (!glob || !glob->has<SizeAttr>())
+    return false;
+  int elemCount = SIZE(glob) / 4;
+  if (elemCount <= 0 || elemCount > maxElems)
+    return false;
+  if (constGlobalEscapes(glob, module))
+    return false;
+
+  struct StoredConst {
+    Op *store = nullptr;
+    Op *value = nullptr;
+  };
+
+  std::vector<StoredConst> values(elemCount);
+  bool sawStore = false;
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    auto addr = store->DEF(1);
+    if (!mayMentionGlobal(addr, glob))
+      continue;
+
+    int offset = 0;
+    if (!exactConstOffset(addr, glob, offset))
+      return false;
+    if (offset < 0 || offset % 4 != 0 || offset / 4 >= elemCount)
+      return false;
+
+    auto value = store->DEF(0);
+    if (!isa<IntOp>(value) && !isa<FloatOp>(value))
+      return false;
+
+    int index = offset / 4;
+    if (values[index].value && !sameConstValue(values[index].value, value))
+      return false;
+    values[index] = { store, value };
+    sawStore = true;
+  }
+  if (!sawStore)
+    return false;
+
+  bool changed = false;
+  auto loads = module->findAll<LoadOp>();
+  for (auto load : loads) {
+    if (load->getOperandCount() != 1 || load->getResultType() == Value::i64)
+      continue;
+
+    int offset = 0;
+    if (!exactConstOffset(load->DEF(0), glob, offset))
+      continue;
+    if (offset < 0 || offset % 4 != 0 || offset / 4 >= elemCount)
+      continue;
+
+    auto known = values[offset / 4];
+    if (!known.store || !known.value || known.value->getResultType() != load->getResultType())
+      continue;
+    if (!opDominatesUse(known.store, load))
+      continue;
+
+    builder.setBeforeOp(load);
+    auto replacement = cloneConstValue(builder, known.value);
+    if (!replacement)
+      continue;
+    load->replaceAllUsesWith(replacement);
+    load->erase();
+    constLoads++;
+    changed = true;
+  }
+
+  return changed;
+}
+
 }
 
 #define BAD { bad = true; break; }
@@ -104,6 +219,12 @@ void InlineStore::run() {
       getenvInt("SISY_INLINE_CONST_ARRAY_MAX_ELEMS", 256, 1, 4096);
 
   Builder constBuilder;
+  for (auto func : module->findAll<FuncOp>())
+    func->getRegion()->updateDoms();
+
+  for (auto &[_, glob] : gMap)
+    inlineInitializedGlobalLoads(glob, module, maxConstElems, constBuilder, constLoads);
+
   for (auto &[name, glob] : gMap) {
     if (!glob->has<ConstAttr>())
       continue;

@@ -265,6 +265,14 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
+    if (getenvEnabled("SISY_ENABLE_POST_UNROLL_DLE", true)) {
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::Alias>();
+      pm.addPass<sys::DLE>();
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+    }
     pm.addPass<sys::SCEV>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", true)) {
       pm.addPass<sys::BoundsCheck>();
