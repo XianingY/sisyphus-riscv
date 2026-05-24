@@ -576,11 +576,15 @@ void RegularFold::run() {
         return false;
       });
 
-      // Signed integer remainder by a compile-time power-of-2 constant,
-      // when Range analysis confirms x >= 0:
-      //   x % 2^n  →  x & (2^n - 1)
-      // This is only valid for non-negative x: for negative x, C semantics give
-      // a negative remainder, but bitwise AND always gives a non-negative result.
+      // Signed integer remainder by a compile-time power-of-2 constant.
+      //
+      // For non-negative x, x % 2^n is just x & (2^n - 1).  For the general
+      // signed case, preserve SysY/C round-toward-zero semantics by using the
+      // same biased quotient as the division fold:
+      //   q = (x + ((x >> 31) & (2^n - 1))) >> n
+      //   r = x - (q << n)
+      // This removes expensive remw without assuming that the source is a
+      // bitwise helper or that x is non-negative.
       runRewriter([&](ModIOp *op) {
         auto x = op->DEF(0);
         auto y = op->DEF(1);
@@ -592,22 +596,42 @@ void RegularFold::run() {
           return false;
 
         int divisor = *maybeMod;
+        if (divisor < 0)
+          divisor = -divisor;
+
         // Must be a positive power of 2.
         if (divisor <= 0 || __builtin_popcount((unsigned)divisor) != 1)
           return false;
 
-        // Range analysis must confirm x >= 0 (lower bound >= 0).
-        if (!x->has<RangeAttr>())
-          return false;
-        auto [low, high] = RANGE(x);
-        if (low < 0)
-          return false;
-
-        int mask = divisor - 1;  // 2^n - 1
+        if (divisor == 1) {
+          builder.replace<IntOp>(op, { new IntAttr(0) });
+          folded++;
+          return true;
+        }
 
         builder.setBeforeOp(op);
+        int shift = __builtin_ctz((unsigned)divisor);
+        int mask = divisor - 1;
+
+        if (x->has<RangeAttr>()) {
+          auto [low, high] = RANGE(x);
+          if (low >= 0) {
+            auto cmask = builder.create<IntOp>({ new IntAttr(mask) });
+            builder.replace<AndIOp>(op, { x, cmask });
+            folded++;
+            return false;
+          }
+        }
+
+        auto c31 = builder.create<IntOp>({ new IntAttr(31) });
+        auto sign = builder.create<RShiftOp>({ x, c31 });
         auto cmask = builder.create<IntOp>({ new IntAttr(mask) });
-        builder.replace<AndIOp>(op, { x, cmask });
+        auto bias = builder.create<AndIOp>({ sign, cmask });
+        auto biased = builder.create<AddIOp>({ x, bias });
+        auto cshift = builder.create<IntOp>({ new IntAttr(shift) });
+        auto quotient = builder.create<RShiftOp>({ biased, cshift });
+        auto product = builder.create<LShiftOp>({ quotient, cshift });
+        builder.replace<SubIOp>(op, { x, product });
 
         folded++;
         return false;

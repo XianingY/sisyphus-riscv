@@ -41,6 +41,8 @@ require_present "${o1_stats}" "\\[hir-poly\\]" \
   "expected HIR polyhedral optimizer stats in strict default O1"
 require_present "${o1_stats}" "^runtime-memoize:" \
   "expected runtime memoization pass to remain in strict default O1"
+require_absent "${o1_stats}" "^function-equivalence:" \
+  "semantic function equivalence replacement must be opt-in under strict defaults"
 require_absent "${o1_stats}" "^structural-bitwise:" \
   "structural bitwise recognizer must be opt-in under strict defaults"
 require_absent "${o1_stats}" "^structural-modmul:" \
@@ -53,6 +55,8 @@ o2_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o2.rv.s" \
 
 echo "${o2_stats}"
 
+require_absent "${o2_stats}" "^function-equivalence:" \
+  "semantic function equivalence replacement must be opt-in under strict default O2"
 require_absent "${o2_stats}" "^cached:" \
   "compile-time recursive precompute cache must be opt-in under strict defaults"
 require_absent "${o2_stats}" "^synth-const-array:" \

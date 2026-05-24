@@ -167,7 +167,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
-    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
       pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", false)) {
       pm.addPass<sys::StructuralBitwise>();
@@ -204,6 +204,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DivPow2LoopFold>();
       pm.addPass<sys::SimplifyCFG>();
     }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", true)) {
+      pm.addPass<sys::ParityIfConversion>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::RegularFold>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::DAE>();
@@ -211,6 +215,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DSE>();
     pm.addPass<sys::DLE>();
     pm.addPass<sys::GVN>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", true)) {
+      pm.addPass<sys::ParityIfConversion>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", false)) {
       pm.addPass<sys::StructuralModMul>();
       pm.addPass<sys::RegularFold>();
@@ -291,7 +299,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::RangeAwareFold>();
       if (getenvEnabled("SISY_ENABLE_WIDE_ARITH_PROMOTION", true))
         pm.addPass<sys::WideArithmeticPromotion>();
-      if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
+      if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
         pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
       pm.addPass<sys::Splice>();
     }

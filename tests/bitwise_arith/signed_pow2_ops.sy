@@ -1,0 +1,6 @@
+int main() {
+  int x = getint();
+  int q = x / 8;
+  int r = x % 8;
+  return q + r;
+}

@@ -27,8 +27,8 @@ if grep -q '^structural-bitwise:$' <<<"${stats}"; then
   exit 1
 fi
 
-if ! grep -A4 '^range-aware-fold:$' <<<"${stats}" | grep -Eq 'folded-ops : [1-9]'; then
-  echo "expected RangeAwareFold to participate in nonnegative power-of-two arithmetic folding" >&2
+if grep -q '^function-equivalence:$' <<<"${stats}"; then
+  echo "FunctionEquivalence should stay disabled by default; this test must rely on generic arithmetic folding" >&2
   exit 1
 fi
 
@@ -55,8 +55,26 @@ if grep -q '^structural-bitwise:$' <<<"${runtime_stats}"; then
   exit 1
 fi
 
+if grep -q '^function-equivalence:$' <<<"${runtime_stats}"; then
+  echo "FunctionEquivalence should stay disabled by default; this test must rely on algebraic folding" >&2
+  exit 1
+fi
+
 if grep -Eq '(^|[[:space:],])(divw|remw)($|[[:space:],])' "${OUT_DIR}/runtime_nonnegative_pow2_ops.rv.s"; then
   echo "expected backend strength reduction to remove divw/remw for power-of-two arithmetic" >&2
+  exit 1
+fi
+
+signed_stats="$(compile_case signed_pow2_ops)"
+echo "${signed_stats}"
+
+if grep -q '^function-equivalence:$' <<<"${signed_stats}"; then
+  echo "FunctionEquivalence should stay disabled by default for signed power-of-two arithmetic" >&2
+  exit 1
+fi
+
+if grep -Eq '(^|[[:space:],])(divw|remw)($|[[:space:],])' "${OUT_DIR}/signed_pow2_ops.rv.s"; then
+  echo "expected signed power-of-two division/remainder to avoid divw/remw" >&2
   exit 1
 fi
 
