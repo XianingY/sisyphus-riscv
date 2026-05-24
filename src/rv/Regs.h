@@ -27,6 +27,12 @@ const Reg leafOrder[] = {
 };
 // Order for non-leaf functions.
 const Reg normalOrder[] = {
+  Reg::a0, Reg::a1, Reg::a2, Reg::a3,
+  Reg::a4, Reg::a5, Reg::a6, Reg::a7,
+
+  Reg::t0, Reg::t1, Reg::t2, Reg::t3,
+  Reg::t4, Reg::t5, Reg::t6,
+  
   Reg::s0, Reg::s1, Reg::s2, Reg::s3, 
   Reg::s4, Reg::s5, Reg::s6, Reg::s7,
   Reg::s8, Reg::s9,
