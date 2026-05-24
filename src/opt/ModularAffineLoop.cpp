@@ -24,6 +24,13 @@ bool isIntConst(Op *op, int value) {
   return op && isa<IntOp>(op) && V(op) == value;
 }
 
+bool intConst(Op *op, int &value) {
+  if (!op || !isa<IntOp>(op))
+    return false;
+  value = V(op);
+  return true;
+}
+
 Op *stripSinglePhi(Op *op) {
   std::set<Op*> seen;
   while (op && isa<PhiOp>(op) && op->getOperandCount() == 1 && !seen.count(op)) {
@@ -31,6 +38,68 @@ Op *stripSinglePhi(Op *op) {
     op = op->DEF(0);
   }
   return op;
+}
+
+bool sameStrippedValue(Op *a, Op *b) {
+  return stripSinglePhi(a) == stripSinglePhi(b);
+}
+
+bool signedPow2RemainderUpper(Op *op, int &upper) {
+  op = stripSinglePhi(op);
+  auto *sub = dyn_cast<SubIOp>(op);
+  if (!sub || sub->getOperandCount() != 2)
+    return false;
+
+  Op *x = stripSinglePhi(sub->DEF(0));
+  auto *product = dyn_cast<LShiftOp>(stripSinglePhi(sub->DEF(1)));
+  if (!x || !product || product->getOperandCount() != 2)
+    return false;
+
+  int shift = 0;
+  if (!intConst(stripSinglePhi(product->DEF(1)), shift) || shift <= 0 || shift >= 31)
+    return false;
+
+  auto *quotient = dyn_cast<RShiftOp>(stripSinglePhi(product->DEF(0)));
+  if (!quotient || quotient->getOperandCount() != 2 ||
+      !isIntConst(stripSinglePhi(quotient->DEF(1)), shift))
+    return false;
+
+  auto *biased = dyn_cast<AddIOp>(stripSinglePhi(quotient->DEF(0)));
+  if (!biased || biased->getOperandCount() != 2)
+    return false;
+
+  Op *bias = nullptr;
+  if (sameStrippedValue(biased->DEF(0), x))
+    bias = stripSinglePhi(biased->DEF(1));
+  else if (sameStrippedValue(biased->DEF(1), x))
+    bias = stripSinglePhi(biased->DEF(0));
+  else
+    return false;
+
+  auto *andOp = dyn_cast<AndIOp>(bias);
+  if (!andOp || andOp->getOperandCount() != 2)
+    return false;
+
+  Op *sign = nullptr;
+  int mask = 0;
+  if (intConst(stripSinglePhi(andOp->DEF(0)), mask))
+    sign = stripSinglePhi(andOp->DEF(1));
+  else if (intConst(stripSinglePhi(andOp->DEF(1)), mask))
+    sign = stripSinglePhi(andOp->DEF(0));
+  else
+    return false;
+
+  if (mask != ((1 << shift) - 1))
+    return false;
+
+  auto *signShift = dyn_cast<RShiftOp>(sign);
+  if (!signShift || signShift->getOperandCount() != 2 ||
+      !sameStrippedValue(signShift->DEF(0), x) ||
+      !isIntConst(stripSinglePhi(signShift->DEF(1)), 31))
+    return false;
+
+  upper = mask;
+  return true;
 }
 
 bool simpleIncrement(Op *op, Op *phi) {
@@ -58,6 +127,8 @@ bool stopUpperBound(Op *stop, int &upper) {
     upper = mod - 1;
     return true;
   }
+  if (signedPow2RemainderUpper(stop, upper))
+    return true;
   return false;
 }
 
