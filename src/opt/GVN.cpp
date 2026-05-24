@@ -45,6 +45,9 @@ bool allowed(Op *op) {
     ALLOW(MulLOp)
     ALLOW(DivLOp)
     ALLOW(ModLOp)
+    ALLOW(AndIOp)
+    ALLOW(OrIOp)
+    ALLOW(XorIOp)
     ALLOW(AddVOp)
     ALLOW(SubVOp)
     ALLOW(MulVOp)
@@ -73,12 +76,17 @@ bool allowed(Op *op) {
     ALLOW(MulshOp)
     ALLOW(MuluhOp)
     ALLOW(SetNotZeroOp)
+    ALLOW(SelectOp)
     ALLOW(GetGlobalOp)
     ALLOW(BroadcastOp)
     ALLOW(BroadcastFOp)
 
   // RISC-V GVN
     ALLOW(rv::AddOp)
+    ALLOW(rv::AddwOp)
+    ALLOW(rv::AndOp)
+    ALLOW(rv::OrOp)
+    ALLOW(rv::XorOp)
     ALLOW(rv::LiOp)
 
   // ARM GVN
@@ -145,7 +153,11 @@ void GVN::dvnt(BasicBlock *bb, Domtree &domtree) {
 
     // Canonicalize for commutative Ops.
     if (isa<AddIOp>(op) || isa<AddFOp>(op) || isa<AddLOp>(op) ||
-        isa<MulIOp>(op) || isa<MulFOp>(op) || isa<MulLOp>(op))
+        isa<MulIOp>(op) || isa<MulFOp>(op) || isa<MulLOp>(op) ||
+        isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+        isa<EqOp>(op) || isa<NeOp>(op) || isa<EqFOp>(op) ||
+        isa<NeFOp>(op) || isa<rv::AddOp>(op) || isa<rv::AddwOp>(op) ||
+        isa<rv::AndOp>(op) || isa<rv::OrOp>(op) || isa<rv::XorOp>(op))
       std::sort(key.operands.begin(), key.operands.end());
 
     if (auto attr = op->find<IntAttr>())
