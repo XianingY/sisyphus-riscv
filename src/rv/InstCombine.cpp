@@ -41,6 +41,20 @@ int combineXorImm(int a, int b) {
   return a ^ b;
 }
 
+bool sameVsetvliInput(Op *a, Op *b) {
+  if (a == b)
+    return true;
+  if (!a || !b)
+    return false;
+  return isa<LiOp>(a) && isa<LiOp>(b) && V(a) == V(b);
+}
+
+bool clobbersVectorConfig(Op *op) {
+  return isa<sys::rv::CallOp>(op) || isa<RetOp>(op) || isa<JOp>(op) ||
+         isa<BeqOp>(op) || isa<BneOp>(op) || isa<BltOp>(op) ||
+         isa<BgeOp>(op) || isa<BleOp>(op) || isa<BgtOp>(op);
+}
+
 static bool getenvEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
   if (!raw || !raw[0])
@@ -481,6 +495,24 @@ void InstCombine::run() {
     combined++;
     builder.replace<SraiwOp>(op, { base->getOperand() }, { new IntAttr(value) });
     return true;
+  });
+
+  runRewriter([&](VsetvliOp *op) {
+    if (!getenvEnabled("SISY_RV_ENABLE_REDUNDANT_VSETVLI_DCE", true))
+      return false;
+    auto vl = op->getOperand(0).defining;
+    for (auto runner = op->prevOp(); runner; runner = runner->prevOp()) {
+      if (isa<PhiOp>(runner) || clobbersVectorConfig(runner))
+        return false;
+      if (!isa<VsetvliOp>(runner))
+        continue;
+      if (!sameVsetvliInput(runner->getOperand(0).defining, vl))
+        return false;
+      combined++;
+      op->erase();
+      return true;
+    }
+    return false;
   });
 
   RvDCE(module).run();
