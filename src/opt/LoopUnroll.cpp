@@ -39,6 +39,24 @@ int loopOpCount(LoopInfo *loop) {
   return loopsize;
 }
 
+int loopBranchCount(LoopInfo *loop) {
+  int count = 0;
+  for (auto bb : loop->getBlocks())
+    for (auto op : bb->getOps())
+      if (isa<BranchOp>(op))
+        count++;
+  return count;
+}
+
+int loopMemoryCount(LoopInfo *loop) {
+  int count = 0;
+  for (auto bb : loop->getBlocks())
+    for (auto op : bb->getOps())
+      if (isa<LoadOp>(op) || isa<StoreOp>(op))
+        count++;
+  return count;
+}
+
 bool loopHasCall(LoopInfo *loop) {
   for (auto bb : loop->getBlocks())
     for (auto op : bb->getOps())
@@ -88,6 +106,28 @@ bool smallConstantTrip(LoopInfo *loop, int loopsize, int &trip) {
   if (trip <= 1 || trip > 128)
     return false;
   return loopsize > 0 && loopsize * (trip - 1) <= 3000;
+}
+
+bool avoidFullUnrollForPressure(LoopInfo *loop, int trip, int loopsize, size_t phiCount) {
+  if (!loop || trip < 16)
+    return false;
+
+  int branches = loopBranchCount(loop);
+  int memory = loopMemoryCount(loop);
+  int pressureScore = (int)phiCount * trip + branches * trip * 2 + memory * trip;
+
+  // Full-unrolling bit-simulation loops such as CRC's 32-step helpers creates
+  // very large straight-line blocks with many carried values.  That exposes
+  // some ILP, but on our RV backend it also explodes live ranges and causes
+  // hundreds of hot spills.  Keep the optimization general: if a loop is small
+  // but branchy and has many loop-carried values, prefer guarded factor unroll.
+  if (phiCount >= 5 && branches > 0 && pressureScore >= 180)
+    return true;
+
+  // Also cap moderately large branch-heavy bodies even when they have fewer
+  // phis.  The duplicated CFG tends to be harder for GCM and register
+  // allocation than the original loop.
+  return branches >= 2 && loopsize * trip > 1400;
 }
 
 bool tryRotateSmallConstantLoop(LoopInfo *info) {
@@ -641,9 +681,11 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     int low = V(lower);
     int high = V(upper);
     int times = (high - low) / V(step);
-    if (times <= 2000 / loopsize ||
+    bool pressureSensitive =
+        avoidFullUnrollForPressure(loop, times, loopsize, phis.size());
+    if (!pressureSensitive && (times <= 2000 / loopsize ||
         (callFree && times > 1 && times <= 32 && loopsize <= 80 &&
-         loopsize * (times - 1) <= 1800))
+         loopsize * (times - 1) <= 1800)))
       unroll = times;
   } else if (runtimeUnrollEnabled()) {
     // Partial unrolling for runtime-bounded loops.
@@ -678,6 +720,14 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   }
   if (unroll == -1) {
     if (!envEnabled("SISY_ENABLE_FACTOR_UNROLL", true))
+      return false;
+
+    // The current factor-unroll transform is intentionally generic, but it can
+    // be applied repeatedly to the same constant loop by the outer fixed-point
+    // driver.  For pressure-sensitive constant loops the profitable choice is
+    // to keep the compact loop form instead of growing the CFG again.
+    if (fixedTripCandidate > 0 &&
+        avoidFullUnrollForPressure(loop, fixedTripCandidate, loopsize, phis.size()))
       return false;
 
     int factor = envIntClamped("SISY_FACTOR_UNROLL_FACTOR", 4, 2, 8);
@@ -946,19 +996,3 @@ void ConstLoopUnroll::run() {
     } while (changed);
   }
 }
-
-// External function from RegisterPressure.cpp
-extern int calculateAdaptiveUnrollFactor(LoopInfo* loop, int defaultFactor);
-
-namespace {
-
-// Get unroll factor considering register pressure
-int getSmartUnrollFactor(LoopInfo* loop, int baselineFactor) {
-  if (!loop || !envEnabled("SISY_ENABLE_ADAPTIVE_UNROLL", true))
-    return baselineFactor;
-
-  int factor = calculateAdaptiveUnrollFactor(loop, baselineFactor);
-  return std::max(1, std::min(factor, baselineFactor));
-}
-
-}  // namespace

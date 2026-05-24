@@ -17,6 +17,17 @@ bool envEnabled(const char *name, bool fallback) {
   return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
 }
 
+int envIntClamped(const char *name, int fallback, int low, int high) {
+  auto env = std::getenv(name);
+  if (!env)
+    return fallback;
+  char *end = nullptr;
+  long parsed = std::strtol(env, &end, 10);
+  if (!end || *end || parsed < low || parsed > high)
+    return fallback;
+  return (int) parsed;
+}
+
 int valueSize(Value::Type ty) {
   return ty == Value::i64 ? 8 : 4;
 }
@@ -137,7 +148,7 @@ void doInline(Op *call, Region *fnRegion) {
   }
 
   builder.setBeforeOp(call);
-  auto load = builder.create<LoadOp>(call->getResultType(), { addr }, { new SizeAttr(4) });
+  auto load = builder.create<LoadOp>(call->getResultType(), { addr }, { new SizeAttr(retSize) });
   call->replaceAllUsesWith(load);
   call->erase();
 }
@@ -283,39 +294,59 @@ void Inline::run() {
   });
 
   if (envEnabled("SISY_ENABLE_RECURSIVE_INLINE", true)) {
-    std::vector<Op*> recursiveCalls;
-    for (auto func : collectFuncs()) {
-      if (!recursive.count(func) && !isRecursive(func))
-        continue;
-      if (!canInlineRecursive(func))
-        continue;
+    int maxDepth = envIntClamped("SISY_RECURSIVE_INLINE_DEPTH", 2, 1, 4);
+    int maxCalls = envIntClamped("SISY_RECURSIVE_INLINE_BUDGET", 48, 1, 256);
+    int usedCalls = 0;
 
-      const auto &fname = NAME(func);
-      for (auto call : module->findAll<CallOp>()) {
-        if (NAME(call) != fname)
+    for (int depth = 0; depth < maxDepth && usedCalls < maxCalls; depth++) {
+      std::vector<Op*> recursiveCalls;
+      for (auto func : collectFuncs()) {
+        if (!recursive.count(func) && !isRecursive(func))
           continue;
-        if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
+        if (!canInlineRecursive(func))
           continue;
-        auto parent = call->getParentOp();
-        if (!parent || !isa<FuncOp>(parent))
-          continue;
-        if (parent == func)
-          continue;
-        recursiveCalls.push_back(call);
+
+        const auto &fname = NAME(func);
+        for (auto call : module->findAll<CallOp>()) {
+          if (NAME(call) != fname)
+            continue;
+          if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
+            continue;
+          auto parent = call->getParentOp();
+          if (!parent || !isa<FuncOp>(parent))
+            continue;
+          if (parent == func)
+            continue;
+          recursiveCalls.push_back(call);
+          if ((int)recursiveCalls.size() + usedCalls >= maxCalls)
+            break;
+        }
+        if ((int)recursiveCalls.size() + usedCalls >= maxCalls)
+          break;
       }
-    }
 
-    for (auto call : recursiveCalls) {
-      const auto &fname = NAME(call);
-      if (!fnMap.count(fname))
-        continue;
-      auto func = fnMap[fname];
-      if (!canInlineRecursive(func))
-        continue;
+      if (recursiveCalls.empty())
+        break;
 
-      doInline(call, func->getRegion());
-      recursiveInlined++;
-      inlined++;
+      int changedThisRound = 0;
+      for (auto call : recursiveCalls) {
+        const auto &fname = NAME(call);
+        if (!fnMap.count(fname))
+          continue;
+        auto func = fnMap[fname];
+        if (!canInlineRecursive(func))
+          continue;
+
+        doInline(call, func->getRegion());
+        recursiveInlined++;
+        inlined++;
+        usedCalls++;
+        changedThisRound++;
+        if (usedCalls >= maxCalls)
+          break;
+      }
+      if (changedThisRound == 0)
+        break;
     }
   }
 
