@@ -92,16 +92,16 @@ const Reg leafOrderf[] = {
 };
 // Order for non-leaf functions.
 const Reg normalOrderf[] = {
-  Reg::ft0, Reg::ft1, Reg::ft2, Reg::ft3,
-  Reg::ft4, Reg::ft5, Reg::ft6, Reg::ft7,
-  Reg::ft8, Reg::ft9, Reg::ft10, Reg::ft11,
-
   Reg::fa0, Reg::fa1, Reg::fa2, Reg::fa3,
   Reg::fa4, Reg::fa5, Reg::fa6, Reg::fa7,
 
   Reg::fs0, Reg::fs1, Reg::fs2, Reg::fs3, 
   Reg::fs4, Reg::fs5, Reg::fs6, Reg::fs7,
   Reg::fs8, Reg::fs9,
+
+  Reg::ft0, Reg::ft1, Reg::ft2, Reg::ft3,
+  Reg::ft4, Reg::ft5, Reg::ft6, Reg::ft7,
+  Reg::ft8, Reg::ft9, Reg::ft10, Reg::ft11,
 };
 const Reg fargRegs[] = {
   Reg::fa0, Reg::fa1, Reg::fa2, Reg::fa3,

@@ -131,12 +131,19 @@ public:
 };
 
 class Reassociate : public Pass {
+  int intReassociated = 0;
+  int floatReassociated = 0;
   void runImpl(Region *region);
 public:
   Reassociate(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "reassociate"; };
-  std::map<std::string, int> stats() override { return {}; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "int-reassociated", intReassociated },
+      { "float-reassociated", floatReassociated },
+    };
+  }
   void run() override;
 };
 

@@ -519,6 +519,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     std::unordered_map<Op*, std::unordered_set<Op*>> interf, spillInterf;
     std::unordered_map<Op*, long long> spillWeight;
     std::unordered_map<Op*, int> callSpan;
+    const int fpSpillBoost = envInt("SISY_RV_FP_SPILL_WEIGHT", 8, 1, 1024);
+    auto spillBoost = [&](Op *op) -> long long {
+      return op && fpreg(op->getResultType()) ? fpSpillBoost : 1;
+    };
 
     // Values of readreg, or operands of writereg, or phis (mvs), are prioritzed.
     std::unordered_map<Op*, int> priority;
@@ -541,12 +545,12 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     auto it = ops.end();
     for (int i = (int) ops.size() - 1; i >= 0; i--) {
       auto op = *--it;
-      spillWeight[op] += localWeight;
+      spillWeight[op] += localWeight * spillBoost(op);
       for (auto v : op->getOperands()) {
         if (!lastUsed.count(v.defining))
           lastUsed[v.defining] = i;
         // Read pressure matters more than pure definition count.
-        spillWeight[v.defining] += 2LL * localWeight;
+        spillWeight[v.defining] += 2LL * localWeight * spillBoost(v.defining);
       }
       defined[op] = i;
 
@@ -608,14 +612,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (def >= last)
         continue;
       int span = last - def;
-      spillWeight[op] += 3LL * localWeight * span;
+      spillWeight[op] += 3LL * localWeight * span * spillBoost(op);
 
       if (!localFastMode) {
         int l = std::max(0, def + 1);
         int r = std::min<int>(ops.size(), last);
         int callCount = callPrefix[r] - callPrefix[l];
         callSpan[op] = std::max(callSpan[op], callCount);
-        spillWeight[op] += 96LL * localWeight * callCount;
+        spillWeight[op] += 96LL * localWeight * callCount * spillBoost(op);
       }
     }
 
