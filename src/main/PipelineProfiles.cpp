@@ -244,7 +244,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
-    if ((opts.rv || opts.arm) && getenvEnabled("SISY_ENABLE_ADVANCED_CONV2D", true))
+    if ((opts.rv || opts.arm) && getenvEnabled("SISY_ENABLE_ADVANCED_CONV2D", false))
       pm.addPass<sys::AdvancedConv2DTransformPass>();
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))

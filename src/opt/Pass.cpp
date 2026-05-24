@@ -83,30 +83,6 @@ DomTree Pass::getDomTree(Region *region) {
 void Pass::cleanup() {
   Op::release();
 
-  // Some CFG rewrites temporarily leave a one-input phi at a join that no
-  // longer has matching predecessor arity. If the sole value dominates the phi
-  // block, the phi is just a copy. Erase it before later verification or GCM
-  // sees an inconsistent operand/predecessor shape.
-  auto funcs = collectFuncs();
-  for (auto *func : funcs) {
-    if (func && func->getRegion())
-      func->getRegion()->updateDoms();
-  }
-  runRewriter([&](PhiOp *op) {
-    if (op->getOperandCount() != 1)
-      return false;
-    auto *def = op->getOperand().defining;
-    if (!def || def == op)
-      return false;
-    auto *defBlock = def->getParent();
-    auto *phiBlock = op->getParent();
-    if (!defBlock || !phiBlock || !defBlock->dominates(phiBlock))
-      return false;
-    op->replaceAllUsesWith(def);
-    op->erase();
-    return true;
-  });
-  
   // Put phi's types right.
   runRewriter([&](PhiOp *op) {
     if (op->getResultType() == Value::f32)
