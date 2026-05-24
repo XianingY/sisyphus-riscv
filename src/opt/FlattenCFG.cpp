@@ -218,45 +218,6 @@ void tidy(FuncOp *func) {
 
   body->updatePreds();
 
-  // If a basic block has only a single terminator, try to inline it.
-  std::map<BasicBlock*, BasicBlock*> inliner;
-  for (auto bb : body->getBlocks()) {
-    if (bb->getOpCount() != 1 || !isa<GotoOp>(bb->getLastOp()))
-      continue;
-
-    auto last = bb->getLastOp();
-    auto target = last->get<TargetAttr>();
-    inliner[bb] = target->bb;
-  }
-
-  // Apply inliner.
-  auto update = [&](BasicBlock *&from) {
-    while (inliner.count(from))
-      from = inliner[from];
-  };
-
-  for (auto bb : body->getBlocks()) {
-    auto last = bb->getLastOp();
-    if (last->has<TargetAttr>()) {
-      auto target = last->get<TargetAttr>();
-      update(target->bb);
-    }
-
-    if (last->has<ElseAttr>()) {
-      auto ifnot = last->get<ElseAttr>();
-      update(ifnot->bb);
-    }
-  }
-
-  // Recalculate preds after change.
-  body->updatePreds();
-
-  // Remove inlined blocks.
-  for (auto [k, v] : inliner)
-    k->erase();
-  
-  body->updatePreds();
-
   // If the (newly produced) first block has any preds, then make a new entry block,
   // and move the real "entry ops" (alloca and getarg) to that block.
   if (body->getFirstBlock()->preds.size() >= 1) {

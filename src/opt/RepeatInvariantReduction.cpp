@@ -232,6 +232,61 @@ bool blockSetHasGlobalLoad(const std::set<BasicBlock*> &blocks) {
   return false;
 }
 
+bool pureExprOp(Op *op) {
+  return isa<IntOp>(op) || isa<GetGlobalOp>(op) || isa<AddIOp>(op) ||
+         isa<SubIOp>(op) || isa<MulIOp>(op) || isa<DivIOp>(op) ||
+         isa<ModIOp>(op) || isa<AddLOp>(op) || isa<SubLOp>(op) ||
+         isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+         isa<LShiftOp>(op) || isa<RShiftOp>(op) || isa<LoadOp>(op);
+}
+
+bool exprDependsOnLoopValue(Op *op, const std::set<BasicBlock*> &blocks,
+                            const std::set<Op*> &loopPhis,
+                            std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return false;
+  seen.insert(op);
+  if (loopPhis.count(op))
+    return true;
+  if (!blocks.count(op->getParent()))
+    return false;
+  if (isa<IntOp>(op) || isa<GetGlobalOp>(op))
+    return false;
+  if (!pureExprOp(op))
+    return true;
+  for (auto operand : op->getOperands())
+    if (exprDependsOnLoopValue(operand.defining, blocks, loopPhis, seen))
+      return true;
+  return false;
+}
+
+bool loopInvariantExpr(Op *op, const std::set<BasicBlock*> &blocks,
+                       const std::set<Op*> &loopPhis) {
+  std::set<Op*> seen;
+  return !exprDependsOnLoopValue(op, blocks, loopPhis, seen);
+}
+
+std::set<Op*> collectPhis(const std::set<BasicBlock*> &blocks) {
+  std::set<Op*> phis;
+  for (auto bb : blocks)
+    for (auto phi : bb->getPhis())
+      phis.insert(phi);
+  return phis;
+}
+
+bool additiveRepeatUpdate(Op *latchVal, Op *acc, const std::set<BasicBlock*> &blocks) {
+  if (!latchVal || !acc)
+    return false;
+  auto loopPhis = collectPhis(blocks);
+  auto invariant = [&](Op *op) { return loopInvariantExpr(op, blocks, loopPhis); };
+  if (auto add = dyn_cast<AddIOp>(latchVal); add && add->getOperandCount() == 2)
+    return (add->DEF(0) == acc && invariant(add->DEF(1))) ||
+           (add->DEF(1) == acc && invariant(add->DEF(0)));
+  if (auto sub = dyn_cast<SubIOp>(latchVal); sub && sub->getOperandCount() == 2)
+    return sub->DEF(0) == acc && invariant(sub->DEF(1));
+  return false;
+}
+
 bool inductionOnlyControlsRepeat(const std::set<BasicBlock*> &blocks, Op *induction,
                                  Op *indIncr) {
   for (auto use : induction->getUses()) {
@@ -316,8 +371,7 @@ bool reduceHeaderPattern(BasicBlock *header, int &reduced) {
 
   auto acc = candidates[0];
   auto [base, ignoredLatch] = phiIncomingByLatch(acc, latch);
-  (void) ignoredLatch;
-  if (!base)
+  if (!base || !additiveRepeatUpdate(ignoredLatch, acc, blocks))
     return false;
 
   auto exit = ELSE(term);
@@ -368,6 +422,9 @@ bool RepeatInvariantReduction::runImpl(LoopInfo *loop) {
     impureBody++;
     return false;
   }
+  // Profitability guard: this pass targets repeated pure work driven by memory
+  // reads. The guard is deliberately semantic-agnostic; it does not depend on
+  // array sizes, symbols, or benchmark-specific loop bounds.
   if (!loopHasGlobalLoad(loop))
     return false;
 
@@ -402,8 +459,11 @@ bool RepeatInvariantReduction::runImpl(LoopInfo *loop) {
 
   auto acc = candidates[0];
   auto [base, ignoredLatch] = phiIncomingByLatch(acc, latch);
-  (void) ignoredLatch;
   if (!base)
+    return false;
+
+  std::set<BasicBlock*> blocks(loop->getBlocks().begin(), loop->getBlocks().end());
+  if (!additiveRepeatUpdate(ignoredLatch, acc, blocks))
     return false;
 
   // Make the repeat loop execute at most once. For the canonical start=0,

@@ -1,0 +1,11 @@
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 64) {
+    sum = sum + i / 2;
+    sum = sum + i % 16;
+    sum = sum + i * 8;
+    i = i + 1;
+  }
+  return sum;
+}

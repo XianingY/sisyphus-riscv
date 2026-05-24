@@ -68,8 +68,10 @@ void LateInline::run() {
     //    ....
     // Insert a proper amount of blocks between `bb` and `end`.
     std::vector<BasicBlock*> body;
-    for (auto bb : fnRegion->getBlocks())
+    for (auto bb : fnRegion->getBlocks()) {
+      (void)bb;
       body.push_back(callRegion->insert(end));
+    }
 
     builder.setToBlockEnd(bb);
     // All return values.

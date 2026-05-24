@@ -4,7 +4,9 @@
 #include "../../codegen/CodeGen.h"
 #include "../../codegen/Attrs.h"
 
+#include <algorithm>
 #include <unordered_map>
+#include <vector>
 
 namespace sys::backend::shared {
 
@@ -15,37 +17,43 @@ std::unordered_map<BasicBlock*, int> computeBlockHotness(Region *region,
                                                          int callLikeMultiplier = 2) {
   std::unordered_map<BasicBlock*, int> bbIndex;
   std::unordered_map<BasicBlock*, int> bbWeight;
+  std::vector<BasicBlock*> blocks;
   int idx = 0;
-  for (auto bb : region->getBlocks())
+  for (auto bb : region->getBlocks()) {
     bbIndex[bb] = idx++;
+    blocks.push_back(bb);
+    bbWeight[bb] = 1;
+  }
 
   for (auto bb : region->getBlocks()) {
-    int weight = 1;
-    if (bb->getOpCount() == 0) {
-      bbWeight[bb] = weight;
+    if (bb->getOpCount() == 0)
       continue;
-    }
 
     auto term = bb->getLastOp();
-    bool hasBackEdge = false;
-    if (auto target = term->find<TargetAttr>()) {
-      if (bbIndex.count(target->bb))
-        hasBackEdge = hasBackEdge || (bbIndex[target->bb] <= bbIndex[bb]);
-    }
-    if (auto ifnot = term->find<ElseAttr>()) {
-      if (bbIndex.count(ifnot->bb))
-        hasBackEdge = hasBackEdge || (bbIndex[ifnot->bb] <= bbIndex[bb]);
-    }
-    if (hasBackEdge)
-      weight *= backEdgeMultiplier;
+    auto markNaturalLoop = [&](BasicBlock *target) {
+      if (!target || !bbIndex.count(target))
+        return;
+      int head = bbIndex[target];
+      int latch = bbIndex[bb];
+      if (head > latch)
+        return;
+      for (int i = head; i <= latch && i < (int) blocks.size(); i++)
+        bbWeight[blocks[i]] = std::min(bbWeight[blocks[i]] * backEdgeMultiplier, 1000000000);
+    };
 
+    if (auto target = term->find<TargetAttr>())
+      markNaturalLoop(target->bb);
+    if (auto ifnot = term->find<ElseAttr>())
+      markNaturalLoop(ifnot->bb);
+  }
+
+  for (auto bb : region->getBlocks()) {
     for (auto op : bb->getOps()) {
       if (!isCallLike(op))
         continue;
-      weight *= callLikeMultiplier;
+      bbWeight[bb] = std::min(bbWeight[bb] * callLikeMultiplier, 1000000000);
       break;
     }
-    bbWeight[bb] = weight;
   }
 
   return bbWeight;

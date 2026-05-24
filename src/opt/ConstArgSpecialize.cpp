@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -27,6 +28,23 @@ int envInt(const char *name, int fallback) {
   if (!env)
     return fallback;
   return std::atoi(env);
+}
+
+bool isRecursiveFunc(FuncOp *func) {
+  if (!func || !func->has<CallerAttr>())
+    return false;
+  const auto &name = NAME(func);
+  const auto &callers = CALLER(func);
+  return std::find(callers.begin(), callers.end(), name) != callers.end();
+}
+
+bool hasOnlyI32Args(FuncOp *func) {
+  if (!func || !func->has<ArgTypesAttr>())
+    return false;
+  for (auto ty : func->get<ArgTypesAttr>()->types)
+    if (ty != Value::i32)
+      return false;
+  return true;
 }
 
 bool isSpecializedName(const std::string &name) {
@@ -81,6 +99,104 @@ int opCount(FuncOp *func) {
     for ([[maybe_unused]] auto op : bb->getOps())
       count++;
   return count;
+}
+
+std::optional<int> immutableScalarGlobalValue(
+    const std::string &name,
+    const std::map<std::string, GlobalOp*> &gMap,
+    const std::set<std::string> &mutableGlobals) {
+  if (mutableGlobals.count(name))
+    return std::nullopt;
+  auto it = gMap.find(name);
+  if (it == gMap.end())
+    return std::nullopt;
+  auto global = it->second;
+  if (!global->has<ConstAttr>())
+    return std::nullopt;
+  if (!global->has<DimensionAttr>() || DIM(global).size() != 1 || DIM(global)[0] != 1)
+    return std::nullopt;
+  auto iarr = global->find<IntArrayAttr>();
+  if (!iarr || iarr->size != 1)
+    return std::nullopt;
+  if (!iarr->vi)
+    return 0;
+  return iarr->vi[0];
+}
+
+bool addressMentionsGlobal(const std::string &name, Op *addr) {
+  if (!addr)
+    return false;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr) == name;
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown)
+    return false;
+  for (auto &[base, _] : alias->location) {
+    if (base && isa<GlobalOp>(base) && NAME(base) == name)
+      return true;
+  }
+  return false;
+}
+
+bool mayStoreToGlobal(const std::string &name, Op *addr,
+                      const std::set<std::string> &escapedGlobals) {
+  if (addressMentionsGlobal(name, addr))
+    return true;
+  auto alias = addr ? addr->find<AliasAttr>() : nullptr;
+  return escapedGlobals.count(name) && (!alias || alias->unknown);
+}
+
+std::optional<std::string> zeroOffsetGlobalName(Op *addr) {
+  if (!addr)
+    return std::nullopt;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr);
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown || alias->location.size() != 1)
+    return std::nullopt;
+  auto &[base, offsets] = *alias->location.begin();
+  if (!base || !isa<GlobalOp>(base) || offsets.size() != 1 || offsets[0] != 0)
+    return std::nullopt;
+  return NAME(base);
+}
+
+std::optional<int> tryGetConstantValue(
+    Op *op,
+    const std::map<std::string, GlobalOp*> &gMap,
+    const std::set<std::string> &mutableGlobals,
+    std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return std::nullopt;
+  seen.insert(op);
+
+  if (isa<IntOp>(op))
+    return V(op);
+
+  if (isa<LoadOp>(op)) {
+    auto name = zeroOffsetGlobalName(op->DEF(0));
+    if (!name)
+      return std::nullopt;
+    return immutableScalarGlobalValue(*name, gMap, mutableGlobals);
+  }
+
+  if (op->getOperandCount() != 2)
+    return std::nullopt;
+  auto lhs = tryGetConstantValue(op->DEF(0), gMap, mutableGlobals, seen);
+  auto rhs = tryGetConstantValue(op->DEF(1), gMap, mutableGlobals, seen);
+  if (!lhs || !rhs)
+    return std::nullopt;
+
+  if (isa<AddIOp>(op))
+    return *lhs + *rhs;
+  if (isa<SubIOp>(op))
+    return *lhs - *rhs;
+  if (isa<MulIOp>(op))
+    return *lhs * *rhs;
+  if (isa<DivIOp>(op) && *rhs != 0)
+    return *lhs / *rhs;
+  if (isa<ModIOp>(op) && *rhs != 0)
+    return *lhs % *rhs;
+  return std::nullopt;
 }
 
 void copyRegion(Region *dst, Region *src) {
@@ -157,9 +273,35 @@ void ConstArgSpecialize::run() {
   if (!envEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true))
     return;
 
+  CallGraph(module).run();
+
   const int budget = envInt("SISY_CONST_ARG_SPECIALIZE_BUDGET", kDefaultBudget);
   const int maxOps = envInt("SISY_CONST_ARG_SPECIALIZE_MAX_OPS", kDefaultMaxOps);
   std::set<std::string> produced;
+  auto gMap = getGlobalMap();
+  std::set<std::string> escapedGlobals;
+  for (auto call : module->findAll<CallOp>()) {
+    for (auto operand : call->getOperands()) {
+      auto def = operand.defining;
+      if (!def || def->getResultType() != Value::i64)
+        continue;
+      for (auto &[name, _] : gMap)
+        if (addressMentionsGlobal(name, def))
+          escapedGlobals.insert(name);
+    }
+  }
+  std::set<std::string> mutableGlobals;
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    auto addr = store->DEF(1);
+    if (!addr)
+      continue;
+    for (auto &[name, _] : gMap)
+      if (mayStoreToGlobal(name, addr, escapedGlobals))
+        mutableGlobals.insert(name);
+  }
+  mutableGlobals.insert(escapedGlobals.begin(), escapedGlobals.end());
 
   for (int round = 0; round < budget; round++) {
     while (foldTinyIntConstants(module));
@@ -175,16 +317,25 @@ void ConstArgSpecialize::run() {
       auto func = fmap[callee];
       if (!func->has<ArgCountAttr>() || opCount(func) > maxOps)
         continue;
+      if (!hasOnlyI32Args(func))
+        continue;
       if (call->getOperandCount() != func->get<ArgCountAttr>()->count)
+        continue;
+      bool recursive = isRecursiveFunc(func);
+      if (recursive)
         continue;
 
       int argIndex = -1;
       int argValue = 0;
       for (int i = 0; i < call->getOperandCount(); i++) {
         auto def = call->DEF(i);
-        if (!def || !isa<IntOp>(def))
+        if (!def)
           continue;
-        int value = V(def);
+        std::set<Op*> seen;
+        auto maybeValue = tryGetConstantValue(def, gMap, mutableGlobals, seen);
+        if (!maybeValue)
+          continue;
+        int value = *maybeValue;
         if (value < -1 || value > 16)
           continue;
         argIndex = i;
@@ -229,6 +380,8 @@ void ConstArgSpecialize::run() {
       break;
 
     while (foldTinyIntConstants(module));
+    RegularFold(module).run();
+    SimplifyCFG(module).run();
     GVN(module).run();
     DCE(module).run();
   }

@@ -234,6 +234,8 @@ bool RotlRepeatLoopFold::runImpl(FuncOp *func, LoopInfo *loop) {
   }
 
   auto stopRange = minMaxStopValue(func, stop);
+  // Keep the closed-form expansion small. The bound is a code-size guard for
+  // this structural rotate recurrence, not a data-size or benchmark filter.
   if (!stopRange || stopRange->first < 1 || stopRange->second > 8) {
     rejected++;
     return false;

@@ -36,6 +36,20 @@ Op *phiFromSafe(Op *phi, BasicBlock *bb) {
   return nullptr;
 }
 
+std::vector<int> negateIncrements(std::vector<int> amt) {
+  for (auto &x : amt)
+    x = -x;
+  return amt;
+}
+
+std::vector<int> subtractIncrements(std::vector<int> lhs, const std::vector<int> &rhs) {
+  if (lhs.size() < rhs.size())
+    lhs.resize(rhs.size(), 0);
+  for (size_t i = 0; i < rhs.size(); i++)
+    lhs[i] -= rhs[i];
+  return lhs;
+}
+
 }
 
 void SCEV::rewrite(BasicBlock *bb, LoopInfo *info) {
@@ -97,20 +111,30 @@ void SCEV::rewrite(BasicBlock *bb, LoopInfo *info) {
       }
     }
 
-    if (isa<SubIOp>(op)) {
+    if (isa<SubIOp>(op) || isa<SubLOp>(op)) {
       auto x = op->DEF(0);
       auto y = op->DEF(1);
-      if (!x->has<IncreaseAttr>()) {
-        if (y->has<IncreaseAttr>())
-          std::swap(x, y);
-        else
-          continue;
+
+      auto xincr = x->find<IncreaseAttr>();
+      auto yincr = y->find<IncreaseAttr>();
+
+      // Case 1. x - y, while both sides have a known recurrence.
+      if (xincr && yincr) {
+        op->add<IncreaseAttr>(subtractIncrements(xincr->amt, yincr->amt));
+        continue;
       }
 
-      // Case 1. x - <invariant>
-      if (y->getParent()->dominates(preheader)) {
+      // Case 2. x - <invariant>
+      if (xincr && y->getParent()->dominates(preheader)) {
         start[y] = y;
-        op->add<IncreaseAttr>(INCR(x)->amt);
+        op->add<IncreaseAttr>(xincr->amt);
+        continue;
+      }
+
+      // Case 3. <invariant> - y.  The recurrence direction is negated.
+      if (yincr && x->getParent()->dominates(preheader)) {
+        start[x] = x;
+        op->add<IncreaseAttr>(negateIncrements(yincr->amt));
         continue;
       }
     }
@@ -118,7 +142,24 @@ void SCEV::rewrite(BasicBlock *bb, LoopInfo *info) {
     if (isa<MulIOp>(op)) {
       auto x = op->DEF(0);
       auto y = op->DEF(1);
-      // Case 1. x * <invar>
+
+      if (!x->has<IncreaseAttr>()) {
+        if (y->has<IncreaseAttr>())
+          std::swap(x, y);
+      }
+
+      // Case 1. x * 'a
+      if (x->has<IncreaseAttr>() && isa<IntOp>(y)) {
+        auto amt = INCR(x)->amt;
+        int v = V(y);
+        for (auto &x : amt)
+          x *= v;
+        op->add<IncreaseAttr>(amt);
+        start[y] = y;
+        continue;
+      }
+
+      // Case 2. x * <invar>
       if (x->has<IncreaseAttr>() && INCR(x)->amt.size() == 1 && !info->contains(y->getParent())) {
         auto amt = INCR(x)->amt[0];
         std::vector<Op*> incr = { y };
@@ -133,7 +174,7 @@ void SCEV::rewrite(BasicBlock *bb, LoopInfo *info) {
         continue;
       }
 
-      // Case 2. <invar> * <invar>
+      // Case 3. <invar> * <invar>
       if (invar.count(x) && !info->contains(y->getParent())) {
         invar[op] = invar[x];
         invar[op].push_back(y);
@@ -146,17 +187,6 @@ void SCEV::rewrite(BasicBlock *bb, LoopInfo *info) {
           std::swap(x, y);
         else
           continue;
-      }
-
-      // Case 3. x * 'a
-      if (isa<IntOp>(y)) {
-        auto amt = INCR(x)->amt;
-        int v = V(y);
-        for (auto &x : amt)
-          x *= v;
-        op->add<IncreaseAttr>(amt);
-        start[y] = y;
-        continue;
       }
     }
   }

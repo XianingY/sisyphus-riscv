@@ -42,6 +42,8 @@
 #define RVOP(Ty) RVOPBASE(Value::i32, Ty)
 #define RVOPL(Ty) RVOPBASE(Value::i64, Ty)
 #define RVOPF(Ty) RVOPBASE(Value::f32, Ty)
+#define RVOPV(Ty) RVOPBASE(Value::i128, Ty)
+#define RVOPFV(Ty) RVOPBASE(Value::f128, Ty)
 
 namespace sys {
 
@@ -121,9 +123,23 @@ RVOPF(FmulOp);
 RVOPF(FdivOp);
 RVOPF(FmvOp);
 
+// Vector Opcodes
+RVOPBASE(Value::unit, VsetvliOp);
+RVOPE(Vle32Op);
+RVOPBASE(Value::unit, Vse32Op);
+RVOPV(VaddvvOp);
+RVOPV(VsubvvOp);
+RVOPV(VmulvvOp);
+RVOPV(VmvvxOp);
+RVOPFV(VfaddvvOp);
+RVOPFV(VfsubvvOp);
+RVOPFV(VfmulvvOp);
+RVOPFV(VfmvvfOp);
+
 inline bool hasRd(Op *op) {
   return !(
     isa<StoreOp>(op) ||
+    isa<Vse32Op>(op) ||
     isa<RetOp>(op) ||
     isa<JOp>(op) ||
     isa<BeqOp>(op) ||
@@ -133,7 +149,8 @@ inline bool hasRd(Op *op) {
     isa<BleOp>(op) ||
     isa<BgtOp>(op) ||
     isa<WriteRegOp>(op) ||
-    isa<CallOp>(op)
+    isa<CallOp>(op) ||
+    isa<VsetvliOp>(op)
   );
 }
 

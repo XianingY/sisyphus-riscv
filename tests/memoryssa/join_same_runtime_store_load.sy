@@ -1,0 +1,13 @@
+int main() {
+  int a[1];
+  int x;
+  int c;
+  x = getint();
+  c = getint();
+  if (c) {
+    a[0] = x;
+  } else {
+    a[0] = x;
+  }
+  return a[0];
+}

@@ -43,9 +43,29 @@ public:
   void run() override;
 };
 
+// Pre-RA list scheduler for RV ops.
+// Reorders instructions within basic blocks to hide load/multiply latency
+// while respecting register-pressure constraints.
+class Schedule : public Pass {
+  int reordered = 0;
+  int criticalPathNodes = 0;
+  int criticalPathMaxHeight = 0;
+  int heightWeight = 3;
+
+  void runImpl(BasicBlock *bb);
+public:
+  Schedule(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "rv-schedule"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class RegAlloc : public Pass {
   int spilled = 0;
   int convertedTotal = 0;
+  int maxBlockHotness = 0;
+  int liveRangeSplits = 0;
   bool fastMode;
 
   std::map<FuncOp*, std::set<Reg>> usedRegisters;

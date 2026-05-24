@@ -171,15 +171,25 @@ LoopForest LoopAnalysis::runImpl(Region *region) {
             // Already rotated. Check latch instead.
             // brRotated: (br (lt (add x z) y))
             term = latch->getLastOp();
-            if (!brRotated.match(term,  { { "x", loop->induction } }))
-              continue;
+            if (brRotated.match(term, { { "x", loop->induction } })) {
+              loop->stop = brRotated.extract("y");
+              break;
+            }
 
-            loop->stop = brRotated.extract("y");
-            break;
+            // Alternative rotated pattern: (br (lt incr_value y))
+            // where incr_value is def2 (the phi's latch-incoming add result)
+            if (br.match(term, { { "x", def2 } })) {
+              loop->stop = br.extract("y");
+              break;
+            }
+
+            continue;
           }
 
+          // Non-rotated: condition is in the header.
+          auto headerTerm = header->getLastOp();
           // br: (br (lt x y))
-          if (!br.match(term, { { "x", loop->induction } }))
+          if (!br.match(headerTerm, { { "x", loop->induction } }))
             continue;
 
           loop->stop = br.extract("y");

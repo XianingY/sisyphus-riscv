@@ -2,6 +2,9 @@
 #include "../utils/Matcher.h"
 #include "../utils/Exec.h"
 
+#include <cstdlib>
+#include <cstring>
+
 using namespace sys;
 
 // Defined in Inline.cpp.
@@ -11,9 +14,21 @@ namespace {
 
 Rule minusone("(sub x 1)");
 
+bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
 }
 
 void Cached::run() {
+  // Compile-time precomputation embeds interpreter-produced data in the binary,
+  // so keep it strict-mode opt-in only.
+  if (!envEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", false))
+    return;
+
   // Identify candidate functions.
   auto funcs = collectFuncs();
   for (auto func : funcs) {

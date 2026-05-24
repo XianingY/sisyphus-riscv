@@ -124,6 +124,12 @@ public:
   AtMostOnceAttr *clone() override { return new AtMostOnceAttr; }
 };
 
+class ConstAttr : public AttrImpl<ConstAttr, __LINE__> {
+public:
+  std::string toString() override { return "<const>"; }
+  ConstAttr *clone() override { return new ConstAttr; }
+};
+
 class ArgCountAttr : public AttrImpl<ArgCountAttr, __LINE__> {
 public:
   int count;

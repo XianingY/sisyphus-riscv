@@ -1,0 +1,25 @@
+int arr[16];
+
+int f(int a, int b, int c) {
+  int i;
+  int j;
+  int sum;
+  i = 0;
+  sum = 0;
+  while (i < 4) {
+    j = 0;
+    while (j < 4) {
+      sum = sum + arr[j];
+      sum = sum + a;
+      sum = sum + b;
+      sum = sum + c;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return f(1, 2, 3);
+}

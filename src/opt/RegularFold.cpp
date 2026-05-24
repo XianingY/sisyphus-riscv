@@ -14,25 +14,101 @@ using namespace sys;
 //      scalar (size == 1) integer global with a known initializer.
 //      This covers patterns like `const int base = 16;` which the frontend
 //      emits as a global variable rather than inlining the constant.
+static bool addressMentionsScalarGlobal(const std::string &name, Op *addr) {
+  if (!addr)
+    return false;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr) == name;
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown)
+    return false;
+  for (auto &[base, _] : alias->location)
+    if (base && isa<GlobalOp>(base) && NAME(base) == name)
+      return true;
+  return false;
+}
+
+static bool scalarGlobalEscapesToCall(const std::string &name, ModuleOp *module) {
+  for (auto call : module->findAll<CallOp>()) {
+    for (auto operand : call->getOperands()) {
+      auto def = operand.defining;
+      if (!def || def->getResultType() != Value::i64)
+        continue;
+      if (addressMentionsScalarGlobal(name, def))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool mayTouchScalarGlobal(const std::string &name, Op *addr, bool escaped) {
+  if (!addr)
+    return false;
+  if (addressMentionsScalarGlobal(name, addr))
+    return true;
+  auto alias = addr->find<AliasAttr>();
+  return escaped && (!alias || alias->unknown);
+}
+
+static bool hasStoreToScalarGlobal(
+    const std::string &name,
+    ModuleOp *module) {
+  bool escaped = scalarGlobalEscapesToCall(name, module);
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    if (mayTouchScalarGlobal(name, store->DEF(1), escaped))
+      return true;
+  }
+
+  return escaped;
+}
+
+static std::optional<int> immutableScalarGlobalValue(
+    const std::string &name,
+    const std::map<std::string, GlobalOp*> &gMap,
+    ModuleOp *module) {
+  auto it = gMap.find(name);
+  if (it == gMap.end())
+    return std::nullopt;
+  auto glob = it->second;
+  if (!glob->has<ConstAttr>())
+    return std::nullopt;
+  auto iarr = glob->get<IntArrayAttr>();
+  if (!iarr || iarr->size != 1)
+    return std::nullopt;
+  if (hasStoreToScalarGlobal(name, module))
+    return std::nullopt;
+  if (!iarr->vi)
+    return 0;
+  return iarr->vi[0];
+}
+
+static std::optional<std::string> zeroOffsetGlobalName(Op *addr) {
+  if (!addr)
+    return std::nullopt;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr);
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown || alias->location.size() != 1)
+    return std::nullopt;
+  auto &[base, offsets] = *alias->location.begin();
+  if (!base || !isa<GlobalOp>(base) || offsets.size() != 1 || offsets[0] != 0)
+    return std::nullopt;
+  return NAME(base);
+}
+
 static std::optional<int> tryGetConstantValue(
-    Op *op, const std::map<std::string, GlobalOp*> &gMap) {
+    Op *op, const std::map<std::string, GlobalOp*> &gMap, ModuleOp *module) {
   if (isa<IntOp>(op))
     return V(op);
 
-  // Pattern: load(getglobal(<name>))
+  // Pattern: load(getglobal(<name>)) or an equivalent zero-offset alias.
   if (isa<LoadOp>(op)) {
-    auto addr = op->DEF(0);
-    if (!isa<GetGlobalOp>(addr))
+    auto name = zeroOffsetGlobalName(op->DEF(0));
+    if (!name)
       return std::nullopt;
-    auto name = NAME(addr);
-    auto it = gMap.find(name);
-    if (it == gMap.end())
-      return std::nullopt;
-    auto glob = it->second;
-    auto iarr = glob->get<IntArrayAttr>();
-    if (!iarr || iarr->size != 1)
-      return std::nullopt;
-    return iarr->vi[0];
+    return immutableScalarGlobalValue(*name, gMap, module);
   }
 
   return std::nullopt;
@@ -87,7 +163,7 @@ static Rule rules[] = {
   "(change (sub (sub x 'a) 'b) (sub x (!add 'a 'b)))",
   "(change (sub x (minus y)) (add x y))",
   "(change (sub (mul x 'a) (mul x 'b)) (mul x (!sub 'a 'b)))",
-  "(change (add (mul x 'a) x) (mul (!sub 'a 1) x))",
+  "(change (sub (mul x 'a) x) (mul (!sub 'a 1) x))",
   "(change (sub (mul x 'a) (mul y 'a)) (mul (sub x y) 'a))",
   "(change (sub (div 'a x) (div 'b x)) (div (!sub 'a 'b) x))",
   "(change (sub (div x 'a) (div y 'a)) (div (sub x y) 'a))",
@@ -346,11 +422,13 @@ int RegularFold::runImpl(Region *region) {
     for (auto op : ops) {
       // Match each rule.
       bool success = false;
-      for (auto &rule : rules) {
-        success = rule.rewrite(op);
-        if (success) {
-          folded++;
-          break;
+      if (!op->has<ImpureAttr>()) {
+        for (auto &rule : rules) {
+          success = rule.rewrite(op);
+          if (success) {
+            folded++;
+            break;
+          }
         }
       }
 
@@ -376,7 +454,13 @@ void RegularFold::run() {
   // We use this to resolve loads from scalar const globals (e.g. `const int base = 16`).
   auto gMap = getGlobalMap();
 
+  int rounds = 0;
   do {
+    currentRound = rounds;
+    if (rounds++ > 1000) {
+      std::cerr << "[RegularFold] warning: algebraic folding did not converge after 1000 rounds! Breaking to prevent infinite loop." << std::endl;
+      break;
+    }
     folded = 0;
     for (auto func : funcs) {
       auto region = func->getRegion();
@@ -385,6 +469,23 @@ void RegularFold::run() {
 
     // Also, run some extra folds.
     Builder builder;
+
+    runRewriter([&](LoadOp *op) {
+      if (op->getResultType() != Value::i32 || op->getOperandCount() != 1)
+        return false;
+      auto addr = op->DEF(0);
+      auto name = zeroOffsetGlobalName(addr);
+      if (!name)
+        return false;
+
+      auto value = immutableScalarGlobalValue(*name, gMap, module);
+      if (!value)
+        return false;
+
+      folded++;
+      builder.replace<IntOp>(op, { new IntAttr(*value) });
+      return true;
+    });
 
     runRewriter([&](BranchOp *op) {
       auto cond = op->DEF();
@@ -447,7 +548,7 @@ void RegularFold::run() {
 
         // Divisor must be a compile-time integer constant (or a load from a
         // scalar const global, e.g. `const int base = 16`).
-        auto maybeDiv = tryGetConstantValue(y, gMap);
+        auto maybeDiv = tryGetConstantValue(y, gMap, module);
         if (!maybeDiv)
           return false;
 
@@ -475,38 +576,62 @@ void RegularFold::run() {
         return false;
       });
 
-      // Signed integer remainder by a compile-time power-of-2 constant,
-      // when Range analysis confirms x >= 0:
-      //   x % 2^n  →  x & (2^n - 1)
-      // This is only valid for non-negative x: for negative x, C semantics give
-      // a negative remainder, but bitwise AND always gives a non-negative result.
+      // Signed integer remainder by a compile-time power-of-2 constant.
+      //
+      // For non-negative x, x % 2^n is just x & (2^n - 1).  For the general
+      // signed case, preserve SysY/C round-toward-zero semantics by using the
+      // same biased quotient as the division fold:
+      //   q = (x + ((x >> 31) & (2^n - 1))) >> n
+      //   r = x - (q << n)
+      // This removes expensive remw without assuming that the source is a
+      // bitwise helper or that x is non-negative.
       runRewriter([&](ModIOp *op) {
         auto x = op->DEF(0);
         auto y = op->DEF(1);
 
         // Divisor must be a compile-time integer constant (or a load from a
         // scalar const global, e.g. `const int base = 16`).
-        auto maybeMod = tryGetConstantValue(y, gMap);
+        auto maybeMod = tryGetConstantValue(y, gMap, module);
         if (!maybeMod)
           return false;
 
         int divisor = *maybeMod;
+        if (divisor < 0)
+          divisor = -divisor;
+
         // Must be a positive power of 2.
         if (divisor <= 0 || __builtin_popcount((unsigned)divisor) != 1)
           return false;
 
-        // Range analysis must confirm x >= 0 (lower bound >= 0).
-        if (!x->has<RangeAttr>())
-          return false;
-        auto [low, high] = RANGE(x);
-        if (low < 0)
-          return false;
-
-        int mask = divisor - 1;  // 2^n - 1
+        if (divisor == 1) {
+          builder.replace<IntOp>(op, { new IntAttr(0) });
+          folded++;
+          return true;
+        }
 
         builder.setBeforeOp(op);
+        int shift = __builtin_ctz((unsigned)divisor);
+        int mask = divisor - 1;
+
+        if (x->has<RangeAttr>()) {
+          auto [low, high] = RANGE(x);
+          if (low >= 0) {
+            auto cmask = builder.create<IntOp>({ new IntAttr(mask) });
+            builder.replace<AndIOp>(op, { x, cmask });
+            folded++;
+            return false;
+          }
+        }
+
+        auto c31 = builder.create<IntOp>({ new IntAttr(31) });
+        auto sign = builder.create<RShiftOp>({ x, c31 });
         auto cmask = builder.create<IntOp>({ new IntAttr(mask) });
-        builder.replace<AndIOp>(op, { x, cmask });
+        auto bias = builder.create<AndIOp>({ sign, cmask });
+        auto biased = builder.create<AddIOp>({ x, bias });
+        auto cshift = builder.create<IntOp>({ new IntAttr(shift) });
+        auto quotient = builder.create<RShiftOp>({ biased, cshift });
+        auto product = builder.create<LShiftOp>({ quotient, cshift });
+        builder.replace<SubIOp>(op, { x, product });
 
         folded++;
         return false;

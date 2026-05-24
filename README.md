@@ -17,7 +17,7 @@ Sisyphus is a SysY compiler project for the 2026 compiler contest track.
   - `--emit-ir`
   - `--verify-ir`
   - `--dump-pass-timing`
-  - `--enable-experimental` (opt-in for experimental O1/O2 passes; off by default)
+  - `--enable-experimental` (opt-in for additional experimental O1/O2 behavior)
   - `--use-legacy-codegen` (escape hatch during dialect migration)
   - `--force-dialect-codegen` (forbid automatic fallback; fail fast on unsupported dialect lowering)
   - `--dialect-fallback-report=stderr|<path>` (emit frontend path and fallback reason codes)
@@ -29,13 +29,16 @@ Sisyphus is a SysY compiler project for the 2026 compiler contest track.
   - `--disable-loop-rotate`
   - `--enable-loop-rotate`
   - `--disable-const-unroll`
-  - Defaults: `-O1 => inline/late=200`, `-O2 => inline/late=256` (unless explicitly overridden), and loop-rotate off by default for O1/O2
+  - Defaults: `-O1 => inline/late=200`, `-O2 => inline/late=256` unless explicitly overridden
 
 ## Build
 
 ```bash
 scripts/build.sh
 ```
+
+`scripts/build.sh` is portable across Linux and macOS. Use `JOBS=<N>` to
+override parallelism.
 
 Contest evaluators may compile all `src/*.cpp` files directly instead of using
 CMake. In that mode the default target comes from
@@ -52,6 +55,15 @@ or with raw CMake:
 ```bash
 cmake -S . -B build -DDEFAULT_TARGET=arm
 cmake --build build -j
+```
+
+For Docker/QEMU runtime evaluation on macOS, build a Linux compiler as well:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:$PWD" -w "$PWD" \
+  sisyphus/compiler-dev-dual:latest \
+  bash -lc 'cmake -S . -B build-linux -G "Unix Makefiles" && cmake --build build-linux -j 8'
 ```
 
 ## Usage
@@ -124,6 +136,13 @@ scripts/eval-vs-biframe.sh official-functional riscv O1
 scripts/eval-official-adapter.sh /path/to/official/functional /path/to/official/perf /path/to/runtime
 ```
 
+When running runtime checks with the Docker-built Linux compiler:
+
+```bash
+export SISY_COMPILER_PATH="$PWD/build-linux/compiler"
+export RUNTIME_SYLIB_C="$PWD/runtime/sylib.c"
+```
+
 ## Runtime
 
 A local runtime library is provided in `runtime/sylib.c` and `runtime/sylib.h`.
@@ -136,6 +155,21 @@ Runtime evaluation environment variables:
 - Runtime CSV includes `suspect_input_underflow` to label likely input-underflow/UB-sensitive cases.
 - Runtime CSV also includes `frontend_path` and `fallback_reason_codes` (for dialect migration coverage tracking).
 - `SISY_COMPILER_EXTRA_ARGS` can be used to forward extra compiler flags in runtime/regression/compare scripts.
+
+Optimization bisection switches:
+
+- `SISY_ENABLE_FUNCTION_EQUIVALENCE=0`
+- `SISY_ENABLE_VECTORIZE=0`
+- `SISY_HIR_ENABLE_INTERCHANGE=0`
+- `SISY_HIR_ENABLE_UNROLL_JAM=0`
+
+Strict-mode opt-in switches for high-risk recognizers:
+
+- `SISY_ENABLE_STRUCTURAL_BITWISE=1`
+- `SISY_ENABLE_STRUCTURAL_MODMUL=1`
+- `SISY_ENABLE_ROW_SCRATCH_MATMUL=1`
+- `SISY_ENABLE_CACHED_PRECOMPUTE=1`
+- `SISY_ENABLE_SYNTH_CONST_ARRAY=1`
 
 Compare/validator environment variables:
 
@@ -166,6 +200,8 @@ Legacy public-suite repos (`open-test-cases`, `compiler-dev-test-cases`, `lvx`) 
 
 - `docs/Design.md`
 - `docs/Compliance.md`
+- `docs/Commands.md`
+- `docs/Optimization.md`
 
 ## Notes
 

@@ -2,6 +2,8 @@
 #include "Regs.h"
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <tuple>
 
 using namespace sys::rv;
 using namespace sys;
@@ -15,6 +17,10 @@ bool envEnabled(const char *name, bool fallback = true) {
   if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
     return false;
   return true;
+}
+
+bool isMemoryClobber(Op *op) {
+  return isa<rv::StoreOp>(op) || isa<FsdOp>(op) || isa<rv::CallOp>(op);
 }
 
 std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
@@ -54,6 +60,59 @@ int getStackArgIndex(const std::vector<Value::Type> &types, int index) {
   }
 
   return -1;
+}
+
+template <typename BranchTy, typename InverseBranchTy>
+bool rotateFallthroughLoop(BranchTy *op, Builder &builder) {
+  if (!op->template has<TargetAttr>() || op->template has<ElseAttr>())
+    return false;
+  auto header = op->getParent();
+  auto exit = op->template get<TargetAttr>()->bb;
+
+  auto &blocks = header->getParent()->getBlocks();
+  auto headerIt = blocks.begin();
+  for (; headerIt != blocks.end() && *headerIt != header; ++headerIt) {}
+  if (headerIt == blocks.end())
+    return false;
+
+  if (headerIt != blocks.begin()) {
+    auto prevIt = headerIt;
+    --prevIt;
+    auto prev = *prevIt;
+    if (prev->getOpCount() == 0)
+      return false;
+    auto prevTerm = prev->getLastOp();
+    if (!isa<JOp>(prevTerm) && !isa<RetOp>(prevTerm))
+      return false;
+  }
+
+  auto bodyIt = headerIt;
+  ++bodyIt;
+  if (bodyIt == blocks.end())
+    return false;
+  auto body = *bodyIt;
+  auto afterBodyIt = bodyIt;
+  ++afterBodyIt;
+
+  if (!exit || body == exit)
+    return false;
+  if (afterBodyIt == blocks.end() || *afterBodyIt != exit)
+    return false;
+  auto bodyTerm = body->getLastOp();
+  if (!bodyTerm || !isa<JOp>(bodyTerm) ||
+      bodyTerm->template get<TargetAttr>()->bb != header)
+    return false;
+  if (!op->template has<RsAttr>() || !op->template has<Rs2Attr>())
+    return false;
+
+  body->moveBefore(header);
+  bodyTerm->erase();
+  builder.replace<InverseBranchTy>(op, std::vector<Attr*> {
+    op->template get<RsAttr>(),
+    op->template get<Rs2Attr>(),
+    new TargetAttr(body),
+  });
+  return true;
 }
 
 }
@@ -189,6 +248,7 @@ int RegAlloc::latePeephole(Op *funcOp) {
     //   mv a1, a0
     auto next = op->nextOp();
     if (isa<LoadOp>(next) &&
+        !isFP(RS(op)) && !isFP(RD(next)) &&
         RS(next) == RS2(op) && V(next) == V(op) && SIZE(next) == SIZE(op)) {
       converted++;
       builder.setBeforeOp(next);
@@ -210,6 +270,7 @@ int RegAlloc::latePeephole(Op *funcOp) {
         if (next && isa<LoadOp>(op) && isa<LoadOp>(next) &&
             op->has<RdAttr>() && op->has<RsAttr>() && op->has<IntAttr>() &&
             next->has<RdAttr>() && next->has<RsAttr>() && next->has<IntAttr>() &&
+            !isFP(RD(op)) && !isFP(RD(next)) &&
             RS(op) == RS(next) && V(op) == V(next) && SIZE(op) == SIZE(next) &&
             op->getResultType() == next->getResultType() &&
             RD(op) != RS(next)) {
@@ -234,6 +295,89 @@ int RegAlloc::latePeephole(Op *funcOp) {
           continue;
         }
 
+        op = next;
+      }
+    }
+  }
+
+  if (envEnabled("SISY_RV_ENABLE_BLOCK_LOAD_CSE", true)) {
+    struct LoadKey {
+      bool fp = false;
+      Reg base = Reg::zero;
+      int offset = 0;
+      int size = 0;
+      Value::Type type = Value::i32;
+
+      bool operator<(const LoadKey &other) const {
+        return std::tie(fp, base, offset, size, type) <
+               std::tie(other.fp, other.base, other.offset, other.size, other.type);
+      }
+    };
+
+    auto removeReg = [](std::map<LoadKey, Reg> &available, Reg reg) {
+      for (auto it = available.begin(); it != available.end(); ) {
+        if (it->first.base == reg || it->second == reg)
+          it = available.erase(it);
+        else
+          ++it;
+      }
+    };
+
+    for (auto bb : funcOp->getRegion()->getBlocks()) {
+      std::map<LoadKey, Reg> available;
+      for (Op *op = bb->getFirstOp(); op; ) {
+        Op *next = op->atBack() ? nullptr : op->nextOp();
+
+        if (isMemoryClobber(op)) {
+          available.clear();
+          op = next;
+          continue;
+        }
+
+        if (isa<rv::LoadOp>(op) && op->has<RdAttr>() && op->has<RsAttr>() &&
+            op->has<IntAttr>()) {
+          bool fpLoad = isFP(RD(op));
+          if (fpLoad) {
+            removeReg(available, RD(op));
+            op = next;
+            continue;
+          }
+          LoadKey key{fpLoad, RS(op), V(op), (int) SIZE(op), op->getResultType()};
+          auto it = available.find(key);
+          if (it != available.end() && RD(op) != key.base) {
+            converted++;
+            builder.setBeforeOp(op);
+            CREATE_MV(fpLoad, RD(op), it->second);
+            op->erase();
+            op = next;
+            continue;
+          }
+          removeReg(available, RD(op));
+          available[key] = RD(op);
+          op = next;
+          continue;
+        }
+
+        if (isa<FldOp>(op) && op->has<RdAttr>() && op->has<RsAttr>() &&
+            op->has<IntAttr>()) {
+          LoadKey key{true, RS(op), V(op), 8, op->getResultType()};
+          auto it = available.find(key);
+          if (it != available.end() && RD(op) != key.base) {
+            converted++;
+            builder.setBeforeOp(op);
+            builder.create<FmvOp>({ RDC(RD(op)), RSC(it->second) });
+            op->erase();
+            op = next;
+            continue;
+          }
+          removeReg(available, RD(op));
+          available[key] = RD(op);
+          op = next;
+          continue;
+        }
+
+        if (op->has<RdAttr>())
+          removeReg(available, RD(op));
         op = next;
       }
     }
@@ -527,7 +671,7 @@ int RegAlloc::latePeephole(Op *funcOp) {
       // This must substitute the move source, not the arithmetic destination:
       //   mv t0, a0; addw a1, t0, t0  ->  addw a1, a0, a0
       // Replacing with RD(next) corrupts cases where RD(next) is unrelated.
-      if (envEnabled("SISY_RV_ENABLE_MOVE_ARITH_PEEPHOLE", false) &&
+      if (envEnabled("SISY_RV_ENABLE_MOVE_ARITH_PEEPHOLE", true) &&
           (isa<MulwOp>(next) || isa<AddwOp>(next) || isa<SubwOp>(next)) &&
           op->getUses().size() == 1 &&
           *op->getUses().begin() == next) {
@@ -732,6 +876,27 @@ void RegAlloc::tidyup(Region *region) {
   REPLACE_BRANCH(BltOp, BgeOp);
   REPLACE_BRANCH(BeqOp, BneOp);
   REPLACE_BRANCH(BleOp, BgtOp);
+
+  {
+    auto blocks = region->getBlocks();
+    for (auto bb : blocks) {
+      if (!bb || bb->getOpCount() == 0)
+        continue;
+      auto term = bb->getLastOp();
+      if (auto op = dyn_cast<BgeOp>(term))
+        changed |= rotateFallthroughLoop<BgeOp, BltOp>(op, builder);
+      else if (auto op = dyn_cast<BltOp>(term))
+        changed |= rotateFallthroughLoop<BltOp, BgeOp>(op, builder);
+      else if (auto op = dyn_cast<BgtOp>(term))
+        changed |= rotateFallthroughLoop<BgtOp, BleOp>(op, builder);
+      else if (auto op = dyn_cast<BleOp>(term))
+        changed |= rotateFallthroughLoop<BleOp, BgtOp>(op, builder);
+      else if (auto op = dyn_cast<BeqOp>(term))
+        changed |= rotateFallthroughLoop<BeqOp, BneOp>(op, builder);
+      else if (auto op = dyn_cast<BneOp>(term))
+        changed |= rotateFallthroughLoop<BneOp, BeqOp>(op, builder);
+    }
+  }
 
   auto inRange12 = [](int x) { return x > -2048 && x < 2048; };
   auto legalizeLargeMemOffsets = [&]() {
@@ -1041,7 +1206,14 @@ void RegAlloc::proEpilogue(FuncOp *funcOp, bool isLeaf) {
     int myoffset = offset + argOffsets[op];
     Value::Type loadTy = argTypes[V(op)];
     builder.setBeforeOp(op);
-    emitStackLoad(builder, RD(op), loadTy, myoffset);
+    Reg rdReg;
+    if (op->has<RdAttr>()) {
+      rdReg = RD(op);
+    } else {
+      bool fp = op->getResultType() == Value::f32;
+      rdReg = fp ? fspillReg : spillReg;
+    }
+    emitStackLoad(builder, rdReg, loadTy, myoffset);
     auto created = op->prevOp();
     if (created)
       op->replaceAllUsesWith(created);

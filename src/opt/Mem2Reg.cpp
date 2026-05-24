@@ -2,6 +2,7 @@
 #include "../codegen/CodeGen.h"
 #include "../codegen/Attrs.h"
 #include <iterator>
+#include <vector>
 
 using namespace sys;
 
@@ -49,6 +50,95 @@ bool sanitizeForMem2Reg(Region *region) {
   if (changed)
     region->updatePreds();
   return ok;
+}
+
+struct AllocaLiveness {
+  std::map<BasicBlock*, bool> liveIn;
+};
+
+bool isLoadFromAlloca(Op *op, Op *alloca) {
+  auto load = dyn_cast<LoadOp>(op);
+  return load && load->getOperand().defining == alloca;
+}
+
+bool isStoreToAlloca(Op *op, Op *alloca) {
+  auto store = dyn_cast<StoreOp>(op);
+  return store && store->getOperand(1).defining == alloca;
+}
+
+AllocaLiveness computeAllocaLiveness(Region *region, Op *alloca) {
+  AllocaLiveness result;
+  std::map<BasicBlock*, bool> liveOut;
+  std::map<BasicBlock*, bool> useBeforeDef;
+  std::map<BasicBlock*, bool> def;
+  std::vector<BasicBlock*> blocks;
+  std::copy(region->begin(), region->end(), std::back_inserter(blocks));
+
+  for (auto *bb : blocks) {
+    bool seenDef = false;
+    for (auto *op : bb->getOps()) {
+      if (isLoadFromAlloca(op, alloca) && !seenDef)
+        useBeforeDef[bb] = true;
+      if (isStoreToAlloca(op, alloca)) {
+        seenDef = true;
+        def[bb] = true;
+      }
+    }
+  }
+
+  bool changed;
+  do {
+    changed = false;
+    for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+      auto *bb = *it;
+      bool out = false;
+      for (auto *succ : bb->succs) {
+        if (result.liveIn[succ]) {
+          out = true;
+          break;
+        }
+      }
+
+      bool in = useBeforeDef[bb] || (out && !def[bb]);
+      if (result.liveIn[bb] != in || liveOut[bb] != out) {
+        result.liveIn[bb] = in;
+        liveOut[bb] = out;
+        changed = true;
+      }
+    }
+  } while (changed);
+
+  return result;
+}
+
+Value materializePhiIncomingOnEdge(BasicBlock *pred, BasicBlock *succ, Value value, Builder &builder) {
+  auto *def = value.defining;
+  if (!def || def->getParent() != succ || !isa<PhiOp>(def))
+    return value;
+
+  auto *term = pred->getLastOp();
+  if (!term)
+    return value;
+
+  // Preserve edge-copy semantics for phi destruction; later folds must not
+  // collapse this back into a same-block phi dependency.
+  builder.setBeforeOp(term);
+  switch (def->getResultType()) {
+  case Value::f32: {
+    auto *zero = builder.create<FloatOp>({ new FloatAttr(0) });
+    return builder.create<AddFOp>({ value, zero }, { new ImpureAttr });
+  }
+  case Value::i64: {
+    auto *zero = builder.create<IntOp>({ new IntAttr(0) });
+    return builder.create<AddLOp>({ value, zero }, { new ImpureAttr });
+  }
+  case Value::i32: {
+    auto *zero = builder.create<IntOp>({ new IntAttr(0) });
+    return builder.create<AddIOp>({ value, zero }, { new ImpureAttr });
+  }
+  default:
+    return value;
+  }
 }
 
 }
@@ -113,6 +203,7 @@ void Mem2Reg::runImpl(FuncOp *func) {
     }
     count++;
     converted.insert(alloca);
+    auto liveness = computeAllocaLiveness(region, alloca);
 
     // Now find all blocks where stores reside in. Use set to de-duplicate.
     std::set<BasicBlock*> bbs;
@@ -131,6 +222,8 @@ void Mem2Reg::runImpl(FuncOp *func) {
       worklist.pop_back();
 
       for (auto dom : bb->getDominanceFrontier()) {
+        if (!liveness.liveIn[dom])
+          continue;
         if (visited.count(dom))
           continue;
         visited.insert(dom);
@@ -230,6 +323,7 @@ void Mem2Reg::fillPhi(BasicBlock *bb, SymbolTable symbols) {
       } else
         value = symbols[alloca];
 
+      value = materializePhiIncomingOnEdge(bb, succ, value, builder);
       op->pushOperand(value);
       op->add<FromAttr>(bb);
     }

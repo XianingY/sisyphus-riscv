@@ -1,0 +1,14 @@
+int main() {
+  int x;
+  int r;
+  x = getint();
+  r = 0;
+  if (x <= 3) {
+    if (x < 5) {
+      r = 1;
+    } else {
+      r = 2;
+    }
+  }
+  return r;
+}

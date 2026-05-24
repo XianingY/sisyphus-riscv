@@ -146,6 +146,14 @@ void Lower::run() {
   REPLACE(SubFOp, FsubOp);
   REPLACE(MulFOp, FmulOp);
   REPLACE(DivFOp, FdivOp);
+  REPLACE(AddVOp, VaddvvOp);
+  REPLACE(SubVOp, VsubvvOp);
+  REPLACE(MulVOp, VmulvvOp);
+  REPLACE(BroadcastOp, VmvvxOp);
+  REPLACE(AddFVOp, VfaddvvOp);
+  REPLACE(SubFVOp, VfsubvvOp);
+  REPLACE(MulFVOp, VfmulvvOp);
+  REPLACE(BroadcastFOp, VfmvvfOp);
   REPLACE(LtFOp, FltOp);
   REPLACE(EqFOp, FeqOp);
   REPLACE(LeFOp, FleOp);
@@ -298,13 +306,74 @@ void Lower::run() {
     return true;
   });
 
+  auto setVL4Before = [&](Op *op) {
+    builder.setBeforeOp(op);
+    auto four = builder.create<LiOp>({ new IntAttr(4) });
+    builder.create<VsetvliOp>({ four });
+  };
+
+  runRewriter([&](VaddvvOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VsubvvOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VmulvvOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VmvvxOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VfaddvvOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VfsubvvOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VfmulvvOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
+  runRewriter([&](VfmvvfOp *op) {
+    setVL4Before(op);
+    return false;
+  });
+
   runRewriter([&](sys::LoadOp *op) {
+    auto size = op->has<SizeAttr>() ? SIZE(op) : 4;
+    if ((op->getResultType() == Value::i128 || op->getResultType() == Value::f128) && size == 16) {
+      setVL4Before(op);
+      builder.replace<Vle32Op>(op, op->getResultType(), op->getOperands());
+      return true;
+    }
+
     auto load = builder.replace<sys::rv::LoadOp>(op, op->getResultType(), op->getOperands(), op->getAttrs());
     load->add<IntAttr>(0);
     return true;
   });
 
   runRewriter([&](sys::StoreOp *op) {
+    auto size = op->has<SizeAttr>() ? SIZE(op) : 4;
+    auto valueTy = op->DEF(0)->getResultType();
+    if ((valueTy == Value::i128 || valueTy == Value::f128) && size == 16) {
+      setVL4Before(op);
+      builder.replace<Vse32Op>(op, op->getOperands(), op->getAttrs());
+      return true;
+    }
+
     auto store = builder.replace<sys::rv::StoreOp>(op, op->getOperands(), op->getAttrs());
     store->add<IntAttr>(0);
     return true;

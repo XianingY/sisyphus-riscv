@@ -1,0 +1,13 @@
+int main() {
+  int x;
+  x = getint();
+  if (x < 10) {
+    putint(1);
+  } else {
+    putint(2);
+  }
+  if (x < 20) {
+    return 1;
+  }
+  return 3;
+}

@@ -1,0 +1,2 @@
+int A[100];
+int f(int i) { return A[i] + A[i+1]; }

@@ -20,11 +20,77 @@ bool isConst(Op *op, int value) {
   return op && isa<IntOp>(op) && V(op) == value;
 }
 
+bool isAbsConst(Op *op, int value) {
+  return op && isa<IntOp>(op) && (V(op) == value || V(op) == -value);
+}
+
+Op *intConst(Builder &builder, int value) {
+  return builder.create<IntOp>({ new IntAttr(value) });
+}
+
+Op *parityBit(Op *op) {
+  if (!op)
+    return nullptr;
+  if (auto mod = dyn_cast<ModIOp>(op);
+      mod && mod->getOperandCount() == 2 && isAbsConst(mod->DEF(1), 2))
+    return mod->DEF(0);
+  if (auto andi = dyn_cast<AndIOp>(op);
+      andi && andi->getOperandCount() == 2 && isConst(andi->DEF(1), 1))
+    return op;
+  if (auto andi = dyn_cast<AndIOp>(op);
+      andi && andi->getOperandCount() == 2 && isConst(andi->DEF(0), 1))
+    return op;
+  return nullptr;
+}
+
+Op *parityTruthValue(Builder &builder, Op *cond) {
+  if (!cond)
+    return cond;
+
+  auto buildBit = [&](Op *value) {
+    return builder.create<AndIOp>(std::vector<Value>{ value, intConst(builder, 1) });
+  };
+
+  if (auto bit = parityBit(cond))
+    return bit == cond ? cond : buildBit(bit);
+
+  auto normalizeCompare = [&](auto *cmp, bool isEq) -> Op* {
+    if (!cmp || cmp->getOperandCount() != 2)
+      return nullptr;
+    auto lhs = cmp->DEF(0);
+    auto rhs = cmp->DEF(1);
+    auto makeCompare = [&](Op *bitSource, Op *constant) -> Op* {
+      if (!isa<IntOp>(constant) || (V(constant) != 0 && V(constant) != 1))
+        return nullptr;
+      auto bit = bitSource == lhs || bitSource == rhs ? bitSource : buildBit(bitSource);
+      if (V(constant) == 1)
+        return isEq ? bit : builder.create<EqOp>(std::vector<Value>{ bit, intConst(builder, 0) });
+      return isEq ? builder.create<EqOp>(std::vector<Value>{ bit, intConst(builder, 0) }) : bit;
+    };
+    if (auto bit = parityBit(lhs))
+      if (auto normalized = makeCompare(bit == lhs ? lhs : bit, rhs))
+        return normalized;
+    if (auto bit = parityBit(rhs))
+      if (auto normalized = makeCompare(bit == rhs ? rhs : bit, lhs))
+        return normalized;
+    return nullptr;
+  };
+
+  if (auto eq = dyn_cast<EqOp>(cond))
+    if (auto folded = normalizeCompare(eq, true))
+      return folded;
+  if (auto ne = dyn_cast<NeOp>(cond))
+    if (auto folded = normalizeCompare(ne, false))
+      return folded;
+
+  return cond;
+}
+
 bool containsParityMod(Op *op, std::set<Op*> &seen) {
   if (!op || seen.count(op))
     return false;
   seen.insert(op);
-  if (isa<ModIOp>(op) && op->getOperandCount() == 2 && isConst(op->DEF(1), 2))
+  if (parityBit(op))
     return true;
   for (auto operand : op->getOperands())
     if (containsParityMod(operand.defining, seen))
@@ -42,6 +108,30 @@ bool pureHoistable(Op *op) {
          isa<SubIOp>(op) || isa<MulIOp>(op) || isa<AddLOp>(op) ||
          isa<SubLOp>(op) || isa<AndIOp>(op) || isa<OrIOp>(op) ||
          isa<XorIOp>(op) || isa<LoadOp>(op);
+}
+
+bool pureConditionHoistable(Op *op) {
+  return isa<IntOp>(op) || isa<AddIOp>(op) || isa<SubIOp>(op) ||
+         isa<MulIOp>(op) || isa<DivIOp>(op) || isa<ModIOp>(op) ||
+         isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+         isa<EqOp>(op) || isa<NeOp>(op) || isa<LtOp>(op) ||
+         isa<LeOp>(op);
+}
+
+bool collectConditionDeps(Op *op, BasicBlock *bb, std::vector<Op*> &out,
+                          std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return true;
+  seen.insert(op);
+  if (op->getParent() != bb)
+    return true;
+  if (!pureConditionHoistable(op))
+    return false;
+  for (auto operand : op->getOperands())
+    if (!collectConditionDeps(operand.defining, bb, out, seen))
+      return false;
+  out.push_back(op);
+  return true;
 }
 
 bool shortPureBlock(BasicBlock *bb) {
@@ -169,13 +259,158 @@ bool convertOne(BranchOp *branch) {
     op->moveBefore(branch);
 
   builder.setBeforeOp(branch);
-  auto select = builder.create<SelectOp>(std::vector<Value>{ branch->DEF(0), trueValue, falseValue });
+  auto cond = parityTruthValue(builder, branch->DEF(0));
+  auto select = builder.create<SelectOp>(std::vector<Value>{ cond, trueValue, falseValue });
   phi->replaceAllUsesWith(select);
   phi->erase();
   builder.replace<GotoOp>(branch, { new TargetAttr(join) });
   calcBlock->forceErase();
   if (eraseEmpty)
     emptyBlock->forceErase();
+  return true;
+}
+
+bool convertNestedShortCircuit(BranchOp *branch) {
+  if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||
+      !branch->has<ElseAttr>() || !isParityCondition(branch->DEF(0)))
+    return false;
+
+  auto outer = branch->getParent();
+  auto trueBlock = TARGET(branch);
+  auto falseBlock = ELSE(branch);
+
+  BasicBlock *calcBlock = nullptr;
+  BasicBlock *testBlock = nullptr;
+  BasicBlock *emptyBlock = nullptr;
+  bool isOrShape = false;
+  Op *innerCond = nullptr;
+
+  auto matchInner = [&](BasicBlock *test, BasicBlock *calc, BasicBlock *empty,
+                        bool buildOr) -> bool {
+    if (!test || !calc || !empty || !shortPureBlock(calc) || !emptyGotoBlock(empty))
+      return false;
+    if (test->preds.size() != 1 || *test->preds.begin() != outer)
+      return false;
+
+    auto inner = dyn_cast<BranchOp>(test->getLastOp());
+    if (!inner || inner->getOperandCount() != 1 || !inner->has<TargetAttr>() ||
+        !inner->has<ElseAttr>())
+      return false;
+
+    if (TARGET(inner) != calc || ELSE(inner) != empty)
+      return false;
+    if (!isParityCondition(inner->DEF(0)))
+      return false;
+    if (!calc->preds.count(test))
+      return false;
+    if (buildOr) {
+      if (empty->preds.size() != 1 || *empty->preds.begin() != test)
+        return false;
+      if (calc->preds.size() != 2 || !calc->preds.count(outer))
+        return false;
+    } else {
+      if (calc->preds.size() != 1)
+        return false;
+      if (empty->preds.size() != 2 || !empty->preds.count(outer) ||
+          !empty->preds.count(test))
+        return false;
+    }
+
+    innerCond = inner->DEF(0);
+    return true;
+  };
+
+  // if (c1) calc; else if (c2) calc; else passthrough;
+  if (trueBlock && falseBlock && trueBlock->preds.count(outer)) {
+    if (auto inner = dyn_cast<BranchOp>(falseBlock->getLastOp())) {
+      if (matchInner(falseBlock, trueBlock, ELSE(inner), true)) {
+        calcBlock = trueBlock;
+        testBlock = falseBlock;
+        emptyBlock = ELSE(inner);
+        isOrShape = true;
+      }
+    }
+  }
+
+  // if (c1) { if (c2) calc; else passthrough; } else passthrough;
+  if (!calcBlock && trueBlock && falseBlock && emptyGotoBlock(falseBlock)) {
+    if (auto inner = dyn_cast<BranchOp>(trueBlock->getLastOp())) {
+      if (matchInner(trueBlock, TARGET(inner), falseBlock, false)) {
+        testBlock = trueBlock;
+        calcBlock = TARGET(inner);
+        emptyBlock = falseBlock;
+      }
+    }
+  }
+
+  if (!calcBlock || !testBlock || !emptyBlock || !innerCond)
+    return false;
+
+  auto calcTerm = dyn_cast<GotoOp>(calcBlock->getLastOp());
+  auto emptyTerm = dyn_cast<GotoOp>(emptyBlock->getLastOp());
+  if (!calcTerm || !emptyTerm || TARGET(calcTerm) != TARGET(emptyTerm))
+    return false;
+  auto join = TARGET(calcTerm);
+  if (!join || join->getPhis().size() != 1)
+    return false;
+
+  auto phi = join->getPhis()[0];
+  if (phi->getOperandCount() != 2 || phi->getResultType() != Value::i32)
+    return false;
+  auto calcValue = incomingFrom(phi, calcBlock);
+  auto passValue = incomingFrom(phi, emptyBlock);
+  if (!calcValue || !passValue)
+    return false;
+  if (calcValue->getParent() != calcBlock ||
+      !onlyLocalUsesOrPhi(calcValue, calcBlock, phi))
+    return false;
+
+  std::vector<Op*> moving;
+  for (auto op : calcBlock->getOps()) {
+    if (op == calcBlock->getLastOp())
+      continue;
+    if (!pureHoistable(op))
+      return false;
+    // Avoid speculating memory reads across a short-circuit branch. The generic
+    // single-branch converter already handles simple cases; this nested form is
+    // meant for arithmetic parity kernels.
+    if (isa<LoadOp>(op))
+      return false;
+    moving.push_back(op);
+  }
+  if (moving.empty() || moving.size() > 12)
+    return false;
+
+  std::vector<Op*> condMoving;
+  std::set<Op*> condSeen;
+  if (!collectConditionDeps(innerCond, testBlock, condMoving, condSeen))
+    return false;
+  if (moving.size() + condMoving.size() > 20)
+    return false;
+
+  for (auto op : moving)
+    op->moveBefore(branch);
+  for (auto op : condMoving)
+    op->moveBefore(branch);
+
+  Builder builder;
+  builder.setBeforeOp(branch);
+  auto outerCond = parityTruthValue(builder, branch->DEF(0));
+  innerCond = parityTruthValue(builder, innerCond);
+  Op *combinedCond = nullptr;
+  if (isOrShape)
+    combinedCond = builder.create<OrIOp>(std::vector<Value>{ outerCond, innerCond });
+  else
+    combinedCond = builder.create<AndIOp>(std::vector<Value>{ outerCond, innerCond });
+  auto select = builder.create<SelectOp>(
+      std::vector<Value>{ combinedCond, calcValue, passValue });
+  phi->replaceAllUsesWith(select);
+  phi->erase();
+  builder.replace<GotoOp>(branch, { new TargetAttr(join) });
+
+  calcBlock->forceErase();
+  testBlock->forceErase();
+  emptyBlock->forceErase();
   return true;
 }
 
@@ -197,7 +432,8 @@ void ParityIfConversion::run() {
 
   auto branches = module->findAll<BranchOp>();
   for (auto op : branches) {
-    if (convertOne(cast<BranchOp>(op)))
+    if (convertNestedShortCircuit(cast<BranchOp>(op)) ||
+        convertOne(cast<BranchOp>(op)))
       converted++;
     else
       rejected++;

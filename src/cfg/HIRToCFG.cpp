@@ -69,6 +69,8 @@ size_t typeSize(Type *ty) {
 }
 
 std::vector<int> typeDims(Type *ty) {
+  if (!ty)
+    return {};
   if (auto arr = dyn_cast<ArrayType>(ty))
     return arr->dims;
   if (auto ptr = dyn_cast<PointerType>(ty)) {
@@ -432,7 +434,7 @@ private:
       return;
     std::string sym = getResolvedSymbol(op);
     if (op->kind == hir::OpKind::VarDecl && !sym.empty() && !seen.count(sym)) {
-      const auto *origin = dyn_cast<VarDeclNode>(op->origin);
+      const auto *origin = op->origin ? dyn_cast<VarDeclNode>(op->origin) : nullptr;
       Type *ty = origin ? origin->type : op->origin ? op->origin->type : nullptr;
       locals.push_back(buildSymbolInfo(sym, ty, false, false, origin ? origin->mut : true));
       seen.insert(sym);

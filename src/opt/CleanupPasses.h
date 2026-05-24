@@ -46,6 +46,8 @@ public:
 // Dead (actually, redundant) load elimination.
 class DLE : public Pass {
   int elim = 0;
+  int readonlyCallsRetained = 0;
+  std::map<std::string, FuncOp*> fnMap;
 
   void runImpl(Region *region);
 public:
@@ -75,6 +77,7 @@ class DSE : public Pass {
   std::map<Op*, bool> used;
 
   int elim = 0;
+  int sunk = 0;
 
   void dfs(BasicBlock *current, DomTree &dom, std::set<Op*> live);
   void runImpl(Region *region);
@@ -101,6 +104,8 @@ public:
 
 class RangeAwareFold : public Pass {
   int folded = 0;
+  int pathReplacements = 0;
+  int threadedEdges = 0;
 public:
   RangeAwareFold(ModuleOp *module): Pass(module) {}
 
@@ -109,13 +114,36 @@ public:
   void run() override;
 };
 
+// Sparse conditional constant propagation over SSA values and executable CFG
+// edges. It folds integer constants and branches before cleanup removes the
+// now-unreachable blocks.
+class SCCP : public Pass {
+  int replacedValues = 0;
+  int foldedBranches = 0;
+  int threadedEdges = 0;
+  int executableBlocks = 0;
+public:
+  SCCP(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "sccp"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class Reassociate : public Pass {
+  int intReassociated = 0;
+  int floatReassociated = 0;
   void runImpl(Region *region);
 public:
   Reassociate(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "reassociate"; };
-  std::map<std::string, int> stats() override { return {}; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "int-reassociated", intReassociated },
+      { "float-reassociated", floatReassociated },
+    };
+  }
   void run() override;
 };
 

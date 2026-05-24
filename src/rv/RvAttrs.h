@@ -73,7 +73,39 @@ namespace rv {
   X(fa4) \
   X(fa5) \
   X(fa6) \
-  X(fa7)
+  X(fa7) \
+  X(v0) \
+  X(v1) \
+  X(v2) \
+  X(v3) \
+  X(v4) \
+  X(v5) \
+  X(v6) \
+  X(v7) \
+  X(v8) \
+  X(v9) \
+  X(v10) \
+  X(v11) \
+  X(v12) \
+  X(v13) \
+  X(v14) \
+  X(v15) \
+  X(v16) \
+  X(v17) \
+  X(v18) \
+  X(v19) \
+  X(v20) \
+  X(v21) \
+  X(v22) \
+  X(v23) \
+  X(v24) \
+  X(v25) \
+  X(v26) \
+  X(v27) \
+  X(v28) \
+  X(v29) \
+  X(v30) \
+  X(v31)
 
 #define X(name) name,
 enum class Reg : signed {
@@ -95,6 +127,10 @@ inline std::string showReg(Reg reg) {
 
 inline bool isFP(Reg reg) {
   return (int) Reg::ft0 <= (int) reg && (int) Reg::fa7 >= (int) reg;
+}
+
+inline bool isVector(Reg reg) {
+  return (int) Reg::v0 <= (int) reg && (int) Reg::v31 >= (int) reg;
 }
 
 class RegAttr : public AttrImpl<RegAttr, RVLINE> {

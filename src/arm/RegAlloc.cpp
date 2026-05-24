@@ -2,12 +2,36 @@
 #include "Regs.h"
 #include "../backend/shared/RegAllocHotness.h"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using namespace sys;
 using namespace sys::arm;
 
 namespace {
+
+bool envEnabled(const char *name, bool fallback = true) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
+    return false;
+  return true;
+}
+
+int envInt(const char *name, int fallback, int minValue, int maxValue) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  char *end = nullptr;
+  long parsed = std::strtol(v, &end, 10);
+  if ((end && *end) || parsed < minValue || parsed > maxValue)
+    return fallback;
+  return (int) parsed;
+}
 
 class SpilledRdAttr : public AttrImpl<SpilledRdAttr, ARMLINE + 4194304> {
 public:
@@ -59,6 +83,143 @@ public:
 
 bool fpreg(Value::Type ty) {
   return ty == Value::f32 || ty == Value::f128;
+}
+
+bool splitCandidateType(Value::Type ty) {
+  return ty == Value::i32 || ty == Value::i64 || ty == Value::f32;
+}
+
+bool splitCandidateValue(Op *op) {
+  if (!op)
+    return false;
+  if (!splitCandidateType(op->getResultType()))
+    return false;
+  if (isa<PlaceHolderOp>(op) || isa<BOp>(op) || isa<RetOp>(op) ||
+      isa<BlOp>(op) || isa<sys::arm::CloneOp>(op) || isa<sys::arm::JoinOp>(op) ||
+      isa<WriteRegOp>(op))
+    return false;
+  // Constants and labels are rematerializable; splitting them only adds copies.
+  if (isa<MovIOp>(op) || isa<MovkOp>(op) || isa<MovnOp>(op) ||
+      isa<FmovFOp>(op) || isa<AdrOp>(op))
+    return false;
+  return true;
+}
+
+bool blockHasCall(BasicBlock *bb) {
+  for (auto *op : bb->getOps())
+    if (isa<BlOp>(op) || isa<sys::arm::CloneOp>(op) || isa<sys::arm::JoinOp>(op))
+      return true;
+  return false;
+}
+
+Op *firstNonPhi(BasicBlock *bb) {
+  for (auto op : bb->getOps())
+    if (!isa<PhiOp>(op))
+      return op;
+  return nullptr;
+}
+
+int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue, Op *stopBefore) {
+  int replaced = 0;
+  (void) bb;
+  for (auto op = copy->nextOp(); op; op = op->nextOp()) {
+    if (op == stopBefore)
+      break;
+    for (int i = 0; i < op->getOperandCount(); i++) {
+      if (op->getOperand(i).defining != oldValue)
+        continue;
+      op->setOperand(i, copy);
+      replaced++;
+    }
+  }
+  return replaced;
+}
+
+int splitHotLiveRanges(Region *region,
+                       const std::unordered_map<BasicBlock*, int> &bbWeight) {
+  if (!envEnabled("SISY_ARM_ENABLE_LIVE_RANGE_SPLIT", true))
+    return 0;
+
+  const int threshold =
+      envInt("SISY_ARM_LIVE_RANGE_SPLIT_HOT_THRESHOLD", 64, 1, 1000000000);
+  const int maxSplitsPerBlock =
+      envInt("SISY_ARM_LIVE_RANGE_SPLIT_MAX_PER_BLOCK", 256, 1, 256);
+
+  Builder builder;
+  int splits = 0;
+
+  auto usedInBlockBody = [](Op *value, BasicBlock *bb) -> bool {
+    if (!value || !bb)
+      return false;
+    for (auto op : bb->getOps()) {
+      if (isa<PhiOp>(op))
+        continue;
+      for (auto operand : op->getOperands()) {
+        if (operand.defining == value)
+          return true;
+      }
+    }
+    return false;
+  };
+
+  for (auto bb : region->getBlocks()) {
+    auto weightIt = bbWeight.find(bb);
+    int weight = weightIt == bbWeight.end() ? 1 : weightIt->second;
+    if (weight < threshold || bb->getOpCount() == 0)
+      continue;
+    if (envEnabled("SISY_ARM_LIVE_RANGE_SPLIT_REQUIRE_CALL", false) &&
+        !blockHasCall(bb))
+      continue;
+
+    Op *insertBefore = firstNonPhi(bb);
+    if (!insertBefore || isa<BOp>(insertBefore) || isa<RetOp>(insertBefore))
+      continue;
+
+    std::vector<Op*> liveIns;
+    liveIns.reserve(bb->getLiveIn().size());
+
+    for (auto value : bb->getLiveIn()) {
+      if (!splitCandidateValue(value))
+        continue;
+      if (value->getParent() == bb)
+        continue;
+      if (!usedInBlockBody(value, bb))
+        continue;
+      liveIns.push_back(value);
+    }
+
+    std::sort(liveIns.begin(), liveIns.end(), [&](Op *a, Op *b) {
+      if (a->getUses().size() != b->getUses().size())
+        return a->getUses().size() > b->getUses().size();
+      return a < b;
+    });
+
+    int blockSplits = 0;
+    for (auto value : liveIns) {
+      if (blockSplits >= maxSplitsPerBlock)
+        break;
+
+      builder.setBeforeOp(insertBefore);
+      Op *copy = nullptr;
+      if (value->getResultType() == Value::f32)
+        copy = builder.create<FmovOp>({ value });
+      else
+        copy = builder.create<MovROp>({ value });
+      copy->setResultType(value->getResultType());
+
+      int replaced = replaceUsesAfterCopy(bb, copy, value, nullptr);
+      if (replaced == 0) {
+        copy->removeAllOperands();
+        copy->erase();
+        continue;
+      }
+
+      splits++;
+      blockSplits++;
+    }
+  }
+
+  return splits;
 }
 
 bool fitsAddImm12(int imm) {
@@ -165,6 +326,8 @@ std::map<std::string, int> RegAlloc::stats() {
   return {
     { "spilled", spilled },
     { "peepholed", convertedTotal },
+    { "max-block-hotness", maxBlockHotness },
+    { "live-range-splits", liveRangeSplits },
   };
 }
 
@@ -220,6 +383,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   const Reg *orderf = isLeaf ? leafOrderf : normalOrderf;
   const int regcount = isLeaf ? leafRegCnt : normalRegCnt;
   const int regcountf = isLeaf ? leafRegCntf : normalRegCntf;
+
+  int opCount = 0;
+  for (auto bb : region->getBlocks()) { opCount += bb->getOps().size(); }
+  bool localFastMode = fastMode || (opCount > 3000);
 
   Builder builder;
   
@@ -340,6 +507,15 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   auto bbWeight = sys::backend::shared::computeBlockHotness(region, [](Op *op) {
     return isa<BlOp>(op) || isa<CloneOp>(op) || isa<JoinOp>(op);
   });
+  for (auto &[_, weight] : bbWeight)
+    maxBlockHotness = std::max(maxBlockHotness, weight);
+
+  int splits = localFastMode ? 0 : splitHotLiveRanges(region, bbWeight);
+  if (splits) {
+    liveRangeSplits += splits;
+    region->updateLiveness();
+  }
+
   const int callPenaltyWeight = std::max(64, callPenalty);
   const int crossCallRiskThreshold = loopHotBoost > 1 ? 0 : 1;
   const bool limitPrefer = preferBudget >= 0;
@@ -348,7 +524,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   std::unordered_map<Op*, int> spillOffset;
   int currentOffset = STACKOFF(funcOp);
   int highest = 0;
-  if (!fastMode) {
+  if (!localFastMode) {
     // Interference graph.
     std::unordered_map<Op*, std::unordered_set<Op*>> interf, spillInterf;
     std::unordered_map<Op*, long long> spillWeight;
@@ -406,7 +582,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         priority[op] = currentPriority + 1;
         for (auto x : op->getOperands()) {
           priority[x.defining] = currentPriority;
-          if (!fastMode && (!limitPrefer || preferCount < preferBudget)) {
+          if (!localFastMode && (!limitPrefer || preferCount < preferBudget)) {
             prefer[x.defining] = op;
             preferCount++;
           }
@@ -416,7 +592,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       }
 
       // Preserve copy chains to reduce move pressure after allocation.
-      if (!fastMode && (isa<MovROp>(op) || isa<FmovOp>(op)) && op->getOperandCount() == 1) {
+      if (!localFastMode && (isa<MovROp>(op) || isa<FmovOp>(op)) && op->getOperandCount() == 1) {
         auto src = op->DEF(0);
         if (!limitPrefer || preferCount < preferBudget) {
           prefer[op] = src;
@@ -434,7 +610,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
     // Penalize long-lived values and values spanning call-like operations.
     std::vector<int> callPrefix;
-    if (!fastMode) {
+    if (!localFastMode) {
       callPrefix.assign(ops.size() + 1, 0);
       int callIdx = 0;
       for (auto liveOp : ops) {
@@ -450,7 +626,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       int span = last - def;
       spillWeight[op] += 3LL * localWeight * span;
 
-      if (!fastMode) {
+      if (!localFastMode) {
         int l = std::max(0, def + 1);
         int r = std::min<int>(ops.size(), last);
         int callCount = callPrefix[r] - callPrefix[l];
@@ -738,11 +914,15 @@ skip_prefer_assign:
   LOWER(AddXOp, BINARY);
   LOWER(AddWOp, BINARY);
   LOWER(AddVOp, BINARY);
+  LOWER(AddFVOp, BINARY);
   LOWER(SubWOp, BINARY);
   LOWER(SubXOp, BINARY);
+  LOWER(SubVOp, BINARY);
+  LOWER(SubFVOp, BINARY);
   LOWER(MulWOp, BINARY);
   LOWER(MulXOp, BINARY);
   LOWER(MulVOp, BINARY);
+  LOWER(MulFVOp, BINARY);
   LOWER(SdivWOp, BINARY);
   LOWER(SdivXOp, BINARY);
   LOWER(AndOp, BINARY);
@@ -802,6 +982,7 @@ skip_prefer_assign:
   LOWER(Ld1Op, UNARY);
   LOWER(AddXIOp, UNARY);
   LOWER(AddWIOp, UNARY);
+  LOWER(MovROp, UNARY);
   LOWER(NegOp, UNARY);
   LOWER(AndIOp, UNARY);
   LOWER(OrIOp, UNARY);
@@ -817,11 +998,13 @@ skip_prefer_assign:
   LOWER(ScvtfOp, UNARY);
   LOWER(FcvtzsOp, UNARY);
   LOWER(FmovWOp, UNARY);
+  LOWER(FmovOp, UNARY);
   LOWER(NegOp, UNARY);
   LOWER(FnegOp, UNARY);
   LOWER(CsetEqFcmpZOp, UNARY);
   LOWER(CsetNeFcmpZOp, UNARY);
   LOWER(DupOp, UNARY);
+  LOWER(DupFOp, UNARY);
 
   // Note that some ops are dealt with later.
   // We can't remove all operands here.

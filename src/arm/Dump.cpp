@@ -150,7 +150,11 @@ void Dump::dumpOp(Op *op, std::ostream &os) {
   BINARY_X(EorOp, "eor");
 
   BINARY_V(AddVOp, "add");
+  BINARY_V(SubVOp, "sub");
   BINARY_V(MulVOp, "mul");
+  BINARY_V(AddFVOp, "fadd");
+  BINARY_V(SubFVOp, "fsub");
+  BINARY_V(MulFVOp, "fmul");
   BINARY_V(MlaVOp, "mla");
 
   UNARY_I_W(AddWIOp, "add");
@@ -391,6 +395,9 @@ void Dump::dumpOp(Op *op, std::ostream &os) {
     break;
   case DupOp::id:
     os << "dup " << vreg(RD(op)) << ", " << wreg(RS(op)) << "\n";
+    break;
+  case DupFOp::id:
+    os << "dup " << vreg(RD(op)) << ", " << freg(RS(op)) << "\n";
     break;
   case St1Op::id:
     os << "st1 {" << vreg(RS(op)) << "}, [" << xreg(RS2(op)) << "]\n";

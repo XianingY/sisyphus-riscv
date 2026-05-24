@@ -11,6 +11,8 @@
 // The whole content of this file should be run after Mem2Reg.
 namespace sys {
 
+class MemorySSA;
+
 // We will take the LLVM terminology:
 //   _Header_ is the only block of loop entry;
 //   _Preheader_ is the only block in header.preds;
@@ -122,6 +124,7 @@ class ConstLoopUnroll : public Pass {
   std::map<Op*, Op*> exitlatch;
   int unrolled = 0;
   int factorUnrolled = 0;
+  int rotatedForUnroll = 0;
 
   // Returns true if changed.
   bool runImpl(LoopInfo *info);
@@ -188,6 +191,7 @@ class LICM : public Pass {
   std::vector<Op*> stores;
   // Whether the current function has an impure call.
   bool impure;
+  MemorySSA *mssa = nullptr;
 
   // A store is hoistable when no branch or load has been met.
   void hoistVariant(LoopInfo *info, BasicBlock *bb, bool hoistable);
@@ -223,6 +227,36 @@ public:
   void run() override;
 };
 
+// Loop tiling (strip-mining) for cache locality improvement.
+// Wraps a loop with a tile-level outer loop iterating in steps of T.
+class LoopTiling : public Pass {
+  int candidates = 0;
+  int tiled = 0;
+  int rejectedShape = 0;
+  int rejectedProfit = 0;
+public:
+  LoopTiling(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "loop-tiling"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+// Reduction-aware loop interchange.
+// Transforms i-j-k loops with a reduction in j (storing temp to A[g(j)])
+// into i-k-j by distributing the reduction.
+class ReductionInterchange : public Pass {
+  int candidates = 0;
+  int interchanged = 0;
+  int rejectedShape = 0;
+public:
+  ReductionInterchange(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "reduction-interchange"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Promotes loop-invariant load/store patterns to scalar registers.
 // For loops where the same address is repeatedly loaded, computed on, and stored,
 // this pass hoists the load to the preheader, replaces in-loop accesses with a phi,
@@ -230,8 +264,12 @@ public:
 class ScalarReplace : public Pass {
   int detected = 0;
   int promoted = 0;
+  int arraysScalarized = 0;
+  int arrayElements = 0;
+  int arrayAccesses = 0;
 
   void runImpl(LoopInfo *info);
+  void runArrayScalarization(FuncOp *func);
 public:
   ScalarReplace(ModuleOp *module): Pass(module) {}
 
@@ -302,6 +340,32 @@ public:
   DivPow2LoopFold(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "div-pow2-loop-fold"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+// Collapses pure repeat-doubling loops such as:
+//   while (n != 0) {
+//     x = x * 2;
+//     n = n - 1;
+//   }
+// into x * ((0 <= n && n < 32) ? (1 << n) : 0). This targets lowered
+// tail-recursive array helpers without changing loops that have side effects.
+class Pow2RepeatLoopFold : public Pass {
+  int visited = 0;
+  int folded = 0;
+  int rejected = 0;
+  int badCfg = 0;
+  int badBranch = 0;
+  int badCounter = 0;
+  int badValue = 0;
+  int impureBody = 0;
+
+  bool runImpl(LoopInfo *info);
+public:
+  Pow2RepeatLoopFold(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "pow2-repeat-loop-fold"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };

@@ -1,0 +1,15 @@
+int a[64];
+int b[64];
+int c[64];
+int d[64];
+int e[64];
+int out[64];
+
+int main() {
+  int i = 0;
+  while (i < 64) {
+    out[i] = a[i] + b[i] + c[i] + d[i] + e[i];
+    i = i + 1;
+  }
+  return out[0];
+}

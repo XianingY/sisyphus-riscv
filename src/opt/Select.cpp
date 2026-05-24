@@ -38,6 +38,13 @@ bool identical(Op *a, Op *b) {
   return true;
 }
 
+bool onlyPhiInMerge(Op *phi) {
+  if (!phi || !isa<PhiOp>(phi))
+    return false;
+  auto phis = phi->getParent()->getPhis();
+  return phis.size() == 1 && phis[0] == phi;
+}
+
 }
 
 std::map<std::string, int> Select::stats() {
@@ -84,6 +91,8 @@ void Select::run() {
   for (auto phi : phis) {
     // If the phi has two empty blocks as predecessors, then it is a `select`.
     if (phi->getOperandCount() != 2)
+      continue;
+    if (!onlyPhiInMerge(phi))
       continue;
 
     const auto &attrs = phi->getAttrs();
@@ -143,6 +152,8 @@ void Select::run() {
 
   for (auto phi : phis) {
     if (phi->getOperandCount() != 2)
+      continue;
+    if (!onlyPhiInMerge(phi))
       continue;
 
     const auto &attrs = phi->getAttrs();

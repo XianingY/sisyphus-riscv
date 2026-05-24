@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using namespace sys;
 using namespace sys::rv;
@@ -18,6 +20,17 @@ bool envEnabled(const char *name, bool fallback = true) {
   if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0)
     return false;
   return true;
+}
+
+int envInt(const char *name, int fallback, int minValue, int maxValue) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  char *end = nullptr;
+  long parsed = std::strtol(v, &end, 10);
+  if ((end && *end) || parsed < minValue || parsed > maxValue)
+    return fallback;
+  return (int) parsed;
 }
 
 class SpilledRdAttr : public AttrImpl<SpilledRdAttr, RVLINE + 2097152> {
@@ -70,6 +83,12 @@ void materializeSpAddr(Builder &builder, Reg tmp, int offset) {
 }
 
 void emitStackStore(Builder &builder, Reg src, bool fp, int offset) {
+  if (isVector(src)) {
+    materializeSpAddr(builder, spillReg2, offset);
+    builder.create<Vse32Op>({ RSC(src), RS2C(spillReg2) });
+    return;
+  }
+
   if (fitsImm12(offset)) {
     if (fp)
       builder.create<FsdOp>({ RSC(src), RS2C(Reg::sp), new IntAttr(offset) });
@@ -86,6 +105,12 @@ void emitStackStore(Builder &builder, Reg src, bool fp, int offset) {
 }
 
 void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset, Reg addrTmp) {
+  if (isVector(dst)) {
+    materializeSpAddr(builder, addrTmp, offset);
+    builder.create<Vle32Op>(ty, { RDC(dst), RSC(addrTmp) });
+    return;
+  }
+
   if (fitsImm12(offset)) {
     builder.create<sys::rv::LoadOp>(ty, { RDC(dst), RSC(Reg::sp), new IntAttr(offset), new SizeAttr(8) });
     return;
@@ -140,12 +165,157 @@ ArgPlacement getArgPlacement(const std::vector<Value::Type> &types, int index) {
   return { false, -1, -1 };
 }
 
+bool shareRegClass(Value::Type t1, Value::Type t2) {
+  if (vecreg(t1) && vecreg(t2)) return true;
+  if (fpreg(t1) && fpreg(t2)) return true;
+  if (!vecreg(t1) && !fpreg(t1) && !vecreg(t2) && !fpreg(t2)) return true;
+  return false;
+}
+
+bool splitCandidateType(Value::Type ty) {
+  return ty == Value::i32 || ty == Value::i64 || ty == Value::f32;
+}
+
+bool splitCandidateValue(Op *op) {
+  if (!op)
+    return false;
+  if (!splitCandidateType(op->getResultType()))
+    return false;
+  if (isa<PlaceHolderOp>(op) || isa<JOp>(op) || isa<RetOp>(op) ||
+      isa<BranchOp>(op) || isa<WriteRegOp>(op) || isa<sys::rv::CallOp>(op))
+    return false;
+  // Constants and labels are cheap to rematerialize at their use sites; splitting
+  // them only creates extra copy pressure.
+  if (isa<LiOp>(op) || isa<LaOp>(op))
+    return false;
+  return true;
+}
+
+bool blockHasCall(BasicBlock *bb) {
+  for (auto *op : bb->getOps())
+    if (isa<sys::rv::CallOp>(op))
+      return true;
+  return false;
+}
+
+Op *firstNonPhi(BasicBlock *bb) {
+  for (auto op : bb->getOps())
+    if (!isa<PhiOp>(op))
+      return op;
+  return nullptr;
+}
+
+int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue, Op *stopBefore) {
+  int replaced = 0;
+  (void) bb;
+  for (auto op = copy->nextOp(); op; op = op->nextOp()) {
+    if (op == stopBefore)
+      break;
+    for (int i = 0; i < op->getOperandCount(); i++) {
+      if (op->getOperand(i).defining != oldValue)
+        continue;
+      op->setOperand(i, copy);
+      replaced++;
+    }
+  }
+  return replaced;
+}
+
+int splitHotLiveRanges(Region *region,
+                       const std::unordered_map<BasicBlock*, int> &bbWeight) {
+  if (!envEnabled("SISY_RV_ENABLE_LIVE_RANGE_SPLIT", true))
+    return 0;
+
+  const int threshold =
+      envInt("SISY_RV_LIVE_RANGE_SPLIT_HOT_THRESHOLD", 64, 1, 1000000000);
+  const int maxSplitsPerBlock =
+      envInt("SISY_RV_LIVE_RANGE_SPLIT_MAX_PER_BLOCK", 256, 1, 256);
+
+  Builder builder;
+  int splits = 0;
+
+  auto usedInBlockBody = [](Op *value, BasicBlock *bb) -> bool {
+    if (!value || !bb)
+      return false;
+    for (auto op : bb->getOps()) {
+      if (isa<PhiOp>(op))
+        continue;
+      for (auto operand : op->getOperands()) {
+        if (operand.defining == value)
+          return true;
+      }
+    }
+    return false;
+  };
+
+  for (auto bb : region->getBlocks()) {
+    auto weightIt = bbWeight.find(bb);
+    int weight = weightIt == bbWeight.end() ? 1 : weightIt->second;
+    if (weight < threshold || bb->getOpCount() == 0)
+      continue;
+    if (envEnabled("SISY_RV_LIVE_RANGE_SPLIT_REQUIRE_CALL", false) &&
+        !blockHasCall(bb))
+      continue;
+
+    Op *insertBefore = firstNonPhi(bb);
+    if (!insertBefore || isa<JOp>(insertBefore) || isa<RetOp>(insertBefore))
+      continue;
+
+    std::vector<Op*> liveIns;
+    liveIns.reserve(bb->getLiveIn().size());
+
+    for (auto value : bb->getLiveIn()) {
+      if (!splitCandidateValue(value))
+        continue;
+      if (value->getParent() == bb)
+        continue;
+      if (!usedInBlockBody(value, bb))
+        continue;
+      liveIns.push_back(value);
+    }
+
+    std::sort(liveIns.begin(), liveIns.end(), [&](Op *a, Op *b) {
+      if (a->getUses().size() != b->getUses().size())
+        return a->getUses().size() > b->getUses().size();
+      return a < b;
+    });
+
+    int blockSplits = 0;
+    for (auto value : liveIns) {
+      if (blockSplits >= maxSplitsPerBlock)
+        break;
+
+      builder.setBeforeOp(insertBefore);
+      Op *copy = nullptr;
+      if (value->getResultType() == Value::f32)
+        copy = builder.create<FmvOp>({ value });
+      else
+        copy = builder.create<MvOp>({ value });
+      copy->setResultType(value->getResultType());
+
+      int replaced = replaceUsesAfterCopy(bb, copy, value, nullptr);
+      if (replaced == 0) {
+        copy->removeAllOperands();
+        copy->erase();
+        continue;
+      }
+
+      splits++;
+      blockSplits++;
+    }
+  }
+
+  return splits;
+}
+
 }
 
 std::map<std::string, int> RegAlloc::stats() {
   return {
     { "spilled", spilled },
     { "peepholed", convertedTotal },
+    { "max-block-hotness", maxBlockHotness },
+    { "live-range-splits", liveRangeSplits },
   };
 }
 
@@ -213,8 +383,14 @@ struct Event {
 void RegAlloc::runImpl(Region *region, bool isLeaf) {
   const Reg *order = isLeaf ? leafOrder : normalOrder;
   const Reg *orderf = isLeaf ? leafOrderf : normalOrderf;
+  const Reg *orderv = isLeaf ? leafOrderv : normalOrderv;
   const int regcount = isLeaf ? leafRegCnt : normalRegCnt;
   const int regcountf = isLeaf ? leafRegCntf : normalRegCntf;
+  const int regcountv = isLeaf ? leafRegCntv : normalRegCntv;
+
+  int opCount = 0;
+  for (auto bb : region->getBlocks()) { opCount += bb->getOps().size(); }
+  bool localFastMode = fastMode || (opCount > 3000);
 
   Builder builder;
   
@@ -323,6 +499,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   auto bbWeight = sys::backend::shared::computeBlockHotness(region, [](Op *op) {
     return isa<CallOp>(op);
   });
+  for (auto &[_, weight] : bbWeight)
+    maxBlockHotness = std::max(maxBlockHotness, weight);
+
+  int splits = localFastMode ? 0 : splitHotLiveRanges(region, bbWeight);
+  if (splits) {
+    liveRangeSplits += splits;
+    region->updateLiveness();
+  }
 
   std::unordered_map<Op*, int> spillOffset;
   int currentOffset = STACKOFF(funcOp);
@@ -330,11 +514,15 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     currentOffset = currentOffset / 8 * 8 + 8;
   int highest = 0;
 
-  if (!fastMode) {
+  if (!localFastMode) {
     // Interference graph.
     std::unordered_map<Op*, std::unordered_set<Op*>> interf, spillInterf;
     std::unordered_map<Op*, long long> spillWeight;
     std::unordered_map<Op*, int> callSpan;
+    const int fpSpillBoost = envInt("SISY_RV_FP_SPILL_WEIGHT", 8, 1, 1024);
+    auto spillBoost = [&](Op *op) -> long long {
+      return op && fpreg(op->getResultType()) ? fpSpillBoost : 1;
+    };
 
     // Values of readreg, or operands of writereg, or phis (mvs), are prioritzed.
     std::unordered_map<Op*, int> priority;
@@ -357,12 +545,12 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     auto it = ops.end();
     for (int i = (int) ops.size() - 1; i >= 0; i--) {
       auto op = *--it;
-      spillWeight[op] += localWeight;
+      spillWeight[op] += localWeight * spillBoost(op);
       for (auto v : op->getOperands()) {
         if (!lastUsed.count(v.defining))
           lastUsed[v.defining] = i;
         // Read pressure matters more than pure definition count.
-        spillWeight[v.defining] += 2LL * localWeight;
+        spillWeight[v.defining] += 2LL * localWeight * spillBoost(v.defining);
       }
       defined[op] = i;
 
@@ -379,14 +567,16 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (isa<ReadRegOp>(op))
         priority[op] = 1;
       
-      if (isa<LiOp>(op) && (V(op) <= 2047 && V(op) >= -2048))
-        priority[op] = -2;
+      if (isa<LiOp>(op))
+        priority[op] = (V(op) <= 2047 && V(op) >= -2048) ? -3 : -1;
+      if (isa<LaOp>(op))
+        priority[op] = op->getUses().size() <= 1 ? -1 : 100000;
 
       if (isa<PhiOp>(op)) {
         priority[op] = currentPriority + 1;
         for (auto x : op->getOperands()) {
           priority[x.defining] = currentPriority;
-          if (!fastMode)
+          if (!localFastMode)
             prefer[x.defining] = op;
           phiOperand[op].push_back(x.defining);
         }
@@ -394,7 +584,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       }
 
       // Preserve copy chains to reduce move pressure after allocation.
-      if (!fastMode && (isa<MvOp>(op) || isa<FmvOp>(op)) && op->getOperandCount() == 1) {
+      if (!localFastMode && (isa<MvOp>(op) || isa<FmvOp>(op)) && op->getOperandCount() == 1) {
         auto src = op->DEF(0);
         prefer[op] = src;
         bumpPriority(op, currentPriority + 2);
@@ -409,7 +599,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
     // Penalize long-lived values and values spanning calls.
     std::vector<int> callPrefix;
-    if (!fastMode) {
+    if (!localFastMode) {
       callPrefix.assign(ops.size() + 1, 0);
       int callIdx = 0;
       for (auto liveOp : ops) {
@@ -422,14 +612,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (def >= last)
         continue;
       int span = last - def;
-      spillWeight[op] += 3LL * localWeight * span;
+      spillWeight[op] += 3LL * localWeight * span * spillBoost(op);
 
-      if (!fastMode) {
+      if (!localFastMode) {
         int l = std::max(0, def + 1);
         int r = std::min<int>(ops.size(), last);
         int callCount = callPrefix[r] - callPrefix[l];
         callSpan[op] = std::max(callSpan[op], callCount);
-        spillWeight[op] += 96LL * localWeight * callCount;
+        spillWeight[op] += 96LL * localWeight * callCount * spillBoost(op);
       }
     }
 
@@ -459,10 +649,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
       if (event.start) {
         for (Op* activeOp : active) {
-          // FP and int are using different registers.
+          // Different register classes use different register files.
           // However, they are using the same stack,
           // so that must be taken into account when spilling.
-          if (fpreg(activeOp->getResultType()) ^ fpreg(op->getResultType())) {
+          if (!shareRegClass(activeOp->getResultType(), op->getResultType())) {
             spillInterf[op].insert(activeOp);
             spillInterf[activeOp].insert(op);
             continue;
@@ -568,8 +758,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       continue;
     }
 
-    auto rcnt = !fpreg(op->getResultType()) ? regcount : regcountf;
-    auto rorder = !fpreg(op->getResultType()) ? order : orderf;
+    auto rcnt = vecreg(op->getResultType()) ? regcountv : (!fpreg(op->getResultType()) ? regcount : regcountf);
+    auto rorder = vecreg(op->getResultType()) ? orderv : (!fpreg(op->getResultType()) ? order : orderf);
     auto tryAssign = [&](bool onlyCallee, bool allowUnpreferred) -> bool {
       for (int i = 0; i < rcnt; i++) {
         Reg cand = rorder[i];
@@ -586,13 +776,18 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     };
 
     bool preferCallee = !isLeaf && callSpan[op] > 0;
-    if (!(preferCallee && tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ false)))
-      tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ false);
+    bool assigned = false;
+    if (preferCallee)
+      assigned = tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ false);
+    else
+      assigned = tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ false);
 
     // We have excluded too much. Try it again.
-    if (!assignment.count(op) && unpreferred.size()) {
-      if (!(preferCallee && tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ true)))
-        tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ true);
+    if (!assigned && unpreferred.size()) {
+      if (preferCallee)
+        assigned = tryAssign(/*onlyCallee=*/ true, /*allowUnpreferred=*/ true);
+      else
+        assigned = tryAssign(/*onlyCallee=*/ false, /*allowUnpreferred=*/ true);
     }
 
     if (assignment.count(op))
@@ -601,6 +796,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     spilled++;
     // Spilled. Try to see all spill offsets of conflicting ops.
     int desired = currentOffset;
+    if (vecreg(op->getResultType())) {
+      if (desired % 16 != 0)
+        desired = (desired / 16 + 1) * 16;
+    }
     std::unordered_set<int> conflict;
 
     // Consider both `interf` (of the same register type)
@@ -619,14 +818,24 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     }
 
     // Try find a space.
-    while (conflict.count(desired))
-      desired += 8;
+    if (vecreg(op->getResultType())) {
+      while (conflict.count(desired) || conflict.count(desired + 8))
+        desired += 16;
+    } else {
+      while (conflict.count(desired))
+        desired += 8;
+    }
 
     spillOffset[op] = desired;
 
     // Update `highest`, which will indicate the size allocated.
+    if (vecreg(op->getResultType())) {
+      if (desired + 8 > highest)
+        highest = desired + 8;
+    } else {
       if (desired > highest)
         highest = desired;
+    }
     }
   } else {
     // Huge-module fast path: avoid O(N^2) interference construction in regalloc.
@@ -638,9 +847,17 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
           continue;
         if (op->getResultType() == Value::unit)
           continue;
-        spillOffset[op] = nextOffset;
-        highest = nextOffset;
-        nextOffset += 8;
+        if (vecreg(op->getResultType())) {
+          if (nextOffset % 16 != 0)
+            nextOffset = (nextOffset / 16 + 1) * 16;
+          spillOffset[op] = nextOffset;
+          highest = nextOffset + 8;
+          nextOffset += 16;
+        } else {
+          spillOffset[op] = nextOffset;
+          highest = nextOffset;
+          nextOffset += 8;
+        }
         spilled++;
       }
     }
@@ -648,24 +865,25 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   // Only a single register is spilled. Let's use s10.
   // Fast mode keeps spill semantics simple and uniform (stack-only).
-  if (!fastMode && highest == currentOffset) {
+  if (!localFastMode && highest == currentOffset) {
     for (auto [op, _] : spillOffset)
       assignment[op] = fpreg(op->getResultType()) ? fspillReg : spillReg;
     spillOffset.clear();
   }
 
   // Only 2 registers are spilled. Let's use s10 and s11..
-  if (!fastMode && highest == currentOffset + 8) {
+  if (!localFastMode && highest == currentOffset + 8) {
     for (auto [op, offset] : spillOffset) {
       auto fp = fpreg(op->getResultType());
-      assignment[op] = offset ? (fp ? fspillReg2 : spillReg2) : (fp ? fspillReg : spillReg);
+      assignment[op] = (offset == currentOffset) ? (fp ? fspillReg : spillReg)
+                                                 : (fp ? fspillReg2 : spillReg2);
     }
     spillOffset.clear();
   }
 
   // Mapping integer spill slots to FP registers is fragile around large
   // argument frames and dynamic call-frame deltas. Keep it opt-in.
-  if (!fastMode && spillOffset.size() && envEnabled("SISY_RV_SPILL_TO_FP", false)) {
+  if (!localFastMode && spillOffset.size() && envEnabled("SISY_RV_SPILL_TO_FP", false)) {
     // Try to reuse floating-point registers for spilling.
     std::unordered_set<Reg> used;
     for (auto [op, x] : assignment) {
@@ -698,7 +916,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   const auto getReg = [&](Op *op) {
     return assignment.count(op) ? assignment[op] :
-      fpreg(op->getResultType()) ? orderf[0] : order[0];
+      vecreg(op->getResultType()) ? orderv[0] : (fpreg(op->getResultType()) ? orderf[0] : order[0]);
   };
 
   // Convert all operands to registers.
@@ -730,6 +948,13 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(FeqOp, BINARY);
   LOWER(FltOp, BINARY);
   LOWER(FleOp, BINARY);
+  LOWER(VaddvvOp, BINARY);
+  LOWER(VsubvvOp, BINARY);
+  LOWER(VmulvvOp, BINARY);
+  LOWER(VfaddvvOp, BINARY);
+  LOWER(VfsubvvOp, BINARY);
+  LOWER(VfmulvvOp, BINARY);
+  LOWER(Vse32Op, BINARY);
   LOWER(SllwOp, BINARY);
   LOWER(SrlwOp, BINARY);
   LOWER(SrawOp, BINARY);
@@ -738,6 +963,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(SrlOp, BINARY);
   
   LOWER(LoadOp, UNARY);
+  LOWER(Vle32Op, UNARY);
+  LOWER(VmvvxOp, UNARY);
+  LOWER(VfmvvfOp, UNARY);
+  LOWER(VsetvliOp, UNARY);
   LOWER(AddiwOp, UNARY);
   LOWER(AddiOp, UNARY);
   LOWER(SlliwOp, UNARY);
@@ -755,6 +984,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(FcvtswOp, UNARY);
   LOWER(FcvtwsRtzOp, UNARY);
   LOWER(FmvwxOp, UNARY);
+  LOWER(MvOp, UNARY);
+  LOWER(FmvOp, UNARY);
 
   // Note that some ops are dealt with later.
   // We can't remove all operands here.
@@ -1109,7 +1340,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
         int offset = delta + rd->offset;
         bool fp = rd->fp;
-        auto reg = fp ? fspillReg : spillReg;
+        auto reg = vecreg(rd->ref->getResultType()) ? vspillReg : (fp ? fspillReg : spillReg);
 
         builder.setAfterOp(op);
         if (offset < delta)
@@ -1122,8 +1353,9 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (auto rs = op->find<SpilledRsAttr>()) {
         int offset = delta + rs->offset;
         bool fp = rs->fp;
-        auto reg = fp ? fspillReg : spillReg;
-        auto ldty = fp ? Value::f32 : Value::i64;
+        bool vec = vecreg(rs->ref->getResultType());
+        auto reg = vec ? vspillReg : (fp ? fspillReg : spillReg);
+        auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
         // Rematerialized.
@@ -1135,15 +1367,16 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
-          emitStackLoad(builder, reg, ldty, offset, spillReg2);
+          emitStackLoad(builder, reg, ldty, offset, spillReg);
         op->add<RsAttr>(reg);
       }
 
       if (auto rs2 = op->find<SpilledRs2Attr>()) {
         int offset = delta + rs2->offset;
         bool fp = rs2->fp;
-        auto reg = fp ? fspillReg2 : spillReg2;
-        auto ldty = fp ? Value::f32 : Value::i64;
+        bool vec = vecreg(rs2->ref->getResultType());
+        auto reg = vec ? vspillReg2 : (fp ? fspillReg2 : spillReg2);
+        auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
         // Rematerialized.
@@ -1155,7 +1388,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
-          emitStackLoad(builder, reg, ldty, offset, spillReg);
+          emitStackLoad(builder, reg, ldty, offset, spillReg2);
         op->add<Rs2Attr>(reg);
       }
     }

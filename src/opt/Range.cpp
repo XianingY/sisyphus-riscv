@@ -156,24 +156,69 @@ bool updateConditional(Op *op, bool &changed) {
   bool isTarget = parent == TARGET(term);
 
   auto cond = term->DEF(0);
-  // TODO: more comparison types (also change Range.cpp)
-  if (!isa<LtOp>(cond))
+  if (!isa<LtOp>(cond) && !isa<LeOp>(cond) && !isa<EqOp>(cond) && !isa<NeOp>(cond))
     return false;
 
-  if (cond->DEF(0) != x)
+  bool isLhs = cond->DEF(0) == x;
+  bool isRhs = cond->DEF(1) == x;
+  if (!isLhs && !isRhs)
     return false;
 
-  auto y = cond->DEF(1);
+  auto y = isLhs ? cond->DEF(1) : cond->DEF(0);
   if (!y->has<RangeAttr>())
     return false;
 
-  // Now this is of form `x < y`.
+  // Now this is of form `x < y` or `y < x`.
   auto [xlow, xhigh] = RANGE(x);
   auto [ylow, yhigh] = RANGE(y);
 
-  IRange r = isTarget
-    ? IRange { xlow, std::min(xhigh, yhigh - 1) } // x < y
-    : IRange { std::max(xlow, ylow), xhigh };     // x >= y
+  IRange r = RANGE(x);
+  if (isa<LtOp>(cond)) {
+    if (isLhs) {
+      r = isTarget
+        ? IRange { xlow, std::min(xhigh, yhigh - 1) } // x < y
+        : IRange { std::max(xlow, ylow), xhigh };     // x >= y
+    } else {
+      r = isTarget
+        ? IRange { std::max(xlow, ylow + 1), xhigh }  // y < x
+        : IRange { xlow, std::min(xhigh, yhigh) };    // y >= x
+    }
+  } else if (isa<LeOp>(cond)) {
+    if (isLhs) {
+      r = isTarget
+        ? IRange { xlow, std::min(xhigh, yhigh) }     // x <= y
+        : IRange { std::max(xlow, ylow + 1), xhigh }; // x > y
+    } else {
+      r = isTarget
+        ? IRange { std::max(xlow, ylow), xhigh }      // y <= x
+        : IRange { xlow, std::min(xhigh, yhigh - 1) };// y > x
+    }
+  } else if (isa<EqOp>(cond)) {
+    if (isTarget) {
+      r = IRange { std::max(xlow, ylow), std::min(xhigh, yhigh) };
+    } else if (ylow == yhigh) {
+      if (xlow == ylow)
+        r.first = std::min<int>(xhigh + 1, INT_MAX);
+      if (xhigh == yhigh)
+        r.second = std::max<int>(xlow - 1, INT_MIN);
+    }
+  } else if (isa<NeOp>(cond)) {
+    if (!isTarget) {
+      r = IRange { std::max(xlow, ylow), std::min(xhigh, yhigh) };
+    } else if (ylow == yhigh) {
+      if (xlow == ylow)
+        r.first = std::min<int>(xhigh + 1, INT_MAX);
+      if (xhigh == yhigh)
+        r.second = std::max<int>(xlow - 1, INT_MIN);
+    }
+  }
+  if (r.first > r.second) {
+    if (op->has<RangeAttr>()) {
+      op->remove<RangeAttr>();
+      changed = true;
+    }
+    return true;
+  }
   if (!op->has<RangeAttr>()) {
     op->add<RangeAttr>(r);
     changed = true;
@@ -349,10 +394,8 @@ void Range::split(Region *region) {
       continue;
 
     auto cond = term->DEF();
-    if (!isa<LtOp>(cond))
+    if (!isa<LtOp>(cond) && !isa<LeOp>(cond) && !isa<EqOp>(cond) && !isa<NeOp>(cond))
       continue;
-
-    auto x = cond->DEF(0);
 
     auto bb1 = TARGET(term), bb2 = ELSE(term);
 
@@ -367,47 +410,56 @@ void Range::split(Region *region) {
     if (!bb->dominates(bb1) || !bb->dominates(bb2))
       continue;
 
-    // Have a look whether we've already split it first.
-    // Don't do it repeatedly.
-    int found = 0;
-    auto bb1phis = bb1->getPhis();
-    for (auto phi : bb1phis) {
-      if (phi->getOperandCount() == 1 && phi->DEF() == x) {
-        found++;
-        break;
+    auto splitValue = [&](Op *x) {
+      if (!x || isa<IntOp>(x))
+        return;
+
+      // Have a look whether we've already split it first.
+      // Don't do it repeatedly.
+      int found = 0;
+      auto bb1phis = bb1->getPhis();
+      for (auto phi : bb1phis) {
+        if (phi->getOperandCount() == 1 && phi->DEF() == x) {
+          found++;
+          break;
+        }
       }
-    }
-    auto bb2phis = bb2->getPhis();
-    for (auto phi : bb2phis) {
-      if (phi->getOperandCount() == 1 && phi->DEF() == x) {
-        found++;
-        break;
+      auto bb2phis = bb2->getPhis();
+      for (auto phi : bb2phis) {
+        if (phi->getOperandCount() == 1 && phi->DEF() == x) {
+          found++;
+          break;
+        }
       }
-    }
-    if (found == 2)
-      continue;
+      if (found == 2)
+        return;
 
-    // Now give a phi for both successors.
-    builder.setToBlockStart(bb1);
-    auto x1 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
-    builder.setToBlockStart(bb2);
-    auto x2 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
+      // Now give a phi for both successors.
+      builder.setToBlockStart(bb1);
+      auto x1 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
+      builder.setToBlockStart(bb2);
+      auto x2 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
 
-    // Rename operations.
-    auto uses = x->getUses();
-    for (auto use : uses) {
-      if (use == x1 || use == x2)
-        continue;
+      // Rename operations.
+      auto uses = x->getUses();
+      for (auto use : uses) {
+        if (use == x1 || use == x2)
+          continue;
 
-      auto parent = use->getParent();
-      // Both branch get to here; use the original `x` instead.
-      if (parent->postDominates(bb1) && parent->postDominates(bb2))
-        continue;
-      if (bb1->dominates(parent))
-        use->replaceOperand(x, x1);
-      if (bb2->dominates(parent))
-        use->replaceOperand(x, x2);
-    }
+        auto parent = use->getParent();
+        // Both branch get to here; use the original `x` instead.
+        if (parent->postDominates(bb1) && parent->postDominates(bb2))
+          continue;
+        if (bb1->dominates(parent))
+          use->replaceOperand(x, x1);
+        if (bb2->dominates(parent))
+          use->replaceOperand(x, x2);
+      }
+    };
+
+    splitValue(cond->DEF(0));
+    if (cond->DEF(1) != cond->DEF(0))
+      splitValue(cond->DEF(1));
   }
 }
 
@@ -439,9 +491,10 @@ void Range::analyze(Region *region) {
       if (!isa<BranchOp>(term) || term->getOperandCount() != 1)
         continue;
       auto cond = term->DEF();
-      if (!isa<LtOp>(cond) || cond->getOperandCount() != 2)
+      if ((!isa<LtOp>(cond) && !isa<LeOp>(cond) && !isa<EqOp>(cond) && !isa<NeOp>(cond)) ||
+          cond->getOperandCount() != 2)
         continue;
-      if (cond->DEF(0) != op->DEF(0))
+      if (cond->DEF(0) != op->DEF(0) && cond->DEF(1) != op->DEF(0))
         continue;
       addCondDep(cond, op);
       addCondDep(cond->DEF(0), op);

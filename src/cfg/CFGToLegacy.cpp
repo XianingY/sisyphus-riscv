@@ -7,6 +7,7 @@
 #include "../utils/DynamicCast.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,13 @@ size_t productDims(const std::vector<int> &dims) {
 
 bool isArrayLike(const SymbolInfo &sym) {
   return !sym.dims.empty() || sym.type == hir::TypeKind::Array || sym.type == hir::TypeKind::Pointer;
+}
+
+Value makeByteOffset(Builder &builder, Value index, size_t strideBytes, size_t objectBytes) {
+  auto stride = builder.create<IntOp>({ new IntAttr((int) strideBytes) });
+  if (objectBytes > (size_t) INT_MAX)
+    return builder.create<MulLOp>({ index, stride });
+  return builder.create<MulIOp>({ index, stride });
 }
 
 std::string normalizeCallee(const std::string &name) {
@@ -179,6 +187,8 @@ private:
           new DimensionAttr(dims),
         });
         g.defining->add<FPAttr>();
+        if (!sym.isMutable)
+          g.defining->add<ConstAttr>();
       } else {
         int *data = nullptr;
         if (!sym.intArrayInit.empty()) {
@@ -199,6 +209,8 @@ private:
           new NameAttr(sym.name),
           new DimensionAttr(dims),
         });
+        if (!sym.isMutable)
+          g.defining->add<ConstAttr>();
       }
       globals[sym.name] = g;
     }
@@ -549,8 +561,7 @@ private:
     Value addr = base;
     for (size_t i = 0; i < indices.size(); i++) {
       auto idx = resolveToken(st, bid, indices[i], hir::TypeKind::Int, false);
-      auto stride = builder.create<IntOp>({ new IntAttr((int) strides[i]) });
-      auto offset = builder.create<MulIOp>({ idx, stride });
+      auto offset = makeByteOffset(builder, idx, strides[i], info.storageSize);
       addr = builder.create<AddLOp>({ addr, offset });
     }
     return addr;

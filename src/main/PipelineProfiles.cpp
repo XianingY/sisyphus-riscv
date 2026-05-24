@@ -76,6 +76,8 @@ void appendRvBackend(sys::PassManager &pm, const sys::Options &opts, const Pipel
     pm.addPass<sys::rv::InstCombine>();
   pm.addPass<sys::rv::RvDCE>();
   pm.addPass<sys::GVN>();
+  if (getenvEnabled("SISY_RV_ENABLE_SCHEDULE", true))
+    pm.addPass<sys::rv::Schedule>();
   pm.addPass<sys::rv::RegAlloc>(plan.backendFastMode);
   pm.addPass<sys::rv::Dump>(opts.outputFile);
 }
@@ -94,6 +96,11 @@ void appendCoreO0(sys::PassManager &pm) {
 
   pm.addPass<sys::FlattenCFG>();
   pm.addPass<sys::Mem2Reg>();
+  if (getenvEnabled("SISY_ENABLE_SCCP", true)) {
+    pm.addPass<sys::SCCP>();
+    pm.addPass<sys::DCE>();
+    pm.addPass<sys::SimplifyCFG>();
+  }
   pm.addPass<sys::RegularFold>();
   pm.addPass<sys::DCE>();
   pm.addPass<sys::SimplifyCFG>();
@@ -107,11 +114,14 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   const bool enableO2Experimental = plan.enableO2Experimental;
   const bool enableO1LiteTail = !aggressive;
   const bool armSafeStructured = opts.arm && !aggressive;
+  // All-optimization profile: enable the full RISC-V optimization stack by
+  // default while keeping per-pass environment overrides for quick bisecting.
+  constexpr bool enableRvSemanticPasses = true;
   const bool enablePrivatizeReduction =
-    getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", !(opts.rv && !aggressive));
+    getenvEnabled("SISY_ENABLE_PRIVATIZE_REDUCTION", false);
   // "large" modules use an economy lane to cap compile-time, but "huge"
   // modules are safer with the full O1-style shrink pipeline before backend.
-  // This avoids sending oversized IR to regalloc on cases like 84_long_array2.
+  // This avoids sending oversized IR to register allocation.
   const bool economyMode = plan.largeModuleMode && !plan.hugeModuleMode;
 
   pm.addPass<sys::MoveAlloca>();
@@ -122,6 +132,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
   };
 
   auto appendLoweredTail = [&]() {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
+      pm.addPass<sys::RuntimeMemoize>();
     appendLoweredTCO();
     if (economyMode) {
       pm.addPass<sys::FlattenCFG>();
@@ -155,48 +167,45 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::FlattenCFG>();
     pm.addPass<sys::GVN>();
     pm.addPass<sys::DCE>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
+      pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", false)) {
+      pm.addPass<sys::StructuralBitwise>();
+      pm.addPass<sys::DCE>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::GVN>();
       pm.addPass<sys::DCE>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_RECURRENCE_SUFFIX", true))
-      pm.addPass<sys::BooleanMatrixRecurrenceFastPath>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MATRIX_ROW_SUM_RECURRENCE", true))
-      pm.addPass<sys::MatrixRowSumRecurrence>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_MATMUL_SUMMARY", true))
-      pm.addPass<sys::SemanticMatmulSummary>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_SEMANTIC_BITWISE", true))
-      pm.addPass<sys::SemanticBitwise>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SEMANTIC_TRANSPOSE", true))
-      pm.addPass<sys::SemanticTranspose>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_BITBUFFER_SPECIALIZE", true))
-      pm.addPass<sys::SemanticBitBuffer>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_SCHEDULING_PRECOMPUTE", true))
-      pm.addPass<sys::SchedulingPrecompute>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_OVERWRITE_COLLAPSE", true))
-      pm.addPass<sys::RepeatOverwriteCollapse>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
     pm.addPass<sys::Globalize>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_RUNTIME_MEMOIZE", true))
-      pm.addPass<sys::RuntimeMemoize>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DEAD_GLOBAL_STORE", true)) {
       pm.addPass<sys::DeadGlobalStore>();
       pm.addPass<sys::DCE>();
     }
 
     pm.addPass<sys::Mem2Reg>();
+    if (getenvEnabled("SISY_ENABLE_SCCP", true)) {
+      pm.addPass<sys::SCCP>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::DCE>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DIV_POW2_LOOP_FOLD", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_DIV_POW2_LOOP_FOLD", true)) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
       pm.addPass<sys::DivPow2LoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", true)) {
+      pm.addPass<sys::ParityIfConversion>();
       pm.addPass<sys::SimplifyCFG>();
     }
     pm.addPass<sys::RegularFold>();
@@ -206,6 +215,16 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::DSE>();
     pm.addPass<sys::DLE>();
     pm.addPass<sys::GVN>();
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", true)) {
+      pm.addPass<sys::ParityIfConversion>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_STRUCTURAL_MODMUL", false)) {
+      pm.addPass<sys::StructuralModMul>();
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::GVN>();
+    }
     if ((aggressive || enableO1LiteTail) && !economyMode)
       pm.addPass<sys::Reassociate>();
 
@@ -213,26 +232,24 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", false))
+      pm.addPass<sys::RowScratchMatmul>();
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
       pm.addPass<sys::ModularAffineLoop>();
-      pm.addPass<sys::SimplifyCFG>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", true)) {
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROTL_REPEAT_FOLD", true)) {
       pm.addPass<sys::RotlRepeatLoopFold>();
       pm.addPass<sys::SimplifyCFG>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", true)) {
-      pm.addPass<sys::RowScratchMatmul>();
-      pm.addPass<sys::Mem2Reg>();
-      pm.addPass<sys::RegularFold>();
-      pm.addPass<sys::DCE>();
-      pm.addPass<sys::SimplifyCFG>();
-    }
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
       pm.addPass<sys::LoopInterchange>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_LOOP_TILING", true))
+      pm.addPass<sys::LoopTiling>();
+    if (opts.rv && getenvEnabled("SISY_ENABLE_REDUCTION_INTERCHANGE", true))
+      pm.addPass<sys::ReductionInterchange>();
     if (enablePrivatizeReduction)
       pm.addPass<sys::PrivatizeReduction>();
     // Early Unswitch before first LICM is useful for invariant branches at O1.
@@ -241,15 +258,29 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::LICM>();
     if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
       pm.addPass<sys::ScalarReplace>();
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_POW2_REPEAT_LOOP_FOLD", true)) {
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+      pm.addPass<sys::Pow2RepeatLoopFold>();
+      pm.addPass<sys::SimplifyCFG>();
+    }
     if (!opts.disableConstUnroll)
       pm.addPass<sys::ConstLoopUnroll>();
+    if (getenvEnabled("SISY_ENABLE_POST_UNROLL_DLE", true)) {
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+      pm.addPass<sys::Alias>();
+      pm.addPass<sys::DLE>();
+      pm.addPass<sys::RegularFold>();
+      pm.addPass<sys::DCE>();
+    }
     pm.addPass<sys::SCEV>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", true)) {
       pm.addPass<sys::BoundsCheck>();
       pm.addPass<sys::SimplifyCFG>();
     }
     pm.addPass<sys::AggressiveDCE>();
-    if (opts.arm && opts.enableExperimental)
+    if ((opts.arm || opts.rv) &&
+        getenvEnabled("SISY_ENABLE_VECTORIZE", opts.enableExperimental || opts.o2))
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::GVN>();
 
@@ -265,7 +296,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DSE>();
       pm.addPass<sys::DLE>();
     }
-    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", false)) {
+    if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_PARITY_IF_CONVERSION", true)) {
       pm.addPass<sys::ParityIfConversion>();
       pm.addPass<sys::SimplifyCFG>();
     }
@@ -274,6 +305,10 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::Range>();
       pm.addPass<sys::EqClass>();
       pm.addPass<sys::RangeAwareFold>();
+      if (getenvEnabled("SISY_ENABLE_WIDE_ARITH_PROMOTION", true))
+        pm.addPass<sys::WideArithmeticPromotion>();
+      if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", false))
+        pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
       pm.addPass<sys::Splice>();
     }
     if (enableO1LiteTail && !economyMode) {
@@ -301,9 +336,11 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     pm.addPass<sys::DCE>();
     pm.addPass<sys::InlineStore>();
-    if (enableO2Experimental && plan.enableO2Heavy)
+    if (enableO2Experimental && plan.enableO2Heavy &&
+        getenvEnabled("SISY_ENABLE_CACHED_PRECOMPUTE", false))
       pm.addPass<sys::Cached>();
-    if (enableO2Experimental && plan.enableO2Heavy)
+    if (enableO2Experimental && plan.enableO2Heavy &&
+        getenvEnabled("SISY_ENABLE_SYNTH_CONST_ARRAY", false))
       pm.addPass<sys::SynthConstArray>();
     pm.addPass<sys::RegularFold>();
     pm.addPass<sys::DCE>();
@@ -346,6 +383,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     pm.addPass<sys::AggressiveDCE>();
     pm.addPass<sys::SimplifyCFG>();
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ZERO_FACTOR_STORE_LOOP", true))
+      pm.addPass<sys::ZeroFactorStoreLoop>();
     pm.addPass<sys::InstSchedule>();
   };
 
@@ -381,7 +420,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::View>();
     pm.addPass<sys::LoopDCE>();
     pm.addPass<sys::TidyMemory>();
-    if (aggressive) {
+    if (aggressive || getenvEnabled("SISY_ENABLE_O1_FUSION", true)) {
       pm.addPass<sys::Fusion>();
     }
     // Repeat Unswitch after simplification to expose later loop cleanup.
@@ -433,8 +472,8 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   // O1 is the stable competition mainline; O2 is the only aggressive lane.
   plan.aggressive = opts.o2;
   plan.enableO2Experimental = opts.o2 && !opts.disableO2Experimental;
-  // O2Heavy enables SMT-based constant array synthesis for better performance on
-  // FFT, Huffman, and similar workloads. Safe since functional is 100%.
+  // O2Heavy enables expensive generic transforms such as SMT-based constant
+  // array synthesis. It is separate from the stable O1 competition mainline.
   // Can be disabled via SISY_O2_ENABLE_HEAVY=0.
   plan.enableO2Heavy = plan.enableO2Experimental && getenvEnabled("SISY_O2_ENABLE_HEAVY", true);
   // More loop rounds for O2 to catch optimization opportunities in tight loops.

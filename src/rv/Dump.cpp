@@ -123,6 +123,61 @@ void dumpOp(Op *op, std::ostream &os) {
     return;
   }
 
+  if (isa<VsetvliOp>(op)) {
+    os << "vsetvli zero, " << RS(op) << ", e32, m1, ta, ma\n";
+    return;
+  }
+
+  if (isa<Vle32Op>(op)) {
+    os << "vle32.v " << RD(op) << ", (" << RS(op) << ")\n";
+    return;
+  }
+
+  if (isa<Vse32Op>(op)) {
+    os << "vse32.v " << RS(op) << ", (" << RS2(op) << ")\n";
+    return;
+  }
+
+  if (isa<VaddvvOp>(op)) {
+    os << "vadd.vv " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VsubvvOp>(op)) {
+    os << "vsub.vv " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VmulvvOp>(op)) {
+    os << "vmul.vv " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VmvvxOp>(op)) {
+    os << "vmv.v.x " << RD(op) << ", " << RS(op) << "\n";
+    return;
+  }
+
+  if (isa<VfaddvvOp>(op)) {
+    os << "vfadd.vv " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VfsubvvOp>(op)) {
+    os << "vfsub.vv " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VfmulvvOp>(op)) {
+    os << "vfmul.vv " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VfmvvfOp>(op)) {
+    os << "vfmv.v.f " << RD(op) << ", " << RS(op) << "\n";
+    return;
+  }
+
   std::stringstream ss;
   ss << name << " ";
   

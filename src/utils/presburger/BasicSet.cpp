@@ -47,8 +47,6 @@ bool BasicSet::empty() {
 
     // Pivot.
     auto pivot = tableau[row][col];
-    auto width = tableau[row].size();
-
     // Normalize the pivot row.
     // We would write:
     //   for (auto &x : tableau[row])
@@ -155,4 +153,45 @@ void BasicSet::dump(std::ostream &os) {
     }
     os << "\n";
   }
+}
+
+BasicSet BasicSet::intersect(const BasicSet &other) const {
+  std::vector<AffineExpr> combined;
+  combined.reserve(tableau.size() + other.tableau.size());
+  for (const auto &row : tableau)
+    combined.push_back(row);
+  for (const auto &row : other.tableau)
+    combined.push_back(row);
+  return BasicSet(combined);
+}
+
+bool BasicSet::isSubsetOf(const BasicSet &other) const {
+  if (other.tableau.empty())
+    return true;
+  if (other.tableau.size() != 1)
+    return false;
+  if (!tableau.empty() && tableau[0].size() != other.tableau[0].size())
+    return false;
+
+  // Rows are interpreted as affine integer inequalities row(x) >= 0.
+  // this ⊆ other iff this ∩ ¬other is empty. For integer domains,
+  // ¬(row(x) >= 0) is row(x) <= -1, i.e. -row(x) - 1 >= 0.
+  AffineExpr negated = other.tableau[0];
+  for (auto &coeff : negated)
+    coeff = -coeff;
+  if (!negated.empty())
+    negated.back() -= 1;
+
+  BasicSet witness = intersect(BasicSet({negated}));
+  return witness.empty();
+}
+
+int BasicSet::numVars() const {
+  if (tableau.empty())
+    return 0;
+  return (int) tableau[0].size() - 1;
+}
+
+void BasicSet::addConstraint(const AffineExpr &row) {
+  tableau.push_back(row);
 }

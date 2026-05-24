@@ -1,0 +1,14 @@
+int main() {
+  int x;
+  int y;
+  int r;
+  x = getint();
+  y = getint();
+  r = 0;
+  if (x == y) {
+    r = x - y;
+  } else {
+    r = 3;
+  }
+  return r;
+}

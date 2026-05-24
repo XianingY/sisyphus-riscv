@@ -1,0 +1,12 @@
+int a[8];
+int b[8];
+int c[8];
+
+int main() {
+  int i = 0;
+  while (i < 2) {
+    c[i] = a[i] + b[i];
+    i = i + 1;
+  }
+  return c[0] + c[1];
+}

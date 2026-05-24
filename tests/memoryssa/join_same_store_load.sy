@@ -1,0 +1,11 @@
+int main() {
+  int a[1];
+  int x;
+  x = getint();
+  if (x) {
+    a[0] = 7;
+  } else {
+    a[0] = 7;
+  }
+  return a[0];
+}

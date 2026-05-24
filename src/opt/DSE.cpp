@@ -1,5 +1,6 @@
 #include "CleanupPasses.h"
 #include "Analysis.h"
+#include <algorithm>
 #include <deque>
 #include <unordered_set>
 
@@ -8,10 +9,174 @@ using namespace sys;
 std::map<std::string, int> DSE::stats() {
   return {
     { "removed-stores", elim },
+    { "sunk-stores", sunk },
   };
 }
 
+namespace {
+
+bool sameStoredValueForSink(Op *a, Op *b) {
+  if (a == b)
+    return true;
+  if (!a || !b || a->opid != b->opid)
+    return false;
+  if (isa<IntOp>(a))
+    return V(a) == V(b);
+  if (isa<FloatOp>(a))
+    return F(a) == F(b);
+  return false;
+}
+
+bool sameStoreAddressForSink(StoreOp *a, StoreOp *b) {
+  if (!a || !b)
+    return false;
+  if (a->has<SizeAttr>() && b->has<SizeAttr>() && SIZE(a) != SIZE(b))
+    return false;
+  return a->DEF(1) == b->DEF(1) || mustAlias(a->DEF(1), b->DEF(1));
+}
+
+StoreOp *trailingStoreToJoin(BasicBlock *pred, BasicBlock *join) {
+  if (!pred || pred->getOpCount() == 0)
+    return nullptr;
+  auto term = pred->getLastOp();
+  if (!isa<GotoOp>(term) || !term->has<TargetAttr>() || TARGET(term) != join)
+    return nullptr;
+  auto prev = term->prevOp();
+  if (!prev)
+    return nullptr;
+  return dyn_cast<StoreOp>(prev);
+}
+
+bool valueAvailableAt(Op *value, BasicBlock *bb) {
+  if (!value)
+    return false;
+  if (isa<IntOp>(value) || isa<FloatOp>(value))
+    return true;
+  auto parent = value->getParent();
+  return parent && parent->dominates(bb);
+}
+
+bool valueAvailableOnEdge(Op *value, BasicBlock *pred) {
+  if (!value || !pred)
+    return false;
+  if (isa<IntOp>(value) || isa<FloatOp>(value))
+    return true;
+  auto parent = value->getParent();
+  return parent && parent->dominates(pred);
+}
+
+Op *materializeSinkValue(Builder &builder, Op *value) {
+  if (isa<IntOp>(value))
+    return builder.create<IntOp>({ new IntAttr(V(value)) });
+  if (isa<FloatOp>(value))
+    return builder.create<FloatOp>({ new FloatAttr(F(value)) });
+  return value;
+}
+
+void setAfterPhis(Builder &builder, BasicBlock *bb) {
+  auto phis = bb->getPhis();
+  if (phis.empty())
+    builder.setToBlockStart(bb);
+  else
+    builder.setAfterOp(phis.back());
+}
+
+Op *materializeStoreSinkValue(Builder &builder, BasicBlock *bb,
+                              const std::vector<StoreOp*> &stores) {
+  auto firstValue = stores.front()->DEF(0);
+  bool sameValue = true;
+  for (auto store : stores) {
+    if (!sameStoredValueForSink(firstValue, store->DEF(0))) {
+      sameValue = false;
+      break;
+    }
+  }
+
+  if (sameValue) {
+    if (!valueAvailableAt(firstValue, bb))
+      return nullptr;
+    return materializeSinkValue(builder, firstValue);
+  }
+
+  std::vector<Value> values;
+  std::vector<Attr*> from;
+  values.reserve(stores.size());
+  from.reserve(stores.size());
+
+  for (auto pred : bb->preds) {
+    StoreOp *storeForPred = nullptr;
+    for (auto store : stores) {
+      auto term = store->nextOp();
+      if (term && isa<GotoOp>(term) && term->has<TargetAttr>() &&
+          TARGET(term) == bb && store->getParent() == pred) {
+        storeForPred = store;
+        break;
+      }
+    }
+    if (!storeForPred)
+      return nullptr;
+    auto value = storeForPred->DEF(0);
+    if (value->getResultType() != firstValue->getResultType())
+      return nullptr;
+    if (!valueAvailableOnEdge(value, pred))
+      return nullptr;
+    values.push_back(value);
+    from.push_back(new FromAttr(pred));
+  }
+
+  return builder.create<PhiOp>(values, from);
+}
+
+}
+
 void DSE::runImpl(Region *region) {
+  region->updateDoms();
+
+  Builder builder;
+  for (auto bb : region->getBlocks()) {
+    if (!bb || bb->preds.size() < 2)
+      continue;
+
+    std::vector<StoreOp*> stores;
+    bool good = true;
+    for (auto pred : bb->preds) {
+      auto store = trailingStoreToJoin(pred, bb);
+      if (!store) {
+        good = false;
+        break;
+      }
+      stores.push_back(store);
+    }
+    if (!good || stores.empty())
+      continue;
+
+    auto first = stores.front();
+    if (!valueAvailableAt(first->DEF(1), bb))
+      continue;
+
+    bool sameAddress = true;
+    for (auto store : stores) {
+      if (!sameStoreAddressForSink(first, store)) {
+        sameAddress = false;
+        break;
+      }
+    }
+    if (!sameAddress)
+      continue;
+
+    setAfterPhis(builder, bb);
+    auto value = materializeStoreSinkValue(builder, bb, stores);
+    if (!value)
+      continue;
+    std::vector<Attr*> storeAttrs;
+    if (first->has<SizeAttr>())
+      storeAttrs.push_back(new SizeAttr(SIZE(first)));
+    builder.create<StoreOp>({ value, first->DEF(1) }, storeAttrs);
+    for (auto store : stores)
+      store->erase();
+    sunk += static_cast<int>(stores.size()) - 1;
+  }
+
   used.clear();
   // Use a dataflow approach.
   std::map<BasicBlock*, std::set<Op*>> in, out;
@@ -177,21 +342,34 @@ void DSE::run() {
   //   %a = load %1
   //   store %a, %1
   // The second store is useless.
-  // Only do this on each basic block to avoid complicated analysis.
+  // Only do this on each basic block to avoid complicated analysis.  Keep the
+  // scan alias-aware so unrelated memory ops do not hide the redundancy.
   auto loads = module->findAll<LoadOp>();
   std::vector<Op*> remove;
+  auto rememberRemove = [&](Op *op) {
+    if (std::find(remove.begin(), remove.end(), op) == remove.end())
+      remove.push_back(op);
+  };
+
   for (auto load : loads) {
     auto loadAddr = load->DEF();
     for (auto runner = load->nextOp(); runner; runner = runner->nextOp()) {
+      if (isa<CallOp>(runner))
+        break;
+      if (isa<LoadOp>(runner)) {
+        if (mayAlias(runner->DEF(), loadAddr))
+          break;
+        continue;
+      }
       if (isa<StoreOp>(runner)) {
         auto addr = runner->DEF(1), value = runner->DEF(0);
-        if (value == load && addr != loadAddr)
-          continue;
-        if (value == load && addr == loadAddr) {
-          remove.push_back(runner);
+        if (value == load && (addr == loadAddr || mustAlias(addr, loadAddr))) {
+          rememberRemove(runner);
           continue;
         }
-        break;
+        if (mayAlias(addr, loadAddr))
+          break;
+        continue;
       }
     }
   }
@@ -205,14 +383,22 @@ void DSE::run() {
   for (auto store : stores) {
     auto storeAddr = store->DEF(1);
     for (auto runner = store->nextOp(); runner; runner = runner->nextOp()) {
-      if (isa<LoadOp>(runner) || isa<CallOp>(runner))
+      if (isa<CallOp>(runner))
         break;
+      if (isa<LoadOp>(runner)) {
+        if (mayAlias(runner->DEF(), storeAddr))
+          break;
+        continue;
+      }
       if (isa<StoreOp>(runner)) {
-        if (runner->DEF(1) == storeAddr) {
-          remove.push_back(store);
+        auto runnerAddr = runner->DEF(1);
+        if (runnerAddr == storeAddr || mustAlias(runnerAddr, storeAddr)) {
+          rememberRemove(store);
           continue;
         }
-        break;
+        if (mayAlias(runnerAddr, storeAddr))
+          break;
+        continue;
       }
     }
   }

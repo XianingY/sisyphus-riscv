@@ -18,6 +18,7 @@
 #include "../hir/HIRBuilder.h"
 #include "../hir/HIRVerifier.h"
 #include "../hir/HIRCanonicalize.h"
+#include "../hir/HIRPolyhedral.h"
 #include "../pass/PassRegistry.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
@@ -323,6 +324,100 @@ int main(int argc, char **argv) {
                   << " dead_branches=" << stats.deadBranchesEliminated << "\n";
       }
     });
+
+    if (!cg && opts.rv) {
+      bool enableHIRPolyhedral = true;
+      if (const char *env = std::getenv("SISY_DISABLE_HIR_POLYHEDRAL"))
+        enableHIRPolyhedral = !(env[0] && std::strcmp(env, "0") != 0 &&
+                                std::strcmp(env, "false") != 0 &&
+                                std::strcmp(env, "FALSE") != 0);
+      if (enableHIRPolyhedral) {
+        runStage("hir.polyhedral", [&]() {
+          sys::hir::PolyhedralOptimizer polyhedral;
+          auto stats = polyhedral.run(*hirModule);
+          if (const char *dumpAfterPoly = std::getenv("SISY_DUMP_HIR_AFTER_POLY")) {
+            if (dumpAfterPoly[0] && std::strcmp(dumpAfterPoly, "0") != 0) {
+              std::cerr << "===== HIR after polyhedral =====\n";
+              sys::hir::dump(*hirModule, std::cerr);
+            }
+          }
+          if (opts.verbose || opts.stats) {
+            std::cerr << "[hir-poly] reduction-jammed=" << stats.reductionJammed
+                      << " reduction-interchanged=" << stats.reductionInterchanged
+                      << " conditional-reduction-interchanged=" << stats.conditionalReductionInterchanged
+                      << " repeat-reduced=" << stats.repeatReduced
+                      << " repeat-rejected=" << stats.repeatRejected
+                      << " repeat-reject-shape=" << stats.repeatRejectShape
+                      << " repeat-reject-init=" << stats.repeatRejectInit
+                      << " repeat-reject-bound=" << stats.repeatRejectBound
+                      << " repeat-reject-legal=" << stats.repeatRejectLegal
+                      << " repeat-reject-clone=" << stats.repeatRejectClone
+                      << " rejected=" << stats.rejected
+                      << " tiling-applied=" << stats.tilingApplied
+                      << " tiling-rejected=" << stats.tilingRejected
+                      << " tiling-reject-shape=" << stats.tilingRejectShape
+                      << " tiling-reject-control=" << stats.tilingRejectControl
+                      << " tiling-reject-bound-write=" << stats.tilingRejectBoundWrite
+                      << " tiling-reject-affine-access=" << stats.tilingRejectAffineAccess
+                      << " tiling-reject-no-inner=" << stats.tilingRejectNoInner
+                      << " tiling-reject-idempotent=" << stats.tilingRejectIdempotent
+                      << " interchange-applied=" << stats.interchangeApplied
+                      << " interchange-rejected=" << stats.interchangeRejected
+                      << " interchange-reject-shape=" << stats.interchangeRejectShape
+                      << " interchange-reject-init=" << stats.interchangeRejectInit
+                      << " interchange-reject-bounds=" << stats.interchangeRejectBounds
+                      << " interchange-reject-control=" << stats.interchangeRejectControl
+                      << " interchange-reject-access=" << stats.interchangeRejectAccess
+                      << " interchange-reject-memory=" << stats.interchangeRejectMemory
+                      << " interchange-3d-applied=" << stats.interchange3DApplied
+                      << " interchange-3d-rejected=" << stats.interchange3DRejected
+                      << " interchange-3d-reject-shape=" << stats.interchange3DRejectShape
+                      << " interchange-3d-reject-init=" << stats.interchange3DRejectInit
+                      << " interchange-3d-reject-bounds=" << stats.interchange3DRejectBounds
+                      << " interchange-3d-reject-control=" << stats.interchange3DRejectControl
+                      << " interchange-3d-reject-access=" << stats.interchange3DRejectAccess
+                      << " interchange-3d-reject-memory=" << stats.interchange3DRejectMemory
+                      << " unroll-jammed=" << stats.unrollJammed
+                      << " unroll-jam-rejected=" << stats.unrollJamRejected
+                      << " unroll-jam-reject-shape=" << stats.unrollJamRejectShape
+                      << " unroll-jam-reject-init=" << stats.unrollJamRejectInit
+                      << " unroll-jam-reject-bounds=" << stats.unrollJamRejectBounds
+                      << " unroll-jam-reject-control=" << stats.unrollJamRejectControl
+                      << " unroll-jam-reject-access=" << stats.unrollJamRejectAccess
+                      << " unroll-jam-reject-memory=" << stats.unrollJamRejectMemory
+                      << " fusion-applied=" << stats.fusionApplied
+                      << " fusion-rejected=" << stats.fusionRejected
+                      << " fusion-reject-shape=" << stats.fusionRejectShape
+                      << " fusion-reject-init=" << stats.fusionRejectInit
+                      << " fusion-reject-bounds=" << stats.fusionRejectBounds
+                      << " fusion-reject-control=" << stats.fusionRejectControl
+                      << " fusion-reject-scalar=" << stats.fusionRejectScalar
+                      << " fusion-reject-memory=" << stats.fusionRejectMemory
+                      << " forwarded-array-store-load=" << stats.forwardedArrayStoreLoads
+                      << " presburger-fusion-queries=" << stats.presburgerFusionQueries
+                      << " presburger-fusion-no-deps=" << stats.presburgerFusionNoDeps
+                      << " presburger-fusion-may-deps=" << stats.presburgerFusionMayDeps
+                      << " presburger-fusion-unknown=" << stats.presburgerFusionUnknown
+                      << " presburger-interchange-queries=" << stats.presburgerInterchangeQueries
+                      << " presburger-interchange-no-deps=" << stats.presburgerInterchangeNoDeps
+                      << " presburger-interchange-may-deps=" << stats.presburgerInterchangeMayDeps
+                      << " presburger-interchange-unknown=" << stats.presburgerInterchangeUnknown
+                      << " affine-nest-candidates=" << stats.affineNestCandidates
+                      << " affine-nest-reject-shape=" << stats.affineNestRejectedShape
+                      << " affine-nest-reject-control=" << stats.affineNestRejectedControl
+                      << " affine-nest-reject-access=" << stats.affineNestRejectedAccess
+                      << " affine-nest-perfect-2d=" << stats.affineNestPerfect2D
+                      << " affine-nest-perfect-3d=" << stats.affineNestPerfect3D
+                      << " matmul-like-candidates=" << stats.matmulLikeCandidates
+                      << " stencil-interior-dispatched=" << stats.stencilInteriorDispatched
+                      << " stencil-interior-rejected=" << stats.stencilInteriorRejected
+                      << " stencil-interior-reject-shape=" << stats.stencilInteriorRejectShape
+                      << " stencil-interior-reject-bounds=" << stats.stencilInteriorRejectBounds
+                      << "\n";
+          }
+        });
+      }
+    }
 
     if (opts.verifyHIR) {
       runStage("hir.verify.post", [&]() {

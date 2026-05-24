@@ -38,6 +38,7 @@ public:
 // Global value numbering.
 class GVN : public Pass {
   int elim = 0;
+  int preSunk = 0;
 
   using SymbolTable = std::unordered_map<Op*, int>;
   using Domtree = std::map<BasicBlock*, std::vector<BasicBlock*>>;
@@ -78,6 +79,7 @@ class GVN : public Pass {
 
   // Dominator-based Value Numbering Technique. See Briggs.
   void dvnt(BasicBlock *bb, Domtree &domtree);
+  bool sinkPhiExpressions(Region *region);
 public:
   GVN(ModuleOp *module): Pass(module) {}
     
@@ -114,45 +116,6 @@ public:
   void run() override;
 };
 
-class BooleanMatrixRecurrenceFastPath : public Pass {
-  int candidates = 0;
-  int fastpaths = 0;
-  int rejectedAlias = 0;
-  int rejectedShape = 0;
-
-public:
-  BooleanMatrixRecurrenceFastPath(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "bool-matrix-recurrence"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class MatrixRowSumRecurrence : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-
-public:
-  MatrixRowSumRecurrence(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "matrix-row-sum-recurrence"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class SemanticMatmulSummary : public Pass {
-  int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
-public:
-  SemanticMatmulSummary(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-matmul-summary"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
 class DeadGlobalStore : public Pass {
   int removed = 0;
   int deadGlobals = 0;
@@ -164,29 +127,23 @@ public:
   void run() override;
 };
 
-class SchedulingPrecompute : public Pass {
+class RuntimeMemoize : public Pass {
   int candidates = 0;
-  int replaced = 0;
-  int rejectedShape = 0;
+  int memoized = 0;
+  int entryChecks = 0;
+  int callEpochBumps = 0;
+  int rejectedImpure = 0;
+  int rejectedArgShape = 0;
+  int rejectedTypes = 0;
+  int rejectedCalls = 0;
+  int rejectedStores = 0;
+  int rejectedOps = 0;
+  int rejectedReturn = 0;
 
 public:
-  SchedulingPrecompute(ModuleOp *module): Pass(module) {}
+  RuntimeMemoize(ModuleOp *module): Pass(module) {}
 
-  std::string name() override { return "scheduling-precompute"; }
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-class RepeatOverwriteCollapse : public Pass {
-  int candidates = 0;
-  int collapsed = 0;
-  int rejectedShape = 0;
-  int rejectedSideEffect = 0;
-
-public:
-  RepeatOverwriteCollapse(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "repeat-overwrite-collapse"; }
+  std::string name() override { return "runtime-memoize"; };
   std::map<std::string, int> stats() override;
   void run() override;
 };
@@ -195,11 +152,23 @@ class RowScratchMatmul : public Pass {
   int candidates = 0;
   int replaced = 0;
   int rejectedShape = 0;
-
 public:
   RowScratchMatmul(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "row-scratch-matmul"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class ZeroFactorStoreLoop : public Pass {
+  int candidates = 0;
+  int replaced = 0;
+  int affineReplaced = 0;
+  int rejectedShape = 0;
+public:
+  ZeroFactorStoreLoop(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "zero-factor-store-loop"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };
@@ -248,6 +217,7 @@ public:
 // Folds a wide range of expressions.
 class RegularFold : public Pass {
   int foldedTotal = 0;
+  int currentRound = 0;
 
   int runImpl(Region *region);
 public:
@@ -258,27 +228,55 @@ public:
   void run() override;
 };
 
-// Recognize tiny pure integer helper functions whose sampled semantics match
-// native bitwise operations, before the helpers are inlined into hot loops.
-class SemanticBitwise : public Pass {
+class FunctionEquivalence : public Pass {
   int classified = 0;
   int replaced = 0;
+  bool allowModMul;
 public:
-  SemanticBitwise(ModuleOp *module): Pass(module) {}
+  FunctionEquivalence(ModuleOp *module, bool allowModMul = false):
+    Pass(module), allowModMul(allowModMul) {}
 
-  std::string name() override { return "semantic-bitwise"; };
+  std::string name() override { return "function-equivalence"; };
   std::map<std::string, int> stats() override;
   void run() override;
 };
 
-class SemanticTranspose : public Pass {
-  int candidates = 0;
-  int callsRewritten = 0;
-  int rejectedShape = 0;
-public:
-  SemanticTranspose(ModuleOp *module): Pass(module) {}
+class StructuralModMul : public Pass {
+  int classified = 0;
+  int replaced = 0;
+  int guarded = 0;
 
-  std::string name() override { return "semantic-transpose"; };
+public:
+  StructuralModMul(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "structural-modmul"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class WideArithmeticPromotion : public Pass {
+  int candidates = 0;
+  int promoted = 0;
+  int rejectedRange = 0;
+  int rejectedShape = 0;
+
+public:
+  WideArithmeticPromotion(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "wide-arith-promotion"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+class StructuralBitwise : public Pass {
+  int classified = 0;
+  int replaced = 0;
+  int guarded = 0;
+
+public:
+  StructuralBitwise(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "structural-bitwise"; }
   std::map<std::string, int> stats() override;
   void run() override;
 };
@@ -293,42 +291,6 @@ public:
   ParityIfConversion(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "parity-if-conversion"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-// Recognize lowered bit-buffer readers after SemanticBitwise has normalized
-// hand-written bitwise helpers, then specialize constant-width calls in-place.
-class SemanticBitBuffer : public Pass {
-  int candidates = 0;
-  int specialized = 0;
-  int repeatFolded = 0;
-  int decodeFastpaths = 0;
-  int predecodedDrivers = 0;
-  int rejectedShape = 0;
-  int rejectedNonConstCall = 0;
-
-public:
-  SemanticBitBuffer(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "semantic-bitbuffer"; };
-  std::map<std::string, int> stats() override;
-  void run() override;
-};
-
-// Adds a bounded runtime memo table for small pure self-recursive integer
-// functions. The cache is guarded by an epoch that is bumped at non-recursive
-// call sites, so recursive calls within one top-level invocation can share
-// results without reusing stale values after global inputs are refreshed.
-class RuntimeMemoize : public Pass {
-  int memoized = 0;
-  int entryChecks = 0;
-  int callEpochBumps = 0;
-
-public:
-  RuntimeMemoize(ModuleOp *module): Pass(module) {}
-
-  std::string name() override { return "runtime-memoize"; };
   std::map<std::string, int> stats() override;
   void run() override;
 };
@@ -359,6 +321,7 @@ public:
 // Inline constant stores to globals.
 class InlineStore : public Pass {
   int inlined = 0;
+  int constLoads = 0;
   
   void attemptHoist(Op *op);
 public:
