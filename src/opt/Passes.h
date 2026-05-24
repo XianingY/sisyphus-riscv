@@ -252,6 +252,20 @@ public:
   void run() override;
 };
 
+class WideArithmeticPromotion : public Pass {
+  int candidates = 0;
+  int promoted = 0;
+  int rejectedRange = 0;
+  int rejectedShape = 0;
+
+public:
+  WideArithmeticPromotion(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "wide-arith-promotion"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class StructuralBitwise : public Pass {
   int classified = 0;
   int replaced = 0;
@@ -305,6 +319,7 @@ public:
 // Inline constant stores to globals.
 class InlineStore : public Pass {
   int inlined = 0;
+  int constLoads = 0;
   
   void attemptHoist(Op *op);
 public:

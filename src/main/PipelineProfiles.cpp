@@ -289,6 +289,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::Range>();
       pm.addPass<sys::EqClass>();
       pm.addPass<sys::RangeAwareFold>();
+      if (getenvEnabled("SISY_ENABLE_WIDE_ARITH_PROMOTION", true))
+        pm.addPass<sys::WideArithmeticPromotion>();
       if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_FUNCTION_EQUIVALENCE", true))
         pm.addPass<sys::FunctionEquivalence>(/*allowModMul=*/ false);
       pm.addPass<sys::Splice>();

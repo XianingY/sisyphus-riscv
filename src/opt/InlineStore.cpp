@@ -1,11 +1,14 @@
 #include "Passes.h"
+#include <cstdlib>
+#include <cstring>
 #include <unordered_set>
 
 using namespace sys;
 
 std::map<std::string, int> InlineStore::stats() {
   return {
-    { "inlined-stores", inlined }
+    { "inlined-stores", inlined },
+    { "const-loads", constLoads }
   };
 }
 
@@ -19,6 +22,76 @@ bool hasStore(BasicBlock *bb) {
   return false;
 }
 
+int getenvInt(const char *name, int fallback, int minValue, int maxValue) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  char *end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if ((end && *end) || value < minValue || value > maxValue)
+    return fallback;
+  return (int)value;
+}
+
+bool mayMentionGlobal(Op *addr, GlobalOp *glob) {
+  if (!addr || !glob)
+    return false;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr) == NAME(glob);
+  auto alias = addr->find<AliasAttr>();
+  if (!alias)
+    return false;
+  if (alias->unknown)
+    return true;
+  return alias->location.count(glob);
+}
+
+bool constGlobalEscapes(GlobalOp *glob, ModuleOp *module) {
+  for (auto call : module->findAll<CallOp>()) {
+    for (auto operand : call->getOperands()) {
+      auto def = operand.defining;
+      if (def && def->getResultType() == Value::i64 && mayMentionGlobal(def, glob))
+        return true;
+    }
+  }
+  for (auto ret : module->findAll<ReturnOp>()) {
+    for (auto operand : ret->getOperands()) {
+      auto def = operand.defining;
+      if (def && def->getResultType() == Value::i64 && mayMentionGlobal(def, glob))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool hasStoreToConstGlobal(GlobalOp *glob, ModuleOp *module) {
+  for (auto store : module->findAll<StoreOp>()) {
+    if (store->getOperandCount() < 2)
+      continue;
+    auto addr = store->DEF(1);
+    if (mayMentionGlobal(addr, glob))
+      return true;
+  }
+  return false;
+}
+
+bool exactConstOffset(Op *addr, GlobalOp *glob, int &offset) {
+  if (!addr || !glob)
+    return false;
+  if (isa<GetGlobalOp>(addr) && NAME(addr) == NAME(glob)) {
+    offset = 0;
+    return true;
+  }
+  auto alias = addr->find<AliasAttr>();
+  if (!alias || alias->unknown || alias->location.size() != 1)
+    return false;
+  auto &[base, offsets] = *alias->location.begin();
+  if (base != glob || offsets.size() != 1 || offsets[0] < 0)
+    return false;
+  offset = offsets[0];
+  return true;
+}
+
 }
 
 #define BAD { bad = true; break; }
@@ -27,6 +100,46 @@ void InlineStore::run() {
   auto gets = module->findAll<GetGlobalOp>();
   auto gMap = getGlobalMap();
   auto fMap = getFunctionMap();
+  int maxConstElems =
+      getenvInt("SISY_INLINE_CONST_ARRAY_MAX_ELEMS", 256, 1, 4096);
+
+  Builder constBuilder;
+  for (auto &[name, glob] : gMap) {
+    if (!glob->has<ConstAttr>())
+      continue;
+    bool fp = glob->has<FloatArrayAttr>();
+    auto *iarr = fp ? nullptr : glob->find<IntArrayAttr>();
+    auto *farr = fp ? glob->find<FloatArrayAttr>() : nullptr;
+    int elemCount = fp ? (farr ? farr->size : 0) : (iarr ? iarr->size : 0);
+    if (elemCount <= 0 || elemCount > maxConstElems)
+      continue;
+    if (constGlobalEscapes(glob, module) || hasStoreToConstGlobal(glob, module))
+      continue;
+
+    auto loads = module->findAll<LoadOp>();
+    for (auto load : loads) {
+      if (load->getOperandCount() != 1 || load->getResultType() == Value::i64)
+        continue;
+      int offset = 0;
+      if (!exactConstOffset(load->DEF(0), glob, offset))
+        continue;
+      if (offset < 0 || offset % 4 != 0 || offset / 4 >= elemCount)
+        continue;
+
+      constBuilder.setBeforeOp(load);
+      Op *replacement = nullptr;
+      if (fp) {
+        replacement = constBuilder.create<FloatOp>(
+            { new FloatAttr(farr->vf[offset / 4]) });
+      } else {
+        replacement = constBuilder.create<IntOp>(
+            { new IntAttr(iarr->vi ? iarr->vi[offset / 4] : 0) });
+      }
+      load->replaceAllUsesWith(replacement);
+      load->erase();
+      constLoads++;
+    }
+  }
 
   // For each global, records in which functions they're used.
   std::unordered_map<std::string, std::unordered_set<std::string>> used;

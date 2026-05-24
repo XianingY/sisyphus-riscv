@@ -58,6 +58,10 @@ if(BUILD_TESTING)
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_bitwise_arith_tests.sh"
   )
   add_test(
+    NAME compliant_replacements_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_compliant_replacements_tests.sh"
+  )
+  add_test(
     NAME memoryssa_reaching_store_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_memoryssa_tests.sh"
   )
