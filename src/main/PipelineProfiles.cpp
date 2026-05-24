@@ -150,7 +150,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // ARM keeps a conservative mid-end tail for stability on open-perf
     // correctness-sensitive families. Run an extra CFG cleanup after select to
     // ensure phi/pred consistency in edge-case structured lowering patterns.
-    if (opts.arm && !aggressive) {
+    if (opts.arm && !aggressive && getenvEnabled("SISY_ARM_CONSERVATIVE_TAIL", true)) {
       pm.addPass<sys::FlattenCFG>();
       pm.addPass<sys::GVN>();
       pm.addPass<sys::DCE>();
@@ -158,6 +158,26 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::ArrayStrideAnalysis>();
       pm.addPass<sys::RegularFold>();
       pm.addPass<sys::DCE>();
+      if (getenvEnabled("SISY_ARM_ENABLE_LOOP_OPT", true)) {
+        pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+        if (!opts.disableLoopRotate)
+          pm.addPass<sys::LoopRotate>();
+        pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+        if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
+          pm.addPass<sys::LoopInterchange>();
+        if (getenvEnabled("SISY_ENABLE_LOOP_TILING", true))
+          pm.addPass<sys::LoopTiling>();
+        if (getenvEnabled("SISY_ENABLE_REDUCTION_INTERCHANGE", true))
+          pm.addPass<sys::ReductionInterchange>();
+        if (getenvEnabled("SISY_ENABLE_O1_UNSWITCH", true))
+          pm.addPass<sys::Unswitch>();
+        pm.addPass<sys::LICM>();
+        if (getenvEnabled("SISY_ENABLE_SCALAR_REPLACE", true))
+          pm.addPass<sys::ScalarReplace>();
+        pm.addPass<sys::GVN>();
+        pm.addPass<sys::RegularFold>();
+        pm.addPass<sys::DCE>();
+      }
       pm.addPass<sys::SimplifyCFG>();
       pm.addPass<sys::DCE>();
       pm.addPass<sys::InstSchedule>();
@@ -246,9 +266,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
       pm.addPass<sys::LoopInterchange>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_LOOP_TILING", true))
+    if ((opts.rv || opts.arm) && getenvEnabled("SISY_ENABLE_LOOP_TILING", true))
       pm.addPass<sys::LoopTiling>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_REDUCTION_INTERCHANGE", true))
+    if ((opts.rv || opts.arm) && getenvEnabled("SISY_ENABLE_REDUCTION_INTERCHANGE", true))
       pm.addPass<sys::ReductionInterchange>();
     if (enablePrivatizeReduction)
       pm.addPass<sys::PrivatizeReduction>();
