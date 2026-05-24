@@ -9,6 +9,7 @@
 #include "../opt/CleanupPasses.h"
 #include "../opt/LowerPasses.h"
 #include "../opt/SMTPasses.h"
+#include "../opt/AdvancedConv2DTransform.h"
 #include "../opt/Analysis.h"
 #include "../pre-opt/PrePasses.h"
 #include "../pre-opt/PreLoopPasses.h"
@@ -243,6 +244,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
+    if ((opts.rv || opts.arm) && getenvEnabled("SISY_ENABLE_ADVANCED_CONV2D", true))
+      pm.addPass<sys::AdvancedConv2DTransformPass>();
     // LoopInterchange after canonicalize+rotate, before LICM/unroll.
     if (getenvEnabled("SISY_ENABLE_LOOP_INTERCHANGE", true))
       pm.addPass<sys::LoopInterchange>();

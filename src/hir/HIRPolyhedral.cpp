@@ -1337,11 +1337,11 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   }
 
   for (size_t i = 0; i < block->children.size(); i++) {
-    // The interior/boundary dispatcher is a general stencil transform, but the
-    // current clone-based lowering can increase register pressure after kernel
-    // unrolling. Keep it opt-in until a spill-aware outline/peeling lowering is
-    // available.
-    if (hirEnvEnabled("SISY_HIR_ENABLE_STENCIL_INTERIOR", false)) {
+    // The interior/boundary dispatcher is a general stencil transform for
+    // convolution-like affine loops. It is still opt-in because cloning the
+    // fast path can increase backend register pressure on large kernels.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_STENCIL_INTERIOR",
+                      hirEnvEnabled("SISY_HIR_ENABLE_ADVANCED_CONV2D", false))) {
       if (block->children[i] && block->children[i]->kind == OpKind::While) {
         if (tryStencilInteriorDispatch(block, i, stats)) {
           changed = true;
