@@ -206,6 +206,123 @@ bool tryRotateSmallConstantLoop(LoopInfo *info) {
   return true;
 }
 
+bool tryRotateConstantCountdownLoop(LoopInfo *info) {
+  if (!info || !info->preheader || info->latches.size() != 1 ||
+      info->exits.size() != 1)
+    return false;
+
+  int loopsize = loopOpCount(info);
+  if (loopsize <= 0 || loopsize > 120 || loopHasCall(info))
+    return false;
+
+  auto exit = info->getExit();
+  auto header = info->header;
+  auto term = dyn_cast<BranchOp>(header->getLastOp());
+  if (!term || term->getOperandCount() != 1 || !term->has<TargetAttr>() ||
+      !term->has<ElseAttr>() || ELSE(term) != exit)
+    return false;
+
+  auto counter = dyn_cast<PhiOp>(stripSinglePhi(term->DEF()));
+  if (!counter)
+    return false;
+
+  auto latch = info->getLatch();
+  auto latchterm = latch->getLastOp();
+  if (!isa<GotoOp>(latchterm) || !latchterm->has<TargetAttr>() ||
+      TARGET(latchterm) != header)
+    return false;
+
+  auto preheader = info->preheader;
+  auto preterm = preheader->getLastOp();
+  if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() ||
+      TARGET(preterm) != header)
+    return false;
+
+  auto headerPhis = header->getPhis();
+  std::map<Op*, Op*> valueMap, initMap;
+  for (auto phi : headerPhis) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    if (attrs.size() != 2 || ops.size() != 2)
+      return false;
+
+    auto bb1 = FROM(attrs[0]);
+    auto bb2 = FROM(attrs[1]);
+    if (bb1 == latch && bb2 == preheader) {
+      valueMap[phi] = ops[0].defining;
+      initMap[phi] = ops[1].defining;
+    } else if (bb2 == latch && bb1 == preheader) {
+      valueMap[phi] = ops[1].defining;
+      initMap[phi] = ops[0].defining;
+    } else {
+      return false;
+    }
+  }
+  if (!valueMap.count(counter) || !initMap.count(counter))
+    return false;
+
+  auto initialCounter = stripSinglePhi(initMap[counter]);
+  if (!initialCounter || !isa<IntOp>(initialCounter))
+    return false;
+  int trip = V(initialCounter);
+  if (trip <= 1 || trip > 64 || loopsize * (trip - 1) > 1800)
+    return false;
+
+  auto nextCounter = stripSinglePhi(valueMap[counter]);
+  auto sub = dyn_cast<SubIOp>(nextCounter);
+  if (!sub || stripSinglePhi(sub->DEF(0)) != stripSinglePhi(counter) ||
+      !isa<IntOp>(stripSinglePhi(sub->DEF(1))) || V(stripSinglePhi(sub->DEF(1))) != 1)
+    return false;
+
+  for (auto phi : exit->getPhis()) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (FROM(attrs[i]) != header)
+        continue;
+      auto def = ops[i].defining;
+      if (!valueMap.count(def) || !initMap.count(def))
+        return false;
+    }
+  }
+
+  Builder builder;
+  builder.setBeforeOp(preterm);
+  auto zero = builder.create<IntOp>({ new IntAttr(0) });
+  auto one = builder.create<IntOp>({ new IntAttr(1) });
+  builder.replace<BranchOp>(preterm, { initialCounter },
+                            { new TargetAttr(header), new ElseAttr(exit) });
+
+  auto body = TARGET(term);
+  builder.replace<GotoOp>(term, { new TargetAttr(body) });
+
+  builder.setBeforeOp(latchterm);
+  builder.replace<BranchOp>(latchterm, { valueMap[counter] },
+                            { new TargetAttr(header), new ElseAttr(exit) });
+
+  for (auto phi : exit->getPhis()) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (FROM(attrs[i]) != header)
+        continue;
+      auto def = ops[i].defining;
+      FROM(attrs[i]) = latch;
+      phi->setOperand(i, valueMap[def]);
+      phi->pushOperand(initMap[def]);
+      phi->add<FromAttr>(preheader);
+      break;
+    }
+  }
+
+  info->induction = counter;
+  info->start = zero;
+  info->stop = initialCounter;
+  info->step = one;
+  header->getParent()->updatePreds();
+  return true;
+}
+
 }
 
 std::map<std::string, int> ConstLoopUnroll::stats() {
@@ -371,12 +488,18 @@ BasicBlock *ConstLoopUnroll::copyLoop(LoopInfo *loop, BasicBlock *bb, int unroll
 }
 
 bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
-  if (!loop->getInduction())
-    return false;
-
   if (loop->exits.size() != 1)
     return false;
   if (loop->latches.size() != 1)
+    return false;
+
+  if (!loop->getInduction()) {
+    if (!tryRotateConstantCountdownLoop(loop))
+      return false;
+    rotatedForUnroll++;
+  }
+
+  if (!loop->getInduction())
     return false;
 
   auto header = loop->header;
