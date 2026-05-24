@@ -38,6 +38,7 @@ public:
 // Global value numbering.
 class GVN : public Pass {
   int elim = 0;
+  int preSunk = 0;
 
   using SymbolTable = std::unordered_map<Op*, int>;
   using Domtree = std::map<BasicBlock*, std::vector<BasicBlock*>>;
@@ -78,6 +79,7 @@ class GVN : public Pass {
 
   // Dominator-based Value Numbering Technique. See Briggs.
   void dvnt(BasicBlock *bb, Domtree &domtree);
+  bool sinkPhiExpressions(Region *region);
 public:
   GVN(ModuleOp *module): Pass(module) {}
     

@@ -6,7 +6,8 @@ using namespace sys;
 
 std::map<std::string, int> GVN::stats() {
   return {
-    { "eliminated-ops", elim }
+    { "eliminated-ops", elim },
+    { "pre-sunk", preSunk }
   };
 }
 
@@ -92,6 +93,34 @@ bool allowed(Op *op) {
   // ARM GVN
     ALLOW(arm::MovIOp)
   ;
+}
+
+bool phiPreAllowed(Op *op) {
+  return isa<AddIOp>(op) || isa<SubIOp>(op) || isa<MulIOp>(op) ||
+         isa<DivIOp>(op) || isa<ModIOp>(op) || isa<AddLOp>(op) ||
+         isa<SubLOp>(op) || isa<MulLOp>(op) || isa<DivLOp>(op) ||
+         isa<ModLOp>(op) || isa<AndIOp>(op) || isa<OrIOp>(op) ||
+         isa<XorIOp>(op) || isa<EqOp>(op) || isa<NeOp>(op) ||
+         isa<LtOp>(op) || isa<LeOp>(op) || isa<MinusOp>(op) ||
+         isa<NotOp>(op) || isa<LShiftOp>(op) || isa<RShiftOp>(op) ||
+         isa<LShiftLOp>(op) || isa<RShiftLOp>(op) ||
+         isa<SetNotZeroOp>(op) || isa<SelectOp>(op);
+}
+
+bool samePhiPreTemplate(Op *a, Op *b) {
+  if (!a || !b || a->opid != b->opid ||
+      a->getOperandCount() != b->getOperandCount())
+    return false;
+  auto ai = a->find<IntAttr>(), bi = b->find<IntAttr>();
+  if (!!ai != !!bi || (ai && ai->value != bi->value))
+    return false;
+  auto af = a->find<FloatAttr>(), bf = b->find<FloatAttr>();
+  if (!!af != !!bf || (af && af->value != bf->value))
+    return false;
+  auto an = a->find<NameAttr>(), bn = b->find<NameAttr>();
+  if (!!an != !!bn || (an && an->name != bn->name))
+    return false;
+  return true;
 }
 
 void GVN::dvnt(BasicBlock *bb, Domtree &domtree) {
@@ -183,6 +212,144 @@ void GVN::dvnt(BasicBlock *bb, Domtree &domtree) {
     dvnt(succ, domtree);
 }
 
+bool GVN::sinkPhiExpressions(Region *region) {
+  bool changed = false;
+
+  for (auto bb : region->getBlocks()) {
+    auto phis = bb->getPhis();
+    if (phis.empty())
+      continue;
+
+    Op *insertBefore = nullptr;
+    for (auto op : bb->getOps()) {
+      if (!isa<PhiOp>(op)) {
+        insertBefore = op;
+        break;
+      }
+    }
+    if (!insertBefore)
+      continue;
+
+    for (auto phi : phis) {
+      if (phi->getParent() != bb || phi->getOperandCount() < 2)
+        continue;
+      if (phi->getUses().empty())
+        continue;
+
+      std::vector<Op*> incomingExprs;
+      bool ok = true;
+      for (auto operand : phi->getOperands()) {
+        auto expr = operand.defining;
+        if (!phiPreAllowed(expr)) {
+          ok = false;
+          break;
+        }
+        if (!incomingExprs.empty() && !samePhiPreTemplate(incomingExprs.front(), expr)) {
+          ok = false;
+          break;
+        }
+        incomingExprs.push_back(expr);
+      }
+      if (!ok || incomingExprs.empty())
+        continue;
+
+      auto arity = incomingExprs.front()->getOperandCount();
+      std::vector<Value> newOperands;
+      std::vector<Op*> createdPhis;
+      for (int operandIndex = 0; operandIndex < arity && ok; operandIndex++) {
+        std::vector<Value> values;
+        std::vector<Attr*> attrs;
+        Op *common = nullptr;
+        bool allSame = true;
+
+        for (int i = 0; i < phi->getOperandCount(); i++) {
+          auto from = dyn_cast<FromAttr>(phi->getAttrs()[i]);
+          if (!from) {
+            ok = false;
+            break;
+          }
+          auto value = incomingExprs[i]->getOperand(operandIndex);
+          if (value.defining == phi) {
+            ok = false;
+            break;
+          }
+          values.push_back(value);
+          attrs.push_back(new FromAttr(from->bb));
+          if (!common)
+            common = value.defining;
+          else if (common != value.defining)
+            allSame = false;
+        }
+        if (!ok) {
+          for (auto attr : attrs)
+            delete attr;
+          break;
+        }
+
+        if (allSame) {
+          for (auto attr : attrs)
+            delete attr;
+          newOperands.push_back(common);
+          continue;
+        }
+
+        Op *existing = nullptr;
+        for (auto candidate : bb->getPhis()) {
+          if (candidate == phi || candidate->getOperandCount() != (int)values.size())
+            continue;
+          bool same = true;
+          for (int i = 0; i < candidate->getOperandCount(); i++) {
+            auto from = dyn_cast<FromAttr>(candidate->getAttrs()[i]);
+            if (!from || FROM(attrs[i]) != from->bb ||
+                candidate->getOperand(i).defining != values[i].defining) {
+              same = false;
+              break;
+            }
+          }
+          if (same) {
+            existing = candidate;
+            break;
+          }
+        }
+
+        if (existing) {
+          for (auto attr : attrs)
+            delete attr;
+          newOperands.push_back(existing);
+          continue;
+        }
+
+        Builder phiBuilder;
+        phiBuilder.setToBlockStart(bb);
+        auto argPhi = phiBuilder.create<PhiOp>(values, attrs);
+        createdPhis.push_back(argPhi);
+        newOperands.push_back(argPhi);
+      }
+      if (!ok || (int)newOperands.size() != arity) {
+        for (auto createdPhi : createdPhis)
+          createdPhi->erase();
+        continue;
+      }
+
+      Builder builder;
+      builder.setBeforeOp(insertBefore);
+      auto sunk = builder.copy(incomingExprs.front());
+      sunk->removeAllOperands();
+      for (auto operand : newOperands)
+        sunk->pushOperand(operand);
+
+      phi->replaceAllUsesWith(sunk);
+      phi->erase();
+      preSunk++;
+      changed = true;
+    }
+  }
+
+  if (changed)
+    region->updatePreds();
+  return changed;
+}
+
 // See https://www.cs.tufts.edu/~nr/cs257/archive/keith-cooper/value-numbering.pdf,
 // "Value Numbering", Briggs, 1997
 // Refer to figure 4.
@@ -197,6 +364,7 @@ void GVN::runImpl(Region *region) {
   }
 
   dvnt(region->getFirstBlock(), domtree);
+  sinkPhiExpressions(region);
 }
 
 void GVN::run() {
