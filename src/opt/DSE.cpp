@@ -233,6 +233,9 @@ void DSE::runImpl(Region *region) {
 
 
   auto funcOp = region->getParent();
+  std::set<Op*> liveLocalAllocas;
+  for (auto *alloca : funcOp->findAll<AllocaOp>())
+    liveLocalAllocas.insert(alloca);
 
   // Find allocas used by calls.
   // Stores to them shouldn't be eliminated. (This is also a kind of escape analysis.)
@@ -243,7 +246,7 @@ void DSE::runImpl(Region *region) {
       auto def = operand.defining;
       if (auto attr = def->find<AliasAttr>()) {
         for (auto &[base, offsets] : attr->location) {
-          if (isa<AllocaOp>(base))
+          if (liveLocalAllocas.count(base))
             outref.insert(base);
         }
       }
@@ -264,14 +267,11 @@ void DSE::runImpl(Region *region) {
     // Never eliminate unknown things.
     bool canElim = !alias->unknown;
     for (auto [base, _] : alias->location) {
-      if (!base || !base->getParent()) {
-        canElim = false;
-        break;
-      }
       // We can only eliminate if this stores to a local variable.
-      // If parent of `base` is a ModuleOp (i.e. global), or another function,
-      // then it's not a candidate of removal.
-      if (base->getParentOp() != funcOp) {
+      // AliasAttr keeps raw Op* bases; after cleanup, old alias entries may
+      // point at released IR.  Do not dereference them here.  Only freshly
+      // collected live allocas from this function are candidates.
+      if (!liveLocalAllocas.count(base)) {
         canElim = false;
         break;
       }

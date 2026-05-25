@@ -89,13 +89,10 @@ static std::optional<std::string> zeroOffsetGlobalName(Op *addr) {
     return std::nullopt;
   if (isa<GetGlobalOp>(addr))
     return NAME(addr);
-  auto alias = addr->find<AliasAttr>();
-  if (!alias || alias->unknown || alias->location.size() != 1)
-    return std::nullopt;
-  auto &[base, offsets] = *alias->location.begin();
-  if (!base || !isa<GlobalOp>(base) || offsets.size() != 1 || offsets[0] != 0)
-    return std::nullopt;
-  return NAME(base);
+  // AliasAttr stores raw Op* bases. Pass cleanup may release detached address
+  // computations between fold rounds, so consulting old alias bases here can
+  // dereference freed IR nodes. Keep this scalar-global fold conservative.
+  return std::nullopt;
 }
 
 static std::optional<int> tryGetConstantValue(
