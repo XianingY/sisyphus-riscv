@@ -250,10 +250,6 @@ void Inline::run() {
 
   fnMap = getFunctionMap();
   std::set<FuncOp*> recursive;
-  std::map<std::string, int> callSites;
-  for (auto call : module->findAll<CallOp>())
-    if (!isExtern(NAME(call)))
-      callSites[NAME(call)]++;
 
   runRewriter([&](CallOp *call) {
     const auto &fname = NAME(call);
@@ -266,7 +262,7 @@ void Inline::run() {
     }
 
     FuncOp *func = fnMap[fname];
-    if (writesGlobalMemory(func) && callSites[fname] != 1)
+    if (writesGlobalMemory(func))
       return false;
 
     // Don't inline overly large functions.
