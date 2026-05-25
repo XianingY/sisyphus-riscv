@@ -18,6 +18,8 @@ struct PolyhedralStats {
   int repeatRejectBound = 0;
   int repeatRejectLegal = 0;
   int repeatRejectClone = 0;
+  int overwriteRepeatReduced = 0;
+  int overwriteRepeatRejected = 0;
   int rejected = 0;
   // Loop tiling counters
   int tilingApplied = 0;
@@ -107,6 +109,7 @@ private:
   bool tryLoopInterchange(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryLoopUnrollJam(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);
+  bool tryDeadOverwriteRepeat(Op *block, size_t idx, PolyhedralStats &stats);
 
   // Loop tiling: strip-mine 2-level or 3-level perfect nests in HIR.
   bool tryLoopTiling(Op *block, size_t idx, PolyhedralStats &stats);
@@ -115,6 +118,7 @@ private:
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
   bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
+  std::unordered_map<std::string, Op*> functions;
 };
 
 }  // namespace sys::hir

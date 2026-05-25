@@ -352,6 +352,8 @@ int main(int argc, char **argv) {
                       << " repeat-reject-bound=" << stats.repeatRejectBound
                       << " repeat-reject-legal=" << stats.repeatRejectLegal
                       << " repeat-reject-clone=" << stats.repeatRejectClone
+                      << " overwrite-repeat-reduced=" << stats.overwriteRepeatReduced
+                      << " overwrite-repeat-rejected=" << stats.overwriteRepeatRejected
                       << " rejected=" << stats.rejected
                       << " tiling-applied=" << stats.tilingApplied
                       << " tiling-rejected=" << stats.tilingRejected

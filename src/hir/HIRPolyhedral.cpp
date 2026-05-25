@@ -1144,6 +1144,88 @@ bool repeatBodyLegal(const Op *body, const std::string &repeatIV, std::string &a
   return !acc.empty() && accUpdates > 0;
 }
 
+bool exprLoadsArray(const Op *op, const std::string &symbol) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Load && !op->children.empty() && op->symbol == symbol)
+    return true;
+  for (const auto &child : op->children)
+    if (exprLoadsArray(child.get(), symbol))
+      return true;
+  return false;
+}
+
+bool collectOverwriteStores(const Op *op, const std::string &repeatIV,
+                            std::unordered_set<std::string> &overwritten,
+                            bool &sawArrayStore) {
+  if (!op)
+    return true;
+  if (exprUsesScalar(op, repeatIV))
+    return false;
+  switch (op->kind) {
+  case OpKind::Call:
+  case OpKind::Return:
+  case OpKind::Break:
+  case OpKind::Continue:
+    return false;
+  default:
+    break;
+  }
+  if (op->kind == OpKind::Store && op->children.size() > 1 && !op->symbol.empty()) {
+    const Op *rhs = op->children.back().get();
+    if (exprLoadsArray(rhs, op->symbol))
+      return false;
+    overwritten.insert(op->symbol);
+    sawArrayStore = true;
+  }
+  for (const auto &child : op->children)
+    if (!collectOverwriteStores(child.get(), repeatIV, overwritten, sawArrayStore))
+      return false;
+  return true;
+}
+
+bool collectCalleeStores(const Op *func, std::unordered_set<std::string> &stores,
+                         std::unordered_set<std::string> &visiting);
+
+bool collectCalleeStoresImpl(const Op *op, std::unordered_set<std::string> &stores,
+                             std::unordered_set<std::string> &visiting) {
+  if (!op)
+    return true;
+  switch (op->kind) {
+  case OpKind::Call:
+    // Keep this analysis intraprocedural unless the call target was already
+    // resolved by collectCalleeStores. Unknown nested calls may have visible
+    // side effects, so do not remove repeated executions around them.
+    return false;
+  case OpKind::Return:
+  case OpKind::Break:
+  case OpKind::Continue:
+    return op->kind == OpKind::Return;
+  default:
+    break;
+  }
+  if (op->kind == OpKind::Store && op->children.size() > 1 && !op->symbol.empty())
+    stores.insert(op->symbol);
+  for (const auto &child : op->children)
+    if (!collectCalleeStoresImpl(child.get(), stores, visiting))
+      return false;
+  return true;
+}
+
+bool collectCalleeStores(const Op *func, std::unordered_set<std::string> &stores,
+                         std::unordered_set<std::string> &visiting) {
+  if (!func || func->kind != OpKind::Func || func->symbol.empty())
+    return false;
+  if (visiting.count(func->symbol))
+    return false;
+  visiting.insert(func->symbol);
+  bool ok = true;
+  for (const auto &child : func->children)
+    ok = ok && collectCalleeStoresImpl(child.get(), stores, visiting);
+  visiting.erase(func->symbol);
+  return ok;
+}
+
 bool blockExceptLastUsesScalar(const Op *block, const std::string &symbol) {
   if (!block || block->kind != OpKind::Block || block->children.empty())
     return false;
@@ -1274,11 +1356,14 @@ PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   if (hirJamFactor > 16)
     hirJamFactor = 16;
   globalArrays.clear();
+  functions.clear();
   for (const auto &child : module.root->children) {
     const Op *decl = unwrapSingleDecl(child.get());
     if (decl && decl->kind == OpKind::VarDecl && !decl->symbol.empty() &&
         !decl->arrayDims.empty())
       globalArrays.insert(decl->symbol);
+    if (child && child->kind == OpKind::Func && !child->symbol.empty())
+      functions[child->symbol] = child.get();
   }
   optimizeBlock(module.root.get(), stats);
   return stats;
@@ -1331,6 +1416,12 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   for (size_t i = 0; i < block->children.size(); i++) {
     if (block->children[i] && block->children[i]->kind == OpKind::While &&
         tryRepeatInvariantReduction(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
+    if (block->children[i] && block->children[i]->kind == OpKind::While &&
+        tryDeadOverwriteRepeat(block, i, stats)) {
       changed = true;
       i = 0;
     }
@@ -2373,6 +2464,117 @@ bool PolyhedralOptimizer::tryRepeatInvariantReduction(Op *block, size_t idx,
   }
   block->children = std::move(replacement);
   stats.repeatReduced++;
+  return true;
+}
+
+bool PolyhedralOptimizer::tryDeadOverwriteRepeat(Op *block, size_t idx,
+                                                  PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size() || idx == 0)
+    return false;
+
+  Op *whileOp = block->children[idx].get();
+  CanonicalLoop loop;
+  if (!matchCanonicalWhile(whileOp, loop) || !loop.body ||
+      loop.body->kind != OpKind::Block || loop.body->children.size() < 3) {
+    stats.overwriteRepeatRejected++;
+    return false;
+  }
+  if (!matchLoopInit(block->children[idx - 1].get(), loop.iv)) {
+    stats.overwriteRepeatRejected++;
+    return false;
+  }
+  const Op *start = initValue(block->children[idx - 1].get());
+  if (!isConstIntValue(start, 0) || !loop.bound ||
+      loop.bound->kind != OpKind::ConstInt || !loop.bound->hasIntValue ||
+      loop.bound->intValue <= 0) {
+    stats.overwriteRepeatRejected++;
+    return false;
+  }
+  if (exprUsesScalar(loop.bound, loop.iv) ||
+      blockExceptLastUsesScalar(loop.body, loop.iv) ||
+      affine::opWritesAnyScalarUsedBy(loop.body, loop.bound)) {
+    stats.overwriteRepeatRejected++;
+    return false;
+  }
+
+  std::unordered_set<std::string> overwritten;
+  bool sawArrayStore = false;
+  size_t firstCall = loop.body->children.size();
+  for (size_t i = 0; i + 1 < loop.body->children.size(); i++) {
+    Op *stmt = unwrapSingleDecl(loop.body->children[i].get());
+    if (stmt && stmt->kind == OpKind::Call) {
+      firstCall = i;
+      break;
+    }
+    if (!collectOverwriteStores(loop.body->children[i].get(), loop.iv,
+                                overwritten, sawArrayStore)) {
+      stats.overwriteRepeatRejected++;
+      return false;
+    }
+  }
+  if (!sawArrayStore || overwritten.empty() || firstCall >= loop.body->children.size() - 1) {
+    stats.overwriteRepeatRejected++;
+    return false;
+  }
+
+  for (size_t i = firstCall; i + 1 < loop.body->children.size(); i++) {
+    Op *stmt = unwrapSingleDecl(loop.body->children[i].get());
+    if (!stmt || exprUsesScalar(stmt, loop.iv)) {
+      stats.overwriteRepeatRejected++;
+      return false;
+    }
+    if (stmt->kind == OpKind::Call) {
+      auto calleeIt = functions.find(stmt->symbol);
+      if (calleeIt == functions.end()) {
+        stats.overwriteRepeatRejected++;
+        return false;
+      }
+      std::unordered_set<std::string> stores;
+      std::unordered_set<std::string> visiting;
+      if (!collectCalleeStores(calleeIt->second, stores, visiting)) {
+        stats.overwriteRepeatRejected++;
+        return false;
+      }
+      for (const auto &sym : stores) {
+        if (!overwritten.count(sym)) {
+          stats.overwriteRepeatRejected++;
+          return false;
+        }
+      }
+      continue;
+    }
+    std::unordered_set<std::string> stores;
+    bool localArrayStore = false;
+    if (!collectOverwriteStores(stmt, loop.iv, stores, localArrayStore)) {
+      stats.overwriteRepeatRejected++;
+      return false;
+    }
+    for (const auto &sym : stores) {
+      if (!overwritten.count(sym)) {
+        stats.overwriteRepeatRejected++;
+        return false;
+      }
+    }
+  }
+
+  auto bodyOnce = cloneBlockWithoutLast(loop.body);
+  if (!bodyOnce) {
+    stats.overwriteRepeatRejected++;
+    return false;
+  }
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 1);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(std::move(bodyOnce));
+      replacement.push_back(makeStore(loop.iv, cloneOp(loop.bound)));
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.overwriteRepeatReduced++;
   return true;
 }
 
