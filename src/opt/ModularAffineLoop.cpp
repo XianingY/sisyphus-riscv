@@ -1,9 +1,12 @@
 #include "LoopPasses.h"
 
 #include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
+#include <vector>
 
 using namespace sys;
 
@@ -267,6 +270,336 @@ bool matchModUpdateBody(BasicBlock *body, Op *induction, Op *incr, ModUpdate &sh
   return true;
 }
 
+int32_t wrap32(int64_t value) {
+  return static_cast<int32_t>(static_cast<uint32_t>(value));
+}
+
+struct LinearShape {
+  Op *induction = nullptr;
+  Op *stop = nullptr;
+  Op *incr = nullptr;
+  BasicBlock *body = nullptr;
+  BasicBlock *exit = nullptr;
+  std::vector<Op*> phis;
+  std::vector<Op*> init;
+  std::vector<std::vector<int32_t>> matrix;
+};
+
+struct LinearExpr {
+  bool valid = false;
+  std::vector<int32_t> coeff;
+  int32_t constant = 0;
+};
+
+LinearExpr invalidExpr() { return {}; }
+
+LinearExpr constExpr(int32_t value, int width) {
+  LinearExpr expr;
+  expr.valid = true;
+  expr.coeff.assign(width, 0);
+  expr.constant = value;
+  return expr;
+}
+
+LinearExpr addExpr(const LinearExpr &a, const LinearExpr &b) {
+  if (!a.valid || !b.valid || a.coeff.size() != b.coeff.size())
+    return invalidExpr();
+  LinearExpr out;
+  out.valid = true;
+  out.coeff.resize(a.coeff.size());
+  for (size_t i = 0; i < a.coeff.size(); i++)
+    out.coeff[i] = wrap32((int64_t)a.coeff[i] + b.coeff[i]);
+  out.constant = wrap32((int64_t)a.constant + b.constant);
+  return out;
+}
+
+LinearExpr subExpr(const LinearExpr &a, const LinearExpr &b) {
+  if (!a.valid || !b.valid || a.coeff.size() != b.coeff.size())
+    return invalidExpr();
+  LinearExpr out;
+  out.valid = true;
+  out.coeff.resize(a.coeff.size());
+  for (size_t i = 0; i < a.coeff.size(); i++)
+    out.coeff[i] = wrap32((int64_t)a.coeff[i] - b.coeff[i]);
+  out.constant = wrap32((int64_t)a.constant - b.constant);
+  return out;
+}
+
+LinearExpr evalLinearExpr(Op *op, const std::map<Op*, LinearExpr> &env,
+                          std::set<Op*> &visiting, int width) {
+  op = stripSinglePhi(op);
+  if (!op)
+    return invalidExpr();
+  if (auto it = env.find(op); it != env.end())
+    return it->second;
+  if (isa<IntOp>(op))
+    return constExpr(V(op), width);
+  if (visiting.count(op))
+    return invalidExpr();
+  visiting.insert(op);
+  LinearExpr result = invalidExpr();
+  if (auto add = dyn_cast<AddIOp>(op)) {
+    result = addExpr(evalLinearExpr(add->DEF(0), env, visiting, width),
+                     evalLinearExpr(add->DEF(1), env, visiting, width));
+  } else if (auto sub = dyn_cast<SubIOp>(op)) {
+    result = subExpr(evalLinearExpr(sub->DEF(0), env, visiting, width),
+                     evalLinearExpr(sub->DEF(1), env, visiting, width));
+  }
+  visiting.erase(op);
+  return result;
+}
+
+bool matchScalarLinearRecurrence(LoopInfo *loop, LinearShape &shape) {
+  if (!loop || !loop->preheader || loop->latches.size() != 1 ||
+      loop->exits.size() != 1 || loop->getBlocks().size() != 2)
+    return false;
+
+  auto header = loop->header;
+  auto body = loop->getLatch();
+  auto exit = loop->getExit();
+  auto branch = dyn_cast<BranchOp>(header->getLastOp());
+  if (!branch || !branch->has<TargetAttr>() || !branch->has<ElseAttr>() ||
+      branch->getOperandCount() != 1 || TARGET(branch) != body || ELSE(branch) != exit)
+    return false;
+
+  auto cond = stripSinglePhi(branch->DEF(0));
+  auto lt = dyn_cast<LtOp>(cond);
+  if (!lt || lt->getOperandCount() != 2)
+    return false;
+  auto induction = stripSinglePhi(lt->DEF(0));
+  auto stop = stripSinglePhi(lt->DEF(1));
+  if (!induction || !isa<PhiOp>(induction) || induction->getParent() != header)
+    return false;
+
+  auto back = dyn_cast<GotoOp>(body->getLastOp());
+  if (!back || !back->has<TargetAttr>() || TARGET(back) != header)
+    return false;
+
+  for (auto op : body->getOps()) {
+    if (isa<GotoOp>(op) || isa<AddIOp>(op) || isa<SubIOp>(op) || isa<IntOp>(op))
+      continue;
+    return false;
+  }
+  for (auto op : header->getOps()) {
+    if (isa<PhiOp>(op) || op == cond || op == branch)
+      continue;
+    return false;
+  }
+
+  auto headerPhis = header->getPhis();
+  std::map<Op*, Op*> latchValue;
+  std::map<Op*, Op*> initValue;
+  for (auto phi : headerPhis) {
+    if (phi->getResultType() != Value::i32)
+      return false;
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    if (ops.size() != 2 || attrs.size() != 2)
+      return false;
+    auto bb1 = FROM(attrs[0]);
+    auto bb2 = FROM(attrs[1]);
+    if (bb1 == body && bb2 == loop->preheader) {
+      latchValue[phi] = ops[0].defining;
+      initValue[phi] = ops[1].defining;
+    } else if (bb2 == body && bb1 == loop->preheader) {
+      latchValue[phi] = ops[1].defining;
+      initValue[phi] = ops[0].defining;
+    } else {
+      return false;
+    }
+  }
+
+  if (!latchValue.count(induction) || !initValue.count(induction) ||
+      !isIntConst(stripSinglePhi(initValue[induction]), 0) ||
+      !simpleIncrement(stripSinglePhi(latchValue[induction]), induction))
+    return false;
+
+  for (auto phi : headerPhis) {
+    if (phi == induction)
+      continue;
+    shape.phis.push_back(phi);
+    shape.init.push_back(stripSinglePhi(initValue[phi]));
+  }
+  if (shape.phis.empty() || shape.phis.size() > 4)
+    return false;
+
+  int width = (int)shape.phis.size();
+  std::map<Op*, LinearExpr> env;
+  for (int i = 0; i < width; i++) {
+    LinearExpr expr;
+    expr.valid = true;
+    expr.coeff.assign(width, 0);
+    expr.coeff[i] = 1;
+    env[shape.phis[i]] = expr;
+  }
+  env[induction] = constExpr(0, width);
+
+  shape.matrix.assign(width + 1, std::vector<int32_t>(width + 1, 0));
+  for (int row = 0; row < width; row++) {
+    std::set<Op*> visiting;
+    auto expr = evalLinearExpr(latchValue[shape.phis[row]], env, visiting, width);
+    if (!expr.valid)
+      return false;
+    for (int col = 0; col < width; col++)
+      shape.matrix[row][col] = expr.coeff[col];
+    shape.matrix[row][width] = expr.constant;
+  }
+  shape.matrix[width][width] = 1;
+
+  for (auto phi : exit->getPhis()) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (FROM(attrs[i]) != header)
+        continue;
+      auto def = stripSinglePhi(ops[i].defining);
+      bool found = false;
+      for (auto recurrencePhi : shape.phis)
+        if (def == recurrencePhi)
+          found = true;
+      if (!found)
+        return false;
+    }
+  }
+
+  shape.induction = induction;
+  shape.stop = stop;
+  shape.incr = latchValue[induction];
+  shape.body = body;
+  shape.exit = exit;
+  return true;
+}
+
+std::vector<std::vector<int32_t>>
+mulMatrix(const std::vector<std::vector<int32_t>> &a,
+          const std::vector<std::vector<int32_t>> &b) {
+  int n = (int)a.size();
+  std::vector<std::vector<int32_t>> out(n, std::vector<int32_t>(n, 0));
+  for (int i = 0; i < n; i++) {
+    for (int k = 0; k < n; k++) {
+      uint32_t av = (uint32_t)a[i][k];
+      if (!av)
+        continue;
+      for (int j = 0; j < n; j++) {
+        uint32_t bv = (uint32_t)b[k][j];
+        if (!bv)
+          continue;
+        uint32_t cur = (uint32_t)out[i][j];
+        cur += av * bv;
+        out[i][j] = (int32_t)cur;
+      }
+    }
+  }
+  return out;
+}
+
+Op *makeInt(Builder &builder, int32_t value) {
+  return builder.create<IntOp>({ new IntAttr(value) });
+}
+
+Op *makeTerm(Builder &builder, int32_t coeff, Op *value) {
+  if (coeff == 1)
+    return value;
+  if (coeff == -1) {
+    auto zero = makeInt(builder, 0);
+    return builder.create<SubIOp>(std::vector<Value>{ zero, value });
+  }
+  auto c = makeInt(builder, coeff);
+  return builder.create<MulIOp>(std::vector<Value>{ value, c });
+}
+
+Op *makeLinearCombination(Builder &builder,
+                          const std::vector<int32_t> &row,
+                          const std::vector<Op*> &state) {
+  Op *sum = nullptr;
+  for (size_t i = 0; i < state.size(); i++) {
+    if (row[i] == 0)
+      continue;
+    auto term = makeTerm(builder, row[i], state[i]);
+    if (!sum)
+      sum = term;
+    else
+      sum = builder.create<AddIOp>(std::vector<Value>{ sum, term });
+  }
+  int32_t constant = row[state.size()];
+  if (constant != 0) {
+    auto c = makeInt(builder, constant);
+    if (!sum)
+      sum = c;
+    else
+      sum = builder.create<AddIOp>(std::vector<Value>{ sum, c });
+  }
+  if (!sum)
+    sum = makeInt(builder, 0);
+  return sum;
+}
+
+bool foldScalarLinearRecurrence(LoopInfo *loop) {
+  LinearShape shape;
+  if (!matchScalarLinearRecurrence(loop, shape))
+    return false;
+
+  auto preterm = loop->preheader->getLastOp();
+  if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() || TARGET(preterm) != loop->header)
+    return false;
+
+  Builder builder;
+  builder.setBeforeOp(preterm);
+  auto zero = makeInt(builder, 0);
+  auto span = builder.create<SubIOp>(std::vector<Value>{ shape.stop, zero });
+  auto positive = builder.create<LtOp>(std::vector<Value>{ zero, span });
+  auto trip = builder.create<SelectOp>(std::vector<Value>{ positive, span, zero });
+
+  std::vector<Op*> state = shape.init;
+  int n = (int)shape.matrix.size();
+  auto power = shape.matrix;
+  for (int bit = 0; bit < 31; bit++) {
+    auto mask = makeInt(builder, 1u << bit);
+    auto masked = builder.create<AndIOp>(std::vector<Value>{ trip, mask });
+    auto enabled = builder.create<NeOp>(std::vector<Value>{ masked, zero });
+    std::vector<Op*> candidate;
+    candidate.reserve(state.size());
+    for (int row = 0; row + 1 < n; row++)
+      candidate.push_back(makeLinearCombination(builder, power[row], state));
+    for (size_t i = 0; i < state.size(); i++)
+      state[i] = builder.create<SelectOp>(std::vector<Value>{ enabled, candidate[i], state[i] });
+    power = mulMatrix(power, power);
+  }
+
+  for (auto phi : shape.exit->getPhis()) {
+    const auto &ops = phi->getOperands();
+    const auto &attrs = phi->getAttrs();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (FROM(attrs[i]) != loop->header)
+        continue;
+      auto def = stripSinglePhi(ops[i].defining);
+      for (size_t j = 0; j < shape.phis.size(); j++) {
+        if (def == shape.phis[j]) {
+          phi->setOperand(i, state[j]);
+          FROM(attrs[i]) = loop->preheader;
+          break;
+        }
+      }
+    }
+  }
+  builder.replace<GotoOp>(preterm, { new TargetAttr(shape.exit) });
+
+  auto detachBlock = [](BasicBlock *bb) {
+    auto ops = bb->getOps();
+    for (auto op : ops)
+      op->removeAllOperands();
+  };
+  detachBlock(loop->header);
+  detachBlock(shape.body);
+  shape.body->preds.clear();
+  shape.body->succs.clear();
+  loop->header->preds.clear();
+  loop->header->succs.clear();
+  shape.body->forceErase();
+  loop->header->forceErase();
+  return true;
+}
+
 } // namespace
 
 std::map<std::string, int> ModularAffineLoop::stats() {
@@ -279,6 +612,11 @@ std::map<std::string, int> ModularAffineLoop::stats() {
 
 bool ModularAffineLoop::runImpl(LoopInfo *loop) {
   visited++;
+
+  if (foldScalarLinearRecurrence(loop)) {
+    folded++;
+    return true;
+  }
 
   Op *induction = nullptr;
   Op *stop = nullptr;
