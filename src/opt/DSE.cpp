@@ -2,6 +2,7 @@
 #include "Analysis.h"
 #include <algorithm>
 #include <deque>
+#include <set>
 #include <unordered_set>
 
 using namespace sys;
@@ -33,6 +34,59 @@ bool sameStoreAddressForSink(StoreOp *a, StoreOp *b) {
   if (a->has<SizeAttr>() && b->has<SizeAttr>() && SIZE(a) != SIZE(b))
     return false;
   return a->DEF(1) == b->DEF(1) || mustAlias(a->DEF(1), b->DEF(1));
+}
+
+bool structurallySameExpr(Op *a, Op *b, std::set<std::pair<Op*, Op*>> &seen) {
+  if (a == b)
+    return true;
+  if (!a || !b || a->opid != b->opid || a->getOperandCount() != b->getOperandCount())
+    return false;
+  if (seen.count({ a, b }))
+    return true;
+  seen.insert({ a, b });
+
+  if (isa<IntOp>(a))
+    return V(a) == V(b);
+  if (isa<FloatOp>(a))
+    return F(a) == F(b);
+  if (isa<GetGlobalOp>(a))
+    return NAME(a) == NAME(b);
+  if (isa<PhiOp>(a) || isa<LoadOp>(a) || isa<CallOp>(a))
+    return false;
+
+  auto sameOrdered = [&]() {
+    for (int i = 0; i < a->getOperandCount(); i++)
+      if (!structurallySameExpr(a->DEF(i), b->DEF(i), seen))
+        return false;
+    return true;
+  };
+  if (sameOrdered())
+    return true;
+
+  if (a->getOperandCount() != 2)
+    return false;
+  if (!isa<AddIOp>(a) && !isa<MulIOp>(a) && !isa<AddLOp>(a) &&
+      !isa<AndIOp>(a) && !isa<OrIOp>(a) && !isa<XorIOp>(a))
+    return false;
+  return structurallySameExpr(a->DEF(0), b->DEF(1), seen) &&
+         structurallySameExpr(a->DEF(1), b->DEF(0), seen);
+}
+
+bool structurallySameExpr(Op *a, Op *b) {
+  std::set<std::pair<Op*, Op*>> seen;
+  return structurallySameExpr(a, b, seen);
+}
+
+bool sameAddressForStoreBack(Op *a, Op *b) {
+  return a == b || mustAlias(a, b) || structurallySameExpr(a, b);
+}
+
+bool valueIsLoadedValue(Op *value, LoadOp *load) {
+  if (value == load)
+    return true;
+  auto valueLoad = dyn_cast<LoadOp>(value);
+  return valueLoad && valueLoad->getResultType() == load->getResultType() &&
+         sameAddressForStoreBack(valueLoad->DEF(), load->DEF());
 }
 
 StoreOp *trailingStoreToJoin(BasicBlock *pred, BasicBlock *join) {
@@ -356,19 +410,21 @@ void DSE::run() {
   };
 
   for (auto load : loads) {
+    auto loadOp = cast<LoadOp>(load);
     auto loadAddr = load->DEF();
     for (auto runner = load->nextOp(); runner; runner = runner->nextOp()) {
       if (isa<CallOp>(runner))
         break;
-      if (isa<LoadOp>(runner)) {
-        if (mayAlias(runner->DEF(), loadAddr))
-          break;
+      if (isa<LoadOp>(runner))
         continue;
-      }
-      if (isa<StoreOp>(runner)) {
-        auto addr = runner->DEF(1), value = runner->DEF(0);
-        if (value == load && (addr == loadAddr || mustAlias(addr, loadAddr))) {
-          rememberRemove(runner);
+      if (auto store = dyn_cast<StoreOp>(runner)) {
+        auto addr = store->DEF(1);
+        auto value = store->DEF(0);
+        bool sameSize = !store->has<SizeAttr>() || !load->has<SizeAttr>() ||
+                        SIZE(store) == SIZE(load);
+        if (sameSize && valueIsLoadedValue(value, loadOp)) {
+          if (sameAddressForStoreBack(addr, loadAddr))
+            rememberRemove(store);
           continue;
         }
         if (mayAlias(addr, loadAddr))
