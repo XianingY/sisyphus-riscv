@@ -854,8 +854,36 @@ bool hasPermutationViolationByDirections(const pres::BasicSet &base,
                                          const std::vector<std::string> &yVars,
                                          const std::vector<int> &permutation,
                                          bool &unknown) {
+  pres::BasicSet queryBase = base;
+  VarOrder queryVars = vars;
+
+  // Direction extraction only needs the two iteration tuples.  Symbolic
+  // parameters from bounds/accesses can make the Presburger tableau much wider
+  // for deep nests, so project them away before enumerating direction
+  // hypotheses.  This is an existential relaxation: it can introduce extra
+  // "may" dependences, but it cannot incorrectly prove a violating dependence
+  // absent.
+  std::unordered_set<std::string> needed;
+  needed.insert(xVars.begin(), xVars.end());
+  needed.insert(yVars.begin(), yVars.end());
+  std::vector<int> projectVars;
+  for (int i = 0; i < (int)vars.names.size(); i++) {
+    if (!needed.count(vars.names[i]))
+      projectVars.push_back(i);
+  }
+  if (!projectVars.empty()) {
+    if (auto projected = base.projectOut(projectVars, 8192)) {
+      queryBase = *projected;
+      queryVars = VarOrder();
+      for (const std::string &var : xVars)
+        queryVars.add(var);
+      for (const std::string &var : yVars)
+        queryVars.add(var);
+    }
+  }
+
   std::vector<DirectionVector> witnesses =
-      extract3DDependencies(base, vars, xVars, yVars, unknown);
+      extract3DDependencies(queryBase, queryVars, xVars, yVars, unknown);
   if (unknown)
     return false;
 

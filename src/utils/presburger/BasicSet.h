@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <iostream>
+#include <optional>
 
 namespace pres {
 
@@ -32,6 +33,15 @@ public:
 
   // Add a single constraint row.
   void addConstraint(const AffineExpr &row);
+
+  // Existentially eliminate variables with Fourier-Motzkin projection.
+  // Rows are affine inequalities row(x) >= 0.  The operation is exact over
+  // rationals and is used as a conservative dependence-analysis accelerator:
+  // an empty projected set proves the original set empty, while a non-empty
+  // projection may still be conservatively treated as "may depend".
+  std::optional<BasicSet> projectOut(int var, size_t maxRows = 4096) const;
+  std::optional<BasicSet> projectOut(const std::vector<int> &vars,
+                                     size_t maxRows = 4096) const;
 
   // Get the tableau for inspection.
   const std::vector<AffineExpr> &getTableau() const { return tableau; }

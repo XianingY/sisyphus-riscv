@@ -1,4 +1,6 @@
 #include "BasicSet.h"
+#include <algorithm>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <iomanip>
@@ -194,4 +196,111 @@ int BasicSet::numVars() const {
 
 void BasicSet::addConstraint(const AffineExpr &row) {
   tableau.push_back(row);
+}
+
+static AffineExpr removeColumn(const AffineExpr &row, int var) {
+  AffineExpr out;
+  out.reserve(row.size() - 1);
+  for (int i = 0; i < (int)row.size(); i++) {
+    if (i != var)
+      out.push_back(row[i]);
+  }
+  return out;
+}
+
+static void normalizeRow(AffineExpr &row) {
+  int gcd = 0;
+  for (int value : row)
+    gcd = std::gcd(gcd, abs(value));
+  if (gcd <= 1)
+    return;
+  for (int &value : row)
+    value /= gcd;
+}
+
+static bool checkedLinearCombination(const AffineExpr &lhs, int lhsScale,
+                                     const AffineExpr &rhs, int rhsScale,
+                                     AffineExpr &out) {
+  if (lhs.size() != rhs.size())
+    return false;
+  out.assign(lhs.size(), 0);
+  for (size_t i = 0; i < lhs.size(); i++) {
+    int64_t value = (int64_t)lhs[i] * lhsScale + (int64_t)rhs[i] * rhsScale;
+    if (value < std::numeric_limits<int>::min() ||
+        value > std::numeric_limits<int>::max())
+      return false;
+    out[i] = (int)value;
+  }
+  normalizeRow(out);
+  return true;
+}
+
+std::optional<BasicSet> BasicSet::projectOut(int var, size_t maxRows) const {
+  const int vars = numVars();
+  if (var < 0 || var >= vars)
+    return std::nullopt;
+  if (tableau.empty())
+    return BasicSet();
+
+  std::vector<AffineExpr> positive;
+  std::vector<AffineExpr> negative;
+  std::vector<AffineExpr> zero;
+  positive.reserve(tableau.size());
+  negative.reserve(tableau.size());
+  zero.reserve(tableau.size());
+
+  for (const AffineExpr &row : tableau) {
+    if ((int)row.size() != vars + 1)
+      return std::nullopt;
+    if (row[var] > 0)
+      positive.push_back(row);
+    else if (row[var] < 0)
+      negative.push_back(row);
+    else
+      zero.push_back(removeColumn(row, var));
+  }
+
+  std::vector<AffineExpr> projected;
+  projected.reserve(zero.size() + positive.size() * negative.size());
+  for (AffineExpr row : zero) {
+    normalizeRow(row);
+    projected.push_back(std::move(row));
+  }
+
+  if (positive.empty() || negative.empty())
+    return BasicSet(projected);
+
+  if (projected.size() + positive.size() * negative.size() > maxRows)
+    return std::nullopt;
+
+  for (const AffineExpr &pos : positive) {
+    const int p = pos[var];
+    AffineExpr posRest = removeColumn(pos, var);
+    for (const AffineExpr &neg : negative) {
+      const int q = -neg[var];
+      AffineExpr negRest = removeColumn(neg, var);
+      AffineExpr combined;
+      // p*x + P >= 0 and -q*x + N >= 0 imply q*P + p*N >= 0.
+      if (!checkedLinearCombination(posRest, q, negRest, p, combined))
+        return std::nullopt;
+      projected.push_back(std::move(combined));
+    }
+  }
+
+  return BasicSet(projected);
+}
+
+std::optional<BasicSet> BasicSet::projectOut(const std::vector<int> &vars,
+                                             size_t maxRows) const {
+  BasicSet current = *this;
+  std::vector<int> sorted = vars;
+  std::sort(sorted.begin(), sorted.end(), std::greater<int>());
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+  for (int var : sorted) {
+    auto next = current.projectOut(var, maxRows);
+    if (!next)
+      return std::nullopt;
+    current = *next;
+  }
+  return current;
 }
