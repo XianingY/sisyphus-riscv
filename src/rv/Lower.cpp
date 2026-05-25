@@ -83,12 +83,12 @@ void Lower::run() {
 
     if (y->getResultType() == Value::i32 && z->getResultType() == Value::i32) {
       builder.setBeforeOp(op);
-      auto nz = builder.create<SnezOp>({ x });
+      auto nz = builder.create<SnezOp>(std::vector<Value>{ x });
       auto zero = builder.create<LiOp>({ new IntAttr(0) });
-      auto mask = builder.create<SubwOp>({ zero, nz });
-      auto diff = builder.create<XorOp>({ y, z });
-      auto masked = builder.create<AndOp>({ diff, mask });
-      builder.replace<XorOp>(op, { z, masked });
+      auto mask = builder.create<SubwOp>(std::vector<Value>{ zero, nz });
+      auto diff = builder.create<XorOp>(std::vector<Value>{ y, z });
+      auto masked = builder.create<AndOp>(std::vector<Value>{ diff, mask });
+      builder.replace<XorOp>(op, std::vector<Value>{ z, masked });
       return false;
     }
 
