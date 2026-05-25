@@ -135,6 +135,74 @@ bool norange(Op *op) {
 }
 
 int nowiden;
+std::map<std::string, IRange> returnRanges;
+
+bool setRange(Op *op, IRange range) {
+  if (!op)
+    return false;
+  if (auto attr = op->find<RangeAttr>()) {
+    if (attr->range == range)
+      return false;
+    attr->range = range;
+    return true;
+  }
+  op->add<RangeAttr>(range);
+  return true;
+}
+
+bool hasUnresolvedSelfCall(Op *op, const std::string &self,
+                           std::unordered_set<Op*> &seen) {
+  if (!op)
+    return false;
+  if (!seen.insert(op).second)
+    return false;
+  if (isa<CallOp>(op) && NAME(op) == self && !returnRanges.count(self))
+    return true;
+  for (auto operand : op->getOperands())
+    if (hasUnresolvedSelfCall(operand.defining, self, seen))
+      return true;
+  return false;
+}
+
+bool hasUnresolvedSelfCall(Op *op, const std::string &self) {
+  std::unordered_set<Op*> seen;
+  return hasUnresolvedSelfCall(op, self, seen);
+}
+
+bool inferReturnRange(FuncOp *func, IRange &out) {
+  const auto &self = NAME(func);
+  bool sawValue = false;
+  IRange joined { INT_MAX, INT_MIN };
+
+  for (auto ret : func->findAll<ReturnOp>()) {
+    if (!ret->getOperandCount())
+      continue;
+    auto value = ret->DEF();
+    if (!value)
+      return false;
+
+    IRange range;
+    if (auto attr = value->find<RangeAttr>()) {
+      range = attr->range;
+    } else if (isa<CallOp>(value) && NAME(value) == self && returnRanges.count(self)) {
+      range = returnRanges[self];
+    } else if (hasUnresolvedSelfCall(value, self)) {
+      continue;
+    } else {
+      return false;
+    }
+
+    if (range.first > range.second)
+      continue;
+    joined = sawValue ? join(joined, range) : range;
+    sawValue = true;
+  }
+
+  if (!sawValue)
+    return false;
+  out = joined;
+  return true;
+}
 
 // Check phi nodes created by Range::split().
 bool updateConditional(Op *op, bool &changed) {
@@ -255,9 +323,11 @@ bool calculateRange(Op *op) {
     // We know the semantics of external calls.
     const auto &name = op->getName();
     if (name == "getch")
-      op->add<RangeAttr>(1, 128);
+      setRange(op, { 1, 128 });
     else if (name == "getarray" || name == "getfarray")
-      op->add<RangeAttr>(1, INT_MAX);
+      setRange(op, { 1, INT_MAX });
+    else if (returnRanges.count(name))
+      setRange(op, returnRanges[name]);
     else if (!op->has<RangeAttr>())
       op->add<RangeAttr>(/*unknown*/);
 
@@ -553,6 +623,7 @@ void Range::analyze(Region *region) {
 
 void Range::run() {
   auto funcs = collectFuncs();
+  returnRanges.clear();
 
   for (auto func : funcs) {
     auto region = func->getRegion();
@@ -584,11 +655,8 @@ void Range::run() {
     }
   }
 
-  for (auto func : funcs) {
-    int argcnt = func->get<ArgCountAttr>()->count;
-    if (argcnt == 0)
-      continue;
-
+  auto seedAndAnalyze = [&](FuncOp *func) {
+    int argcnt = func->has<ArgCountAttr>() ? func->get<ArgCountAttr>()->count : 0;
     auto region = func->getRegion();
     removeRange(region);
 
@@ -606,5 +674,29 @@ void Range::run() {
     }
 
     analyze(region);
+  };
+
+  for (int round = 0; round < 5; round++) {
+    bool changed = false;
+    for (auto func : funcs) {
+      seedAndAnalyze(func);
+
+      IRange inferred;
+      if (!inferReturnRange(func, inferred))
+        continue;
+
+      const auto &name = NAME(func);
+      auto it = returnRanges.find(name);
+      IRange next = it == returnRanges.end() ? inferred : join(it->second, inferred);
+      if (it == returnRanges.end() || it->second != next) {
+        returnRanges[name] = next;
+        changed = true;
+      }
+    }
+    if (!changed)
+      break;
   }
+
+  for (auto func : funcs)
+    seedAndAnalyze(func);
 }

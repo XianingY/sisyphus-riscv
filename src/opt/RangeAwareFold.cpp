@@ -540,6 +540,35 @@ void RangeAwareFold::run() {
     return false;
   });
 
+  runRewriter([&](ModIOp *op) {
+    auto x = op->DEF(0);
+    auto y = op->DEF(1);
+    if (!isa<IntOp>(y) || !x->has<RangeAttr>())
+      return false;
+
+    int divisor = V(y);
+    if (divisor <= 0)
+      return false;
+
+    auto [low, high] = RANGE(x);
+    if (low > high || low < 0)
+      return false;
+
+    // For a non-negative dividend known to be below 2*M, x % M is exactly
+    // one conditional subtraction.  This is a general modulo-strength
+    // reduction; it does not depend on the source algorithm that produced x.
+    if ((int64_t)high >= 2LL * divisor)
+      return false;
+
+    folded++;
+    builder.setBeforeOp(op);
+    auto mod = builder.create<IntOp>({ new IntAttr(divisor) });
+    auto below = builder.create<LtOp>({ x, mod });
+    auto reduced = builder.create<SubIOp>({ x, mod });
+    builder.replace<SelectOp>(op, { below, x, reduced });
+    return false;
+  });
+
   Rule eq_or("(or (eq x 1) (not x))");
   runRewriter([&](OrIOp *op) {
     if (eq_or.match(op)) {
