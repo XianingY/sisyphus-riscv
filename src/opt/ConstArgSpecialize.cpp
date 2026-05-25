@@ -314,7 +314,7 @@ void ConstArgSpecialize::run() {
       if (!argTypes || (int) argTypes->types.size() != call->getOperandCount())
         continue;
       if (isRecursiveFunc(func) &&
-          !envEnabled("SISY_ENABLE_RECURSIVE_CONST_ARG_SPECIALIZE", false))
+          !envEnabled("SISY_ENABLE_RECURSIVE_CONST_ARG_SPECIALIZE", true))
         continue;
 
       int argIndex = -1;

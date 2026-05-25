@@ -73,10 +73,25 @@ void Lower::run() {
   // When `x` is 0 or 1, we have:
   //   x ? y : z = (-x & y) | ((x - 1) & z)
   //
-  // It's 7 ops though, so I strongly suspect branches will be better.
-  // Here I'll use branches.
+  // For integer values, use a branchless xor/and select:
+  //   m = -snez(x)
+  //   z ^ ((y ^ z) & m)
+  // This is profitable for the tiny if-converted blocks emitted by Select and
+  // avoids reintroducing unpredictable branches in sorting/bit-twiddling loops.
   runRewriter([&](SelectOp *op) {
     auto x = op->DEF(0), y = op->DEF(1), z = op->DEF(2);
+
+    if (y->getResultType() == Value::i32 && z->getResultType() == Value::i32) {
+      builder.setBeforeOp(op);
+      auto nz = builder.create<SnezOp>({ x });
+      auto zero = builder.create<LiOp>({ new IntAttr(0) });
+      auto mask = builder.create<SubwOp>({ zero, nz });
+      auto diff = builder.create<XorOp>({ y, z });
+      auto masked = builder.create<AndOp>({ diff, mask });
+      builder.replace<XorOp>(op, { z, masked });
+      return false;
+    }
+
     auto parent = op->getParent();
     auto region = parent->getParent();
     auto tgt = region->appendBlock();

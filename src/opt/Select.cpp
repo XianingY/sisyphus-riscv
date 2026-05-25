@@ -1,5 +1,8 @@
 #include "Passes.h"
 
+#include <set>
+#include <vector>
+
 using namespace sys;
 
 namespace {
@@ -45,6 +48,130 @@ bool onlyPhiInMerge(Op *phi) {
   return phis.size() == 1 && phis[0] == phi;
 }
 
+bool emptyGotoBlock(BasicBlock *bb) {
+  return bb && bb->getOpCount() == 1 && isa<GotoOp>(bb->getLastOp());
+}
+
+bool pureSpeculatable(Op *op) {
+  return isa<IntOp>(op) || isa<AddIOp>(op) || isa<SubIOp>(op) ||
+         isa<MulIOp>(op) || isa<AddLOp>(op) || isa<SubLOp>(op) ||
+         isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+         isa<LShiftOp>(op) || isa<RShiftOp>(op) || isa<EqOp>(op) ||
+         isa<NeOp>(op) || isa<LtOp>(op) || isa<LeOp>(op) ||
+         isa<SetNotZeroOp>(op) || isa<NotOp>(op);
+}
+
+bool shortPureBlock(BasicBlock *bb) {
+  if (!bb || !isa<GotoOp>(bb->getLastOp()))
+    return false;
+  int count = 0;
+  for (auto op : bb->getOps()) {
+    if (op == bb->getLastOp())
+      continue;
+    if (!pureSpeculatable(op))
+      return false;
+    if (++count > 10)
+      return false;
+  }
+  return count > 0;
+}
+
+Op *incomingFrom(Op *phi, BasicBlock *bb) {
+  const auto &ops = phi->getOperands();
+  const auto &attrs = phi->getAttrs();
+  if (ops.size() != attrs.size())
+    return nullptr;
+  for (size_t i = 0; i < ops.size(); i++) {
+    auto from = dyn_cast<FromAttr>(attrs[i]);
+    if (from && from->bb == bb)
+      return ops[i].defining;
+  }
+  return nullptr;
+}
+
+bool onlyLocalUsesOrPhi(Op *op, BasicBlock *bb, Op *phi) {
+  for (auto use : op->getUses())
+    if (use != phi && use->getParent() != bb)
+      return false;
+  return true;
+}
+
+bool convertShortPureBranch(BranchOp *branch) {
+  if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||
+      !branch->has<ElseAttr>())
+    return false;
+
+  auto trueBlock = TARGET(branch);
+  auto falseBlock = ELSE(branch);
+  BasicBlock *calcBlock = nullptr;
+  BasicBlock *emptyBlock = nullptr;
+  if (shortPureBlock(trueBlock) && emptyGotoBlock(falseBlock)) {
+    calcBlock = trueBlock;
+    emptyBlock = falseBlock;
+  } else if (shortPureBlock(falseBlock) && emptyGotoBlock(trueBlock)) {
+    calcBlock = falseBlock;
+    emptyBlock = trueBlock;
+  } else {
+    return false;
+  }
+
+  if (calcBlock->preds.size() != 1 || emptyBlock->preds.size() != 1 ||
+      *calcBlock->preds.begin() != branch->getParent() ||
+      *emptyBlock->preds.begin() != branch->getParent())
+    return false;
+
+  auto calcTerm = dyn_cast<GotoOp>(calcBlock->getLastOp());
+  auto emptyTerm = dyn_cast<GotoOp>(emptyBlock->getLastOp());
+  if (!calcTerm || !emptyTerm || TARGET(calcTerm) != TARGET(emptyTerm))
+    return false;
+  auto join = TARGET(calcTerm);
+  if (!join || join->getPhis().size() != 1)
+    return false;
+
+  std::vector<Op*> phis;
+  for (auto phi : join->getPhis()) {
+    if (phi->getOperandCount() != 2 || phi->getResultType() != Value::i32)
+      continue;
+    auto fromCalc = incomingFrom(phi, calcBlock);
+    auto fromEmpty = incomingFrom(phi, emptyBlock);
+    if (!fromCalc || !fromEmpty)
+      continue;
+    if (fromCalc->getParent() == calcBlock && onlyLocalUsesOrPhi(fromCalc, calcBlock, phi))
+      phis.push_back(phi);
+  }
+  if (phis.size() != 1)
+    return false;
+
+  auto phi = phis[0];
+  auto trueValue = incomingFrom(phi, trueBlock);
+  auto falseValue = incomingFrom(phi, falseBlock);
+  if (!trueValue || !falseValue)
+    return false;
+
+  std::vector<Op*> moving;
+  for (auto op : calcBlock->getOps()) {
+    if (op == calcBlock->getLastOp())
+      continue;
+    if (!pureSpeculatable(op))
+      return false;
+    moving.push_back(op);
+  }
+
+  for (auto op : moving)
+    op->moveBefore(branch);
+
+  Builder builder;
+  builder.setBeforeOp(branch);
+  auto select = builder.create<SelectOp>(
+      std::vector<Value>{ branch->DEF(0), trueValue, falseValue });
+  phi->replaceAllUsesWith(select);
+  phi->erase();
+  builder.replace<GotoOp>(branch, { new TargetAttr(join) });
+  calcBlock->forceErase();
+  emptyBlock->forceErase();
+  return true;
+}
+
 }
 
 std::map<std::string, int> Select::stats() {
@@ -55,6 +182,18 @@ std::map<std::string, int> Select::stats() {
 
 void Select::run() {
   Builder builder;
+  for (auto func : collectFuncs())
+    func->getRegion()->updatePreds();
+
+  auto branches = module->findAll<BranchOp>();
+  for (auto op : branches) {
+    if (convertShortPureBranch(cast<BranchOp>(op)))
+      raised++;
+  }
+
+  for (auto func : collectFuncs())
+    func->getRegion()->updatePreds();
+
   auto phis = module->findAll<PhiOp>();
 
   // Hoist identical ops out of an if.

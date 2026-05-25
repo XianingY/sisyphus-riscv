@@ -70,6 +70,56 @@ bool noAliasWithMemorySSA(Op *load, LoopInfo *loop, MemorySSA *mssa, const std::
   return noAlias(load, stores);
 }
 
+bool knownNonNegative(Op *op, std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return false;
+  seen.insert(op);
+
+  if (isa<IntOp>(op))
+    return V(op) >= 0;
+
+  if (auto range = op->find<RangeAttr>())
+    return range->range.first >= 0;
+
+  if (isa<AddIOp>(op) || isa<AddLOp>(op))
+    return knownNonNegative(op->DEF(0), seen) && knownNonNegative(op->DEF(1), seen);
+
+  if (isa<ModIOp>(op) && op->getOperandCount() == 2) {
+    if (auto divisor = dyn_cast<IntOp>(op->DEF(1)); divisor && V(divisor) > 0)
+      return knownNonNegative(op->DEF(0), seen);
+  }
+
+  if (isa<PhiOp>(op)) {
+    bool hasNonSelf = false;
+    for (auto operand : op->getOperands()) {
+      auto incoming = operand.defining;
+      if (incoming == op)
+        continue;
+      if (auto add = dyn_cast<AddIOp>(incoming)) {
+        if ((add->DEF(0) == op && knownNonNegative(add->DEF(1), seen)) ||
+            (add->DEF(1) == op && knownNonNegative(add->DEF(0), seen)))
+          continue;
+      }
+      if (auto add = dyn_cast<AddLOp>(incoming)) {
+        if ((add->DEF(0) == op && knownNonNegative(add->DEF(1), seen)) ||
+            (add->DEF(1) == op && knownNonNegative(add->DEF(0), seen)))
+          continue;
+      }
+      hasNonSelf = true;
+      if (!knownNonNegative(incoming, seen))
+        return false;
+    }
+    return hasNonSelf;
+  }
+
+  return false;
+}
+
+bool knownNonNegative(Op *op) {
+  std::set<Op*> seen;
+  return knownNonNegative(op, seen);
+}
+
 std::optional<long long> evalAtLoopEntry(Op *op, LoopInfo *info, std::set<Op*> &seen) {
   if (!op || seen.count(op))
     return std::nullopt;
@@ -126,6 +176,49 @@ std::optional<bool> evalCondAtLoopEntry(Op *op, LoopInfo *info) {
   return std::nullopt;
 }
 
+bool branchEdgeDominates(BasicBlock *edge, BasicBlock *bb) {
+  return edge && bb && (edge == bb || edge->dominates(bb));
+}
+
+bool dominatingBranchProvesPositive(Op *value, BasicBlock *useBlock) {
+  if (!value || !useBlock)
+    return false;
+
+  auto region = useBlock->getParent();
+  for (auto bb : region->getBlocks()) {
+    auto branch = dyn_cast<BranchOp>(bb->getLastOp());
+    if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||
+        !branch->has<ElseAttr>())
+      continue;
+
+    auto cond = branch->DEF(0);
+    if (!cond || cond->getOperandCount() != 2)
+      continue;
+
+    auto lhs = cond->DEF(0);
+    auto rhs = cond->DEF(1);
+
+    // On a dominated true edge of `x < value`, any non-negative x proves
+    // value > 0.  This is common in nests such as:
+    //   while (i < n) { ... while (k < n) load(A[i][i]) ... }
+    // and lets LICM speculate loop-invariant loads from the inner loop without
+    // assuming anything about test-case dimensions.
+    if (isa<LtOp>(cond) && rhs == value &&
+        branchEdgeDominates(TARGET(branch), useBlock) && knownNonNegative(lhs))
+      return true;
+
+    // Symmetric false edge: !(value < c) gives value >= c.
+    if (isa<LtOp>(cond) && lhs == value && isa<IntOp>(rhs) && V(rhs) > 0 &&
+        branchEdgeDominates(ELSE(branch), useBlock))
+      return true;
+
+    if (isa<LeOp>(cond) && lhs == value && isa<IntOp>(rhs) && V(rhs) >= 0 &&
+        branchEdgeDominates(ELSE(branch), useBlock))
+      return true;
+  }
+  return false;
+}
+
 bool loopKnownToRunOnce(LoopInfo *info) {
   if (!info || !info->header || !info->preheader)
     return false;
@@ -138,6 +231,12 @@ bool loopKnownToRunOnce(LoopInfo *info) {
     if (step < 0 && V(info->start) > V(info->stop))
       return true;
   }
+
+  if (info->start && info->stop && info->step &&
+      isa<IntOp>(info->start) && V(info->start) == 0 &&
+      isa<IntOp>(info->step) && V(info->step) > 0 &&
+      dominatingBranchProvesPositive(info->stop, info->preheader))
+    return true;
 
   auto branch = dyn_cast<BranchOp>(info->header->getLastOp());
   if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||

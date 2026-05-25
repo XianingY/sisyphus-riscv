@@ -264,6 +264,10 @@ void DSE::runImpl(Region *region) {
     // Never eliminate unknown things.
     bool canElim = !alias->unknown;
     for (auto [base, _] : alias->location) {
+      if (!base || !base->getParent()) {
+        canElim = false;
+        break;
+      }
       // We can only eliminate if this stores to a local variable.
       // If parent of `base` is a ModuleOp (i.e. global), or another function,
       // then it's not a candidate of removal.
