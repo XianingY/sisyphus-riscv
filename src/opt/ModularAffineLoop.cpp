@@ -6,7 +6,6 @@
 #include <cstring>
 #include <map>
 #include <set>
-#include <string>
 #include <vector>
 
 using namespace sys;
@@ -494,41 +493,45 @@ mulMatrix(const std::vector<std::vector<int32_t>> &a,
   return out;
 }
 
-std::string createLinearPowerTable(ModuleOp *module,
-                                   const std::vector<std::vector<int32_t>> &matrix) {
-  static int nextId = 0;
-  int n = (int)matrix.size();
-  std::vector<std::vector<std::vector<int32_t>>> powers;
-  powers.reserve(31);
-  powers.push_back(matrix);
-  for (int bit = 1; bit < 31; bit++)
-    powers.push_back(mulMatrix(powers.back(), powers.back()));
-
-  int total = 31 * n * n;
-  int *data = new int[total];
-  for (int bit = 0; bit < 31; bit++) {
-    for (int row = 0; row < n; row++) {
-      for (int col = 0; col < n; col++) {
-        data[bit * n * n + row * n + col] = powers[bit][row][col];
-      }
-    }
-  }
-
-  std::string name = "__sisy_linear_rec_pow_" + std::to_string(nextId++);
-  Builder builder;
-  builder.setToRegionStart(module->getRegion());
-  auto global = builder.create<GlobalOp>({
-      new SizeAttr((size_t)total * 4),
-      new IntArrayAttr(data, total),
-      new NameAttr(name),
-      new DimensionAttr({ 31, n, n }),
-  });
-  global->add<ConstAttr>();
-  return name;
-}
-
 Op *makeInt(Builder &builder, int32_t value) {
   return builder.create<IntOp>({ new IntAttr(value) });
+}
+
+Op *makeTerm(Builder &builder, int32_t coeff, Op *value) {
+  if (coeff == 1)
+    return value;
+  if (coeff == -1) {
+    auto zero = makeInt(builder, 0);
+    return builder.create<SubIOp>(std::vector<Value>{ zero, value });
+  }
+  auto c = makeInt(builder, coeff);
+  return builder.create<MulIOp>(std::vector<Value>{ value, c });
+}
+
+Op *makeLinearCombination(Builder &builder,
+                          const std::vector<int32_t> &row,
+                          const std::vector<Op*> &state) {
+  Op *sum = nullptr;
+  for (size_t i = 0; i < state.size(); i++) {
+    if (row[i] == 0)
+      continue;
+    auto term = makeTerm(builder, row[i], state[i]);
+    if (!sum)
+      sum = term;
+    else
+      sum = builder.create<AddIOp>(std::vector<Value>{ sum, term });
+  }
+  int32_t constant = row[state.size()];
+  if (constant != 0) {
+    auto c = makeInt(builder, constant);
+    if (!sum)
+      sum = c;
+    else
+      sum = builder.create<AddIOp>(std::vector<Value>{ sum, c });
+  }
+  if (!sum)
+    sum = makeInt(builder, 0);
+  return sum;
 }
 
 bool foldScalarLinearRecurrence(LoopInfo *loop) {
@@ -540,105 +543,28 @@ bool foldScalarLinearRecurrence(LoopInfo *loop) {
   if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() || TARGET(preterm) != loop->header)
     return false;
 
-  int width = (int)shape.phis.size();
-  int n = (int)shape.matrix.size();
-  if (width <= 0 || width + 1 != n)
-    return false;
-
-  auto region = loop->header->getParent();
-  auto func = region->getParent();
-  auto moduleOp = cast<ModuleOp>(func->getParentOp());
-  auto tableName = createLinearPowerTable(moduleOp, shape.matrix);
-  auto condBB = region->insertAfter(loop->preheader);
-  auto bodyBB = region->insertAfter(condBB);
-  auto applyBB = region->insertAfter(bodyBB);
-  auto updateBB = region->insertAfter(applyBB);
-  auto doneBB = region->insertAfter(updateBB);
-
   Builder builder;
   builder.setBeforeOp(preterm);
   auto zero = makeInt(builder, 0);
-  auto one = makeInt(builder, 1);
-  auto stateSlots = std::vector<Op*>();
-  stateSlots.reserve(width);
-  for (int i = 0; i < width; i++) {
-    auto slot = builder.create<AllocaOp>({ new SizeAttr(4) });
-    builder.create<StoreOp>({ shape.init[i], slot }, { new SizeAttr(4) });
-    stateSlots.push_back(slot);
-  }
-  auto nSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
-  auto bitSlot = builder.create<AllocaOp>({ new SizeAttr(4) });
   auto span = builder.create<SubIOp>(std::vector<Value>{ shape.stop, zero });
   auto positive = builder.create<LtOp>(std::vector<Value>{ zero, span });
   auto trip = builder.create<SelectOp>(std::vector<Value>{ positive, span, zero });
-  builder.create<StoreOp>({ trip, nSlot }, { new SizeAttr(4) });
-  builder.create<StoreOp>({ zero, bitSlot }, { new SizeAttr(4) });
-  builder.replace<GotoOp>(preterm, { new TargetAttr(condBB) });
 
-  builder.setToBlockEnd(condBB);
-  auto nVal = builder.create<LoadOp>(Value::i32, { nSlot }, { new SizeAttr(4) });
-  auto keepGoing = builder.create<LtOp>(std::vector<Value>{ zero, nVal });
-  builder.create<BranchOp>(std::vector<Value>{ keepGoing },
-                           { new TargetAttr(bodyBB), new ElseAttr(doneBB) });
-
-  builder.setToBlockEnd(bodyBB);
-  auto bitVal = builder.create<LoadOp>(Value::i32, { bitSlot }, { new SizeAttr(4) });
-  auto odd = builder.create<AndIOp>(std::vector<Value>{ nVal, one });
-  auto shouldApply = builder.create<NeOp>(std::vector<Value>{ odd, zero });
-  builder.create<BranchOp>(std::vector<Value>{ shouldApply },
-                           { new TargetAttr(applyBB), new ElseAttr(updateBB) });
-
-  builder.setToBlockEnd(applyBB);
-  auto base = builder.create<GetGlobalOp>({ new NameAttr(tableName) });
-  int pageBytes = n * n * 4;
-  auto pageSize = makeInt(builder, pageBytes);
-  auto pageOffset = builder.create<MulIOp>(std::vector<Value>{ bitVal, pageSize });
-  auto pageBase = builder.create<AddLOp>(std::vector<Value>{ base, pageOffset });
-  std::vector<Op*> state;
-  state.reserve(width);
-  for (int col = 0; col < width; col++)
-    state.push_back(builder.create<LoadOp>(Value::i32, { stateSlots[col] },
-                                           { new SizeAttr(4) }));
-  std::vector<Op*> nextState;
-  nextState.reserve(width);
-  for (int row = 0; row < width; row++) {
-    Op *sum = nullptr;
-    for (int col = 0; col < width; col++) {
-      int offset = (row * n + col) * 4;
-      auto addr = offset == 0 ? pageBase
-                              : builder.create<AddLOp>(
-                                    std::vector<Value>{ pageBase, makeInt(builder, offset) });
-      auto coeff = builder.create<LoadOp>(Value::i32, { addr }, { new SizeAttr(4) });
-      auto term = builder.create<MulIOp>(std::vector<Value>{ coeff, state[col] });
-      sum = sum ? (Op*)builder.create<AddIOp>(std::vector<Value>{ sum, term })
-                : (Op*)term;
-    }
-    int constOffset = (row * n + width) * 4;
-    auto constAddr = builder.create<AddLOp>(
-        std::vector<Value>{ pageBase, makeInt(builder, constOffset) });
-    auto constTerm = builder.create<LoadOp>(Value::i32, { constAddr }, { new SizeAttr(4) });
-    sum = sum ? (Op*)builder.create<AddIOp>(std::vector<Value>{ sum, constTerm })
-              : (Op*)constTerm;
-    nextState.push_back(sum);
+  std::vector<Op*> state = shape.init;
+  int n = (int)shape.matrix.size();
+  auto power = shape.matrix;
+  for (int bit = 0; bit < 31; bit++) {
+    auto mask = makeInt(builder, 1u << bit);
+    auto masked = builder.create<AndIOp>(std::vector<Value>{ trip, mask });
+    auto enabled = builder.create<NeOp>(std::vector<Value>{ masked, zero });
+    std::vector<Op*> candidate;
+    candidate.reserve(state.size());
+    for (int row = 0; row + 1 < n; row++)
+      candidate.push_back(makeLinearCombination(builder, power[row], state));
+    for (size_t i = 0; i < state.size(); i++)
+      state[i] = builder.create<SelectOp>(std::vector<Value>{ enabled, candidate[i], state[i] });
+    power = mulMatrix(power, power);
   }
-  for (int i = 0; i < width; i++)
-    builder.create<StoreOp>({ nextState[i], stateSlots[i] }, { new SizeAttr(4) });
-  builder.create<GotoOp>({ new TargetAttr(updateBB) });
-
-  builder.setToBlockEnd(updateBB);
-  auto half = builder.create<RShiftOp>(std::vector<Value>{ nVal, one });
-  auto nextBit = builder.create<AddIOp>(std::vector<Value>{ bitVal, one });
-  builder.create<StoreOp>({ half, nSlot }, { new SizeAttr(4) });
-  builder.create<StoreOp>({ nextBit, bitSlot }, { new SizeAttr(4) });
-  builder.create<GotoOp>({ new TargetAttr(condBB) });
-
-  builder.setToBlockEnd(doneBB);
-  std::vector<Op*> finalState;
-  finalState.reserve(width);
-  for (int i = 0; i < width; i++)
-    finalState.push_back(builder.create<LoadOp>(Value::i32, { stateSlots[i] },
-                                                { new SizeAttr(4) }));
-  builder.create<GotoOp>({ new TargetAttr(shape.exit) });
 
   for (auto phi : shape.exit->getPhis()) {
     const auto &ops = phi->getOperands();
@@ -649,13 +575,14 @@ bool foldScalarLinearRecurrence(LoopInfo *loop) {
       auto def = stripSinglePhi(ops[i].defining);
       for (size_t j = 0; j < shape.phis.size(); j++) {
         if (def == shape.phis[j]) {
-          phi->setOperand(i, finalState[j]);
-          FROM(attrs[i]) = doneBB;
+          phi->setOperand(i, state[j]);
+          FROM(attrs[i]) = loop->preheader;
           break;
         }
       }
     }
   }
+  builder.replace<GotoOp>(preterm, { new TargetAttr(shape.exit) });
 
   auto detachBlock = [](BasicBlock *bb) {
     auto ops = bb->getOps();
