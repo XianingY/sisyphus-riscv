@@ -96,6 +96,25 @@ public:
   void run() override;
 };
 
+// Pre-RA list scheduler for ARM ops.
+// Reorders instructions within basic blocks to hide load/multiply/divide
+// latency on Cortex-A class cores. Mirrors the structure of sys::rv::Schedule
+// but uses an ARM-specific latency table and op classification.
+class Schedule : public Pass {
+  int reordered = 0;
+  int criticalPathNodes = 0;
+  int criticalPathMaxHeight = 0;
+  int heightWeight = 3;
+
+  void runImpl(BasicBlock *bb);
+public:
+  Schedule(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "arm-schedule"; };
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class LateLegalize : public Pass {
 public:
   LateLegalize(ModuleOp *module): Pass(module) {}
