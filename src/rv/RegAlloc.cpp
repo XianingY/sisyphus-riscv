@@ -333,7 +333,9 @@ std::map<std::string, int> RegAlloc::stats() {
 // In that case just give it a random register.
 #define ADD_ATTR(Index, AttrTy) \
   auto v##Index = op->getOperand(Index).defining; \
-  if (!spillOffset.count(v##Index)) \
+  if (!fpreg(v##Index->getResultType()) && isa<LiOp>(v##Index) && V(v##Index) == 0) \
+    op->add<AttrTy>(Reg::zero); \
+  else if (!spillOffset.count(v##Index)) \
     op->add<AttrTy>(getReg(v##Index)); \
   else \
     op->add<Spilled##AttrTy> GET_SPILLED_ARGS(v##Index);
@@ -567,8 +569,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       if (isa<ReadRegOp>(op))
         priority[op] = 1;
       
-      if (isa<LiOp>(op))
-        priority[op] = (V(op) <= 2047 && V(op) >= -2048) ? -3 : -1;
+      if (isa<LiOp>(op)) {
+        if (V(op) == 0) {
+          assignment[op] = Reg::zero;
+          priority[op] = 1000000;
+        } else {
+          priority[op] = (V(op) <= 2047 && V(op) >= -2048) ? -3 : -1;
+        }
+      }
       if (isa<LaOp>(op))
         priority[op] = op->getUses().size() <= 1 ? -1 : 100000;
 

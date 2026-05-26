@@ -48,6 +48,16 @@ std::unordered_map<BasicBlock*, int> computeBlockHotness(Region *region,
   }
 
   for (auto bb : region->getBlocks()) {
+    // Very large straight-line blocks are usually produced by full unrolling or
+    // if-conversion.  They have no back edge left, but spilling inside them is
+    // still expensive because the generated code is hot and dense.  Model that
+    // pressure generically instead of treating such blocks as cold.
+    int opCount = bb->getOpCount();
+    if (opCount >= 256) {
+      int linearBoost = std::min(opCount / 128, 64);
+      bbWeight[bb] = std::max(bbWeight[bb], std::max(2, linearBoost));
+    }
+
     for (auto op : bb->getOps()) {
       if (!isCallLike(op))
         continue;
