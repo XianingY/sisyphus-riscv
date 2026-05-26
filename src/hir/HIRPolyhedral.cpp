@@ -288,6 +288,52 @@ bool matchStepStore(Op *op, const std::string &iv, int expectedStep) {
           isScalarLoad(rhs->children[1].get(), iv));
 }
 
+bool matchContinueStepThenBlock(const Op *op, const std::string &iv) {
+  op = unwrapSingleDecl(op);
+  if (!op || op->kind != OpKind::Block || op->children.empty())
+    return false;
+
+  bool sawStep = false;
+  bool sawContinue = false;
+  for (const auto &child : op->children) {
+    const Op *stmt = unwrapSingleDecl(child.get());
+    if (!stmt)
+      return false;
+    if (!sawStep && matchStepStore(const_cast<Op*>(stmt), iv, 1)) {
+      sawStep = true;
+      continue;
+    }
+    if (stmt->kind == OpKind::Continue) {
+      sawContinue = true;
+      continue;
+    }
+    return false;
+  }
+  return sawStep && sawContinue;
+}
+
+bool matchPrefixSkipGuard(const Op *op, const std::string &iv,
+                          std::string &limitScalar) {
+  op = unwrapSingleDecl(op);
+  if (!op || op->kind != OpKind::If || op->children.size() < 2)
+    return false;
+  const Op *cond = op->children[0].get();
+  if (!cond || cond->kind != OpKind::Cmp || cond->symbol != "<" ||
+      cond->children.size() != 2)
+    return false;
+  const Op *lhs = cond->children[0].get();
+  const Op *rhs = cond->children[1].get();
+  if (!rhs || !isScalarLoad(rhs, iv))
+    return false;
+  std::string scalar;
+  if (!isScalarLoadAny(lhs, scalar) || scalar.empty() || scalar == iv)
+    return false;
+  if (!matchContinueStepThenBlock(op->children[1].get(), iv))
+    return false;
+  limitScalar = scalar;
+  return true;
+}
+
 bool matchCanonicalWhile(Op *op, CanonicalLoop &loop) {
   if (!op || op->kind != OpKind::While || op->children.size() < 2)
     return false;
@@ -1341,6 +1387,28 @@ bool fusionWithinCacheBudget(const Op *bodyA, const Op *bodyB) {
   return estimatedFootprint <= kL1DataCacheSize;
 }
 
+bool writesScalarHere(const Op *op, const std::string &symbol) {
+  op = unwrapSingleDecl(op);
+  if (!op)
+    return false;
+  return (op->kind == OpKind::Store || op->kind == OpKind::VarDecl) &&
+         op->symbol == symbol && op->children.size() <= 1;
+}
+
+bool scalarUsedBeforeRedef(const Op *block, size_t startIdx,
+                           const std::string &symbol) {
+  if (!block || block->kind != OpKind::Block)
+    return true;
+  for (size_t i = startIdx; i < block->children.size(); i++) {
+    const Op *stmt = block->children[i].get();
+    if (writesScalarHere(stmt, symbol))
+      return false;
+    if (exprUsesScalar(stmt, symbol))
+      return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
@@ -1428,6 +1496,12 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   }
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    if (block->children[i] && block->children[i]->kind == OpKind::While &&
+        tryMonotoneGuardBoundTightening(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
     // The interior/boundary dispatcher is a general stencil transform for
     // convolution-like affine loops. It is still opt-in because cloning the
     // fast path can increase backend register pressure on large kernels.
@@ -1554,6 +1628,79 @@ bool PolyhedralOptimizer::tryStencilInteriorDispatch(Op *block, size_t idx,
   auto newWhile = makeWhile(cloneOp(whileOp->children[0].get()), std::move(dispatchedBody));
   block->children[idx] = std::move(newWhile);
   stats.stencilInteriorDispatched++;
+  return true;
+}
+
+bool PolyhedralOptimizer::tryMonotoneGuardBoundTightening(
+    Op *block, size_t idx, PolyhedralStats &stats) {
+  if (!block || block->kind != OpKind::Block || idx >= block->children.size()) {
+    stats.monotoneGuardRejected++;
+    stats.monotoneGuardRejectShape++;
+    return false;
+  }
+
+  Op *whileOp = block->children[idx].get();
+  CanonicalLoop loop;
+  if (!matchCanonicalWhile(whileOp, loop) || !loop.body ||
+      loop.body->kind != OpKind::Block || loop.body->children.size() < 2) {
+    stats.monotoneGuardRejected++;
+    stats.monotoneGuardRejectShape++;
+    return false;
+  }
+
+  std::string limitScalar;
+  if (!matchPrefixSkipGuard(loop.body->children.front().get(), loop.iv, limitScalar)) {
+    stats.monotoneGuardRejected++;
+    stats.monotoneGuardRejectShape++;
+    return false;
+  }
+
+  // The transform shortens the loop and removes the continue.  It is only
+  // semantics-preserving when the guard scalar is invariant inside the loop,
+  // and when the final value of the shortened induction variable is not used
+  // before being redefined.  In the original loop the IV would finish at the
+  // old bound; after tightening it finishes at min(oldBound, limit + 1).
+  if (bodyWritesScalar(loop.body, limitScalar) ||
+      scalarUsedBeforeRedef(block, idx + 1, loop.iv)) {
+    stats.monotoneGuardRejected++;
+    stats.monotoneGuardRejectUse++;
+    return false;
+  }
+
+  const std::string stopVar =
+      "__hir_guard_stop_" + loop.iv + "_" + std::to_string(uniqueId++);
+
+  auto stopInit = makeVarDecl(
+      stopVar,
+      makeArith("+", makeLoad(limitScalar), makeConstInt(1)));
+
+  auto clampThen = makeBlock();
+  clampThen->children.push_back(makeStore(stopVar, cloneOp(loop.bound)));
+  auto clampIf = makeIf(
+      makeCmp("<", cloneOp(loop.bound), makeLoad(stopVar)),
+      std::move(clampThen),
+      nullptr);
+
+  auto newBody = makeBlock();
+  for (size_t i = 1; i < loop.body->children.size(); i++)
+    newBody->children.push_back(cloneOp(loop.body->children[i].get()));
+  auto newWhile =
+      makeWhile(makeCmp("<", makeLoad(loop.iv), makeLoad(stopVar)),
+                std::move(newBody));
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 2);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(std::move(stopInit));
+      replacement.push_back(std::move(clampIf));
+      replacement.push_back(std::move(newWhile));
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.monotoneGuardTightened++;
   return true;
 }
 

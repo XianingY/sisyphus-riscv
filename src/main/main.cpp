@@ -320,8 +320,10 @@ int main(int argc, char **argv) {
       sys::hir::Canonicalizer canonicalizer;
       auto stats = canonicalizer.run(*hirModule);
       if (opts.verbose || opts.stats) {
-        std::cerr << "[hir] const_folded=" << stats.constFolded
-                  << " dead_branches=" << stats.deadBranchesEliminated << "\n";
+            std::cerr << "[hir] const_folded=" << stats.constFolded
+                  << " dead_branches=" << stats.deadBranchesEliminated
+                  << " simple-affine-calls-inlined=" << stats.simpleAffineCallsInlined
+                  << "\n";
       }
     });
 
@@ -415,6 +417,10 @@ int main(int argc, char **argv) {
                       << " stencil-interior-rejected=" << stats.stencilInteriorRejected
                       << " stencil-interior-reject-shape=" << stats.stencilInteriorRejectShape
                       << " stencil-interior-reject-bounds=" << stats.stencilInteriorRejectBounds
+                      << " monotone-guard-tightened=" << stats.monotoneGuardTightened
+                      << " monotone-guard-rejected=" << stats.monotoneGuardRejected
+                      << " monotone-guard-reject-shape=" << stats.monotoneGuardRejectShape
+                      << " monotone-guard-reject-use=" << stats.monotoneGuardRejectUse
                       << "\n";
           }
         });

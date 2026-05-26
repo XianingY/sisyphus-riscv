@@ -89,6 +89,13 @@ struct PolyhedralStats {
   int stencilInteriorRejected = 0;
   int stencilInteriorRejectShape = 0;
   int stencilInteriorRejectBounds = 0;
+  // Monotone guard tightening:
+  //   while (j < B) { if (i < j) { j++; continue; } body; j++; }
+  // becomes j < min(B, i + 1).  This is a general triangular-loop cleanup.
+  int monotoneGuardTightened = 0;
+  int monotoneGuardRejected = 0;
+  int monotoneGuardRejectShape = 0;
+  int monotoneGuardRejectUse = 0;
 };
 
 class PolyhedralOptimizer {
@@ -118,6 +125,7 @@ private:
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
   bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
+  bool tryMonotoneGuardBoundTightening(Op *block, size_t idx, PolyhedralStats &stats);
   std::unordered_map<std::string, Op*> functions;
 };
 
