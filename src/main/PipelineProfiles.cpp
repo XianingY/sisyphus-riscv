@@ -57,6 +57,8 @@ void appendArmBackend(sys::PassManager &pm, const sys::Options &opts, const Pipe
   pm.addPass<sys::GVN>();
   pm.addPass<sys::arm::PostIncr>();
   pm.addPass<sys::arm::ArmDCE>();
+  if (getenvEnabled("SISY_ARM_ENABLE_SCHEDULE", false))
+    pm.addPass<sys::arm::Schedule>();
   pm.addPass<sys::arm::RegAlloc>(
     plan.backendFastMode,
     plan.armRegAllocCallPenalty,
