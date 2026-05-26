@@ -76,6 +76,7 @@ void analyzeLoopBody(const Op *op, LoopBodyMetrics &metrics);
 TypeKind detectMainType(const Op *op);
 int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType);
 int computeOptimalTileSize(TypeKind mainType);
+int computeOptimalTileSize(TypeKind mainType, const Op *innerBody);
 
 bool hirEnvEnabled(const char *name, bool fallback);
 int hirEnvInt(const char *name, int fallback);

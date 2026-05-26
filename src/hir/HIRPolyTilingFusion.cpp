@@ -79,7 +79,7 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
     return false;
   }
 
-  int dynamicTileSize = computeOptimalTileSize(detectMainType(outer.body));
+  int dynamicTileSize = computeOptimalTileSize(detectMainType(outer.body), outer.body);
 
   const std::string tileIV = "__hir_tile_" + outer.iv + "_" + std::to_string(uniqueId);
   const std::string stopVar = "__hir_tile_stop_" + outer.iv + "_" + std::to_string(uniqueId);

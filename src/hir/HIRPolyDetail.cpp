@@ -84,7 +84,30 @@ int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
   return bestFactor;
 }
 
-int computeOptimalTileSize(TypeKind mainType) {
+// Round `n` down to the nearest power-of-two in [lo, hi]. Used to keep tile
+// sizes vectorization-friendly (multiples of 4 lanes) and cache-aligned.
+static int clampPow2(int n, int lo, int hi) {
+  if (n < lo) return lo;
+  if (n > hi) return hi;
+  int p = 1;
+  while ((p << 1) <= n) p <<= 1;
+  return p;
+}
+
+// Cache-aware tile size. Considers:
+//   1. SISY_HIR_TILE_SIZE env override (highest priority).
+//   2. Per-element-type byte size (4 for i32/f32, 8 for i64/f64).
+//   3. Number of distinct array streams touched in the inner body — each
+//      stream lives in its own cache way, so total tile footprint is
+//      tile * elemSize * streams.
+//   4. A fixed L1 budget (half of kL1DataCacheSize to leave room for stack
+//      slots, scalars, and conflict misses).
+//   5. Backend usable vector lane count, so the tile size stays a clean
+//      multiple of 4 lanes when fixed-128-bit SIMD eventually consumes it.
+//
+// The caller passes an optional inner-body Op. When non-null we walk it to
+// collect array-stream counts; otherwise we fall back to the type-only path.
+int computeOptimalTileSize(TypeKind mainType, const Op *innerBody) {
   const char *envRaw = std::getenv("SISY_HIR_TILE_SIZE");
   if (envRaw && envRaw[0]) {
     int val = std::atoi(envRaw);
@@ -94,10 +117,42 @@ int computeOptimalTileSize(TypeKind mainType) {
   }
   using namespace sys::backend::riscv;
 
-  int elementSize = (mainType == TypeKind::Float || mainType == TypeKind::Int) ? 4 : 8;
-  int elementsPerCacheLine = kCacheLineSize / elementSize;
-  
-  return elementsPerCacheLine * 2;
+  const int elementSize = (mainType == TypeKind::Float || mainType == TypeKind::Int) ? 4 : 8;
+  const int elementsPerCacheLine = kCacheLineSize / elementSize;
+
+  // Fall back to the original heuristic when we have no body context.
+  if (!innerBody)
+    return elementsPerCacheLine * 2;
+
+  LoopBodyMetrics metrics;
+  analyzeLoopBody(innerBody, metrics);
+  int streams = (int) (metrics.arrayReadStreams.size() + metrics.arrayWriteStreams.size());
+  if (streams <= 0) streams = 1;
+
+  // Reserve half of L1 for non-tile data: stack, scalars, conflict misses.
+  const int cacheBudgetBytes = kL1DataCacheSize / 2;
+  const int perIterFootprint = elementSize * streams;
+  const int budgetFitTile = cacheBudgetBytes / std::max(1, perIterFootprint);
+
+  // Lower bound: at least one cache line per stream so prefetchers can ramp.
+  // Upper bound: 256 (avoid pathological tile sizes that bury the outer loop).
+  const int loBound = std::max(4, elementsPerCacheLine);
+  const int hiBound = 256;
+
+  int candidate = clampPow2(budgetFitTile, loBound, hiBound);
+
+  // Further halve when the stream count is high (>=4), since real workloads
+  // commonly bring in extra associativity pressure from index registers and
+  // small lookup tables not visible in the metrics walk.
+  if (streams >= 4 && candidate > loBound)
+    candidate /= 2;
+
+  return candidate;
+}
+
+// Backward-compatible overload (older callers had no body context).
+int computeOptimalTileSize(TypeKind mainType) {
+  return computeOptimalTileSize(mainType, nullptr);
 }
 
 
