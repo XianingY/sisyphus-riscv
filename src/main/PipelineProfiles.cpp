@@ -158,7 +158,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::ArrayStrideAnalysis>();
       pm.addPass<sys::RegularFold>();
       pm.addPass<sys::DCE>();
-      if (getenvEnabled("SISY_ARM_ENABLE_LOOP_OPT", true)) {
+      if (getenvEnabled("SISY_ARM_ENABLE_LOOP_OPT", false)) {
         pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
         if (!opts.disableLoopRotate)
           pm.addPass<sys::LoopRotate>();

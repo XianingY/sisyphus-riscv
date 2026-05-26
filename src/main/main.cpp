@@ -325,7 +325,7 @@ int main(int argc, char **argv) {
       }
     });
 
-    if (!cg && opts.rv) {
+    if (!cg && (opts.rv || opts.arm)) {
       bool enableHIRPolyhedral = true;
       if (const char *env = std::getenv("SISY_DISABLE_HIR_POLYHEDRAL"))
         enableHIRPolyhedral = !(env[0] && std::strcmp(env, "0") != 0 &&
