@@ -278,14 +278,26 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::RegularFold>();
       pm.addPass<sys::DCE>();
     }
+    // Early Vectorize attempt: SCEV below strength-reduces the integer IV
+    // into a stride-N pointer phi, which Vectorize then rejects with
+    // "non-unit loop step". Run a first vectorize pass while the IV is
+    // still in its canonical `i++` form so trivial unit-stride loops
+    // (e.g. tests/vectorize/rvv_add_loop.sy) are caught. Loops that only
+    // become canonical after SCEV/DLE cleanup are picked up by the late
+    // Vectorize call below. Idempotent — already-vectorized loops no
+    // longer match the (lt phi, x) shape and are skipped.
+    const bool enableVectorize =
+        (opts.arm || opts.rv) &&
+        getenvEnabled("SISY_ENABLE_VECTORIZE", opts.enableExperimental || opts.o2);
+    if (enableVectorize && getenvEnabled("SISY_ENABLE_EARLY_VECTORIZE", true))
+      pm.addPass<sys::Vectorize>();
     pm.addPass<sys::SCEV>();
     if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", true)) {
       pm.addPass<sys::BoundsCheck>();
       pm.addPass<sys::SimplifyCFG>();
     }
     pm.addPass<sys::AggressiveDCE>();
-    if ((opts.arm || opts.rv) &&
-        getenvEnabled("SISY_ENABLE_VECTORIZE", opts.enableExperimental || opts.o2))
+    if (enableVectorize)
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::GVN>();
 
