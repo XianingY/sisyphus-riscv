@@ -640,6 +640,9 @@ std::string formatPlan(const PipelinePlan &plan) {
       << ", getarg=" << plan.metrics.getArgCount
       << ", max_getarg_arity=" << plan.metrics.maxGetArgArity
       << ", loop_depth=" << plan.metrics.maxLoopDepth
+      << ", hir_poly_applied=" << plan.metrics.hirPolyApplied
+      << ", hir_poly_tiling=" << plan.metrics.hirPolyTilingApplied
+      << ", hir_poly_affine_rejected=" << plan.metrics.hirPolyAffineRejected
       << ", complexity_score=" << complexityScore(plan.metrics)
       << ", large_module_mode=" << (plan.largeModuleMode ? "1" : "0")
       << ", huge_module_mode=" << (plan.hugeModuleMode ? "1" : "0")

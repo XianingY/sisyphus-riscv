@@ -207,6 +207,12 @@ int main(int argc, char **argv) {
   std::unique_ptr<sys::hir::Module> hirModule;
   std::unique_ptr<sys::cfg::Module> cfgModule;
 
+  // Captured from the HIR polyhedral stage and forwarded into
+  // PipelineMetrics so selectPlan / appendCoreO1 can react to the
+  // outcome (e.g. skip a redundant SCEV+GVN cleanup when nothing fired).
+  sys::hir::PolyhedralStats hirPolyStats;
+  bool hirPolyRan = false;
+
   auto runStage = [&](const char *stageName, auto &&fn) {
     auto start = std::chrono::steady_clock::now();
     fn();
@@ -337,6 +343,8 @@ int main(int argc, char **argv) {
         runStage("hir.polyhedral", [&]() {
           sys::hir::PolyhedralOptimizer polyhedral;
           auto stats = polyhedral.run(*hirModule);
+          hirPolyStats = stats;
+          hirPolyRan = true;
           if (const char *dumpAfterPoly = std::getenv("SISY_DUMP_HIR_AFTER_POLY")) {
             if (dumpAfterPoly[0] && std::strcmp(dumpAfterPoly, "0") != 0) {
               std::cerr << "===== HIR after polyhedral =====\n";
@@ -557,6 +565,33 @@ int main(int argc, char **argv) {
     for (auto *func : module->findAll<sys::FuncOp>()) {
       walkRegion(func->getRegion(), 0);
     }
+  }
+
+  // Forward HIR polyhedral outcome into pipeline metrics so the planner
+  // and the SSA pipeline can adjust cleanup intensity. Only meaningful
+  // when the polyhedral stage actually ran (RV path with the env knob on).
+  if (hirPolyRan) {
+    int applied =
+      hirPolyStats.reductionJammed +
+      hirPolyStats.reductionInterchanged +
+      hirPolyStats.conditionalReductionInterchanged +
+      hirPolyStats.repeatReduced +
+      hirPolyStats.overwriteRepeatReduced +
+      hirPolyStats.tilingApplied +
+      hirPolyStats.interchangeApplied +
+      hirPolyStats.interchange3DApplied +
+      hirPolyStats.unrollJammed +
+      hirPolyStats.fusionApplied +
+      hirPolyStats.stencilInteriorDispatched +
+      hirPolyStats.monotoneGuardTightened +
+      hirPolyStats.forwardedArrayStoreLoads;
+    int rejected =
+      hirPolyStats.affineNestRejectedShape +
+      hirPolyStats.affineNestRejectedControl +
+      hirPolyStats.affineNestRejectedAccess;
+    metrics.hirPolyApplied = applied;
+    metrics.hirPolyTilingApplied = hirPolyStats.tilingApplied;
+    metrics.hirPolyAffineRejected = rejected;
   }
 
   if (opts.dumpMidIR) {

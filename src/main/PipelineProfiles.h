@@ -29,6 +29,14 @@ struct PipelineMetrics {
   size_t getArgCount = 0;
   int maxGetArgArity = 0;
   int maxLoopDepth = 0;
+
+  // Forwarded from the HIR polyhedral stage (see PolyhedralStats). Zero
+  // when the frontend ran without HIR polyhedral or no transformation
+  // fired. Used by selectPlan / appendCoreO1 to condition downstream
+  // cleanup intensity.
+  int hirPolyApplied = 0;          // sum of all transforms that fired
+  int hirPolyTilingApplied = 0;
+  int hirPolyAffineRejected = 0;   // shape+control+access rejection sum
 };
 
 struct PipelinePlan {
