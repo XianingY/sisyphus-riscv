@@ -7,10 +7,57 @@
 
 using namespace sys;
 
+// Vectorize rejection reasons are tracked via the pass `stats()` map so the
+// pipeline runtime can observe how many candidate loops were vetoed by each
+// cost-model gate. The stat keys also serve as the canonical names of those
+// gates and double as documentation of the rejection logic.
+namespace { struct VecStats {
+  int vectorized = 0;
+  int rejectMultipleLatches = 0;
+  int rejectShape = 0;
+  int rejectStop = 0;
+  int rejectStep = 0;
+  int rejectTripCount = 0;
+  int rejectControl = 0;
+  int rejectCall = 0;
+  int rejectInductionPhi = 0;
+  int rejectPointerPhi = 0;
+  int rejectMemoryDep = 0;
+  int rejectAddress = 0;
+  int rejectStreams = 0;
+  int rejectOther = 0;
+};
+static VecStats g_vecStats;
+}
 #define VECDEBUG(msg) do { if (std::getenv("SISY_DEBUG_VECTORIZE")) std::cerr << "[vectorize] " << msg << "\n"; } while (0)
-#define VECREJECT(msg) do { VECDEBUG(msg); return; } while (0)
+#define VECREJECT_KIND(kind, msg) do { ++g_vecStats.kind; VECDEBUG(msg); return; } while (0)
+#define VECREJECT(msg) VECREJECT_KIND(rejectOther, msg)
 
 namespace {
+
+// Cost-model knobs are environment-tunable so different targets and benchmark
+// suites can experiment with thresholds without recompiling. The defaults are
+// chosen for fixed 4-lane 128-bit SIMD (RVV with vlen=128 / NEON), where two
+// vector iterations (8 scalar iters) already amortize the setup overhead.
+int vecGetenvInt(const char *name, int fallback, int minValue, int maxValue) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  char *end = nullptr;
+  long v = std::strtol(raw, &end, 10);
+  if (!end || *end != '\0' || v < minValue || v > maxValue)
+    return fallback;
+  return (int) v;
+}
+
+int vecMinFixedTripCount() {
+  return vecGetenvInt("SISY_VEC_MIN_TRIP_COUNT", 8, 4, 1024);
+}
+
+int vecMaxLoadStreams() {
+  return vecGetenvInt("SISY_VEC_MAX_LOAD_STREAMS", 4, 1, 32);
+}
+
 
 std::vector<Value> vecValues(std::initializer_list<Value> values) {
   return std::vector<Value>(values);
@@ -353,7 +400,7 @@ void Vectorize::runImpl(LoopInfo *info) {
   base.clear();
 
   if (info->latches.size() > 1)
-    VECREJECT("multiple latches");
+    VECREJECT_KIND(rejectMultipleLatches, "multiple latches");
 
   auto header = info->header;
   auto latch = info->getLatch();
@@ -364,17 +411,17 @@ void Vectorize::runImpl(LoopInfo *info) {
       if (info->latches.count(pred))
         continue;
       if (preheader)
-        VECREJECT("multiple external header predecessors");
+        VECREJECT_KIND(rejectShape, "multiple external header predecessors");
       preheader = pred;
     }
     if (!preheader)
-      VECREJECT("missing external header predecessor");
+      VECREJECT_KIND(rejectShape, "missing external header predecessor");
     info->preheader = preheader;
   }
 
   // The loop must be rotated.
   if (!isa<BranchOp>(latch->getLastOp()))
-    VECREJECT("latch terminator is not branch");
+    VECREJECT_KIND(rejectShape, "latch terminator is not branch");
 
   auto latchterm = latch->getLastOp();
   auto phis = header->getPhis();
@@ -425,25 +472,26 @@ void Vectorize::runImpl(LoopInfo *info) {
 
   // The loop must have a stop (in order to unroll below).
   if (!info->stop)
-    VECREJECT("missing loop stop");
+    VECREJECT_KIND(rejectStop, "missing loop stop");
 
   // This pass widens four i32 lanes at a time. Non-unit scalar IV steps need
   // a separate lane-address construction to stay correct.
   if (!info->step || !isConstInt(info->step, 1))
-    VECREJECT("non-unit loop step");
+    VECREJECT_KIND(rejectStep, "non-unit loop step");
 
   // A fixed tiny loop does not amortize RVV/NEON setup and can be handled
-  // better by scalar unrolling or straight scalar code.
-  constexpr int kMinFixedTripCount = 16;
+  // better by scalar unrolling or straight scalar code. The threshold is
+  // tunable via SISY_VEC_MIN_TRIP_COUNT to allow experimentation per workload.
+  const int kMinFixedTripCount = vecMinFixedTripCount();
   int fixedTrip = fixedTripCount(info);
   if (fixedTrip > 0 && fixedTrip < kMinFixedTripCount)
-    VECREJECT("fixed trip count too small");
+    VECREJECT_KIND(rejectTripCount, "fixed trip count too small");
 
   // Ensure no branching except for the latch.
   for (auto bb : info->getBlocks()) {
     auto term = bb->getLastOp();
     if (isa<BranchOp>(term) && bb != latch) {
-      VECREJECT("branching block inside loop is not latch");
+      VECREJECT_KIND(rejectControl, "branching block inside loop is not latch");
     }
   }
 
@@ -451,7 +499,7 @@ void Vectorize::runImpl(LoopInfo *info) {
   for (auto bb : info->getBlocks()) {
     for (auto op : bb->getOps()) {
       if (isa<CallOp>(op))
-        VECREJECT("call inside loop");
+        VECREJECT_KIND(rejectCall, "call inside loop");
     }
   }
 
@@ -478,21 +526,21 @@ void Vectorize::runImpl(LoopInfo *info) {
 
     if (phi == info->induction) {
       if (!isa<AddIOp>(latchval) || latchval->DEF(0) != phi || !isConstInt(latchval->DEF(1), 1))
-        VECREJECT("induction phi is not addi + 1");
+        VECREJECT_KIND(rejectInductionPhi, "induction phi is not addi + 1");
       continue;
     }
 
     if (!isa<AddLOp>(latchval)) {
       // Other phi nodes cannot easily get mutated.
-      VECREJECT("unsupported non-induction phi");
+      VECREJECT_KIND(rejectPointerPhi, "unsupported non-induction phi");
     }
 
     auto base = findBase(latchval);
     if (!base || !isa<IntOp>(latchval->DEF(1)) || V(latchval->DEF(1)) != 4)
-      VECREJECT("pointer phi is not stride-4");
+      VECREJECT_KIND(rejectPointerPhi, "pointer phi is not stride-4");
 
     if (bases.count(base))
-      VECREJECT("duplicate pointer phi base");
+      VECREJECT_KIND(rejectPointerPhi, "duplicate pointer phi base");
     bases.insert(base);
   }
 
@@ -520,13 +568,14 @@ void Vectorize::runImpl(LoopInfo *info) {
 
   // Accessed unknown places.
   if (stored.count(nullptr) || loaded.count(nullptr))
-    VECREJECT("unknown memory base");
+    VECREJECT_KIND(rejectAddress, "unknown memory base");
 
   // Keep the loop vectorizer from creating more live vector loads than the
-  // current backends are prepared to schedule cheaply.
-  constexpr int kMaxVectorLoadStreams = 4;
+  // current backends are prepared to schedule cheaply. The cap is tunable via
+  // SISY_VEC_MAX_LOAD_STREAMS for backends with deeper vector register files.
+  const int kMaxVectorLoadStreams = vecMaxLoadStreams();
   if ((int) loads.size() > kMaxVectorLoadStreams)
-    VECREJECT("too many vector load streams");
+    VECREJECT_KIND(rejectStreams, "too many vector load streams");
 
   for (auto load : loads) {
     auto loadBase = findBase(load->DEF(0));
@@ -546,14 +595,14 @@ void Vectorize::runImpl(LoopInfo *info) {
     }
 
     if (!sameLaneUpdate)
-      VECREJECT("loop-carried memory dependence");
+      VECREJECT_KIND(rejectMemoryDep, "loop-carried memory dependence");
   }
 
   // Ensure we only read/store to those phis.
   std::unordered_set<Op*> phiset(phis.begin(), phis.end());
   for (auto x : addrs) {
     if (!phiset.count(x) && !indexedBase(x))
-      VECREJECT("memory address is not vectorizable");
+      VECREJECT_KIND(rejectAddress, "memory address is not vectorizable");
   }
 
   // Start rewriting.
@@ -883,6 +932,7 @@ void Vectorize::runImpl(LoopInfo *info) {
   }
 
   if (!success) {
+    ++g_vecStats.rejectOther;
     // Undo operations.
     VECDEBUG("undo for loop " << bbmap[info->header]);
     for (auto op : created)
@@ -893,6 +943,7 @@ void Vectorize::runImpl(LoopInfo *info) {
   }
 
   // Success.
+  ++g_vecStats.vectorized;
   VECDEBUG("success, vectorized loop " << bbmap[info->header]);
 
   // Create a side loop.
@@ -1036,7 +1087,27 @@ void Vectorize::runImpl(LoopInfo *info) {
   }
 }
 
+std::map<std::string, int> Vectorize::stats() {
+  std::map<std::string, int> out;
+  if (g_vecStats.vectorized)              out["vectorized-loops"]      = g_vecStats.vectorized;
+  if (g_vecStats.rejectMultipleLatches)   out["reject-multi-latch"]    = g_vecStats.rejectMultipleLatches;
+  if (g_vecStats.rejectShape)             out["reject-shape"]          = g_vecStats.rejectShape;
+  if (g_vecStats.rejectStop)              out["reject-stop"]           = g_vecStats.rejectStop;
+  if (g_vecStats.rejectStep)              out["reject-step"]           = g_vecStats.rejectStep;
+  if (g_vecStats.rejectTripCount)         out["reject-trip-count"]     = g_vecStats.rejectTripCount;
+  if (g_vecStats.rejectControl)           out["reject-control"]        = g_vecStats.rejectControl;
+  if (g_vecStats.rejectCall)              out["reject-call"]           = g_vecStats.rejectCall;
+  if (g_vecStats.rejectInductionPhi)      out["reject-induction-phi"]  = g_vecStats.rejectInductionPhi;
+  if (g_vecStats.rejectPointerPhi)        out["reject-pointer-phi"]    = g_vecStats.rejectPointerPhi;
+  if (g_vecStats.rejectMemoryDep)         out["reject-mem-dep"]        = g_vecStats.rejectMemoryDep;
+  if (g_vecStats.rejectAddress)           out["reject-address"]        = g_vecStats.rejectAddress;
+  if (g_vecStats.rejectStreams)           out["reject-streams"]        = g_vecStats.rejectStreams;
+  if (g_vecStats.rejectOther)             out["reject-other"]          = g_vecStats.rejectOther;
+  return out;
+}
+
 void Vectorize::run() {
+  g_vecStats = VecStats{};
   LoopAnalysis analysis(module);
   analysis.run();
   auto forests = analysis.getResult();

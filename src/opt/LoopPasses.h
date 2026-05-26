@@ -393,7 +393,7 @@ public:
   Vectorize(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "vectorize"; }
-  std::map<std::string, int> stats() override { return {}; }
+  std::map<std::string, int> stats() override;
   void run() override;
 };
 
