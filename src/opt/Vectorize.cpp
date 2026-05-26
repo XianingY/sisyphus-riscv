@@ -435,37 +435,58 @@ void Vectorize::runImpl(LoopInfo *info) {
     Rule addl("(addl x y)");
     Rule addi("(add x y)");
 
-    for (auto phi : phis) {
+    // Try-bind one phi as the induction. Returns true on success.
+    // `unitStepOnly` restricts the match to canonical `addi x 1` integer IVs;
+    // when false, falls back to any addi/addl with a valid step.
+    auto tryBind = [&](Op *phi, bool unitStepOnly) -> bool {
       auto def1 = Op::getPhiFrom(phi, info->preheader);
       auto def2 = Op::getPhiFrom(phi, latch);
 
-      bool matchedAddL = addl.match(def2, { { "x", phi } });
+      bool matchedAddL = !unitStepOnly && addl.match(def2, { { "x", phi } });
       bool matchedAddI = !matchedAddL && addi.match(def2, { { "x", phi } });
-      if (matchedAddL || matchedAddI) {
-        auto step = matchedAddL ? addl.extract("y") : addi.extract("y");
+      if (!matchedAddL && !matchedAddI)
+        return false;
 
-        if (!isa<IntOp>(step) && !step->getParent()->dominates(info->preheader))
-          continue;
-        if (isa<LoadOp>(step))
-          continue;
-        
-        info->induction = phi;
-        info->start = def1;
-        info->step = step;
+      auto step = matchedAddL ? addl.extract("y") : addi.extract("y");
 
-        auto term = latch->getLastOp();
-        if (brRotatedL.match(term, { { "x", info->induction } })) {
-          info->stop = brRotatedL.extract("y");
-          break;
-        }
-        if (brRotatedI.match(term, { { "x", info->induction } })) {
-          info->stop = brRotatedI.extract("y");
-          break;
-        }
-        if (brI.match(term, { { "x", def2 } })) {
-          info->stop = brI.extract("y");
-          break;
-        }
+      if (!isa<IntOp>(step) && !step->getParent()->dominates(info->preheader))
+        return false;
+      if (isa<LoadOp>(step))
+        return false;
+      if (unitStepOnly && !isConstInt(step, 1))
+        return false;
+
+      auto term = latch->getLastOp();
+      Op *stop = nullptr;
+      if (brRotatedL.match(term, { { "x", phi } }))
+        stop = brRotatedL.extract("y");
+      else if (brRotatedI.match(term, { { "x", phi } }))
+        stop = brRotatedI.extract("y");
+      else if (brI.match(term, { { "x", def2 } }))
+        stop = brI.extract("y");
+      if (!stop)
+        return false;
+
+      info->induction = phi;
+      info->start = def1;
+      info->step = step;
+      info->stop = stop;
+      return true;
+    };
+
+    // Pass 1: prefer the canonical integer IV with const step 1. SCEV /
+    // strength-reduction can introduce a stride-N pointer phi alongside the
+    // original integer IV; without this preference, scanning order may pick
+    // the pointer phi and downstream code rejects with "non-unit loop step".
+    bool bound = false;
+    for (auto phi : phis) {
+      if (tryBind(phi, /*unitStepOnly=*/true)) { bound = true; break; }
+    }
+
+    // Pass 2: fall back to any addi/addl with a valid step (original logic).
+    if (!bound) {
+      for (auto phi : phis) {
+        if (tryBind(phi, /*unitStepOnly=*/false)) break;
       }
     }
   }
