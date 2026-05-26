@@ -232,7 +232,7 @@ bool canInlineRecursive(FuncOp *func) {
     return false;
 
   auto shape = analyzeInlineShape(func);
-  if (shape.opcount >= 48)
+  if (shape.opcount >= envIntClamped("SISY_RECURSIVE_INLINE_MAX_OPS", 96, 16, 256))
     return false;
   if (shape.selfCalls == 0 || shape.selfCalls > 2)
     return false;
@@ -295,7 +295,7 @@ void Inline::run() {
 
   if (envEnabled("SISY_ENABLE_RECURSIVE_INLINE", true)) {
     int maxDepth = envIntClamped("SISY_RECURSIVE_INLINE_DEPTH", 2, 1, 4);
-    int maxCalls = envIntClamped("SISY_RECURSIVE_INLINE_BUDGET", 48, 1, 256);
+    int maxCalls = envIntClamped("SISY_RECURSIVE_INLINE_BUDGET", 2, 1, 256);
     int usedCalls = 0;
 
     for (int depth = 0; depth < maxDepth && usedCalls < maxCalls; depth++) {
