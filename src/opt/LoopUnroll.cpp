@@ -130,6 +130,27 @@ bool avoidFullUnrollForPressure(LoopInfo *loop, int trip, int loopsize, size_t p
   return branches >= 2 && loopsize * trip > 1400;
 }
 
+bool allowPressureSensitiveFactorUnroll(LoopInfo *loop, int factor,
+                                        int loopsize, size_t phiCount) {
+  if (!loop || factor <= 1)
+    return false;
+  if (loopHasCall(loop))
+    return false;
+
+  // Generic low-risk case: a tiny branch-light kernel with several carried
+  // scalars.  Full unroll would create a large live range fan-out, but guarded
+  // 2x unrolling usually cuts loop-control overhead without blowing pressure.
+  if (phiCount > 6)
+    return false;
+  if (loopsize <= 0 || loopsize * factor > 160)
+    return false;
+  if (loopMemoryCount(loop) > 1)
+    return false;
+  if (loopBranchCount(loop) > 2)
+    return false;
+  return true;
+}
+
 bool tryRotateSmallConstantLoop(LoopInfo *info) {
   if (!info || !info->preheader || info->latches.size() != 1 ||
       info->exits.size() != 1 || !info->getInduction())
@@ -727,8 +748,17 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     // driver.  For pressure-sensitive constant loops the profitable choice is
     // to keep the compact loop form instead of growing the CFG again.
     if (fixedTripCandidate > 0 &&
-        avoidFullUnrollForPressure(loop, fixedTripCandidate, loopsize, phis.size()))
+        avoidFullUnrollForPressure(loop, fixedTripCandidate, loopsize, phis.size())) {
+      int pressureFactor =
+          envIntClamped("SISY_PRESSURE_SENSITIVE_UNROLL_FACTOR", 2, 2, 4);
+      if (allowPressureSensitiveFactorUnroll(loop, pressureFactor, loopsize,
+                                             phis.size()) &&
+          tryFactorUnroll(loop, pressureFactor)) {
+        factorUnrolled++;
+        return true;
+      }
       return false;
+    }
 
     int factor = envIntClamped("SISY_FACTOR_UNROLL_FACTOR", 4, 2, 8);
     if (tryFactorUnroll(loop, factor)) {
@@ -815,7 +845,7 @@ bool ConstLoopUnroll::tryFactorUnroll(LoopInfo *loop, int factor) {
     return false;
 
   auto phis = header->getPhis();
-  if (phis.size() >= 5)
+  if (phis.size() > 6)
     return false;
 
   phiMap.clear();
