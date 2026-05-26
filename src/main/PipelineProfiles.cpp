@@ -156,10 +156,41 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::FlattenCFG>();
       pm.addPass<sys::GVN>();
       pm.addPass<sys::DCE>();
+      if (getenvEnabled("SISY_ARM_ENABLE_SMALL_INLINE", true)) {
+        int armInlineThreshold =
+          getenvPositive("SISY_ARM_SMALL_INLINE_THRESHOLD", 200, 8, 512);
+        pm.addPass<sys::Inline>(armInlineThreshold);
+        pm.addPass<sys::DCE>();
+      }
       pm.addPass<sys::Mem2Reg>();
+      if (getenvEnabled("SISY_ENABLE_SCCP", true)) {
+        pm.addPass<sys::SCCP>();
+        pm.addPass<sys::DCE>();
+        pm.addPass<sys::SimplifyCFG>();
+      }
       pm.addPass<sys::ArrayStrideAnalysis>();
+      pm.addPass<sys::Alias>();
       pm.addPass<sys::RegularFold>();
       pm.addPass<sys::DCE>();
+      if (getenvEnabled("SISY_ARM_ENABLE_SAFE_MEMORY_CLEANUP", true)) {
+        pm.addPass<sys::DSE>();
+        pm.addPass<sys::DLE>();
+        pm.addPass<sys::GVN>();
+        pm.addPass<sys::RegularFold>();
+        pm.addPass<sys::DCE>();
+      }
+      if (getenvEnabled("SISY_ARM_ENABLE_RANGE_FOLD", true)) {
+        pm.addPass<sys::Range>();
+        pm.addPass<sys::EqClass>();
+        pm.addPass<sys::RangeAwareFold>();
+        pm.addPass<sys::RegularFold>();
+        pm.addPass<sys::DCE>();
+      }
+      if (getenvEnabled("SISY_ARM_ENABLE_VECTORIZE", false)) {
+        pm.addPass<sys::Vectorize>();
+        pm.addPass<sys::GVN>();
+        pm.addPass<sys::DCE>();
+      }
       if (getenvEnabled("SISY_ARM_ENABLE_LOOP_OPT", false)) {
         pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
         if (!opts.disableLoopRotate)
@@ -182,6 +213,11 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       }
       pm.addPass<sys::SimplifyCFG>();
       pm.addPass<sys::DCE>();
+      if (getenvEnabled("SISY_ARM_ENABLE_SELECT", true)) {
+        pm.addPass<sys::Select>();
+        pm.addPass<sys::SimplifyCFG>();
+        pm.addPass<sys::DCE>();
+      }
       pm.addPass<sys::InstSchedule>();
       return;
     }
