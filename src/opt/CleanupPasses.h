@@ -47,6 +47,7 @@ public:
 class DLE : public Pass {
   int elim = 0;
   int readonlyCallsRetained = 0;
+  int memorySsaForwarded = 0;
   std::map<std::string, FuncOp*> fnMap;
 
   void runImpl(Region *region);

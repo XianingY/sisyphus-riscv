@@ -1,4 +1,5 @@
 #include "CleanupPasses.h"
+#include "MemorySSA.h"
 
 using namespace sys;
 
@@ -25,6 +26,18 @@ bool sameMemoryValue(StoreOp *a, StoreOp *b) {
   if (!sameStoredValue(a->DEF(0), b->DEF(0)))
     return false;
   return mustAlias(STORE_ADDR(a), STORE_ADDR(b)) || STORE_ADDR(a) == STORE_ADDR(b);
+}
+
+bool sameLoadStoreSlot(LoadOp *load, StoreOp *store) {
+  if (!load || !store)
+    return false;
+  if (store->DEF(0)->getResultType() != load->getResultType())
+    return false;
+  if (store->has<SizeAttr>() && load->has<SizeAttr>() && SIZE(store) != SIZE(load))
+    return false;
+  auto loadAddr = LOAD_ADDR(load);
+  auto storeAddr = STORE_ADDR(store);
+  return loadAddr == storeAddr || mustAlias(loadAddr, storeAddr);
 }
 
 std::vector<StoreOp*> commonStores(const std::set<BasicBlock*> &preds,
@@ -319,11 +332,34 @@ Op *tryMaterializeReachingStorePhi(Builder &builder, BasicBlock *bb, LoadOp *loa
   return materializeEdgePhi(builder, bb, incoming);
 }
 
+Op *tryForwardMemorySSALoad(Builder &builder, MemorySSA &mssa, LoadOp *load) {
+  if (!load)
+    return nullptr;
+
+  auto clobbers = mssa.getClobberingDefs(load);
+  std::set<MemoryAccess*> unique(clobbers.begin(), clobbers.end());
+  if (unique.size() != 1)
+    return nullptr;
+
+  auto *access = *unique.begin();
+  auto store = access ? dyn_cast<StoreOp>(access->op) : nullptr;
+  if (!sameLoadStoreSlot(load, store))
+    return nullptr;
+
+  auto storeBlock = store->getParent();
+  auto loadBlock = load->getParent();
+  if (!storeBlock || !loadBlock || !storeBlock->dominates(loadBlock))
+    return nullptr;
+
+  return materializeDominatingValue(builder, load, store->DEF(0));
+}
+
 }
 
 std::map<std::string, int> DLE::stats() {
   return {
     { "removed-loads", elim },
+    { "memory-ssa-forwarded", memorySsaForwarded },
     { "readonly-calls-retained", readonlyCallsRetained },
   };
 }
@@ -468,6 +504,25 @@ void DLE::runImpl(Region *region) {
           }
         }
       }
+    }
+  }
+
+  region->updateDoms();
+  MemorySSA memorySSA(region);
+  memorySSA.build();
+  for (auto bb : region->getBlocks()) {
+    auto ops = bb->getOps();
+    for (auto op : ops) {
+      auto load = dyn_cast<LoadOp>(op);
+      if (!load)
+        continue;
+      auto replacement = tryForwardMemorySSALoad(builder, memorySSA, load);
+      if (!replacement)
+        continue;
+      load->replaceAllUsesWith(replacement);
+      load->erase();
+      elim++;
+      memorySsaForwarded++;
     }
   }
 
