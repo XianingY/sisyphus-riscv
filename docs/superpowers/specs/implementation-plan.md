@@ -1,5 +1,8 @@
 # Sisyphus 深度优化实施方案
 
+> **历史草案**：本文档保留早期优化设想和实施拆解，可能包含已经过时的默认开关、性能数字或状态描述。
+> 当前事实请以源码、`docs/Compliance.md`、`docs/Optimization.md` 和 `docs/superpowers/status.md` 为准。
+
 ## 执行摘要
 
 本文档是 `docs/superpowers/specs/2026-05-10-deep-optimization-design.md` 的实施细化方案，将设计文档中的9个优化模块转化为具体的代码实现计划。

@@ -1,20 +1,115 @@
-# Compliance Notes
+# Compliance Policy
 
-- This project is implemented as a standalone codebase in `sisyphus`.
-- `base` and `biframe` are used as design references for architecture and optimization ideas.
-- Any generated or AI-assisted edits should be documented in commit messages or code review notes with impacted file paths.
-- Do not perform testcase-specific optimizations. Passes must remain semantics-preserving and input-agnostic.
-- The default RISC-V profile keeps general optimizations enabled, but high-risk
-  semantic or structural recognizers are strict-mode opt-in only. Use
-  `SISY_ENABLE_*` switches for explicit comparison runs instead of editing pass
-  code during validation.
-- Compile-time recursive precomputation, structural bitwise/modmul recognition,
-  row-scratch matrix helper replacement, and SMT synthesized constant arrays
-  must remain disabled by default. Prefer runtime memoization, affine loop
-  transforms, scalar replacement, DSE/DLE, SCEV, and ordinary algebraic folds.
-- Keep generated outputs under ignored directories such as `tests/.out/`,
-  `build/`, `build-linux/`, or `output/`. Do not commit local assembly dumps,
-  logs, `.DS_Store`, or temporary files.
+This document is the source of truth for optimization legality in this
+repository. It describes what is acceptable in the default compiler profile and
+which existing experimental passes must stay opt-in.
 
-See `docs/Optimization.md` for the optimization legality checklist and
-`docs/Commands.md` for the current verification commands.
+Last reviewed: 2026-05-27.
+
+## Core Rule
+
+Every default optimization must be a semantics-preserving compiler
+transformation over the program IR. It must not depend on benchmark identity,
+source filename, output hash, public input data, final answer shape, or a magic
+combination of constants that only describes one contest case.
+
+Acceptable triggers are program properties such as:
+
+- dominance, SSA use-def facts, constant values from the source program, and
+  value ranges proven by analysis;
+- alias/noalias facts, readonly/pure call properties, and MemorySSA-style
+  reaching definitions;
+- affine loop domains, dependence directions, and Presburger feasibility
+  results;
+- target-independent algebraic identities and target-specific instruction
+  peepholes that preserve ISA semantics for all inputs.
+
+Rejected triggers include:
+
+- test names such as `fft`, `huffman`, `conv2d`, `many_mat_cal`, or local
+  source paths;
+- fixed dimensions used as fingerprints, such as a transform that only exists
+  because a public case uses one matrix size;
+- interpreting a program at compile time to materialize hidden runtime answers;
+- replacing a whole algorithm with a helper unless the helper is a general
+  runtime primitive and the replacement is proven valid from IR semantics;
+- any dependence on output checksums, timing loops, grader behavior, or known
+  public input values.
+
+## Default-Allowed Optimization Families
+
+These are the preferred places to improve performance:
+
+- SSA cleanup: `Mem2Reg`, copy propagation, `GVN`, `DCE`, `SCCP`,
+  `RangeAwareFold`, `EqClass`, branch simplification, and ordinary CFG cleanup.
+- Memory optimization: alias-aware `DSE`/`DLE`, load forwarding, readonly/pure
+  call handling, scalar replacement, and conservative MemorySSA side tables.
+- Loop optimization: loop canonicalization, LICM, SCEV/LSR, generic unrolling,
+  fusion, interchange, tiling, unroll-and-jam, reduction privatization, and
+  vectorization when legality follows from affine/dependence analysis.
+- Recursion optimization: tail-call elimination and runtime memoization of
+  proven pure recursive functions. Runtime memoization is allowed because all
+  cache entries are computed at runtime for the actual input.
+- Backend optimization: register allocation hotness/spill heuristics,
+  rematerialization, instruction scheduling, target peepholes, address-mode
+  folding, and legal strength reduction.
+
+## Strict-Mode Or Experimental Only
+
+The following passes may exist in the tree for experiments and A/B comparison,
+but must remain disabled in default contest profiles unless they are redesigned
+with a written, general legality proof:
+
+| Pass or feature | Default | Compliance concern |
+| --- | --- | --- |
+| `FunctionEquivalence` | off | Uses compile-time sampling/interpreter checks to replace whole pure functions with known operations. |
+| `StructuralBitwise` | off | Recognizes software-emulated bitwise algorithms and replaces them directly. |
+| `StructuralModMul` | off | Recognizes recursive modular multiplication and replaces it directly. |
+| `RowScratchMatmul` | off | Replaces recognized matrix multiplication with a helper implementation. |
+| `Cached` / compile-time precompute | off | Can materialize compile-time results into the binary. |
+| `SynthConstArray` | off | Uses SMT-style synthesis for constant-array values. |
+| `AdvancedConv2DTransform` / Winograd or im2col dispatcher | off | Safe only after a general affine/padding legality proof; otherwise too close to algorithm-specific lowering. |
+| HIR stencil interior dispatcher | off unless explicitly enabled | Can be valid, but only as a general guarded-loop transform, not a conv2d fingerprint. |
+
+Current environment switches for these features are documented in
+`docs/Commands.md`. Prefer disabling/enabling by environment variable for
+diagnosis rather than editing source defaults during a performance experiment.
+
+## Current Default Direction
+
+The active RISC-V path should prefer:
+
+- affine legality improvements in `HIRAffine`/`HIRPolyhedral`;
+- generic 2D/3D tiling and dependence-preserving interchange;
+- spill-aware register allocation and pre-RA scheduling;
+- range-driven `/2`, `%2`, and power-of-two folds;
+- branch-to-select conversion when CFG and SSA conditions are proven;
+- MemorySSA-backed LICM, DLE, and DSE.
+
+For CRC, Huffman, FFT, convolution, matrix multiplication, transpose, and
+scheduling workloads, the acceptable path is to expose and optimize the
+underlying IR structure. Do not restore semantic recognizers just because they
+produce a better score.
+
+## Review Checklist
+
+Before enabling or committing an optimization:
+
+1. Write the legality argument in the commit message or a nearby design note.
+2. Confirm the pass does not mention benchmark names, source paths, expected
+   outputs, or public-case-only constants.
+3. Confirm every memory transform has an alias/side-effect proof or cleanly
+   bails out.
+4. Confirm signed overflow, division, modulo, shifts, float semantics, and
+   runtime calls are preserved under this compiler's IR rules.
+5. Add or keep an environment kill switch for new risky transforms.
+6. Run affected cases plus unrelated regression probes.
+7. Keep generated files under ignored paths such as `build/`, `build-linux/`,
+   `tests/.out/`, and `output/`.
+
+## Documentation Hygiene
+
+Historical planning notes under `docs/superpowers/` and `docs/goal.md` are
+useful design references, but they are not authoritative. When they conflict
+with this file or with `src/main/PipelineProfiles.cpp`, the code and this
+compliance policy win.

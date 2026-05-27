@@ -118,11 +118,24 @@ semantic or structural recognizers are strict-mode opt-in, while ordinary
 generic passes keep bisection kill switches. Examples:
 
 ```bash
-SISY_ENABLE_FUNCTION_EQUIVALENCE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_HIR_ENABLE_REDUCTION_PRIVATIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+```
+
+Strict-mode comparison switches:
+
+```bash
+SISY_ENABLE_FUNCTION_EQUIVALENCE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_STRUCTURAL_BITWISE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_SYNTH_CONST_ARRAY=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_ADVANCED_CONV2D=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
+
+Do not use the strict-mode switches as submission defaults without updating
+`docs/Compliance.md` with a general legality argument and running a broad
+correctness sweep.

@@ -39,6 +39,15 @@ Default frontend path is dialect-based:
 - Stage boundaries emit timing with `--dump-pass-timing` as `[stage-timing] ...`
 - Legacy frontend remains available with `--use-legacy-codegen` for A/B rollback during migration
 
+The key architectural split is intentional:
+
+- HIR keeps structured loops and array accesses visible long enough for affine
+  analysis and loop rewrites.
+- CFG provides explicit control-flow for SSA, MemorySSA-style analysis,
+  scalar optimization, and verifier checks.
+- The legacy `ModuleOp` adapter lets the mature mid-end and backends continue
+  to operate while the dialect pipeline is incrementally expanded.
+
 ### O0 (stable baseline)
 
 - MoveAlloca
@@ -65,6 +74,22 @@ Default frontend path is dialect-based:
 - Tail stage: add one more `CanonicalizeLoop -> LICM -> SCEV -> GVN -> RegularFold`
 - `Cached` remains experimental-only (`--enable-experimental`)
 - Defaults: inline/late-inline thresholds are `256/256` unless explicitly overridden; loop-rotate is off by default for O1/O2 (can be manually enabled)
+
+### Compliance Boundary In The Pipeline
+
+Default O1/O2 should only enable general compiler transformations. Semantic
+whole-function recognizers and algorithm helper replacements are strict-mode
+experiments, not architectural requirements. The intended optimization stack is:
+
+- HIR: affine loop legality, reduction privatization, fusion/interchange,
+  guarded-loop simplification, and optional tiling after dependence proof.
+- CFG/mid-end: SSA, MemorySSA-style load/store reasoning, alias analysis, LICM,
+  DSE/DLE, SCCP/range folds, SCEV, inlining, and select conversion.
+- Backend: target lowering, instruction scheduling, hotness-aware register
+  allocation, rematerialization-friendly decisions, and peepholes.
+
+See `docs/Compliance.md` for pass families that must remain disabled by
+default.
 
 ## Backends
 

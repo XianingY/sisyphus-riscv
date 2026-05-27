@@ -108,9 +108,9 @@ High-level source layout:
 - `src/codegen/`: legacy IR data model (`ModuleOp`/ops/attrs) and legacy AST-to-IR lowering.
 - `src/pre-opt/`: early structured/CFG cleanup passes such as alloca movement, const folding, loop raising, CFG flattening, and mem2reg.
 - `src/opt/`: mid-level optimization passes such as alias analysis, DSE/DLE, GVN, LICM, inlining, loop transforms, range folding, vectorization, and pass management.
-- `src/pass/`: pass registry and pipeline-facing pass APIs; keep pass ordering centralized in pipeline profile code.
+- `src/pass/`: thin forwarding header (`PassRegistry.h`) that re-exports `PassManager` and `PipelineProfiles`; actual pass ordering is centralized in `src/main/PipelineProfiles.cpp`.
 - `src/rv/` and `src/arm/`: current RISC-V and ARM backend lowering, scheduling, register allocation, and assembly dumping.
-- `src/backend/`: shared and newer backend organization for target-specific code.
+- `src/backend/`: thin architecture-boundary facade headers (`BackendPasses.h` per target, `RegAllocHotness.h` shared utility, `RiscvParams.h` hardware constants); primary implementation still lives in `src/rv/` and `src/arm/`.
 - `src/utils/`: common utilities, including Presburger/SMT helpers used by loop and affine analyses.
 - `runtime/`: SysY runtime library used by runtime evaluation scripts.
 
@@ -120,19 +120,31 @@ High-level source layout:
 - **O1**: O0 plus structured CFG optimization, alias analysis, DSE/DLE, GVN, LICM, and inlining.
 - **O2**: O1 plus more aggressive loop, range, splice, vectorization, and tail optimization rounds.
 
-Before changing pipeline defaults, read `docs/Commands.md` and `docs/Optimization.md`. Optimizations must be general compiler transformations over IR and must not depend on benchmark names, source filenames, public test identity, expected output formats, or magic constants unique to a case.
+Before changing pipeline defaults, read `docs/Compliance.md`, `docs/Commands.md`, and `docs/Optimization.md`. Optimizations must be general compiler transformations over IR and must not depend on benchmark names, source filenames, public test identity, expected output formats, hidden inputs, or magic constants unique to a case.
+
+The default profile should prefer SSA, MemorySSA-style load/store reasoning,
+alias/noalias proofs, affine dependence analysis, range/SCEV folds,
+vectorization legality, register-allocation hotness, scheduling, and target
+peepholes. Do not enable semantic whole-function recognizers or algorithm
+helper replacements as a default scoring path.
 
 Common bisection switches:
 
 ```bash
-SISY_ENABLE_FUNCTION_EQUIVALENCE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_STRUCTURAL_MODMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_ROW_SCRATCH_MATMUL=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
-SISY_ENABLE_CACHED_PRECOMPUTE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_FUNCTION_EQUIVALENCE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_BITWISE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_SYNTH_CONST_ARRAY=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
+SISY_ENABLE_ADVANCED_CONV2D=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
+
+The switches set to `1` above are strict-mode/experiment toggles, not default
+submission guidance.
 
 ## Dual-Target Submission
 

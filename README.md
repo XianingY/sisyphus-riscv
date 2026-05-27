@@ -203,6 +203,21 @@ Legacy public-suite repos (`open-test-cases`, `compiler-dev-test-cases`, `lvx`) 
 - `docs/Commands.md`
 - `docs/Optimization.md`
 
+## Optimization And Compliance
+
+Default optimization profiles are intended to be general compiler profiles, not
+benchmark recognizers. High-risk semantic recognizers such as function
+equivalence sampling, structural bitwise/modmul replacement, row-scratch matrix
+helper replacement, compile-time recursive precompute, synthesized constant
+arrays, and advanced conv2d dispatch are disabled by default and should only be
+used for explicit comparison runs.
+
+Preferred optimization work should go through ordinary IR facts: SSA,
+MemorySSA-style reaching definitions, alias/noalias proofs, affine loop
+dependence, range analysis, SCEV, vector legality, register allocation hotness,
+and target peepholes. See `docs/Compliance.md` for the required legality
+boundary before changing defaults.
+
 ## Notes
 
 This repository is built as a standalone implementation. Other repositories are used only as design references.
