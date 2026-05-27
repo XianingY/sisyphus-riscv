@@ -286,9 +286,13 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // become canonical after SCEV/DLE cleanup are picked up by the late
     // Vectorize call below. Idempotent — already-vectorized loops no
     // longer match the (lt phi, x) shape and are skipped.
+    const bool polyVectorize =
+        opts.rv && plan.metrics.hirPolyApplied > 0 &&
+        getenvEnabled("SISY_ENABLE_POLY_VECTORIZE", true);
     const bool enableVectorize =
         (opts.arm || opts.rv) &&
-        getenvEnabled("SISY_ENABLE_VECTORIZE", opts.enableExperimental || opts.o2);
+        getenvEnabled("SISY_ENABLE_VECTORIZE",
+                      opts.enableExperimental || opts.o2 || polyVectorize);
     if (enableVectorize && getenvEnabled("SISY_ENABLE_EARLY_VECTORIZE", true))
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::SCEV>();
@@ -365,6 +369,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::GVN>();
 
     int loopRounds = aggressive ? plan.o2LoopRounds : (economyMode ? 1 : 3);
+    if (!aggressive && !economyMode && plan.metrics.hirPolyApplied > 0) {
+      loopRounds = getenvPositive("SISY_POLY_LOOP_ROUNDS", 4, 1, 6);
+    }
     for (int i = 0; i < loopRounds; i++) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
       if (enablePrivatizeReduction)
@@ -532,6 +539,7 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   const bool o1StableLargeMode = !plan.aggressive && opts.rv &&
                                  getenvEnabled("SISY_O1_STABLE_LARGE_MODE", true) &&
                                  !highParamPressure &&
+                                 plan.metrics.hirPolyApplied == 0 &&
                                  (hitBlocks || hitCalls || hitScore);
   plan.largeModuleMode = (plan.aggressive && largeModeEnabled &&
                          (hitOps || hitBlocks || hitEdges || hitPhis || hitCalls || hitDepth || hitScore))

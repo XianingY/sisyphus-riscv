@@ -429,6 +429,11 @@ int main(int argc, char **argv) {
                       << " monotone-guard-rejected=" << stats.monotoneGuardRejected
                       << " monotone-guard-reject-shape=" << stats.monotoneGuardRejectShape
                       << " monotone-guard-reject-use=" << stats.monotoneGuardRejectUse
+                      << " loop-distribution-applied=" << stats.loopDistributionApplied
+                      << " loop-distribution-rejected=" << stats.loopDistributionRejected
+                      << " loop-distribution-reject-shape=" << stats.loopDistributionRejectShape
+                      << " loop-distribution-reject-control=" << stats.loopDistributionRejectControl
+                      << " loop-distribution-reject-no-split=" << stats.loopDistributionRejectNoSplit
                       << "\n";
           }
         });
@@ -582,6 +587,7 @@ int main(int argc, char **argv) {
       hirPolyStats.interchange3DApplied +
       hirPolyStats.unrollJammed +
       hirPolyStats.fusionApplied +
+      hirPolyStats.loopDistributionApplied +
       hirPolyStats.stencilInteriorDispatched +
       hirPolyStats.monotoneGuardTightened +
       hirPolyStats.forwardedArrayStoreLoads;

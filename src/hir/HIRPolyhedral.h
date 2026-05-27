@@ -96,6 +96,15 @@ struct PolyhedralStats {
   int monotoneGuardRejected = 0;
   int monotoneGuardRejectShape = 0;
   int monotoneGuardRejectUse = 0;
+  // Loop distribution / fission counters. Splits a single canonical loop
+  // body into two adjacent loops when the two halves access disjoint
+  // memory (no array/scalar overlap), exposing each half independently
+  // to vectorize / regalloc.
+  int loopDistributionApplied = 0;
+  int loopDistributionRejected = 0;
+  int loopDistributionRejectShape = 0;     // not a canonical perfect while
+  int loopDistributionRejectControl = 0;   // calls / nested while in body
+  int loopDistributionRejectNoSplit = 0;   // no viable split point found
 };
 
 class PolyhedralOptimizer {
@@ -126,6 +135,11 @@ private:
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
   bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryMonotoneGuardBoundTightening(Op *block, size_t idx, PolyhedralStats &stats);
+
+  // Loop distribution: split one canonical perfect while into two adjacent
+  // whiles over the same iteration space, when the two halves of the body
+  // access disjoint arrays and scalars.
+  bool tryLoopDistribute(Op *block, size_t idx, PolyhedralStats &stats);
   std::unordered_map<std::string, Op*> functions;
 };
 

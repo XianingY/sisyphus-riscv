@@ -164,6 +164,20 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
         }
       }
     }
+    // Loop distribution / fission: split a single canonical loop body into
+    // two adjacent loops when the two halves access disjoint arrays and
+    // scalars. Default off — enables more aggressive vectorization on
+    // mixed-stream loops (e.g. FFT butterfly, conv with bias) at the cost
+    // of doubling the loop overhead. Toggle via SISY_HIR_ENABLE_DISTRIBUTE.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_DISTRIBUTE", false)) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryLoopDistribute(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
   }
   return changed;
 }
@@ -355,4 +369,129 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
   if (isMatmulLikeNest(loops, accesses))
     stats.matmulLikeCandidates++;
 }
+bool PolyhedralOptimizer::tryLoopDistribute(Op *block, size_t idx,
+                                             PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size())
+    return false;
+  Op *whileOp = block->children[idx].get();
+  if (!whileOp || whileOp->kind != OpKind::While)
+    return false;
+
+  CanonicalLoop loop;
+  if (!matchCanonicalWhile(whileOp, loop) || !loop.body ||
+      loop.body->kind != OpKind::Block) {
+    stats.loopDistributionRejected++;
+    stats.loopDistributionRejectShape++;
+    return false;
+  }
+
+  // Need at least two non-step statements in the body to consider splitting.
+  auto &bodyChildren = loop.body->children;
+  if (bodyChildren.size() < 3) {
+    stats.loopDistributionRejected++;
+    stats.loopDistributionRejectShape++;
+    return false;
+  }
+
+  // Conservative: bail on any control flow / calls / nested loops in the body.
+  // tilingSafeBody already rejects calls, breaks, returns, etc.
+  if (!tilingSafeBody(loop.body) || containsWhile(loop.body)) {
+    stats.loopDistributionRejected++;
+    stats.loopDistributionRejectControl++;
+    return false;
+  }
+
+  // For correctness when re-emitting the loop twice, we require an init
+  // statement at children[idx-1] of the form `iv = start` so the second
+  // copy can be preceded by a re-init.
+  if (idx == 0 || !matchLoopInit(block->children[idx - 1].get(), loop.iv)) {
+    stats.loopDistributionRejected++;
+    stats.loopDistributionRejectShape++;
+    return false;
+  }
+
+  const size_t numStmts = bodyChildren.size() - 1;  // exclude step at end
+  if (bodyChildren[numStmts].get() != loop.step &&
+      !matchStepStore(bodyChildren[numStmts].get(), loop.iv, 1)) {
+    stats.loopDistributionRejected++;
+    stats.loopDistributionRejectShape++;
+    return false;
+  }
+
+  // Try each candidate split point K (1..numStmts-1). For each, test that
+  // the two halves access disjoint arrays and disjoint scalars (besides
+  // the loop IV). This is a conservative legality check that guarantees
+  // no flow / anti / output dependence across the split — same iteration
+  // and loop-carried alike.
+  size_t bestK = 0;
+  for (size_t K = 1; K < numStmts; K++) {
+    // Array symbol disjointness.
+    std::unordered_set<std::string> arr1, arr2;
+    for (size_t i = 0; i < K; i++)
+      collectArrayAccessSymbols(bodyChildren[i].get(), arr1);
+    for (size_t i = K; i < numStmts; i++)
+      collectArrayAccessSymbols(bodyChildren[i].get(), arr2);
+
+    bool overlap = false;
+    for (const auto &s : arr1) {
+      if (arr2.count(s)) { overlap = true; break; }
+    }
+    if (overlap) continue;
+
+    // Scalar def disjointness (plus IV — fine, both halves use IV).
+    std::unordered_set<std::string> scal1, scal2;
+    for (size_t i = 0; i < K; i++)
+      collectDefinedScalars(bodyChildren[i].get(), scal1);
+    scal1.erase(loop.iv);
+    for (size_t i = K; i < numStmts; i++)
+      collectDefinedScalars(bodyChildren[i].get(), scal2);
+    scal2.erase(loop.iv);
+
+    // No half may consume scalars defined by the other half.
+    bool scalarFlow = false;
+    for (size_t i = K; i < numStmts; i++) {
+      if (bodyUsesAnyOf(bodyChildren[i].get(), scal1)) { scalarFlow = true; break; }
+    }
+    if (scalarFlow) continue;
+    for (size_t i = 0; i < K; i++) {
+      if (bodyUsesAnyOf(bodyChildren[i].get(), scal2)) { scalarFlow = true; break; }
+    }
+    if (scalarFlow) continue;
+
+    bestK = K;
+    break;
+  }
+
+  if (bestK == 0) {
+    stats.loopDistributionRejected++;
+    stats.loopDistributionRejectNoSplit++;
+    return false;
+  }
+
+  // Build two new while ops, each with its own copy of the body half plus
+  // the original step. The condition op is cloned for each.
+  auto cloneStep = [&]() { return cloneOp(bodyChildren[numStmts].get()); };
+  auto buildWhile = [&](size_t lo, size_t hi) -> std::unique_ptr<Op> {
+    auto newBody = makeBlock();
+    for (size_t i = lo; i < hi; i++)
+      newBody->children.push_back(cloneOp(bodyChildren[i].get()));
+    newBody->children.push_back(cloneStep());
+    return makeWhile(cloneOp(whileOp->children[0].get()), std::move(newBody));
+  };
+
+  auto while1 = buildWhile(0, bestK);
+  auto while2 = buildWhile(bestK, numStmts);
+  // Re-init the IV between the two loops so loop2 starts from the same
+  // value as loop1 originally did.
+  auto reInit = cloneOp(block->children[idx - 1].get());
+
+  // Replace block->children[idx] (the original while) with: while1, reInit, while2.
+  block->children[idx] = std::move(while1);
+  block->children.insert(block->children.begin() + idx + 1, std::move(while2));
+  block->children.insert(block->children.begin() + idx + 1, std::move(reInit));
+
+  stats.loopDistributionApplied++;
+  return true;
+}
+
 }  // namespace sys::hir
