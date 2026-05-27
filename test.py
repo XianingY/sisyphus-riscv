@@ -46,7 +46,7 @@ if not args.directory and not args.test and not args.asm and not args.sat and no
 
 SRC_DIR = Path("src")
 BUILD_DIR = Path("build")
-FINAL_BINARY = BUILD_DIR / "sysc"
+FINAL_BINARY = BUILD_DIR / "compiler"
 COMPILER = "clang++"
 AR = "ar"
 CFLAGS = [
@@ -170,8 +170,7 @@ def build():
   proc.check_call(["cmake", "--build", "build", "-j", "2"])
   
   import shutil
-  shutil.copy2("build/compiler", "build/sysc")
-  print("Build and copy successful.")
+  print("Build successful.")
 
 
 
@@ -193,7 +192,7 @@ def run_asm(file: str):
 def run(full_file: str, no_exec: bool):
   basename = os.path.splitext(os.path.basename(full_file))[0]
 
-  command = [f"{BUILD_DIR}/sysc", full_file]
+  command = [f"{BUILD_DIR}/compiler", full_file]
 
   if args.gdb:
     command = ["gdb", "--args", *command]
@@ -255,8 +254,8 @@ def run_test_case(sy_path: Path, in_path: Path, out_path: Path):
     asm_path = Path(tmpdir) / "output.s"
     exe_path = Path(tmpdir) / "a.out"
     
-    # Step 1: Compile .sy to .s using sysc
-    commands = [f"{BUILD_DIR}/sysc", str(sy_path), "-o", str(asm_path)]
+    # Step 1: Compile .sy to .s using compiler
+    commands = [f"{BUILD_DIR}/compiler", str(sy_path), "-o", str(asm_path)]
     if args.arm:
       commands.append("--arm")
     if args.verify:
@@ -391,7 +390,7 @@ def test_sat():
   files = os.listdir("test/cnf")
   for file in files:
     print(f"checking: {file}")
-    out = proc.run(f"{BUILD_DIR}/sysc --sat < test/cnf/{file}", stdout=proc.PIPE, shell=True, text=True).stdout
+    out = proc.run(f"{BUILD_DIR}/compiler --sat < test/cnf/{file}", stdout=proc.PIPE, shell=True, text=True).stdout
     if file.startswith("uf") and not out.startswith("sat"):
       print(f"error: {file} out = '{out}'")
     elif file.startswith("uuf") and not out.startswith("unsat"):
@@ -407,7 +406,7 @@ if __name__ == "__main__":
   build()
 
   if args.bv:
-    commands = [f"{BUILD_DIR}/sysc", "--bv"]
+    commands = [f"{BUILD_DIR}/compiler", "--bv"]
     if args.stats:
       commands.append("-s")
     if args.verbose:

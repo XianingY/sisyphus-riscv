@@ -350,8 +350,27 @@ bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
   // interchange.  In-place recurrences keep the existing order-preserving jam
   // path; row buffering them is legal only for narrower shapes and was slower
   // on cache-sized integer kernels.
-  if (!strictReductionInterchangeLegal(pat, globalArrays))
-    return false;
+  if (!strictReductionInterchangeLegal(pat, globalArrays)) {
+    bool fail = true;
+    if (exprUsesScalar(pat.destStore, pat.k)) {
+      fail = true;
+    } else {
+      fail = false;
+      std::vector<affine::Access> accesses = affine::collectArrayAccesses(pat.kReductionStmt);
+      for (const auto &acc : accesses) {
+        if (!globalArrays.count(acc.base)) { fail = true; break; }
+        if (acc.base == pat.destStore->symbol) {
+          if (acc.indices.size() != pat.destStore->children.size() - 1) { fail = true; break; }
+          if (acc.indices.size() > (size_t)jDim) {
+            const affine::Expr &jExpr = acc.indices[jDim];
+            if (jExpr.coeffs.size() != 1 || jExpr.coeffs.count(pat.j) == 0 || jExpr.coeffs.at(pat.j) != 1 || jExpr.constant != 0) { fail = true; break; }
+          } else { fail = true; break; }
+        }
+      }
+    }
+    if (fail)
+      return false;
+  }
 
   const std::string scratch =
       "__poly_rowbuf_" + pat.destStore->symbol + "_" + std::to_string(uniqueId++);

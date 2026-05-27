@@ -79,6 +79,13 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
     return false;
   }
 
+  // Don't tile if this is already the inner loop of a tiled loop.
+  if (outer.bound && outer.bound->kind == OpKind::Load && outer.bound->symbol.find("__hir_tile_stop_") == 0) {
+    stats.tilingRejected++;
+    stats.tilingRejectIdempotent++;
+    return false;
+  }
+
   int dynamicTileSize = computeOptimalTileSize(detectMainType(outer.body), outer.body);
 
   const std::string tileIV = "__hir_tile_" + outer.iv + "_" + std::to_string(uniqueId);
