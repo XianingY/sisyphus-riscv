@@ -81,6 +81,7 @@ The active RISC-V path should prefer:
 
 - affine legality improvements in `HIRAffine`/`HIRPolyhedral`;
 - generic 2D/3D tiling and dependence-preserving interchange;
+- dependence-proven reduction microtiling with cache/register pressure gates;
 - spill-aware register allocation and pre-RA scheduling;
 - range-driven `/2`, `%2`, and power-of-two folds;
 - branch-to-select conversion when CFG and SSA conditions are proven;

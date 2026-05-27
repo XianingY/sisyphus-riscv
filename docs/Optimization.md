@@ -163,6 +163,21 @@ Best legal path:
   ranges unnecessarily;
 - post-RA peepholes for redundant moves and address calculation chains.
 
+### Affine Reduction Microtiling
+
+The default RISC-V HIR path can panelize proven integer additive reductions
+over affine two-dimensional outputs. It preserves a row scratch buffer when
+in-place reads require write isolation, holds a small contiguous column tile
+in scalar registers while processing a `k` panel, and writes partial sums only
+at panel boundaries. The profitability gate rejects conditional updates that
+increase spill pressure on the current scalar backend.
+
+This transform is driven only by canonical loop shape, affine accesses,
+dependence legality, cache budget, and register-pressure estimates. It does
+not identify matrix test cases, dimensions, or algorithm names. Use
+`SISY_HIR_ENABLE_REDUCTION_MICROTILE=0` for bisection and
+`SISY_HIR_MICRO_NR` / `SISY_HIR_MICRO_KC` for cost-model experiments.
+
 ## 5. Environment Switches
 
 Common bisection and experiment flags are listed in `docs/Commands.md`. The
@@ -181,6 +196,7 @@ important defaults as of this review:
 - `SISY_HIR_ENABLE_INTERCHANGE=true`
 - `SISY_HIR_ENABLE_UNROLL_JAM=true`
 - `SISY_HIR_ENABLE_REDUCTION_PRIVATIZE=true`
+- `SISY_HIR_ENABLE_REDUCTION_MICROTILE=true`
 - `SISY_HIR_ENABLE_INVARIANT_GUARD_HOIST=true`
 
 Always verify current defaults in `src/main/PipelineProfiles.cpp`,

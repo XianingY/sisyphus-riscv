@@ -162,6 +162,7 @@ Optimization bisection switches:
 - `SISY_ENABLE_VECTORIZE=0`
 - `SISY_HIR_ENABLE_INTERCHANGE=0`
 - `SISY_HIR_ENABLE_UNROLL_JAM=0`
+- `SISY_HIR_ENABLE_REDUCTION_MICROTILE=0`
 
 Strict-mode opt-in switches for high-risk recognizers:
 

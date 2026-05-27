@@ -213,6 +213,11 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     return changed;
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    if (tryReductionMicroTile(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
     if (tryReductionRowPrivatize(block, i, stats)) {
       changed = true;
       i = 0;

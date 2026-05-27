@@ -88,6 +88,57 @@ int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
   return bestFactor;
 }
 
+static int clampPow2(int n, int lo, int hi);
+
+ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
+                                           TypeKind mainType,
+                                           bool needsScratch) {
+  using namespace sys::backend::riscv;
+
+  ReductionTilePlan plan;
+  plan.needsScratch = needsScratch;
+  if (mainType != TypeKind::Int)
+    return plan;
+
+  LoopBodyMetrics metrics;
+  analyzeLoopBody(innerBody, metrics);
+  int readStreams = static_cast<int>(metrics.arrayReadStreams.size());
+  int writeStreams = static_cast<int>(metrics.arrayWriteStreams.size());
+  int basePressure = 7 + readStreams + writeStreams +
+                     metrics.scalarIntDefs;
+  int usableRegs = kUsableGPRs;
+
+  int requestedNr = hirEnvInt("SISY_HIR_MICRO_NR", 0);
+  if (requestedNr >= 2 && requestedNr <= 8) {
+    plan.nr = requestedNr;
+  } else {
+    for (int candidate : {4, 2}) {
+      // Each output lane holds an accumulator and one transient operand;
+      // panel cursors and common inputs are accounted for in basePressure.
+      if (basePressure + 2 * candidate <= usableRegs - 2) {
+        plan.nr = candidate;
+        break;
+      }
+    }
+  }
+  if (plan.nr < 2)
+    return plan;
+
+  const int elementBytes = 4;
+  const int streamCount = std::max(2, readStreams + writeStreams);
+  const int panelBudget = kL1DataCacheSize / 4;
+  int cacheKc = panelBudget / std::max(elementBytes * streamCount * plan.nr, 1);
+  cacheKc = clampPow2(cacheKc, 8, 64);
+  plan.kc = hirEnvInt("SISY_HIR_MICRO_KC", cacheKc);
+  if (plan.kc < 2) {
+    plan.nr = 0;
+    plan.kc = 0;
+    return plan;
+  }
+  plan.nc = plan.nr;
+  return plan;
+}
+
 // Round `n` down to the nearest power-of-two in [lo, hi]. Used to keep tile
 // sizes vectorization-friendly (multiples of 4 lanes) and cache-aligned.
 static int clampPow2(int n, int lo, int hi) {

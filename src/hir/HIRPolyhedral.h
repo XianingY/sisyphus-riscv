@@ -11,6 +11,15 @@ namespace sys::hir {
 struct PolyhedralStats {
   int reductionJammed = 0;
   int reductionPrivatized = 0;
+  int reductionMicroTiled = 0;
+  int reductionMicroTileInPlace = 0;
+  int reductionMicroTile3D = 0;
+  int reductionMicroTileRejectDependence = 0;
+  int reductionMicroTileRejectPressure = 0;
+  int microTileMrSum = 0;
+  int microTileNrSum = 0;
+  int microTileKcSum = 0;
+  int microTileNcSum = 0;
   int reductionInterchanged = 0;
   int conditionalReductionInterchanged = 0;
   int repeatReduced = 0;
@@ -135,6 +144,7 @@ private:
   bool optimizeBlock(Op *block, PolyhedralStats &stats);
   void scanAffineNest(Op *op, PolyhedralStats &stats);
   bool tryReductionInterchange(Op *block, size_t initIndex, PolyhedralStats &stats);
+  bool tryReductionMicroTile(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionRowPrivatize(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryLoopInterchange3D(Op *block, size_t idx, PolyhedralStats &stats);

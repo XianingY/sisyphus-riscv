@@ -52,6 +52,32 @@ std::unique_ptr<Op> makeSyntheticArrayDecl(const std::string &symbol,
   return op;
 }
 
+bool privatizedReductionLegal(
+    const ReductionPattern &pat, int jDim,
+    const std::unordered_set<std::string> &globalArrays) {
+  if (strictReductionInterchangeLegal(pat, globalArrays))
+    return true;
+  if (exprUsesScalar(pat.destStore, pat.k))
+    return false;
+
+  std::vector<affine::Access> accesses =
+      affine::collectArrayAccesses(pat.kReductionStmt);
+  for (const auto &access : accesses) {
+    if (!globalArrays.count(access.base))
+      return false;
+    if (access.base != pat.destStore->symbol)
+      continue;
+    if (access.indices.size() != pat.destStore->children.size() - 1 ||
+        access.indices.size() <= static_cast<size_t>(jDim))
+      return false;
+    const affine::Expr &jExpr = access.indices[jDim];
+    if (jExpr.coeffs.size() != 1 || !jExpr.coeffs.count(pat.j) ||
+        jExpr.coeffs.at(pat.j) != 1 || jExpr.constant != 0)
+      return false;
+  }
+  return true;
+}
+
 std::unique_ptr<Op> cloneReductionStmtToScratch(const Op *op,
                                                 const ReductionPattern &pat,
                                                 const std::string &scratch) {
@@ -311,6 +337,197 @@ bool PolyhedralOptimizer::tryReductionInterchange(Op *block, size_t initIndex,
   return true;
 }
 
+bool PolyhedralOptimizer::tryReductionMicroTile(Op *block, size_t initIndex,
+                                                PolyhedralStats &stats) {
+  if (!hirEnvEnabled("SISY_HIR_ENABLE_REDUCTION_MICROTILE", true) ||
+      !block || initIndex + 1 >= block->children.size())
+    return false;
+
+  ReductionPattern pat;
+  if (!matchReductionPattern(block->children[initIndex + 1].get(), pat) ||
+      !matchLoopInit(block->children[initIndex].get(), pat.j) ||
+      !pat.destStore || pat.destStore->children.size() != 3 ||
+      !pat.accUpdate || !pat.kReductionStmt)
+    return false;
+
+  auto dimsIt = globalArrayDims.find(pat.destStore->symbol);
+  if (dimsIt == globalArrayDims.end() || dimsIt->second.size() != 2)
+    return false;
+
+  int jDim = -1;
+  for (int dim = 0; dim < 2; dim++)
+    if (isDirectLoadOf(pat.destStore->children[dim].get(), pat.j))
+      jDim = dim;
+  if (jDim < 0)
+    return false;
+
+  const int scratchElems = dimsIt->second[jDim];
+  constexpr int kMaxScratchElems = 1 << 16;
+  if (scratchElems <= 0 || scratchElems > kMaxScratchElems)
+    return false;
+
+  const bool inPlace =
+      containsArrayAccessTo(pat.kReductionStmt, pat.destStore->symbol);
+  if (!privatizedReductionLegal(pat, jDim, globalArrays)) {
+    stats.reductionMicroTileRejectDependence++;
+    return false;
+  }
+  // Conditional updates duplicate guard values and address temporaries for
+  // every lane.  Until the backend can keep that pressure bounded, retaining
+  // the scalar row-buffer form is preferable to introducing spills.
+  if (pat.kReductionStmt != pat.accUpdate) {
+    stats.reductionMicroTileRejectPressure++;
+    return false;
+  }
+
+  ReductionTilePlan plan = computeReductionTilePlan(
+      pat.kReductionStmt, detectMainType(pat.kReductionStmt), true);
+  if (plan.nr < 2 || plan.kc < 2) {
+    stats.reductionMicroTileRejectPressure++;
+    return false;
+  }
+
+  const int id = uniqueId++;
+  const std::string stem =
+      "__poly_micro_" + pat.destStore->symbol + "_" + std::to_string(id);
+  const std::string scratch = stem + "_row";
+  const std::string panelK = stem + "_kk";
+  const std::string panelEnd = stem + "_kend";
+  const std::string innerK = stem + "_k";
+  const std::string tailK = stem + "_tail_k";
+  const std::string tailAcc = stem + "_tail_acc";
+
+  auto scratchDecl = makeSyntheticArrayDecl(scratch, scratchElems, TypeKind::Int);
+
+  auto initBody = makeBlock();
+  auto initValueClone = cloneOp(initValue(pat.accInit));
+  if (!initValueClone)
+    initValueClone = makeConstInt(0);
+  initBody->children.push_back(makeArrayStoreAt(
+      scratch, makeLoad(pat.j), std::move(initValueClone), TypeKind::Int));
+  initBody->children.push_back(cloneOp(pat.jStep));
+  auto initLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                            std::move(initBody));
+
+  std::vector<std::string> accNames;
+  for (int lane = 0; lane < plan.nr; lane++)
+    accNames.push_back(stem + "_acc_" + std::to_string(lane));
+
+  auto vectorBody = makeBlock();
+  for (int lane = 0; lane < plan.nr; lane++) {
+    vectorBody->children.push_back(makeVarDecl(
+        accNames[lane],
+        makeArrayLoadAt(scratch, makeIndexWithOffset(pat.j, lane),
+                        TypeKind::Int)));
+  }
+  vectorBody->children.push_back(makeVarDecl(innerK, makeLoad(panelK)));
+
+  auto vectorKBody = makeBlock();
+  for (int lane = 0; lane < plan.nr; lane++) {
+    std::unordered_map<std::string, std::string> renames = {
+        {pat.acc, accNames[lane]}, {pat.k, innerK}};
+    std::unordered_map<std::string, int> offsets = {{pat.j, lane}};
+    auto update = cloneReplacing(pat.kReductionStmt, renames, offsets);
+    if (!update)
+      return false;
+    vectorKBody->children.push_back(std::move(update));
+  }
+  vectorKBody->children.push_back(
+      cloneReplacing(pat.kStep, {{pat.k, innerK}}, {}));
+  vectorBody->children.push_back(makeWhile(
+      makeCmp("<", makeLoad(innerK), makeLoad(panelEnd)),
+      std::move(vectorKBody)));
+  for (int lane = 0; lane < plan.nr; lane++) {
+    vectorBody->children.push_back(makeArrayStoreAt(
+        scratch, makeIndexWithOffset(pat.j, lane), makeLoad(accNames[lane]),
+        TypeKind::Int));
+  }
+  vectorBody->children.push_back(makeJamStep(pat.j, plan.nr));
+  auto vectorLoop = makeWhile(
+      makeCmp("<",
+              makeArith("+", makeLoad(pat.j), makeConstInt(plan.nr - 1)),
+              cloneOp(pat.jBound)),
+      std::move(vectorBody));
+
+  auto tailBody = makeBlock();
+  tailBody->children.push_back(makeVarDecl(
+      tailAcc, makeArrayLoadAt(scratch, makeLoad(pat.j), TypeKind::Int)));
+  tailBody->children.push_back(makeVarDecl(tailK, makeLoad(panelK)));
+  auto tailKBody = makeBlock();
+  auto tailUpdate =
+      cloneReplacing(pat.kReductionStmt,
+                     {{pat.acc, tailAcc}, {pat.k, tailK}}, {});
+  if (!tailUpdate)
+    return false;
+  tailKBody->children.push_back(std::move(tailUpdate));
+  tailKBody->children.push_back(cloneReplacing(pat.kStep, {{pat.k, tailK}}, {}));
+  tailBody->children.push_back(makeWhile(
+      makeCmp("<", makeLoad(tailK), makeLoad(panelEnd)),
+      std::move(tailKBody)));
+  tailBody->children.push_back(makeArrayStoreAt(
+      scratch, makeLoad(pat.j), makeLoad(tailAcc), TypeKind::Int));
+  tailBody->children.push_back(cloneOp(pat.jStep));
+  auto tailLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                            std::move(tailBody));
+
+  auto panelBody = makeBlock();
+  panelBody->children.push_back(makeVarDecl(
+      panelEnd, makeArith("+", makeLoad(panelK), makeConstInt(plan.kc))));
+  auto clampBody = makeBlock();
+  clampBody->children.push_back(makeStore(panelEnd, cloneOp(pat.kBound)));
+  panelBody->children.push_back(makeIf(
+      makeCmp("<", cloneOp(pat.kBound), makeLoad(panelEnd)),
+      std::move(clampBody), nullptr));
+  panelBody->children.push_back(cloneOp(block->children[initIndex].get()));
+  panelBody->children.push_back(std::move(vectorLoop));
+  panelBody->children.push_back(std::move(tailLoop));
+  panelBody->children.push_back(makeStore(panelK, makeLoad(panelEnd)));
+
+  auto panelInit =
+      makeVarDecl(panelK, cloneOp(initValue(pat.kInit)));
+  auto panelLoop = makeWhile(makeCmp("<", makeLoad(panelK), cloneOp(pat.kBound)),
+                             std::move(panelBody));
+
+  auto commitBody = makeBlock();
+  auto commitStore = makeArrayStoreLike(
+      pat.destStore,
+      makeArrayLoadAt(scratch, makeLoad(pat.j), TypeKind::Int));
+  if (!commitStore)
+    return false;
+  commitBody->children.push_back(std::move(commitStore));
+  commitBody->children.push_back(cloneOp(pat.jStep));
+  auto commitLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                              std::move(commitBody));
+  auto commitJInit = cloneOp(block->children[initIndex].get());
+  if (!commitJInit)
+    return false;
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 6);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == initIndex) {
+      replacement.push_back(std::move(scratchDecl));
+      replacement.push_back(std::move(block->children[i]));
+      replacement.push_back(std::move(initLoop));
+      replacement.push_back(std::move(panelInit));
+      replacement.push_back(std::move(panelLoop));
+      replacement.push_back(std::move(commitJInit));
+      replacement.push_back(std::move(commitLoop));
+      i++;
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.reductionMicroTiled++;
+  stats.reductionMicroTileInPlace += inPlace ? 1 : 0;
+  stats.microTileMrSum += plan.mr;
+  stats.microTileNrSum += plan.nr;
+  stats.microTileKcSum += plan.kc;
+  stats.microTileNcSum += plan.nc;
+  return true;
+}
+
 bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
                                                    PolyhedralStats &stats) {
   if (!block || initIndex + 1 >= block->children.size())
@@ -346,31 +563,10 @@ bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
   if (scratchElems <= 0 || scratchElems > kMaxScratchElems)
     return false;
 
-  // This is scalar expansion for reductions that are already legal to
-  // interchange.  In-place recurrences keep the existing order-preserving jam
-  // path; row buffering them is legal only for narrower shapes and was slower
-  // on cache-sized integer kernels.
-  if (!strictReductionInterchangeLegal(pat, globalArrays)) {
-    bool fail = true;
-    if (exprUsesScalar(pat.destStore, pat.k)) {
-      fail = true;
-    } else {
-      fail = false;
-      std::vector<affine::Access> accesses = affine::collectArrayAccesses(pat.kReductionStmt);
-      for (const auto &acc : accesses) {
-        if (!globalArrays.count(acc.base)) { fail = true; break; }
-        if (acc.base == pat.destStore->symbol) {
-          if (acc.indices.size() != pat.destStore->children.size() - 1) { fail = true; break; }
-          if (acc.indices.size() > (size_t)jDim) {
-            const affine::Expr &jExpr = acc.indices[jDim];
-            if (jExpr.coeffs.size() != 1 || jExpr.coeffs.count(pat.j) == 0 || jExpr.coeffs.at(pat.j) != 1 || jExpr.constant != 0) { fail = true; break; }
-          } else { fail = true; break; }
-        }
-      }
-    }
-    if (fail)
-      return false;
-  }
+  // A row buffer isolates writes for both out-of-place reductions and the
+  // narrow in-place form whose reads remain within the current output column.
+  if (!privatizedReductionLegal(pat, jDim, globalArrays))
+    return false;
 
   const std::string scratch =
       "__poly_rowbuf_" + pat.destStore->symbol + "_" + std::to_string(uniqueId++);

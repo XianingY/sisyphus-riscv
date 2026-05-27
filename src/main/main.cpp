@@ -354,6 +354,15 @@ int main(int argc, char **argv) {
           if (opts.verbose || opts.stats) {
             std::cerr << "[hir-poly] reduction-jammed=" << stats.reductionJammed
                       << " reduction-privatized=" << stats.reductionPrivatized
+                      << " reduction-microtiled=" << stats.reductionMicroTiled
+                      << " reduction-microtile-inplace=" << stats.reductionMicroTileInPlace
+                      << " reduction-microtile-3d=" << stats.reductionMicroTile3D
+                      << " reduction-microtile-reject-dep=" << stats.reductionMicroTileRejectDependence
+                      << " reduction-microtile-reject-pressure=" << stats.reductionMicroTileRejectPressure
+                      << " microtile-mr-sum=" << stats.microTileMrSum
+                      << " microtile-nr-sum=" << stats.microTileNrSum
+                      << " microtile-kc-sum=" << stats.microTileKcSum
+                      << " microtile-nc-sum=" << stats.microTileNcSum
                       << " reduction-interchanged=" << stats.reductionInterchanged
                       << " conditional-reduction-interchanged=" << stats.conditionalReductionInterchanged
                       << " repeat-reduced=" << stats.repeatReduced

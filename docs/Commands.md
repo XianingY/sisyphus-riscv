@@ -122,6 +122,9 @@ SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --t
 SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_REDUCTION_PRIVATIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_HIR_ENABLE_REDUCTION_MICROTILE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+# Diagnostic cost-model overrides; never key off case identity.
+SISY_HIR_MICRO_NR=2 SISY_HIR_MICRO_KC=32 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_STENCIL_INTERIOR=1 SISY_HIR_STENCIL_SPLIT_COLUMNS=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
 

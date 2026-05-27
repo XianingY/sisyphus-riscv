@@ -59,6 +59,14 @@ struct ReductionPattern {
   Op *jStep = nullptr;
 };
 
+struct ReductionTilePlan {
+  int mr = 1;
+  int nr = 0;
+  int kc = 0;
+  int nc = 0;
+  bool needsScratch = true;
+};
+
 struct StencilBounds {
   std::string rowSpatial;
   std::string colSpatial;
@@ -77,6 +85,9 @@ TypeKind detectMainType(const Op *op);
 int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType);
 int computeOptimalTileSize(TypeKind mainType);
 int computeOptimalTileSize(TypeKind mainType, const Op *innerBody);
+ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
+                                           TypeKind mainType,
+                                           bool needsScratch);
 
 bool hirEnvEnabled(const char *name, bool fallback);
 int hirEnvInt(const char *name, int fallback);
