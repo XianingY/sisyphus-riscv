@@ -414,6 +414,138 @@ bool convertNestedShortCircuit(BranchOp *branch) {
   return true;
 }
 
+bool sameAddressValue(Op *a, Op *b) {
+  if (a == b)
+    return true;
+  if (!a || !b || a->opid != b->opid ||
+      a->getOperandCount() != b->getOperandCount())
+    return false;
+  if (isa<IntOp>(a) || isa<FloatOp>(a))
+    return false;
+  for (int i = 0; i < a->getOperandCount(); i++)
+    if (a->DEF(i) != b->DEF(i))
+      return false;
+  return true;
+}
+
+bool matchLoadModifyStore(StoreOp *store, Op *&oldValue, Op *&newValue) {
+  if (!store || store->getOperandCount() < 2)
+    return false;
+  auto stored = store->DEF(0);
+  auto addr = store->DEF(1);
+  auto add = dyn_cast<AddIOp>(stored);
+  if (!add || add->getOperandCount() != 2)
+    return false;
+  for (int i = 0; i < 2; i++) {
+    auto load = dyn_cast<LoadOp>(add->DEF(i));
+    if (!load || load->getOperandCount() != 1)
+      continue;
+    if (!sameAddressValue(load->DEF(0), addr))
+      continue;
+    oldValue = load;
+    newValue = stored;
+    return true;
+  }
+  return false;
+}
+
+bool convertParityStoreUpdate(BranchOp *branch) {
+  if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||
+      !branch->has<ElseAttr>() || !isParityCondition(branch->DEF(0)))
+    return false;
+
+  auto trueBlock = TARGET(branch);
+  auto falseBlock = ELSE(branch);
+  BasicBlock *calcBlock = nullptr;
+  BasicBlock *emptyBlock = nullptr;
+  if (shortPureBlock(trueBlock) && emptyGotoBlock(falseBlock)) {
+    // shortPureBlock intentionally rejects stores; handle the store shape
+    // below, so don't take this arm.
+    return false;
+  }
+
+  auto blockHasSingleStoreUpdate = [&](BasicBlock *bb, StoreOp *&store,
+                                       Op *&oldValue, Op *&newValue) -> bool {
+    if (!bb || !isa<GotoOp>(bb->getLastOp()))
+      return false;
+    int stores = 0;
+    for (auto op : bb->getOps()) {
+      if (op == bb->getLastOp())
+        continue;
+      if (auto st = dyn_cast<StoreOp>(op)) {
+        stores++;
+        store = st;
+        continue;
+      }
+      if (!pureHoistable(op))
+        return false;
+    }
+    if (stores != 1)
+      return false;
+    return matchLoadModifyStore(store, oldValue, newValue);
+  };
+
+  StoreOp *store = nullptr;
+  Op *oldValue = nullptr;
+  Op *newValue = nullptr;
+  bool calcOnTrue = false;
+  if (blockHasSingleStoreUpdate(trueBlock, store, oldValue, newValue) &&
+      emptyGotoBlock(falseBlock)) {
+    calcBlock = trueBlock;
+    emptyBlock = falseBlock;
+    calcOnTrue = true;
+  } else if (blockHasSingleStoreUpdate(falseBlock, store, oldValue, newValue) &&
+             emptyGotoBlock(trueBlock)) {
+    calcBlock = falseBlock;
+    emptyBlock = trueBlock;
+    calcOnTrue = false;
+  } else {
+    return false;
+  }
+
+  if (calcBlock->preds.size() != 1 || emptyBlock->preds.size() != 1 ||
+      *calcBlock->preds.begin() != branch->getParent() ||
+      *emptyBlock->preds.begin() != branch->getParent())
+    return false;
+
+  auto calcTerm = dyn_cast<GotoOp>(calcBlock->getLastOp());
+  auto emptyTerm = dyn_cast<GotoOp>(emptyBlock->getLastOp());
+  if (!calcTerm || !emptyTerm || TARGET(calcTerm) != TARGET(emptyTerm))
+    return false;
+  auto join = TARGET(calcTerm);
+  if (!join || !join->getPhis().empty())
+    return false;
+
+  std::vector<Op*> moving;
+  for (auto op : calcBlock->getOps()) {
+    if (op == calcBlock->getLastOp() || op == store)
+      continue;
+    if (!pureHoistable(op))
+      return false;
+    moving.push_back(op);
+  }
+  if (moving.empty() || moving.size() > 16)
+    return false;
+
+  for (auto op : moving)
+    op->moveBefore(branch);
+
+  Builder builder;
+  builder.setBeforeOp(branch);
+  auto cond = parityTruthValue(builder, branch->DEF(0));
+  auto selected = calcOnTrue
+      ? builder.create<SelectOp>(std::vector<Value>{ cond, newValue, oldValue })
+      : builder.create<SelectOp>(std::vector<Value>{ cond, oldValue, newValue });
+  size_t storeSize = store->has<SizeAttr>() ? SIZE(store) : 4;
+  builder.create<StoreOp>(std::vector<Value>{ selected, store->DEF(1) },
+                          std::vector<Attr*>{ new SizeAttr(storeSize) });
+  builder.replace<GotoOp>(branch, { new TargetAttr(join) });
+
+  calcBlock->forceErase();
+  emptyBlock->forceErase();
+  return true;
+}
+
 } // namespace
 
 std::map<std::string, int> ParityIfConversion::stats() {
@@ -432,7 +564,8 @@ void ParityIfConversion::run() {
 
   auto branches = module->findAll<BranchOp>();
   for (auto op : branches) {
-    if (convertNestedShortCircuit(cast<BranchOp>(op)) ||
+    if (convertParityStoreUpdate(cast<BranchOp>(op)) ||
+        convertNestedShortCircuit(cast<BranchOp>(op)) ||
         convertOne(cast<BranchOp>(op)))
       converted++;
     else

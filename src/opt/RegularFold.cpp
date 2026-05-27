@@ -521,6 +521,103 @@ void RegularFold::run() {
       return false;
     });
 
+    auto constantInt = [&](Op *op) -> std::optional<int> {
+      return tryGetConstantValue(op, gMap, module);
+    };
+
+    auto productParity = [&](Op *op) -> Op * {
+      auto mod = dyn_cast<ModIOp>(op);
+      if (!mod || mod->getOperandCount() != 2)
+        return nullptr;
+      auto divisor = constantInt(mod->DEF(1));
+      if (!divisor || (*divisor != 2 && *divisor != -2))
+        return nullptr;
+      auto mul = dyn_cast<MulIOp>(mod->DEF(0));
+      if (!mul || mul->getOperandCount() != 2)
+        return nullptr;
+
+      builder.setBeforeOp(op);
+      auto oneA = builder.create<IntOp>(std::vector<Attr*>{ new IntAttr(1) });
+      auto oneB = builder.create<IntOp>(std::vector<Attr*>{ new IntAttr(1) });
+      auto lhsBit = builder.create<AndIOp>(std::vector<Value>{ mul->DEF(0), oneA });
+      auto rhsBit = builder.create<AndIOp>(std::vector<Value>{ mul->DEF(1), oneB });
+      return builder.create<AndIOp>(std::vector<Value>{ lhsBit, rhsBit });
+    };
+
+    auto foldProductParityCompare = [&](Op *op, bool isEq) -> bool {
+      if (op->getOperandCount() != 2)
+        return false;
+      auto lhs = op->DEF(0);
+      auto rhs = op->DEF(1);
+
+      Op *modSide = nullptr;
+      Op *constSide = nullptr;
+      if (auto bit = productParity(lhs)) {
+        modSide = bit;
+        constSide = rhs;
+      } else if (auto bit = productParity(rhs)) {
+        modSide = bit;
+        constSide = lhs;
+      } else {
+        return false;
+      }
+
+      auto constant = constantInt(constSide);
+      if (!constant || (*constant != 0 && *constant != 1))
+        return false;
+
+      builder.setBeforeOp(op);
+      if ((*constant == 1) == isEq) {
+        op->replaceAllUsesWith(modSide);
+        op->erase();
+      } else {
+        auto zero = builder.create<IntOp>(std::vector<Attr*>{ new IntAttr(0) });
+        builder.replace<EqOp>(op, std::vector<Value>{ modSide, zero });
+      }
+      folded++;
+      return true;
+    };
+
+    // Product parity is independent of signed overflow in the full product:
+    // (x * y) is odd iff both operands are odd.  Fold comparisons against
+    // `% +/-2` to low-bit tests so later if-conversion and backend lowering
+    // never need to materialize a multiply just to ask an even/odd question.
+    runRewriter([&](EqOp *op) { return foldProductParityCompare(op, true); });
+    runRewriter([&](NeOp *op) { return foldProductParityCompare(op, false); });
+    runRewriter([&](NotOp *op) {
+      if (op->getOperandCount() != 1)
+        return false;
+      auto bit = productParity(op->DEF(0));
+      if (!bit)
+        return false;
+      builder.setBeforeOp(op);
+      auto zero = builder.create<IntOp>(std::vector<Attr*>{ new IntAttr(0) });
+      builder.replace<EqOp>(op, std::vector<Value>{ bit, zero });
+      folded++;
+      return true;
+    });
+    runRewriter([&](SetNotZeroOp *op) {
+      if (op->getOperandCount() != 1)
+        return false;
+      auto bit = productParity(op->DEF(0));
+      if (!bit)
+        return false;
+      op->replaceAllUsesWith(bit);
+      op->erase();
+      folded++;
+      return true;
+    });
+    runRewriter([&](BranchOp *op) {
+      if (op->getOperandCount() != 1 || !op->has<TargetAttr>() || !op->has<ElseAttr>())
+        return false;
+      auto bit = productParity(op->DEF(0));
+      if (!bit)
+        return false;
+      builder.replace<BranchOp>(op, std::vector<Value>{ bit }, op->getAttrs());
+      folded++;
+      return true;
+    });
+
     runRewriter([&](DivFOp *op) {
       auto y = op->DEF(1);
       if (isa<FloatOp>(y) && F(y) == 2) {
