@@ -74,8 +74,11 @@ int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
   int activeScalars = (mainType == TypeKind::Float) ? metrics.scalarFloatDefs : metrics.scalarIntDefs;
 
   int bestFactor = 4;
-  for (int factor : {8, 4, 2}) {
-    int estimatedPressure = (factor * activeStreams) + activeScalars;
+  for (int factor : {8, 6, 4, 2}) {
+    // Each jam lane keeps the active memory streams plus address/update
+    // temporaries alive.  Modeling those temporaries keeps the transform from
+    // choosing a wide jam that immediately spills in the target allocator.
+    int estimatedPressure = factor * (activeStreams + 1) + activeScalars + 2;
     if (estimatedPressure <= usableRegs) {
       bestFactor = factor;
       break;
@@ -673,9 +676,10 @@ bool strictReductionInterchangeLegal(const ReductionPattern &pat,
   if (!globalArrays.count(pat.destStore->symbol))
     return false;
 
-  // Strict mode: do not interchange an in-place reduction. If the destination
-  // array is read while computing the reduction, swapping k outside j changes
-  // the order of visible writes (many_mat_cal has exactly this hazard).
+  // Do not interchange an in-place reduction. If the destination array is
+  // read while computing the reduction, swapping k outside j changes the
+  // order of visible writes.  Order-preserving transforms such as
+  // reduction unroll-and-jam may still handle these loops.
   if (containsArrayAccessTo(pat.kReductionStmt, pat.destStore->symbol))
     return false;
 

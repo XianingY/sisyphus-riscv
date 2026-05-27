@@ -145,6 +145,14 @@ int computeAdaptiveTileSize(LoopInfo *outer, LoopInfo *inner, int fallback) {
     hi = std::min(hi, std::max(elemsPerLine, trip));
 
   int candidate = clampPow2(fitByCache, elemsPerLine, hi);
+  // Single-dimension strip-mining does not reuse a full 2D cache tile by
+  // itself.  For loops with several independent memory streams, large tiles
+  // mostly lengthen live ranges and branch bodies; keeping them near one
+  // cache line is usually the better generic tradeoff.
+  if (streams >= 3)
+    candidate = std::min(candidate, elemsPerLine);
+  else if (streams == 2)
+    candidate = std::min(candidate, elemsPerLine * 4);
   if (streams >= 5 && candidate > elemsPerLine)
     candidate /= 2;
   if (streams >= 8 && candidate > elemsPerLine)
