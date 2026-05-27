@@ -236,6 +236,8 @@ class LoopTiling : public Pass {
   int tiled = 0;
   int rejectedShape = 0;
   int rejectedProfit = 0;
+  int adaptiveTiles = 0;
+  int tileSizeSum = 0;
 public:
   LoopTiling(ModuleOp *module): Pass(module) {}
 

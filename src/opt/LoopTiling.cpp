@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <set>
 #include <map>
+#include <unordered_set>
 
 using namespace sys;
 
@@ -20,6 +21,8 @@ namespace {
 
 constexpr int kDefaultTileSize = 32;
 constexpr int kMinTripForTiling = 64;
+constexpr int kL1DataCacheBytes = 32 * 1024;
+constexpr int kCacheLineBytes = 64;
 
 bool envEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
@@ -32,6 +35,121 @@ int envInt(const char *name, int fallback) {
   if (!raw || !raw[0]) return fallback;
   int v = std::atoi(raw);
   return v > 0 ? v : fallback;
+}
+
+int estimateTrip(LoopInfo *loop);
+
+int floorPow2(int n) {
+  int p = 1;
+  while ((p << 1) > 0 && (p << 1) <= n)
+    p <<= 1;
+  return p;
+}
+
+int clampPow2(int n, int lo, int hi) {
+  if (n < lo) return lo;
+  if (n > hi) return hi;
+  return std::max(lo, floorPow2(n));
+}
+
+int typeBytes(Value::Type ty) {
+  switch (ty) {
+  case Value::i64:
+    return 8;
+  case Value::i128:
+  case Value::f128:
+    return 16;
+  case Value::i32:
+  case Value::f32:
+  default:
+    return 4;
+  }
+}
+
+Op *addressRoot(Op *addr, std::set<Op*> &visiting) {
+  if (!addr || visiting.count(addr))
+    return addr;
+  visiting.insert(addr);
+  if ((isa<AddLOp>(addr) || isa<AddIOp>(addr)) && addr->getOperandCount() == 2) {
+    auto lhs = addr->DEF(0);
+    auto rhs = addr->DEF(1);
+    if (isa<IntOp>(lhs))
+      return addressRoot(rhs, visiting);
+    if (isa<IntOp>(rhs))
+      return addressRoot(lhs, visiting);
+    // Prefer the pointer-like side when one operand is clearly an integer
+    // offset expression. This keeps base+linear-index streams together
+    // without requiring a full affine analysis in this CFG pass.
+    if (lhs && lhs->getResultType() == Value::i64 && rhs &&
+        rhs->getResultType() == Value::i32)
+      return addressRoot(lhs, visiting);
+    if (rhs && rhs->getResultType() == Value::i64 && lhs &&
+        lhs->getResultType() == Value::i32)
+      return addressRoot(rhs, visiting);
+  }
+  return addr;
+}
+
+Op *addressRoot(Op *addr) {
+  std::set<Op*> visiting;
+  return addressRoot(addr, visiting);
+}
+
+struct TileFootprint {
+  std::unordered_set<Op*> readStreams;
+  std::unordered_set<Op*> writeStreams;
+  int maxElemBytes = 4;
+};
+
+void collectTileFootprint(LoopInfo *loop, TileFootprint &fp) {
+  for (auto bb : loop->getBlocks()) {
+    for (auto op : bb->getOps()) {
+      if (isa<LoadOp>(op) && op->getOperandCount() >= 1) {
+        fp.readStreams.insert(addressRoot(op->DEF(0)));
+        fp.maxElemBytes = std::max(fp.maxElemBytes, typeBytes(op->getResultType()));
+      } else if (isa<StoreOp>(op) && op->getOperandCount() >= 2) {
+        fp.writeStreams.insert(addressRoot(op->DEF(1)));
+        auto val = op->DEF(0);
+        if (val)
+          fp.maxElemBytes = std::max(fp.maxElemBytes, typeBytes(val->getResultType()));
+      }
+    }
+  }
+}
+
+int computeAdaptiveTileSize(LoopInfo *outer, LoopInfo *inner, int fallback) {
+  const int forced = envInt("SISY_TILE_SIZE", 0);
+  if (forced > 0)
+    return forced;
+
+  TileFootprint fp;
+  collectTileFootprint(inner, fp);
+  int streams = (int)fp.readStreams.size() + (int)fp.writeStreams.size();
+  if (streams <= 0)
+    streams = 1;
+
+  // Strip-mining this pass tiles a single loop dimension. Model the working
+  // set as one cache-line-friendly span per active stream and reserve half of
+  // L1 for unrelated live data, stack slots, and conflict misses.
+  const int elemBytes = std::max(4, fp.maxElemBytes);
+  const int elemsPerLine = std::max(4, kCacheLineBytes / elemBytes);
+  const int budgetBytes = kL1DataCacheBytes / 2;
+  const int fitByCache = budgetBytes / std::max(1, streams * elemBytes);
+  int hi = 256;
+
+  // If the static trip count is known, never choose a tile bigger than it;
+  // otherwise keep a conservative upper bound to avoid burying outer-loop
+  // progress behind very large tiles.
+  int trip = estimateTrip(outer);
+  if (trip > 0)
+    hi = std::min(hi, std::max(elemsPerLine, trip));
+
+  int candidate = clampPow2(fitByCache, elemsPerLine, hi);
+  if (streams >= 5 && candidate > elemsPerLine)
+    candidate /= 2;
+  if (streams >= 8 && candidate > elemsPerLine)
+    candidate /= 2;
+  return candidate > 0 ? candidate : fallback;
 }
 
 // Check if loop has unit-step induction variable.
@@ -309,6 +427,8 @@ std::map<std::string, int> LoopTiling::stats() {
     { "tiled", tiled },
     { "rejected-shape", rejectedShape },
     { "rejected-profit", rejectedProfit },
+    { "adaptive-tiles", adaptiveTiles },
+    { "tile-size-sum", tileSizeSum },
   };
 }
 
@@ -316,7 +436,6 @@ void LoopTiling::run() {
   if (!envEnabled("SISY_ENABLE_LOOP_TILING", true))
     return;
 
-  int tileSize = envInt("SISY_TILE_SIZE", kDefaultTileSize);
   int maxRounds = envInt("SISY_TILE_ROUNDS", 3);
 
   // Run multiple rounds to handle deeper nests (tile from inside out).
@@ -400,7 +519,10 @@ void LoopTiling::run() {
             continue;
           }
 
+          int tileSize = computeAdaptiveTileSize(cur, inner, kDefaultTileSize);
           if (applyStripMine(cur, tileSize)) {
+            adaptiveTiles++;
+            tileSizeSum += tileSize;
             tiled++;
             changed = true;
             break; // Re-run analysis after modifying
