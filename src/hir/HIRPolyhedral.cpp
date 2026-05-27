@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -19,6 +20,8 @@ namespace sys::hir {
 using namespace sys::hir::detail;
 
 namespace {
+
+constexpr const char *kStencilSplitLoopMarker = "__hir_stencil_split_loop";
 
 bool termVariesInLoop(const Op *op, const Op *body) {
   if (!op)
@@ -186,6 +189,21 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
         }
       }
     }
+
+    // Stencil border peeling must run before recursive descent. Otherwise a
+    // nested guard-hoist pass can split the full boundary conjunction inside
+    // the kernel loop before this parent spatial loop has a chance to create
+    // the left/interior/right regions.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_STENCIL_INTERIOR",
+                      hirEnvEnabled("SISY_HIR_ENABLE_ADVANCED_CONV2D", false))) {
+      for (size_t i = 0; i < block->children.size(); i++) {
+        if (block->children[i] && block->children[i]->kind == OpKind::While &&
+            tryStencilInteriorDispatch(block, i, stats)) {
+          changed = true;
+          i = 0;
+        }
+      }
+    }
   }
 
   for (auto &child : block->children)
@@ -226,6 +244,20 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   }
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    // The interior/boundary dispatcher is a general stencil transform for
+    // guarded affine loops. Run it before generic guard splitting so it can see
+    // the full conjunction of lower/upper bounds and peel the long contiguous
+    // interior range out of the boundary path.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_STENCIL_INTERIOR",
+                      hirEnvEnabled("SISY_HIR_ENABLE_ADVANCED_CONV2D", false))) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryStencilInteriorDispatch(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
     if (hirEnvEnabled("SISY_HIR_ENABLE_INVARIANT_GUARD_HOIST", true) &&
         block->children[i] && block->children[i]->kind == OpKind::While &&
         tryInvariantGuardHoist(block, i, stats)) {
@@ -238,19 +270,6 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
       changed = true;
       i = 0;
       continue;
-    }
-    // The interior/boundary dispatcher is a general stencil transform for
-    // convolution-like affine loops. It is still opt-in because cloning the
-    // fast path can increase backend register pressure on large kernels.
-    if (hirEnvEnabled("SISY_HIR_ENABLE_STENCIL_INTERIOR",
-                      hirEnvEnabled("SISY_HIR_ENABLE_ADVANCED_CONV2D", false))) {
-      if (block->children[i] && block->children[i]->kind == OpKind::While) {
-        if (tryStencilInteriorDispatch(block, i, stats)) {
-          changed = true;
-          i = 0;
-          continue;
-        }
-      }
     }
     if (hirEnvEnabled("SISY_HIR_ENABLE_INTERCHANGE", true)) {
       if (block->children[i] && block->children[i]->kind == OpKind::While) {
@@ -382,6 +401,11 @@ bool PolyhedralOptimizer::tryStencilInteriorDispatch(Op *block, size_t idx,
   }
 
   Op *whileOp = block->children[idx].get();
+  if (whileOp->symbol == kStencilSplitLoopMarker) {
+    stats.stencilInteriorRejected++;
+    stats.stencilInteriorRejectShape++;
+    return false;
+  }
   CanonicalLoop colLoop;
   if (!matchCanonicalWhile(whileOp, colLoop) || !colLoop.body ||
       colLoop.body->kind != OpKind::Block || colLoop.body->children.size() < 2) {
@@ -428,10 +452,79 @@ bool PolyhedralOptimizer::tryStencilInteriorDispatch(Op *block, size_t idx,
 
   auto fastBody = cloneDroppingStencilGuard(colLoop.body, bounds.guardedIf);
   auto slowBody = cloneOp(colLoop.body);
-  if (!fastBody || !slowBody) {
+  auto leftSlowBody = cloneOp(colLoop.body);
+  auto rightSlowBody = cloneOp(colLoop.body);
+  if (!fastBody || !slowBody || !leftSlowBody || !rightSlowBody) {
     stats.stencilInteriorRejected++;
     stats.stencilInteriorRejectShape++;
     return false;
+  }
+
+  if (hirEnvEnabled("SISY_HIR_STENCIL_SPLIT_COLUMNS", true)) {
+    // Peel the guarded stencil loop into:
+    //   left boundary:   original guarded body while c < min(bound, pad)
+    //   interior:        guard-free body      while c < bound - pad
+    //   right boundary:  original guarded body while c < bound
+    //
+    // This is the affine/border-peeling form used by production stencil
+    // optimizers.  It removes the per-pixel interior branch from the long
+    // contiguous middle region while preserving the original guarded body for
+    // both borders.  The final value of the column IV may differ when
+    // bound < pad, so require that it is not observed before a redefinition.
+    if (scalarUsedBeforeRedef(block, idx + 1, colLoop.iv)) {
+      stats.stencilInteriorRejected++;
+      stats.stencilInteriorRejectBounds++;
+      return false;
+    }
+
+    auto leftCond = makeLogicalAnd(
+        cloneOp(whileOp->children[0].get()),
+        makeCmp("<", makeLoad(colLoop.iv), makeLoad(bounds.pad)));
+    auto middleStop =
+        makeArith("-", cloneOp(bounds.bound), makeLoad(bounds.pad));
+    auto middleCond =
+        makeCmp("<", makeLoad(colLoop.iv), std::move(middleStop));
+    auto rightCond = cloneOp(whileOp->children[0].get());
+    if (!leftCond || !middleCond || !rightCond) {
+      stats.stencilInteriorRejected++;
+      stats.stencilInteriorRejectShape++;
+      return false;
+    }
+
+    auto rowLower = makeCmp("<=", makeLoad(bounds.pad), makeLoad(bounds.rowSpatial));
+    auto rowUpper = makeCmp("<", makeLoad(bounds.rowSpatial),
+                            makeArith("-", cloneOp(bounds.bound),
+                                      makeLoad(bounds.pad)));
+    auto rowInterior = makeLogicalAnd(std::move(rowLower), std::move(rowUpper));
+    if (!rowInterior) {
+      stats.stencilInteriorRejected++;
+      stats.stencilInteriorRejectShape++;
+      return false;
+    }
+
+    auto middleBody = makeBlock();
+    middleBody->children.push_back(
+        makeIf(std::move(rowInterior), std::move(fastBody), std::move(slowBody)));
+
+    std::vector<std::unique_ptr<Op>> replacement;
+    auto leftLoop = makeWhile(std::move(leftCond), std::move(leftSlowBody));
+    auto middleLoop = makeWhile(std::move(middleCond), std::move(middleBody));
+    auto rightLoop = makeWhile(std::move(rightCond), std::move(rightSlowBody));
+    leftLoop->symbol = kStencilSplitLoopMarker;
+    middleLoop->symbol = kStencilSplitLoopMarker;
+    rightLoop->symbol = kStencilSplitLoopMarker;
+    replacement.push_back(std::move(leftLoop));
+    replacement.push_back(makeStore(colLoop.iv, makeLoad(bounds.pad)));
+    replacement.push_back(std::move(middleLoop));
+    replacement.push_back(std::move(rightLoop));
+
+    auto first = block->children.begin() + static_cast<std::ptrdiff_t>(idx);
+    first = block->children.erase(first);
+    block->children.insert(first,
+                           std::make_move_iterator(replacement.begin()),
+                           std::make_move_iterator(replacement.end()));
+    stats.stencilInteriorDispatched++;
+    return true;
   }
 
   auto dispatchedBody = makeBlock();
