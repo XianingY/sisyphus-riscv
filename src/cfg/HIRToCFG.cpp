@@ -121,6 +121,21 @@ SymbolInfo buildSymbolInfo(const std::string &name, Type *ty, bool isGlobal, boo
   return info;
 }
 
+void applySyntheticArrayShape(SymbolInfo &info, const hir::Op *op) {
+  if (!op || op->arrayDims.empty() || !info.dims.empty())
+    return;
+
+  info.type = hir::TypeKind::Array;
+  info.elementType = (op->type == hir::TypeKind::Float) ? hir::TypeKind::Float
+                                                        : hir::TypeKind::Int;
+  info.dims = op->arrayDims;
+  info.elemSize = 4;
+  info.storageSize = productDims(info.dims) * info.elemSize;
+  if (info.storageSize == 0)
+    info.storageSize = info.elemSize;
+  info.strideBytes = computeStrideBytes(info.dims, info.elemSize);
+}
+
 std::string formatFloat(double value) {
   std::ostringstream oss;
   // Preserve enough decimal digits to round-trip through strtof() in
@@ -398,6 +413,7 @@ private:
         const auto *origin = dyn_cast<VarDeclNode>(op->origin);
         Type *ty = origin ? origin->type : op->origin ? op->origin->type : nullptr;
         auto info = buildSymbolInfo(op->symbol, ty, true, false, origin ? origin->mut : true);
+        applySyntheticArrayShape(info, op);
 
         if (origin && origin->init) {
           if (auto i = dyn_cast<IntNode>(origin->init)) {
@@ -436,7 +452,9 @@ private:
     if (op->kind == hir::OpKind::VarDecl && !sym.empty() && !seen.count(sym)) {
       const auto *origin = op->origin ? dyn_cast<VarDeclNode>(op->origin) : nullptr;
       Type *ty = origin ? origin->type : op->origin ? op->origin->type : nullptr;
-      locals.push_back(buildSymbolInfo(sym, ty, false, false, origin ? origin->mut : true));
+      auto info = buildSymbolInfo(sym, ty, false, false, origin ? origin->mut : true);
+      applySyntheticArrayShape(info, op);
+      locals.push_back(std::move(info));
       seen.insert(sym);
     }
     for (const auto &child : op->children)
@@ -808,7 +826,7 @@ private:
       auto it = symbols.find(sym);
       bool isArray = it != symbols.end() && !it->second.dims.empty();
       if (isArray) {
-        auto *var = dyn_cast<VarDeclNode>(op->origin);
+        auto *var = op->origin ? dyn_cast<VarDeclNode>(op->origin) : nullptr;
         emitLocalArrayInit(sym, var, func, st, cur, symbols, stores);
         return cur;
       }

@@ -3,12 +3,14 @@
 
 #include "HIROps.h"
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace sys::hir {
 
 struct PolyhedralStats {
   int reductionJammed = 0;
+  int reductionPrivatized = 0;
   int reductionInterchanged = 0;
   int conditionalReductionInterchanged = 0;
   int repeatReduced = 0;
@@ -122,12 +124,14 @@ private:
   int hirTileSize = 32;
   int hirJamFactor = 4;
   std::unordered_set<std::string> globalArrays;
+  std::unordered_map<std::string, std::vector<int>> globalArrayDims;
   std::unordered_set<const Op*> monotoneTightenedLoops;
   std::unordered_set<const Op*> partialUnrollRemainders;
 
   bool optimizeBlock(Op *block, PolyhedralStats &stats);
   void scanAffineNest(Op *op, PolyhedralStats &stats);
   bool tryReductionInterchange(Op *block, size_t initIndex, PolyhedralStats &stats);
+  bool tryReductionRowPrivatize(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryReductionJam(Op *block, size_t initIndex, PolyhedralStats &stats);
   bool tryLoopInterchange3D(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryLoopInterchange(Op *block, size_t idx, PolyhedralStats &stats);

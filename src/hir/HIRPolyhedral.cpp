@@ -32,14 +32,17 @@ PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   if (hirJamFactor > 16)
     hirJamFactor = 16;
   globalArrays.clear();
+  globalArrayDims.clear();
   monotoneTightenedLoops.clear();
   partialUnrollRemainders.clear();
   functions.clear();
   for (const auto &child : module.root->children) {
     const Op *decl = unwrapSingleDecl(child.get());
     if (decl && decl->kind == OpKind::VarDecl && !decl->symbol.empty() &&
-        !decl->arrayDims.empty())
+        !decl->arrayDims.empty()) {
       globalArrays.insert(decl->symbol);
+      globalArrayDims[decl->symbol] = decl->arrayDims;
+    }
     if (child && child->kind == OpKind::Func && !child->symbol.empty())
       functions[child->symbol] = child.get();
   }
@@ -80,6 +83,11 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     return changed;
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    if (tryReductionRowPrivatize(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
     if (tryReductionInterchange(block, i, stats)) {
       changed = true;
       i = 0;

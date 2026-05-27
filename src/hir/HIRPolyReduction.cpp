@@ -14,6 +14,77 @@ namespace sys::hir {
 
 using namespace sys::hir::detail;
 
+namespace {
+
+std::unique_ptr<Op> makeArrayLoadAt(const std::string &symbol,
+                                    std::unique_ptr<Op> index,
+                                    TypeKind type = TypeKind::Int) {
+  auto op = std::make_unique<Op>(OpKind::Load);
+  op->type = type;
+  op->symbol = symbol;
+  op->children.push_back(std::move(index));
+  return op;
+}
+
+std::unique_ptr<Op> makeArrayStoreAt(const std::string &symbol,
+                                     std::unique_ptr<Op> index,
+                                     std::unique_ptr<Op> value,
+                                     TypeKind type = TypeKind::Int) {
+  auto op = std::make_unique<Op>(OpKind::Store);
+  op->type = type;
+  op->symbol = symbol;
+  op->children.push_back(std::move(index));
+  op->children.push_back(std::move(value));
+  return op;
+}
+
+bool isDirectLoadOf(const Op *op, const std::string &symbol) {
+  return op && op->kind == OpKind::Load && op->children.empty() &&
+         op->symbol == symbol;
+}
+
+std::unique_ptr<Op> makeSyntheticArrayDecl(const std::string &symbol,
+                                           int elements, TypeKind elementType) {
+  auto op = std::make_unique<Op>(OpKind::VarDecl);
+  op->type = elementType == TypeKind::Float ? TypeKind::Float : TypeKind::Int;
+  op->symbol = symbol;
+  op->arrayDims.push_back(elements);
+  return op;
+}
+
+std::unique_ptr<Op> cloneReductionStmtToScratch(const Op *op,
+                                                const ReductionPattern &pat,
+                                                const std::string &scratch) {
+  if (!op)
+    return nullptr;
+  if (isScalarLoad(op, pat.acc))
+    return makeArrayLoadAt(scratch, makeLoad(pat.j), op->type);
+  if (op->kind == OpKind::Store && op->symbol == pat.acc && op->children.size() == 1) {
+    auto oldValue = makeArrayLoadAt(scratch, makeLoad(pat.j), op->type);
+    auto nextValue = cloneReplacingScalarLoad(op->children[0].get(), pat.acc,
+                                              oldValue.get());
+    if (!nextValue)
+      return nullptr;
+    return makeArrayStoreAt(scratch, makeLoad(pat.j), std::move(nextValue),
+                            op->type);
+  }
+
+  auto out = std::make_unique<Op>(op->kind, op->origin);
+  out->type = op->type;
+  out->traits = op->traits;
+  out->symbol = op->symbol;
+  out->hasIntValue = op->hasIntValue;
+  out->intValue = op->intValue;
+  out->hasFloatValue = op->hasFloatValue;
+  out->floatValue = op->floatValue;
+  out->arrayDims = op->arrayDims;
+  for (const auto &child : op->children)
+    out->children.push_back(cloneReductionStmtToScratch(child.get(), pat, scratch));
+  return out;
+}
+
+}  // namespace
+
 bool PolyhedralOptimizer::tryRepeatInvariantReduction(Op *block, size_t idx,
                                                        PolyhedralStats &stats) {
   if (!block || idx >= block->children.size() || idx == 0)
@@ -237,6 +308,120 @@ bool PolyhedralOptimizer::tryReductionInterchange(Op *block, size_t initIndex,
   stats.reductionInterchanged++;
   if (pat.kReductionStmt != pat.accUpdate)
     stats.conditionalReductionInterchanged++;
+  return true;
+}
+
+bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
+                                                   PolyhedralStats &stats) {
+  if (!block || initIndex + 1 >= block->children.size())
+    return false;
+
+  if (!hirEnvEnabled("SISY_HIR_ENABLE_REDUCTION_PRIVATIZE", true))
+    return false;
+
+  Op *whileOp = block->children[initIndex + 1].get();
+  ReductionPattern pat;
+  if (!matchReductionPattern(whileOp, pat))
+    return false;
+  if (!matchLoopInit(block->children[initIndex].get(), pat.j))
+    return false;
+  if (!pat.destStore || pat.destStore->children.size() != 3 ||
+      !pat.accUpdate || !pat.kReductionStmt)
+    return false;
+
+  auto dimsIt = globalArrayDims.find(pat.destStore->symbol);
+  if (dimsIt == globalArrayDims.end() || dimsIt->second.size() != 2)
+    return false;
+
+  int jDim = -1;
+  for (int dim = 0; dim < 2; dim++) {
+    if (isDirectLoadOf(pat.destStore->children[dim].get(), pat.j))
+      jDim = dim;
+  }
+  if (jDim < 0)
+    return false;
+
+  const int scratchElems = dimsIt->second[jDim];
+  constexpr int kMaxScratchElems = 1 << 16;
+  if (scratchElems <= 0 || scratchElems > kMaxScratchElems)
+    return false;
+
+  // This is scalar expansion for reductions that are already legal to
+  // interchange.  In-place recurrences keep the existing order-preserving jam
+  // path; row buffering them is legal only for narrower shapes and was slower
+  // on cache-sized integer kernels.
+  if (!strictReductionInterchangeLegal(pat, globalArrays))
+    return false;
+
+  const std::string scratch =
+      "__poly_rowbuf_" + pat.destStore->symbol + "_" + std::to_string(uniqueId++);
+
+  auto scratchDecl = makeSyntheticArrayDecl(
+      scratch, scratchElems,
+      pat.destStore->type == TypeKind::Float ? TypeKind::Float : TypeKind::Int);
+
+  auto initBody = makeBlock();
+  auto initValueClone = cloneOp(initValue(pat.accInit));
+  if (!initValueClone)
+    initValueClone = makeConstInt(0);
+  initBody->children.push_back(
+      makeArrayStoreAt(scratch, makeLoad(pat.j), std::move(initValueClone),
+                       pat.destStore->type));
+  initBody->children.push_back(cloneOp(pat.jStep));
+  auto initLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                            std::move(initBody));
+
+  CanonicalLoop kLoop;
+  if (!matchCanonicalWhile(pat.kWhile, kLoop))
+    return false;
+
+  auto innerJBody = makeBlock();
+  auto scratchUpdate = cloneReductionStmtToScratch(pat.kReductionStmt, pat, scratch);
+  if (!scratchUpdate)
+    return false;
+  innerJBody->children.push_back(std::move(scratchUpdate));
+  innerJBody->children.push_back(cloneOp(pat.jStep));
+  auto innerJLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                              std::move(innerJBody));
+
+  auto kBody = makeBlock();
+  kBody->children.push_back(cloneOp(block->children[initIndex].get()));
+  kBody->children.push_back(std::move(innerJLoop));
+  kBody->children.push_back(cloneOp(pat.kStep));
+  auto kWhile = makeWhile(cloneOp(pat.kWhile->children[0].get()), std::move(kBody));
+
+  auto commitBody = makeBlock();
+  auto scratchLoad = makeArrayLoadAt(scratch, makeLoad(pat.j), pat.destStore->type);
+  auto commitStore = makeArrayStoreLike(pat.destStore, std::move(scratchLoad));
+  if (!commitStore)
+    return false;
+  commitBody->children.push_back(std::move(commitStore));
+  commitBody->children.push_back(cloneOp(pat.jStep));
+  auto commitLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                              std::move(commitBody));
+  auto commitJInit = cloneOp(block->children[initIndex].get());
+  if (!commitJInit)
+    return false;
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 5);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == initIndex) {
+      replacement.push_back(std::move(scratchDecl));
+      replacement.push_back(std::move(block->children[i]));
+      replacement.push_back(std::move(initLoop));
+      replacement.push_back(cloneOp(pat.kInit));
+      replacement.push_back(std::move(kWhile));
+      replacement.push_back(std::move(commitJInit));
+      replacement.push_back(std::move(commitLoop));
+      i++; // skip original j loop
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+
+  block->children = std::move(replacement);
+  stats.reductionPrivatized++;
   return true;
 }
 

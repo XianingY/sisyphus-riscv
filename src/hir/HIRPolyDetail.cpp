@@ -75,13 +75,11 @@ int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
 
   int bestFactor = 4;
   for (int factor : {8, 6, 4, 2}) {
-    // Unroll-and-jam is only applied to order-preserving affine/reduction
-    // nests.  A wider lane group increases instruction-level parallelism and
-    // amortizes loop/control overhead; the backend live-range splitter handles
-    // the occasional address temporary better than a too-conservative HIR
-    // model.  Keep this estimate tied to actual memory streams and scalar defs
-    // instead of source-level dimensions or benchmark names.
-    int estimatedPressure = factor * activeStreams + activeScalars + factor / 2;
+    // Each jam lane keeps the active memory streams plus address/update
+    // temporaries alive. Modeling those temporaries keeps the transform from
+    // choosing a wide jam that immediately spills or stretches scheduling on
+    // the target backend.
+    int estimatedPressure = factor * (activeStreams + 1) + activeScalars + 2;
     if (estimatedPressure <= usableRegs) {
       bestFactor = factor;
       break;
