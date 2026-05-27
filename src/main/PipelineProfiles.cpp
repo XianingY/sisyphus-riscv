@@ -293,6 +293,12 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
         (opts.arm || opts.rv) &&
         getenvEnabled("SISY_ENABLE_VECTORIZE",
                       opts.enableExperimental || opts.o2 || polyVectorize);
+    if (polyVectorize && getenvEnabled("SISY_POLY_VECTORIZE_ROTATE", true)) {
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+      if (!opts.disableLoopRotate || !opts.loopRotateExplicit)
+        pm.addPass<sys::LoopRotate>(/*allowCanonicalizedHeaders=*/ true);
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+    }
     if (enableVectorize && getenvEnabled("SISY_ENABLE_EARLY_VECTORIZE", true))
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::SCEV>();

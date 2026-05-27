@@ -15,12 +15,53 @@ std::map<std::string, int> LoopRotate::stats() {
   };
 }
 
+static bool isConstInt(Op *op, int value) {
+  return isa<IntOp>(op) && V(op) == value;
+}
+
+static bool inferInductionForRotate(LoopInfo *info) {
+  if (!info || info->getInduction() || info->latches.size() != 1 ||
+      !info->header || !info->preheader)
+    return info && info->getInduction();
+
+  auto latch = info->getLatch();
+  auto phis = info->header->getPhis();
+  Rule br("(br (lt i x))"), brle("(br (le i x))");
+  Rule addi("(add x y)");
+
+  for (auto phi : phis) {
+    auto start = Op::getPhiFrom(phi, info->preheader);
+    auto latchVal = Op::getPhiFrom(phi, latch);
+    if (!start || !latchVal || !addi.match(latchVal, { { "x", phi } }))
+      continue;
+    auto step = addi.extract("y");
+    if (!isConstInt(step, 1))
+      continue;
+
+    auto term = info->header->getLastOp();
+    Op *stop = nullptr;
+    if (br.match(term, { { "i", phi } }))
+      stop = br.extract("x");
+    else if (brle.match(term, { { "i", phi } }))
+      stop = brle.extract("x");
+    if (!stop)
+      continue;
+
+    info->induction = phi;
+    info->start = start;
+    info->stop = stop;
+    info->step = step;
+    return true;
+  }
+  return false;
+}
+
 void LoopRotate::runImpl(LoopInfo *info) {
-  if (skipHeaders.count(info->header))
+  if (!allowCanonicalizedHeaders && skipHeaders.count(info->header))
     return;
   if (info->latches.size() != 1)
     return;
-  if (!info->getInduction())
+  if (!inferInductionForRotate(info))
     return;
   if (info->exits.size() != 1)
     return;

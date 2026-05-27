@@ -109,10 +109,12 @@ public:
 class LoopRotate : public Pass {
   int rotated = 0;
   std::set<BasicBlock*> skipHeaders;
+  bool allowCanonicalizedHeaders = false;
 
   void runImpl(LoopInfo *info);
 public:
-  LoopRotate(ModuleOp *module): Pass(module) {}
+  LoopRotate(ModuleOp *module, bool allowCanonicalizedHeaders = false):
+    Pass(module), allowCanonicalizedHeaders(allowCanonicalizedHeaders) {}
 
   std::string name() override { return "loop-rotate"; }
   std::map<std::string, int> stats() override;
