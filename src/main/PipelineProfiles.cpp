@@ -286,9 +286,15 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // become canonical after SCEV/DLE cleanup are picked up by the late
     // Vectorize call below. Idempotent — already-vectorized loops no
     // longer match the (lt phi, x) shape and are skipped.
+    // Keep the HIR-poly -> Vectorize bridge opt-in by default. The current
+    // online RISC-V assembler profile does not necessarily enable RVV, so
+    // automatically emitting v* instructions from a generic polyhedral
+    // cleanup signal can turn valid scalar code into link failures. The
+    // bridge is still available for RVV-capable experiments via
+    // SISY_ENABLE_POLY_VECTORIZE=1.
     const bool polyVectorize =
         opts.rv && plan.metrics.hirPolyApplied > 0 &&
-        getenvEnabled("SISY_ENABLE_POLY_VECTORIZE", true);
+        getenvEnabled("SISY_ENABLE_POLY_VECTORIZE", false);
     const bool enableVectorize =
         (opts.arm || opts.rv) &&
         getenvEnabled("SISY_ENABLE_VECTORIZE",
