@@ -1,0 +1,20 @@
+int a[16][16];
+
+int main() {
+  int i = 0;
+  while (i < 16) {
+    int j = 0;
+    while (j < 16) {
+      if (i < j) {
+        j = j + 1;
+        continue;
+      }
+      int curr = a[i][j];
+      a[i][j] = a[j][i];
+      a[j][i] = curr;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return a[0][0];
+}

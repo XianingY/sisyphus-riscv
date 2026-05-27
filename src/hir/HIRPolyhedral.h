@@ -57,6 +57,12 @@ struct PolyhedralStats {
   int unrollJamRejectControl = 0;
   int unrollJamRejectAccess = 0;
   int unrollJamRejectMemory = 0;
+  // Order-preserving innermost partial unroll counters.
+  int partialUnrolled = 0;
+  int partialUnrollRejected = 0;
+  int partialUnrollRejectShape = 0;
+  int partialUnrollRejectControl = 0;
+  int partialUnrollRejectAccess = 0;
   // Loop fusion counters
   int fusionApplied = 0;
   int fusionRejected = 0;
@@ -116,6 +122,8 @@ private:
   int hirTileSize = 32;
   int hirJamFactor = 4;
   std::unordered_set<std::string> globalArrays;
+  std::unordered_set<const Op*> monotoneTightenedLoops;
+  std::unordered_set<const Op*> partialUnrollRemainders;
 
   bool optimizeBlock(Op *block, PolyhedralStats &stats);
   void scanAffineNest(Op *op, PolyhedralStats &stats);
@@ -124,6 +132,7 @@ private:
   bool tryLoopInterchange3D(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryLoopInterchange(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryLoopUnrollJam(Op *block, size_t idx, PolyhedralStats &stats);
+  bool tryInnermostPartialUnroll(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryDeadOverwriteRepeat(Op *block, size_t idx, PolyhedralStats &stats);
 

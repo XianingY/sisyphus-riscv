@@ -490,4 +490,119 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
   return true;
 }
 
+namespace {
+
+bool containsCarriedScalarStore(const Op *op, const std::string &iv) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Store && op->children.size() == 1 &&
+      op->symbol != iv)
+    return true;
+  for (const auto &child : op->children)
+    if (containsCarriedScalarStore(child.get(), iv))
+      return true;
+  return false;
+}
+
+void collectLocalScalarDecls(const Op *op, std::unordered_set<std::string> &syms) {
+  if (!op)
+    return;
+  if (op->kind == OpKind::VarDecl && op->arrayDims.empty() &&
+      !op->symbol.empty())
+    syms.insert(op->symbol);
+  for (const auto &child : op->children)
+    collectLocalScalarDecls(child.get(), syms);
+}
+
+}  // namespace
+
+bool PolyhedralOptimizer::tryInnermostPartialUnroll(
+    Op *block, size_t idx, PolyhedralStats &stats) {
+  if (!block || (block->kind != OpKind::Block && block->kind != OpKind::Module) ||
+      idx >= block->children.size()) {
+    stats.partialUnrollRejected++;
+    stats.partialUnrollRejectShape++;
+    return false;
+  }
+
+  Op *whileOp = block->children[idx].get();
+  if (!monotoneTightenedLoops.count(whileOp))
+    return false;
+  if (partialUnrollRemainders.count(whileOp))
+    return false;
+
+  CanonicalLoop loop;
+  if (!matchCanonicalWhile(whileOp, loop) || !loop.body ||
+      loop.body->kind != OpKind::Block || loop.body->children.size() < 2 ||
+      containsWhile(loop.body)) {
+    stats.partialUnrollRejected++;
+    stats.partialUnrollRejectShape++;
+    return false;
+  }
+
+  if (!tilingSafeBody(loop.body) ||
+      blockExceptLastWritesScalar(loop.body, loop.iv) ||
+      containsCarriedScalarStore(loop.body, loop.iv)) {
+    stats.partialUnrollRejected++;
+    stats.partialUnrollRejectControl++;
+    return false;
+  }
+
+  // This transform only duplicates adjacent iterations in their original
+  // order; unlike interchange it does not need an affine dependence proof.
+  // Requiring affine recovery here would reject linearized multidimensional
+  // addresses with symbolic row strides, including triangular transpose.
+  if (countArrayAccessOps(loop.body) < 2) {
+    stats.partialUnrollRejected++;
+    stats.partialUnrollRejectAccess++;
+    return false;
+  }
+
+  std::unordered_set<std::string> localScalars;
+  collectLocalScalarDecls(loop.body, localScalars);
+  localScalars.erase(loop.iv);
+
+  constexpr int kFactor = 2;
+  auto unrolledBody = makeBlock();
+  for (int lane = 0; lane < kFactor; lane++) {
+    std::unordered_map<std::string, std::string> scalarRenames;
+    if (lane != 0) {
+      for (const auto &scalar : localScalars) {
+        scalarRenames[scalar] =
+            "__hir_partial_" + std::to_string(uniqueId) + "_" +
+            std::to_string(lane) + "_" + scalar;
+      }
+    }
+    std::unordered_map<std::string, int> ivOffsets = {{loop.iv, lane}};
+    for (size_t stmt = 0; stmt + 1 < loop.body->children.size(); stmt++) {
+      unrolledBody->children.push_back(
+          cloneReplacing(loop.body->children[stmt].get(), scalarRenames, ivOffsets));
+    }
+  }
+  uniqueId++;
+  unrolledBody->children.push_back(makeJamStep(loop.iv, kFactor));
+
+  auto unrolledCond =
+      makeCmp("<",
+              makeArith("+", makeLoad(loop.iv), makeConstInt(kFactor - 1)),
+              cloneOp(loop.bound));
+  auto unrolledWhile = makeWhile(std::move(unrolledCond), std::move(unrolledBody));
+  auto remainderWhile = cloneOp(whileOp);
+  partialUnrollRemainders.insert(remainderWhile.get());
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() + 1);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(std::move(unrolledWhile));
+      replacement.push_back(std::move(remainderWhile));
+    } else {
+      replacement.push_back(std::move(block->children[i]));
+    }
+  }
+  block->children = std::move(replacement);
+  stats.partialUnrolled++;
+  return true;
+}
+
 }  // namespace sys::hir

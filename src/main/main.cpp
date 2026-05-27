@@ -397,6 +397,11 @@ int main(int argc, char **argv) {
                       << " unroll-jam-reject-control=" << stats.unrollJamRejectControl
                       << " unroll-jam-reject-access=" << stats.unrollJamRejectAccess
                       << " unroll-jam-reject-memory=" << stats.unrollJamRejectMemory
+                      << " partial-unrolled=" << stats.partialUnrolled
+                      << " partial-unroll-rejected=" << stats.partialUnrollRejected
+                      << " partial-unroll-reject-shape=" << stats.partialUnrollRejectShape
+                      << " partial-unroll-reject-control=" << stats.partialUnrollRejectControl
+                      << " partial-unroll-reject-access=" << stats.partialUnrollRejectAccess
                       << " fusion-applied=" << stats.fusionApplied
                       << " fusion-rejected=" << stats.fusionRejected
                       << " fusion-reject-shape=" << stats.fusionRejectShape

@@ -32,6 +32,8 @@ PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   if (hirJamFactor > 16)
     hirJamFactor = 16;
   globalArrays.clear();
+  monotoneTightenedLoops.clear();
+  partialUnrollRemainders.clear();
   functions.clear();
   for (const auto &child : module.root->children) {
     const Op *decl = unwrapSingleDecl(child.get());
@@ -135,6 +137,18 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     if (hirEnvEnabled("SISY_HIR_ENABLE_UNROLL_JAM", true)) {
       if (block->children[i] && block->children[i]->kind == OpKind::While) {
         if (tryLoopUnrollJam(block, i, stats)) {
+          changed = true;
+          i = 0;
+          continue;
+        }
+      }
+    }
+    // Partial unroll preserves the original iteration order.  It is useful
+    // after guarded triangular loops have been tightened into a straight
+    // affine inner loop, and does not require dependence permutation.
+    if (hirEnvEnabled("SISY_HIR_ENABLE_PARTIAL_UNROLL", true)) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While) {
+        if (tryInnermostPartialUnroll(block, i, stats)) {
           changed = true;
           i = 0;
           continue;
@@ -309,6 +323,7 @@ bool PolyhedralOptimizer::tryMonotoneGuardBoundTightening(
   auto newWhile =
       makeWhile(makeCmp("<", makeLoad(loop.iv), makeLoad(stopVar)),
                 std::move(newBody));
+  Op *tightenedWhile = newWhile.get();
 
   std::vector<std::unique_ptr<Op>> replacement;
   replacement.reserve(block->children.size() + 2);
@@ -322,6 +337,7 @@ bool PolyhedralOptimizer::tryMonotoneGuardBoundTightening(
     }
   }
   block->children = std::move(replacement);
+  monotoneTightenedLoops.insert(tightenedWhile);
   stats.monotoneGuardTightened++;
   return true;
 }

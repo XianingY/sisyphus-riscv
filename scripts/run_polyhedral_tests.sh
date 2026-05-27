@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPILER="${ROOT_DIR}/build/compiler"
+COMPILER="${COMPILER:-${ROOT_DIR}/build/compiler}"
 CASE_DIR="${ROOT_DIR}/tests/polyhedral"
 OUT_DIR="${ROOT_DIR}/tests/.out/polyhedral"
 mkdir -p "${OUT_DIR}"
@@ -114,4 +114,20 @@ if ! grep -q "interchange-3d-reject-memory=[1-9]" <<<"${unsafe_3d_stats}"; then
   exit 1
 fi
 
-echo "HIR polyhedral Presburger fusion and unroll-and-jam tests passed."
+triangular_stats="$("${COMPILER}" "${CASE_DIR}/triangular_partial_unroll.sy" -S \
+  -o "${OUT_DIR}/triangular_partial_unroll.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${triangular_stats}"
+
+if ! grep -q "monotone-guard-tightened=1" <<<"${triangular_stats}"; then
+  echo "expected HIR monotone guard tightening on triangular loop" >&2
+  exit 1
+fi
+
+if ! grep -q "partial-unrolled=1" <<<"${triangular_stats}"; then
+  echo "expected HIR order-preserving partial unroll after triangular tightening" >&2
+  exit 1
+fi
+
+echo "HIR polyhedral Presburger fusion, interchange, jam, and triangular unroll tests passed."
