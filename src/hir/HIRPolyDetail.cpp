@@ -74,7 +74,7 @@ int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
   int activeScalars = (mainType == TypeKind::Float) ? metrics.scalarFloatDefs : metrics.scalarIntDefs;
 
   int bestFactor = 4;
-  for (int factor : {8, 6, 4, 2}) {
+  for (int factor : {8, 7, 6, 4, 2}) {
     // Each jam lane keeps the active memory streams plus address/update
     // temporaries alive. Modeling those temporaries keeps the transform from
     // choosing a wide jam that immediately spills or stretches scheduling on
