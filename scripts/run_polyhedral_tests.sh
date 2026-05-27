@@ -130,4 +130,15 @@ if ! grep -q "partial-unrolled=1" <<<"${triangular_stats}"; then
   exit 1
 fi
 
-echo "HIR polyhedral Presburger fusion, interchange, jam, and triangular unroll tests passed."
+guard_stats="$("${COMPILER}" "${CASE_DIR}/invariant_guard_hoist.sy" -S \
+  -o "${OUT_DIR}/invariant_guard_hoist.rv.s" \
+  -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
+
+echo "${guard_stats}"
+
+if ! grep -q "invariant-guard-hoisted=1" <<<"${guard_stats}"; then
+  echo "expected HIR loop-invariant guard hoisting on split conjunction" >&2
+  exit 1
+fi
+
+echo "HIR polyhedral Presburger fusion, interchange, jam, triangular unroll, and guard-hoist tests passed."

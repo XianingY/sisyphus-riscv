@@ -97,6 +97,10 @@ struct PolyhedralStats {
   int stencilInteriorRejected = 0;
   int stencilInteriorRejectShape = 0;
   int stencilInteriorRejectBounds = 0;
+  // Hoist an invariant conjunct from a guarded inner loop when the loop has
+  // no observable work outside that guard.
+  int invariantGuardHoisted = 0;
+  int invariantGuardRejected = 0;
   // Monotone guard tightening:
   //   while (j < B) { if (i < j) { j++; continue; } body; j++; }
   // becomes j < min(B, i + 1).  This is a general triangular-loop cleanup.
@@ -147,6 +151,7 @@ private:
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
   bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
+  bool tryInvariantGuardHoist(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryMonotoneGuardBoundTightening(Op *block, size_t idx, PolyhedralStats &stats);
 
   // Loop distribution: split one canonical perfect while into two adjacent

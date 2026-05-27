@@ -18,6 +18,118 @@ namespace sys::hir {
 
 using namespace sys::hir::detail;
 
+namespace {
+
+bool termVariesInLoop(const Op *op, const Op *body) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Call)
+    return true;
+  if (op->kind == OpKind::Load) {
+    if (!op->children.empty())
+      return true;
+    if (bodyWritesScalar(body, op->symbol))
+      return true;
+  }
+  for (const auto &child : op->children)
+    if (termVariesInLoop(child.get(), body))
+      return true;
+  return false;
+}
+
+std::unique_ptr<Op> makeConjunction(const std::vector<const Op *> &terms) {
+  if (terms.empty())
+    return nullptr;
+  auto result = cloneOp(terms.front());
+  for (size_t i = 1; i < terms.size(); i++)
+    result = makeLogicalAnd(std::move(result), cloneOp(terms[i]));
+  return result;
+}
+
+bool findSplitGuard(const Op *op, const Op *loopBody, const Op *&guard,
+                    std::vector<const Op *> &invariant,
+                    std::vector<const Op *> &varying) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::If && op->children.size() == 2) {
+    std::vector<const Op *> terms;
+    if (flattenAndTerms(op->children[0].get(), terms) && terms.size() >= 2) {
+      for (const Op *term : terms) {
+        if (termVariesInLoop(term, loopBody))
+          varying.push_back(term);
+        else
+          invariant.push_back(term);
+      }
+      if (!invariant.empty() && !varying.empty()) {
+        guard = op;
+        return true;
+      }
+      invariant.clear();
+      varying.clear();
+    }
+  }
+  for (const auto &child : op->children)
+    if (findSplitGuard(child.get(), loopBody, guard, invariant, varying))
+      return true;
+  return false;
+}
+
+bool guardDominatesObservableWork(const Op *op, const Op *guard,
+                                  const Op *step) {
+  if (!op)
+    return true;
+  if (op == guard)
+    return true;
+  switch (op->kind) {
+  case OpKind::Block:
+  case OpKind::Arith:
+  case OpKind::Cmp:
+  case OpKind::ConstInt:
+  case OpKind::ConstFloat:
+  case OpKind::Load:
+    break;
+  case OpKind::VarDecl:
+    if (!op->arrayDims.empty())
+      return false;
+    break;
+  case OpKind::Store:
+    if (op != step)
+      return false;
+    break;
+  default:
+    return false;
+  }
+  for (const auto &child : op->children)
+    if (!guardDominatesObservableWork(child.get(), guard, step))
+      return false;
+  return true;
+}
+
+std::unique_ptr<Op> cloneReplacingGuardCond(const Op *op, const Op *guard,
+                                            const Op *newCondition) {
+  if (!op)
+    return nullptr;
+  auto out = std::make_unique<Op>(op->kind, op->origin);
+  out->type = op->type;
+  out->traits = op->traits;
+  out->symbol = op->symbol;
+  out->hasIntValue = op->hasIntValue;
+  out->intValue = op->intValue;
+  out->hasFloatValue = op->hasFloatValue;
+  out->floatValue = op->floatValue;
+  out->arrayDims = op->arrayDims;
+  for (size_t i = 0; i < op->children.size(); i++) {
+    if (op == guard && i == 0)
+      out->children.push_back(cloneOp(newCondition));
+    else
+      out->children.push_back(
+          cloneReplacingGuardCond(op->children[i].get(), guard, newCondition));
+  }
+  return out;
+}
+
+}  // namespace
+
 
 PolyhedralStats PolyhedralOptimizer::run(Module &module) {
   PolyhedralStats stats;
@@ -114,6 +226,13 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
   }
 
   for (size_t i = 0; i < block->children.size(); i++) {
+    if (hirEnvEnabled("SISY_HIR_ENABLE_INVARIANT_GUARD_HOIST", true) &&
+        block->children[i] && block->children[i]->kind == OpKind::While &&
+        tryInvariantGuardHoist(block, i, stats)) {
+      changed = true;
+      i = 0;
+      continue;
+    }
     if (block->children[i] && block->children[i]->kind == OpKind::While &&
         tryMonotoneGuardBoundTightening(block, i, stats)) {
       changed = true;
@@ -202,6 +321,56 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     }
   }
   return changed;
+}
+
+bool PolyhedralOptimizer::tryInvariantGuardHoist(Op *block, size_t idx,
+                                                 PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size())
+    return false;
+
+  CanonicalLoop loop;
+  Op *whileOp = block->children[idx].get();
+  if (!matchCanonicalWhile(whileOp, loop) || !loop.body ||
+      loop.body->kind != OpKind::Block) {
+    stats.invariantGuardRejected++;
+    return false;
+  }
+
+  const Op *guard = nullptr;
+  std::vector<const Op *> invariantTerms;
+  std::vector<const Op *> varyingTerms;
+  if (!findSplitGuard(loop.body, loop.body, guard, invariantTerms, varyingTerms))
+    return false;
+
+  // If the guard is false, the original loop may only have computed local
+  // temporaries and advanced its now-dead IV. Otherwise skipping its
+  // iterations would remove observable effects.
+  if (!guardDominatesObservableWork(loop.body, guard, loop.step) ||
+      scalarUsedBeforeRedef(block, idx + 1, loop.iv)) {
+    stats.invariantGuardRejected++;
+    return false;
+  }
+
+  auto invariantCond = makeConjunction(invariantTerms);
+  auto varyingCond = makeConjunction(varyingTerms);
+  if (!invariantCond || !varyingCond) {
+    stats.invariantGuardRejected++;
+    return false;
+  }
+
+  auto innerBody =
+      cloneReplacingGuardCond(loop.body, guard, varyingCond.get());
+  if (!innerBody) {
+    stats.invariantGuardRejected++;
+    return false;
+  }
+  auto thenBody = makeBlock();
+  thenBody->children.push_back(
+      makeWhile(cloneOp(whileOp->children[0].get()), std::move(innerBody)));
+  block->children[idx] =
+      makeIf(std::move(invariantCond), std::move(thenBody), nullptr);
+  stats.invariantGuardHoisted++;
+  return true;
 }
 
 bool PolyhedralOptimizer::tryStencilInteriorDispatch(Op *block, size_t idx,

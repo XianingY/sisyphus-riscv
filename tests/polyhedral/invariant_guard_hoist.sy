@@ -1,0 +1,18 @@
+int data[64];
+
+int main() {
+  int r = 0;
+  while (r < 8) {
+    int rr = r - 1;
+    int c = 0;
+    while (c < 8) {
+      if (rr >= 0 && rr < 8 && c >= 0 && c < 8) {
+        data[r * 8 + c] = rr + c;
+      }
+      c = c + 1;
+    }
+    r = r + 1;
+  }
+  putint(data[63]);
+  return 0;
+}

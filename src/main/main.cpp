@@ -431,6 +431,8 @@ int main(int argc, char **argv) {
                       << " stencil-interior-rejected=" << stats.stencilInteriorRejected
                       << " stencil-interior-reject-shape=" << stats.stencilInteriorRejectShape
                       << " stencil-interior-reject-bounds=" << stats.stencilInteriorRejectBounds
+                      << " invariant-guard-hoisted=" << stats.invariantGuardHoisted
+                      << " invariant-guard-rejected=" << stats.invariantGuardRejected
                       << " monotone-guard-tightened=" << stats.monotoneGuardTightened
                       << " monotone-guard-rejected=" << stats.monotoneGuardRejected
                       << " monotone-guard-reject-shape=" << stats.monotoneGuardRejectShape
@@ -595,6 +597,7 @@ int main(int argc, char **argv) {
       hirPolyStats.fusionApplied +
       hirPolyStats.loopDistributionApplied +
       hirPolyStats.stencilInteriorDispatched +
+      hirPolyStats.invariantGuardHoisted +
       hirPolyStats.monotoneGuardTightened +
       hirPolyStats.forwardedArrayStoreLoads;
     int rejected =
