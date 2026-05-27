@@ -491,6 +491,26 @@ void Vectorize::runImpl(LoopInfo *info) {
     }
   }
 
+  // Stop-fallback: LoopAnalysis only fills `stop` when the latch terminator
+  // shape matches its narrow patterns. If induction was set but stop was not,
+  // try to recover stop from the latch terminator here using the same rules
+  // the bind path uses. Otherwise the matmul inner j-loop (and friends) get
+  // rejected as "missing loop stop" even after rotation.
+  if (info->induction && !info->stop) {
+    Rule brRotatedL("(br (lt (addl x z) y))");
+    Rule brRotatedI("(br (lt (add x z) y))");
+    Rule brI("(br (lt x y))");
+    auto phi = info->induction;
+    auto def2 = Op::getPhiFrom(phi, latch);
+    auto term = latch->getLastOp();
+    if (brRotatedL.match(term, { { "x", phi } }))
+      info->stop = brRotatedL.extract("y");
+    else if (brRotatedI.match(term, { { "x", phi } }))
+      info->stop = brRotatedI.extract("y");
+    else if (def2 && brI.match(term, { { "x", def2 } }))
+      info->stop = brI.extract("y");
+  }
+
   // The loop must have a stop (in order to unroll below).
   if (!info->stop)
     VECREJECT_KIND(rejectStop, "missing loop stop");

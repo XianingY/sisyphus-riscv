@@ -313,6 +313,17 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::SimplifyCFG>();
     }
     pm.addPass<sys::AggressiveDCE>();
+    // Re-canonicalize and re-rotate just-in-time before the late Vectorize
+    // pass. Earlier passes (LICM, ScalarReplace, ConstLoopUnroll, post-unroll
+    // DLE) can de-canonicalize loops, leaving the latch ending in GotoOp.
+    // Vectorize requires a rotated latch (BranchOp), so loops slip through
+    // as "latch terminator is not branch" without this step.
+    if (enableVectorize && getenvEnabled("SISY_ENABLE_LATE_LOOP_ROTATE", true)) {
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
+      if (!opts.disableLoopRotate || !opts.loopRotateExplicit)
+        pm.addPass<sys::LoopRotate>(/*allowCanonicalizedHeaders=*/ true);
+      pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
+    }
     if (enableVectorize)
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::GVN>();
