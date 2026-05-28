@@ -120,6 +120,40 @@ void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset, Reg ad
   builder.create<sys::rv::LoadOp>(ty, { RDC(dst), RSC(addrTmp), new IntAttr(0), new SizeAttr(8) });
 }
 
+bool rematerializableValue(Op *op) {
+  if (!op)
+    return false;
+  if (isa<LiOp>(op) || isa<LaOp>(op))
+    return true;
+  if (!isa<AddiOp>(op) || !op->has<RsAttr>() || !op->has<IntAttr>() ||
+      op->has<SpilledRsAttr>())
+    return false;
+  Reg base = RS(op);
+  return base == Reg::sp || base == Reg::zero;
+}
+
+bool emitRematerializedValue(Builder &builder, Op *ref, Reg dst) {
+  if (!ref)
+    return false;
+  if (isa<LiOp>(ref)) {
+    builder.create<LiOp>({ RDC(dst), new IntAttr(V(ref)) });
+    return true;
+  }
+  if (isa<LaOp>(ref)) {
+    builder.create<LaOp>({ RDC(dst), new NameAttr(NAME(ref)) });
+    return true;
+  }
+  if (isa<AddiOp>(ref) && ref->has<RsAttr>() && ref->has<IntAttr>() &&
+      !ref->has<SpilledRsAttr>()) {
+    Reg base = RS(ref);
+    if (base == Reg::sp || base == Reg::zero) {
+      builder.create<AddiOp>({ RDC(dst), RSC(base), new IntAttr(V(ref)) });
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<Value::Type> getArgTypes(FuncOp *funcOp) {
   int argcnt = funcOp->get<ArgCountAttr>()->count;
   if (auto argTypes = funcOp->find<ArgTypesAttr>()) {
@@ -316,6 +350,7 @@ std::map<std::string, int> RegAlloc::stats() {
     { "peepholed", convertedTotal },
     { "max-block-hotness", maxBlockHotness },
     { "live-range-splits", liveRangeSplits },
+    { "rematerialized", rematerialized },
   };
 }
 
@@ -1340,8 +1375,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
       }
 
       if (auto rd = op->find<SpilledRdAttr>()) {
-        // We will rematerialize them later.
-        if (isa<LiOp>(rd->ref) || isa<LaOp>(rd->ref)) {
+        // We will rematerialize them at each use site.
+        if (rematerializableValue(rd->ref)) {
           remove.push_back(op);
           continue;
         }
@@ -1366,12 +1401,9 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
-        // Rematerialized.
         auto ref = rs->ref;
-        if (isa<LiOp>(ref))
-          builder.create<LiOp>({ RDC(reg), new IntAttr(V(ref)) });
-        else if (isa<LaOp>(ref))
-          builder.create<LaOp>({ RDC(reg), new NameAttr(NAME(ref)) });
+        if (emitRematerializedValue(builder, ref, reg))
+          rematerialized++;
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
@@ -1387,12 +1419,9 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
-        // Rematerialized.
         auto ref = rs2->ref;
-        if (isa<LiOp>(ref))
-          builder.create<LiOp>({ RDC(reg), new IntAttr(V(ref)) });
-        else if (isa<LaOp>(ref))
-          builder.create<LaOp>({ RDC(reg), new NameAttr(NAME(ref)) });
+        if (emitRematerializedValue(builder, ref, reg))
+          rematerialized++;
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
