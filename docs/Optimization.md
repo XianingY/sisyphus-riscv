@@ -260,10 +260,33 @@ incrementally.
 - **RV superblock schedule v1** (`src/rv/SuperblockSchedule.cpp`): hoists
   pure RV loads across single-pred / single-succ hot edges, gated by
   shape, dependency, `AliasAttr::neverAlias`, and pressure budget. Off by
-  default; enable via `SISY_RV_ENABLE_SUPERBLOCK=1`.
+  default; enable via `SISY_RV_ENABLE_SUPERBLOCK=1`.  Recommended tuning
+  sweep before flipping the default: hold `SISY_RV_SUPERBLOCK_PRESSURE_BUDGET`
+  at one of {12, 16, 20, 24, 28} and compare cycle counts against the
+  closed-default baseline on the public regression suite; pick the
+  smallest budget at which cycles do not regress on any case.
 - **SMT proof helper** (`src/opt/SmtProver.cpp`):
   `smt_prover::tryProveEqualI32(a, b)` returns `Equal` / `NotEqual` /
   `Unknown`. Consumers must treat `Unknown` as "do not fold".
+
+## 7a. Imperfect Reduction Nest Status
+
+The scalar-promotion + I-K-J interchange transform that the project plan
+once flagged as "Plan A" is already present:
+
+- `PolyhedralOptimizer::tryReductionInterchange`
+  (`src/hir/HIRPolyReduction.cpp`) detects the canonical
+  `init; for k { acc += ... }; store(acc)` shape and performs the
+  semantic interchange behind `SISY_HIR_ENABLE_REDUCTION_PRIVATIZE`.
+- `tryReductionRowPrivatize` introduces a per-row scratch buffer when the
+  cleaner in-place interchange is not legal.
+
+If a particular matmul-like nest still appears unmodified, the gap is in
+legality checks (`privatizedReductionLegal`,
+`strictReductionInterchangeLegal`), not in pattern detection.  Adding a
+parallel pre-pass would duplicate analysis; the responsible follow-up is
+to relax the existing legality predicates with proof obligations, not to
+introduce a new transformer.
 
 ## 8. Compliance Boundary For New Infrastructure
 

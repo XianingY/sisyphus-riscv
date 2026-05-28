@@ -277,6 +277,19 @@ std::set<Op*> collectPhis(const std::set<BasicBlock*> &blocks) {
 bool additiveRepeatUpdate(Op *latchVal, Op *acc, const std::set<BasicBlock*> &blocks) {
   if (!latchVal || !acc)
     return false;
+  // Look through trivial single-operand phis (LCSSA-style exit phis introduced
+  // by nested sub-loops).  Each strip step requires the phi to be outside the
+  // outer loop's blocks; otherwise it could be a real merge we must not skip.
+  if (envEnabled("SISY_REPEAT_REDUCTION_PEEL_LCSSA", false)) {
+    std::set<Op*> seen;
+    while (latchVal && isa<PhiOp>(latchVal) &&
+           latchVal->getOperandCount() == 1 && !seen.count(latchVal)) {
+      auto bb = latchVal->getParent();
+      if (bb && blocks.count(bb)) break;
+      seen.insert(latchVal);
+      latchVal = latchVal->DEF(0);
+    }
+  }
   auto loopPhis = collectPhis(blocks);
   auto invariant = [&](Op *op) { return loopInvariantExpr(op, blocks, loopPhis); };
   if (auto add = dyn_cast<AddIOp>(latchVal); add && add->getOperandCount() == 2)
