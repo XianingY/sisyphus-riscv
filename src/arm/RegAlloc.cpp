@@ -226,6 +226,53 @@ bool fitsAddImm12(int imm) {
   return imm >= -4095 && imm <= 4095;
 }
 
+bool envEnabledArm(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0]) return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
+// True for SSA defs that can be cheaply recomputed at the use site
+// instead of being kept alive in a register or reloaded from a spill slot.
+// Currently: 32/64-bit immediate moves, label loads, and sp-relative
+// `add` with a fits-imm12 offset.
+bool armRematerializable(Op *ref) {
+  if (!ref) return false;
+  if (isa<MovIOp>(ref) || isa<AdrOp>(ref))
+    return true;
+  if (envEnabledArm("SISY_ARM_ENABLE_SP_REMAT", false) &&
+      isa<AddXIOp>(ref) && ref->has<RsAttr>() && ref->has<IntAttr>()) {
+    Reg base = RS(ref);
+    if (base == Reg::sp && fitsAddImm12(V(ref)))
+      return true;
+  }
+  return false;
+}
+
+// Emit a copy of the rematerializable value into `dst`.  Returns false if
+// `ref` is not a recognized rematerializable shape.
+bool emitArmRemat(Builder &builder, Op *ref, Reg dst) {
+  if (!ref) return false;
+  if (isa<MovIOp>(ref)) {
+    builder.create<MovIOp>({ RDC(dst), new IntAttr(V(ref)) });
+    return true;
+  }
+  if (isa<AdrOp>(ref)) {
+    builder.create<AdrOp>({ RDC(dst), new NameAttr(NAME(ref)) });
+    return true;
+  }
+  if (envEnabledArm("SISY_ARM_ENABLE_SP_REMAT", false) &&
+      isa<AddXIOp>(ref) && ref->has<RsAttr>() && ref->has<IntAttr>() &&
+      fitsAddImm12(V(ref))) {
+    Reg base = RS(ref);
+    if (base == Reg::sp) {
+      builder.create<AddXIOp>({ RDC(dst), RSC(base), new IntAttr(V(ref)) });
+      return true;
+    }
+  }
+  return false;
+}
+
 bool fitsMemImm32(int imm) {
   return imm >= 0 && imm <= 16380 && imm % 4 == 0;
 }
@@ -1327,7 +1374,7 @@ skip_prefer_assign:
 
       if (auto rd = op->find<SpilledRdAttr>()) {
         // We will rematerialize them later.
-        if (isa<MovIOp>(rd->ref) || isa<AdrOp>(rd->ref)) {
+        if (armRematerializable(rd->ref)) {
           remove.push_back(op);
           rematerialized++;
           continue;
@@ -1353,10 +1400,8 @@ skip_prefer_assign:
         builder.setBeforeOp(op);
         // Rematerialized.
         auto ref = rs->ref;
-        if (isa<MovIOp>(ref))
-          builder.create<MovIOp>({ RDC(reg), new IntAttr(V(ref)) });
-        else if (isa<AdrOp>(ref))
-          builder.create<AdrOp>({ RDC(reg), new NameAttr(NAME(ref)) });
+        if (emitArmRemat(builder, ref, reg))
+          rematerialized++;
         else if (offset < delta)
           builder.create<FmovDOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
@@ -1371,10 +1416,8 @@ skip_prefer_assign:
 
         builder.setBeforeOp(op);
         auto ref = rs2->ref;
-        if (isa<MovIOp>(ref))
-          builder.create<MovIOp>({ RDC(reg), new IntAttr(V(ref)) });
-        else if (isa<AdrOp>(ref))
-          builder.create<AdrOp>({ RDC(reg), new NameAttr(NAME(ref)) });
+        if (emitArmRemat(builder, ref, reg))
+          rematerialized++;
         else if (offset < delta)
           builder.create<FmovDOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
@@ -1389,10 +1432,8 @@ skip_prefer_assign:
 
         builder.setBeforeOp(op);
         auto ref = rs3->ref;
-        if (isa<MovIOp>(ref))
-          builder.create<MovIOp>({ RDC(reg), new IntAttr(V(ref)) });
-        else if (isa<AdrOp>(ref))
-          builder.create<AdrOp>({ RDC(reg), new NameAttr(NAME(ref)) });
+        if (emitArmRemat(builder, ref, reg))
+          rematerialized++;
         else if (offset < delta)
           builder.create<FmovDOp>({ RDC(reg), RSC(Reg(delta - offset)) });
         else
