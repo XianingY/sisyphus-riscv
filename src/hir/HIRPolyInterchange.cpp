@@ -153,18 +153,18 @@ bool PolyhedralOptimizer::tryLoopInterchange3D(Op *block, size_t idx,
     return false;
   }
 
-  affine::PresburgerInterchangeResult dep =
-      affine::permutationMemorySafePresburger(
+  affine::DependenceResult dep =
+      affine::permutationDependence(
           {outerWhile, middleWhile, innerWhile},
           {outerInitOp, middleInitOp, innerInitOp},
           {0, 2, 1});
   stats.presburgerInterchangeQueries += dep.queries;
-  stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
-  stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
+  stats.presburgerInterchangeNoDeps += dep.noDeps;
+  stats.presburgerInterchangeMayDeps += dep.mayDeps;
   stats.presburgerInterchangeUnknown += dep.unknown;
   stats.presburgerProjectedDims += dep.projectedDims;
   stats.presburgerUnknownBudget += dep.projectionUnknown;
-  if (!dep.safe) {
+  if (!dep.safe()) {
     stats.interchange3DRejected++;
     stats.interchange3DRejectMemory++;
     return false;
@@ -295,16 +295,16 @@ bool PolyhedralOptimizer::tryLoopInterchange(Op *block, size_t idx,
     return false;
   }
 
-  affine::PresburgerInterchangeResult dep =
-      affine::interchangeMemorySafePresburger(outerWhile, innerWhile,
-                                              outerInitOp, innerInitOp);
+  affine::DependenceResult dep =
+      affine::interchangeDependence(outerWhile, innerWhile,
+                                    outerInitOp, innerInitOp);
   stats.presburgerInterchangeQueries += dep.queries;
-  stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
-  stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
+  stats.presburgerInterchangeNoDeps += dep.noDeps;
+  stats.presburgerInterchangeMayDeps += dep.mayDeps;
   stats.presburgerInterchangeUnknown += dep.unknown;
   stats.presburgerProjectedDims += dep.projectedDims;
   stats.presburgerUnknownBudget += dep.projectionUnknown;
-  if (!dep.safe) {
+  if (!dep.safe()) {
     stats.interchangeRejected++;
     stats.interchangeRejectMemory++;
     return false;
@@ -441,16 +441,16 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
     return false;
   }
 
-  affine::PresburgerInterchangeResult dep =
-      affine::interchangeMemorySafePresburger(outerWhile, innerWhile,
-                                              outerInitOp, innerInitOp);
+  affine::DependenceResult dep =
+      affine::interchangeDependence(outerWhile, innerWhile,
+                                    outerInitOp, innerInitOp);
   stats.presburgerInterchangeQueries += dep.queries;
-  stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
-  stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
+  stats.presburgerInterchangeNoDeps += dep.noDeps;
+  stats.presburgerInterchangeMayDeps += dep.mayDeps;
   stats.presburgerInterchangeUnknown += dep.unknown;
   stats.presburgerProjectedDims += dep.projectedDims;
   stats.presburgerUnknownBudget += dep.projectionUnknown;
-  if (!dep.safe) {
+  if (!dep.safe()) {
     stats.unrollJamRejected++;
     stats.unrollJamRejectMemory++;
     return false;

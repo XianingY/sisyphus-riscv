@@ -139,6 +139,48 @@ ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
   return plan;
 }
 
+ReductionKernelPlan planReductionKernel(const Op *innerBody,
+                                        TypeKind mainType,
+                                        bool conditional,
+                                        bool inPlace,
+                                        int scratchElems,
+                                        bool dependenceSafe,
+                                        bool needsScratch) {
+  ReductionKernelPlan plan;
+  plan.conditional = conditional;
+  plan.inPlace = inPlace;
+  plan.needsScratch = needsScratch;
+  plan.scratchElems = scratchElems;
+  if (!dependenceSafe || scratchElems <= 0)
+    return plan;
+  if (mainType == TypeKind::Float &&
+      !hirEnvEnabled("SISY_HIR_ENABLE_FP_REDUCTION_REASSOC", false))
+    return plan;
+
+  ReductionTilePlan tile =
+      computeReductionTilePlan(innerBody, mainType, needsScratch);
+  plan.mr = tile.mr;
+  plan.nr = tile.nr;
+  plan.kc = tile.kc;
+  plan.nc = tile.nc;
+  if (conditional) {
+    plan.mr = 1;
+    plan.nr = hirEnvInt("SISY_HIR_COND_MICRO_NR", 2);
+    plan.kc = hirEnvInt("SISY_HIR_COND_MICRO_KC", 32);
+    plan.nc = plan.nr;
+  }
+  constexpr int kMaxScratchElems = 1 << 16;
+  if (scratchElems > kMaxScratchElems)
+    return plan;
+  if (plan.nr < 2 || plan.kc < 2)
+    return plan;
+  if (conditional &&
+      (plan.nr < 2 || plan.nr > 4 || plan.kc < 8 || plan.kc > 64))
+    return plan;
+  plan.legal = true;
+  return plan;
+}
+
 // Round `n` down to the nearest power-of-two in [lo, hi]. Used to keep tile
 // sizes vectorization-friendly (multiples of 4 lanes) and cache-aligned.
 static int clampPow2(int n, int lo, int hi) {

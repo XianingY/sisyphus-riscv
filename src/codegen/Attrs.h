@@ -48,6 +48,23 @@ public:
   SizeAttr *clone() override { return new SizeAttr(value); }
 };
 
+class VectorShapeAttr : public AttrImpl<VectorShapeAttr, __LINE__> {
+public:
+  int elemBits;
+  bool scalable;
+  bool masked;
+  bool strided;
+
+  VectorShapeAttr(int elemBits, bool scalable = true,
+                  bool masked = false, bool strided = false):
+    elemBits(elemBits), scalable(scalable), masked(masked), strided(strided) {}
+
+  std::string toString() override;
+  VectorShapeAttr *clone() override {
+    return new VectorShapeAttr(elemBits, scalable, masked, strided);
+  }
+};
+
 // A map for printing purposes.
 extern std::map<BasicBlock*, int> bbmap;
 extern int bbid;
@@ -322,6 +339,7 @@ bool mayAlias(Op *a, Op *b);
 #define V(op) (op)->get<IntAttr>()->value
 #define F(op) (op)->get<FloatAttr>()->value
 #define SIZE(op) (op)->get<SizeAttr>()->value
+#define VSHAPE(op) (op)->get<VectorShapeAttr>()
 #define NAME(op) (op)->get<NameAttr>()->name
 #define TARGET(op) (op)->get<TargetAttr>()->bb
 #define ELSE(op) (op)->get<ElseAttr>()->bb

@@ -89,6 +89,13 @@ void BlockFrequency::run() {
 
   freqMap().clear();
   auto profile = readProfile();
+  std::ofstream generated;
+  const char *generatePath = std::getenv("SISY_PROFILE_GENERATE");
+  if (generatePath && generatePath[0]) {
+    generated.open(generatePath);
+    if (generated.is_open())
+      generated << "# sisyphus block profile v1\n";
+  }
 
   for (auto func : collectFuncs()) {
     auto region = func->getRegion();
@@ -124,6 +131,8 @@ void BlockFrequency::run() {
         for (int i = 0; i < depth; i++) f *= kLoopBoost;
       }
       freqMap()[bb] = f;
+      if (generated.is_open())
+        generated << NAME(func) << ' ' << idx << ' ' << f << '\n';
       if (f >= kHotThreshold) hotBlocks++;
       if (f < kColdThreshold) coldBlocks++;
       idx++;

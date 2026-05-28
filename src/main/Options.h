@@ -34,6 +34,8 @@ struct Options {
     option verifyCFG : 1;
     option bv : 1;
     option sat : 1;
+    option enableRVV : 1;
+    option disableSMTSynth : 1;
   };
 
   std::string inputFile;
@@ -43,6 +45,12 @@ struct Options {
   std::string compareWith;
   std::string simulateInput;
   std::string dialectFallbackReport;
+  std::string thinSummaryOut;
+  std::string thinSummaryIn;
+  std::string thinLinkOut;
+  std::string profileGenerate;
+  std::string profileUse;
+  std::string fdoUse;
   int inlineThreshold;
   int lateInlineThreshold;
   bool inlineThresholdExplicit;

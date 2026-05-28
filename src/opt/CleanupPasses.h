@@ -154,6 +154,31 @@ public:
   void run() override;
 };
 
+// Souper-style local synthesis over tiny integer SSA expressions.  The pass
+// enumerates a very small replacement set (operands and constants) for local
+// arithmetic/bitwise ops, and commits a rewrite only when SmtProver proves
+// bit-vector equivalence.  Unknown means no change.
+class SmtSynth : public Pass {
+  int considered = 0;
+  int proved = 0;
+  int replaced = 0;
+  int unknown = 0;
+
+public:
+  SmtSynth(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "smt-synth"; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "considered", considered },
+      { "proved", proved },
+      { "replaced", replaced },
+      { "unknown", unknown },
+    };
+  }
+  void run() override;
+};
+
 class Reassociate : public Pass {
   int intReassociated = 0;
   int floatReassociated = 0;

@@ -39,6 +39,8 @@ Options::Options() {
   verifyCFG = true;
   sat = false;
   bv = false;
+  enableRVV = false;
+  disableSMTSynth = false;
   inlineThreshold = 200;
   lateInlineThreshold = 200;
   inlineThresholdExplicit = false;
@@ -212,10 +214,66 @@ Options sys::parseArgs(int argc, char **argv) {
       }
       continue;
     }
+    if (strcmp(argv[i], "--thin-summary-out") == 0) {
+      opts.thinSummaryOut = requireValue(i, "--thin-summary-out");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--thin-summary-out=", 19) == 0) {
+      opts.thinSummaryOut = argv[i] + 19;
+      continue;
+    }
+    if (strcmp(argv[i], "--thin-summary-in") == 0) {
+      opts.thinSummaryIn = requireValue(i, "--thin-summary-in");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--thin-summary-in=", 18) == 0) {
+      opts.thinSummaryIn = argv[i] + 18;
+      continue;
+    }
+    if (strcmp(argv[i], "--thin-link-out") == 0) {
+      opts.thinLinkOut = requireValue(i, "--thin-link-out");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--thin-link-out=", 16) == 0) {
+      opts.thinLinkOut = argv[i] + 16;
+      continue;
+    }
+    if (strcmp(argv[i], "--profile-generate") == 0) {
+      opts.profileGenerate = requireValue(i, "--profile-generate");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--profile-generate=", 19) == 0) {
+      opts.profileGenerate = argv[i] + 19;
+      continue;
+    }
+    if (strcmp(argv[i], "--profile-use") == 0) {
+      opts.profileUse = requireValue(i, "--profile-use");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--profile-use=", 14) == 0) {
+      opts.profileUse = argv[i] + 14;
+      continue;
+    }
+    if (strcmp(argv[i], "--fdo-use") == 0) {
+      opts.fdoUse = requireValue(i, "--fdo-use");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--fdo-use=", 10) == 0) {
+      opts.fdoUse = argv[i] + 10;
+      continue;
+    }
     PARSEOPT("--dump-hir", dumpHIR);
     PARSEOPT("--dump-cfg", dumpCFG);
     PARSEOPT("--verify-hir", verifyHIR);
     PARSEOPT("--verify-cfg", verifyCFG);
+    PARSEOPT("--enable-rvv", enableRVV);
+    PARSEOPT("--disable-smt-synth", disableSMTSynth);
     if (strcmp(argv[i], "--disable-loop-rotate") == 0) {
       opts.disableLoopRotate = true;
       opts.loopRotateExplicit = true;
@@ -283,11 +341,14 @@ Options sys::parseArgs(int argc, char **argv) {
       opts.disableLoopRotate = true;
   }
 
-  if (opts.inputFile.empty() && !opts.bv && !opts.sat) {
+  if (opts.inputFile.empty() && !opts.bv && !opts.sat && opts.thinLinkOut.empty()) {
     std::cerr
       << "usage: compiler <input.sy> -S -o <output.s> [-O0|-O1|-O2] [--target=riscv|arm]\n"
       << "       [--inline-threshold=N] [--late-inline-threshold=N]\n"
       << "       [--disable-o2-experimental]\n"
+      << "       [--thin-summary-out=<path>] [--thin-summary-in=<path>] [--thin-link-out=<path>]\n"
+      << "       [--profile-generate=<path>] [--profile-use=<path>] [--fdo-use=<path>]\n"
+      << "       [--enable-rvv] [--disable-smt-synth]\n"
       << "       [--enable-hir-pipeline|--disable-hir-pipeline|--use-legacy-codegen|--force-dialect-codegen]\n"
       << "       [--dialect-fallback-report=stderr|<path>]\n"
       << "       [--dump-hir] [--dump-cfg] [--verify-hir] [--verify-cfg]\n"

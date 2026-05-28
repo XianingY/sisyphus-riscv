@@ -205,6 +205,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     }
     // SMT-assisted branch pruning.  No-op unless SISY_ENABLE_SMT_PATH_PRUNE=1.
     pm.addPass<sys::SmtBranchPrune>();
+    if (!opts.disableSMTSynth)
+      pm.addPass<sys::SmtSynth>();
     pm.addPass<sys::DCE>();
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
@@ -305,10 +307,15 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     const bool polyVectorize =
         opts.rv && plan.metrics.hirPolyApplied > 0 &&
         getenvEnabled("SISY_ENABLE_POLY_VECTORIZE", false);
+    const bool rvvAvailable =
+        !opts.rv || getenvEnabled("SISY_ENABLE_RVV",
+                                  opts.enableRVV || opts.enableExperimental ||
+                                  opts.o2 || polyVectorize);
     const bool enableVectorize =
-        (opts.arm || opts.rv) &&
+        (opts.arm || (opts.rv && rvvAvailable)) &&
         getenvEnabled("SISY_ENABLE_VECTORIZE",
-                      opts.enableExperimental || opts.o2 || polyVectorize);
+                      opts.enableRVV || opts.enableExperimental || opts.o2 ||
+                          polyVectorize);
     if (polyVectorize && getenvEnabled("SISY_POLY_VECTORIZE_ROTATE", true)) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
       if (!opts.disableLoopRotate || !opts.loopRotateExplicit)
@@ -674,6 +681,14 @@ PipelinePlan configurePipeline(PassManager &pm, const Options &opts, PipelineMet
     appendCoreO1(pm, opts, plan);
     break;
   }
+
+  // Refresh interprocedural facts after the mid-end has finished cloning,
+  // inlining, DAE, and CFG cleanup.  The dialect frontend skips the legacy
+  // structured pre-opt stage where these used to run, so keep this late
+  // summary available for ThinLTO, LICM/DSE/DLE, inlining cost models, and
+  // backend profile consumers on every frontend path.
+  pm.addPass<sys::Pureness>();
+  pm.addPass<sys::FunctionSummary>();
 
   // Static block-frequency / branch-probability analysis.  Pure side-table
   // population; no IR mutation.  Future consumers (RegAlloc spill weight,

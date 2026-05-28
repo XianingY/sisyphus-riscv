@@ -63,7 +63,7 @@ SISY_COMPARE_STEP_LIMIT=2000000000 "${COMPILER}" \
   --compare "${ROOT_DIR}/tests/regression/nussinov_o1_signed_mod.out" \
   -i "${ROOT_DIR}/tests/regression/nussinov_o1_signed_mod.in"
 
-"${ROOT_DIR}/scripts/run_polyhedral_tests.sh" >/tmp/sisyphus-polyhedral-deep.log 2>&1
-cat /tmp/sisyphus-polyhedral-deep.log
+polyhedral_log="${OUT_DIR}/polyhedral-deep.log"
+bash "${ROOT_DIR}/scripts/run_polyhedral_tests.sh" >"${polyhedral_log}" 2>&1
 
 echo "Deep optimization tests passed."

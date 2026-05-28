@@ -315,6 +315,10 @@ void Op::dump(std::ostream &os, int depth) {
   os << getValueNumber(getResult()) << " = " << opname;
   if (resultTy == Value::f32)
     os << ".f";
+  else if (resultTy == Value::vscale_i32)
+    os << ".vscale.i32";
+  else if (resultTy == Value::vscale_f32)
+    os << ".vscale.f32";
   for (auto &operand : operands)
     os << " " << getValueNumber(operand);
   for (auto attr : attrs)

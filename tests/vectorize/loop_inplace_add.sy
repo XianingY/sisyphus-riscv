@@ -2,6 +2,8 @@ int a[64];
 int b[64];
 
 int main() {
+  a[0] = getint();
+  b[0] = getint();
   int i = 0;
   while (i < 64) {
     a[i] = a[i] + b[i];

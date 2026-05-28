@@ -887,7 +887,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     // Update `highest`, which will indicate the size allocated.
     if (vecreg(op->getResultType())) {
       if (desired + 8 > highest)
-        highest = desired + 8;
+        highest = desired + 16;
     } else {
       if (desired > highest)
         highest = desired;
@@ -907,7 +907,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
           if (nextOffset % 16 != 0)
             nextOffset = (nextOffset / 16 + 1) * 16;
           spillOffset[op] = nextOffset;
-          highest = nextOffset + 8;
+          highest = nextOffset + 16;
           nextOffset += 16;
         } else {
           spillOffset[op] = nextOffset;
@@ -923,7 +923,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   // Fast mode keeps spill semantics simple and uniform (stack-only).
   if (!localFastMode && highest == currentOffset) {
     for (auto [op, _] : spillOffset)
-      assignment[op] = fpreg(op->getResultType()) ? fspillReg : spillReg;
+      assignment[op] = vecreg(op->getResultType()) ? vspillReg :
+                       (fpreg(op->getResultType()) ? fspillReg : spillReg);
     spillOffset.clear();
   }
 
@@ -931,8 +932,9 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   if (!localFastMode && highest == currentOffset + 8) {
     for (auto [op, offset] : spillOffset) {
       auto fp = fpreg(op->getResultType());
-      assignment[op] = (offset == currentOffset) ? (fp ? fspillReg : spillReg)
-                                                 : (fp ? fspillReg2 : spillReg2);
+      auto vec = vecreg(op->getResultType());
+      assignment[op] = (offset == currentOffset) ? (vec ? vspillReg : (fp ? fspillReg : spillReg))
+                                                 : (vec ? vspillReg2 : (fp ? fspillReg2 : spillReg2));
     }
     spillOffset.clear();
   }
@@ -1010,7 +1012,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(VfaddvvOp, BINARY);
   LOWER(VfsubvvOp, BINARY);
   LOWER(VfmulvvOp, BINARY);
+  LOWER(VredsumOp, BINARY);
+  LOWER(VfredsumOp, BINARY);
   LOWER(Vse32Op, BINARY);
+  LOWER(Vlse32Op, BINARY);
   LOWER(SllwOp, BINARY);
   LOWER(SrlwOp, BINARY);
   LOWER(SrawOp, BINARY);
@@ -1023,6 +1028,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   LOWER(VmvvxOp, UNARY);
   LOWER(VfmvvfOp, UNARY);
   LOWER(VsetvliOp, UNARY);
+  LOWER(VsetvliResultOp, UNARY);
   LOWER(AddiwOp, UNARY);
   LOWER(AddiOp, UNARY);
   LOWER(SlliwOp, UNARY);
@@ -1415,7 +1421,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         bool fp = rs->fp;
         bool vec = vecreg(rs->ref->getResultType());
         auto reg = vec ? vspillReg : (fp ? fspillReg : spillReg);
-        auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
+        auto ldty = vec ? rs->ref->getResultType() : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
         auto ref = rs->ref;
@@ -1435,7 +1441,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         bool fp = rs2->fp;
         bool vec = vecreg(rs2->ref->getResultType());
         auto reg = vec ? vspillReg2 : (fp ? fspillReg2 : spillReg2);
-        auto ldty = vec ? Value::i128 : (fp ? Value::f32 : Value::i64);
+        auto ldty = vec ? rs2->ref->getResultType() : (fp ? Value::f32 : Value::i64);
 
         builder.setBeforeOp(op);
         auto ref = rs2->ref;

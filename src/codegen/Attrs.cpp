@@ -75,6 +75,18 @@ std::string FloatArrayAttr::toString() {
   return ss.str();
 }
 
+std::string VectorShapeAttr::toString() {
+  std::stringstream ss;
+  ss << "<vshape = e" << elemBits;
+  ss << (scalable ? ", scalable" : ", fixed");
+  if (masked)
+    ss << ", masked";
+  if (strided)
+    ss << ", strided";
+  ss << ">";
+  return ss.str();
+}
+
 std::string ArgTypesAttr::toString() {
   std::stringstream ss;
   ss << "<arg_types = ";

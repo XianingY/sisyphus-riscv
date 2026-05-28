@@ -254,13 +254,13 @@ bool PolyhedralOptimizer::tryLoopFusion(Op *block, size_t idx,
   }
   const Op *initA = hasBInit && idx > 0 ? initValue(block->children[idx - 1].get()) : nullptr;
   const Op *initB = hasBInit ? initValue(block->children[bInitIdx].get()) : nullptr;
-  affine::PresburgerFusionResult fusionDep =
-      affine::fusionMemorySafePresburger(whileA, whileB, initA, initB);
+  affine::DependenceResult fusionDep =
+      affine::fusionDependence(whileA, whileB, initA, initB);
   stats.presburgerFusionQueries += fusionDep.queries;
-  stats.presburgerFusionNoDeps += fusionDep.noReorderedDependence;
-  stats.presburgerFusionMayDeps += fusionDep.mayReorderedDependence;
+  stats.presburgerFusionNoDeps += fusionDep.noDeps;
+  stats.presburgerFusionMayDeps += fusionDep.mayDeps;
   stats.presburgerFusionUnknown += fusionDep.unknown;
-  if (!fusionDep.safe) {
+  if (!fusionDep.safe()) {
     stats.fusionRejected++;
     stats.fusionRejectMemory++;
     return false;

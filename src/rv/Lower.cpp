@@ -185,6 +185,52 @@ void Lower::run() {
     return true;
   });
 
+  runRewriter([&](VSetVLOp *op) {
+    builder.replace<VsetvliResultOp>(
+        op, op->getResultType(), op->getOperands(), op->getAttrs());
+    return true;
+  });
+
+  runRewriter([&](VScaleAddOp *op) {
+    if (op->getResultType() == Value::vscale_f32)
+      builder.replace<VfaddvvOp>(op, op->getOperands(), op->getAttrs());
+    else
+      builder.replace<VaddvvOp>(op, op->getOperands(), op->getAttrs());
+    return true;
+  });
+
+  runRewriter([&](VScaleSubOp *op) {
+    if (op->getResultType() == Value::vscale_f32)
+      builder.replace<VfsubvvOp>(op, op->getOperands(), op->getAttrs());
+    else
+      builder.replace<VsubvvOp>(op, op->getOperands(), op->getAttrs());
+    return true;
+  });
+
+  runRewriter([&](VScaleMulOp *op) {
+    if (op->getResultType() == Value::vscale_f32)
+      builder.replace<VfmulvvOp>(op, op->getOperands(), op->getAttrs());
+    else
+      builder.replace<VmulvvOp>(op, op->getOperands(), op->getAttrs());
+    return true;
+  });
+
+  runRewriter([&](VScaleBroadcastOp *op) {
+    if (op->getResultType() == Value::vscale_f32)
+      builder.replace<VfmvvfOp>(op, op->getOperands(), op->getAttrs());
+    else
+      builder.replace<VmvvxOp>(op, op->getOperands(), op->getAttrs());
+    return true;
+  });
+
+  runRewriter([&](VScaleReduceAddOp *op) {
+    if (op->getResultType() == Value::f32)
+      builder.replace<VfredsumOp>(op, op->getResultType(), op->getOperands(), op->getAttrs());
+    else
+      builder.replace<VredsumOp>(op, op->getResultType(), op->getOperands(), op->getAttrs());
+    return true;
+  });
+
   runRewriter([&](MinusOp *op) {
     auto value = op->getOperand();
     
@@ -322,6 +368,8 @@ void Lower::run() {
   });
 
   auto setVL4Before = [&](Op *op) {
+    if (op->has<VectorShapeAttr>() && VSHAPE(op)->scalable)
+      return;
     builder.setBeforeOp(op);
     auto four = builder.create<LiOp>({ new IntAttr(4) });
     builder.create<VsetvliOp>({ four });
@@ -377,6 +425,34 @@ void Lower::run() {
 
     auto load = builder.replace<sys::rv::LoadOp>(op, op->getResultType(), op->getOperands(), op->getAttrs());
     load->add<IntAttr>(0);
+    return true;
+  });
+
+  runRewriter([&](VScaleLoadOp *op) {
+    bool strided = op->has<VectorShapeAttr>() && VSHAPE(op)->strided;
+    if (strided) {
+      builder.replace<Vlse32Op>(op, op->getResultType(), op->getOperands());
+      return true;
+    }
+    std::vector<Value> operands;
+    if (op->getOperandCount() > 0)
+      operands.push_back(op->getOperand(0));
+    builder.replace<Vle32Op>(op, op->getResultType(), operands);
+    return true;
+  });
+
+  runRewriter([&](VScaleStoreOp *op) {
+    bool strided = op->has<VectorShapeAttr>() && VSHAPE(op)->strided;
+    if (strided) {
+      builder.replace<Vsse32Op>(op, op->getOperands(), op->getAttrs());
+      return true;
+    }
+    std::vector<Value> operands;
+    if (op->getOperandCount() > 0)
+      operands.push_back(op->getOperand(0));
+    if (op->getOperandCount() > 1)
+      operands.push_back(op->getOperand(1));
+    builder.replace<Vse32Op>(op, operands, op->getAttrs());
     return true;
   });
 

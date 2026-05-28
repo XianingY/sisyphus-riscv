@@ -138,7 +138,8 @@ inline bool fpreg(Value::Type ty) {
 }
 
 inline bool vecreg(Value::Type ty) {
-  return ty == Value::i128 || ty == Value::f128;
+  return ty == Value::i128 || ty == Value::f128 ||
+         ty == Value::vscale_i32 || ty == Value::vscale_f32;
 }
 
 }

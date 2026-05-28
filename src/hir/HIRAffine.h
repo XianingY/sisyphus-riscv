@@ -35,6 +35,48 @@ struct Access {
   bool isStore = false;
 };
 
+enum class DependenceStatus {
+  Safe,
+  Unsafe,
+  Unknown,
+};
+
+struct DependenceResult {
+  DependenceStatus status = DependenceStatus::Unknown;
+  int queries = 0;
+  int noDeps = 0;
+  int mayDeps = 0;
+  int unknown = 0;
+  int projectedDims = 0;
+  int projectionUnknown = 0;
+
+  bool safe() const { return status == DependenceStatus::Safe; }
+};
+
+struct MemoryAccess {
+  const Op *op = nullptr;
+  std::string base;
+  std::vector<Expr> indices;
+  bool isWrite = false;
+  bool isAffine = false;
+  bool isContiguous = false;
+  bool isStrided = false;
+  int64_t strideBytes = 0;
+};
+
+struct ReductionKernelPlan {
+  bool legal = false;
+  bool conditional = false;
+  bool inPlace = false;
+  bool needsScratch = true;
+  int mr = 1;
+  int nr = 0;
+  int kc = 0;
+  int nc = 0;
+  int scratchElems = 0;
+  DependenceStatus dependence = DependenceStatus::Unknown;
+};
+
 struct PresburgerFusionResult {
   bool safe = false;
   int queries = 0;
@@ -82,6 +124,7 @@ struct AffineNest {
   std::vector<CanonicalLoop> loops;
   std::vector<LoopDomain> domains;
   std::vector<Access> accesses;
+  std::vector<MemoryAccess> memory;
   std::vector<const Op*> guards;
   SideEffectSummary effects;
   bool imperfect = false;
@@ -113,6 +156,18 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoop,
                                                             const Op *outerInit,
                                                             const Op *innerInit);
 PresburgerInterchangeResult permutationMemorySafePresburger(
+    const std::vector<const Op*> &loopOps,
+    const std::vector<const Op*> &initOps,
+    const std::vector<int> &permutation);
+DependenceResult toDependenceResult(const PresburgerFusionResult &result);
+DependenceResult toDependenceResult(const PresburgerInterchangeResult &result);
+DependenceResult fusionDependence(const Op *loopA, const Op *loopB,
+                                  const Op *initA, const Op *initB);
+DependenceResult interchangeDependence(const Op *outerLoop,
+                                       const Op *innerLoop,
+                                       const Op *outerInit,
+                                       const Op *innerInit);
+DependenceResult permutationDependence(
     const std::vector<const Op*> &loopOps,
     const std::vector<const Op*> &initOps,
     const std::vector<int> &permutation);

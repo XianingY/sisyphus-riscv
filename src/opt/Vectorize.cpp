@@ -2,8 +2,11 @@
 #include "../utils/Matcher.h"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <functional>
 #include <initializer_list>
+#include <iostream>
 
 using namespace sys;
 
@@ -26,6 +29,9 @@ namespace { struct VecStats {
   int rejectAddress = 0;
   int rejectStreams = 0;
   int rejectOther = 0;
+  int scalableVectorized = 0;
+  int scalableReductions = 0;
+  int scalableMaskedTails = 0;
 };
 static VecStats g_vecStats;
 }
@@ -58,6 +64,13 @@ int vecMaxLoadStreams() {
   return vecGetenvInt("SISY_VEC_MAX_LOAD_STREAMS", 4, 1, 32);
 }
 
+bool vecEnvEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
 
 std::vector<Value> vecValues(std::initializer_list<Value> values) {
   return std::vector<Value>(values);
@@ -105,6 +118,14 @@ Value::Type vectorTypeForScalar(Value::Type ty) {
     return Value::i128;
   if (ty == Value::f32)
     return Value::f128;
+  return Value::unit;
+}
+
+Value::Type scalableVectorTypeForScalar(Value::Type ty) {
+  if (ty == Value::i32)
+    return Value::vscale_i32;
+  if (ty == Value::f32)
+    return Value::vscale_f32;
   return Value::unit;
 }
 
@@ -358,6 +379,351 @@ void runSLPOnBlock(BasicBlock *bb) {
   }
 }
 
+bool tryScalableRVVLoop(LoopInfo *info) {
+  if (!vecEnvEnabled("SISY_ENABLE_RVV", true) ||
+      !vecEnvEnabled("SISY_ENABLE_RVV_VLA", true) ||
+      !vecEnvEnabled("SISY_TARGET_RISCV", false))
+    return false;
+  if (!info || info->latches.size() != 1)
+    return false;
+
+  auto header = info->header;
+  auto latch = info->getLatch();
+  if (!header || !latch || !isa<BranchOp>(latch->getLastOp()))
+    return false;
+
+  if (!info->preheader) {
+    BasicBlock *preheader = nullptr;
+    for (auto pred : header->preds) {
+      if (info->latches.count(pred))
+        continue;
+      if (preheader)
+        return false;
+      preheader = pred;
+    }
+    info->preheader = preheader;
+  }
+  if (!info->preheader || !info->induction || !info->stop ||
+      !info->step || !isConstInt(info->step, 1))
+    return false;
+
+  int fixedTrip = fixedTripCount(info);
+  if (fixedTrip > 0 && fixedTrip < vecMinFixedTripCount())
+    return false;
+
+  auto phis = header->getPhis();
+  for (auto phi : phis) {
+    if (phi != info->induction)
+      return false;
+  }
+
+  for (auto bb : info->getBlocks()) {
+    auto term = bb->getLastOp();
+    if (isa<BranchOp>(term) && bb != latch)
+      return false;
+    for (auto op : bb->getOps())
+      if (isa<CallOp>(op))
+        return false;
+  }
+
+  std::unordered_map<Op*, Op*> base;
+  std::function<Op*(Op*)> findBaseLocal = [&](Op *op) -> Op* {
+    if (!op)
+      return nullptr;
+    if (base.count(op))
+      return base[op];
+    if (isa<AddLOp>(op)) {
+      auto lhs = findBaseLocal(op->DEF(0));
+      if (lhs)
+        return base[op] = lhs;
+      return base[op] = findBaseLocal(op->DEF(1));
+    }
+    if (isa<AllocaOp>(op) || isa<GetGlobalOp>(op))
+      return base[op] = op;
+    if (isa<PhiOp>(op)) {
+      const auto &operands = op->getOperands();
+      if (operands.empty())
+        return base[op] = nullptr;
+      auto b0 = findBaseLocal(operands[0].defining);
+      for (int i = 1; i < operands.size(); i++)
+        if (findBaseLocal(operands[i].defining) != b0)
+          return base[op] = nullptr;
+      return base[op] = b0;
+    }
+    return base[op] = nullptr;
+  };
+
+  std::unordered_set<Op*> stored, loaded;
+  std::vector<Op*> loads, stores, addrs;
+  std::unordered_map<Op*, int> memOrder;
+  int memOrdinal = 0;
+  for (auto bb : info->getBlocks()) {
+    for (auto op : bb->getOps()) {
+      if (isa<StoreOp>(op)) {
+        memOrder[op] = memOrdinal++;
+        stored.insert(findBaseLocal(op->DEF(1)));
+        addrs.push_back(op->DEF(1));
+        stores.push_back(op);
+      }
+      if (isa<LoadOp>(op)) {
+        memOrder[op] = memOrdinal++;
+        loaded.insert(findBaseLocal(op->DEF(0)));
+        addrs.push_back(op->DEF(0));
+        loads.push_back(op);
+      }
+    }
+  }
+
+  if (loads.empty() || stores.empty() ||
+      stored.count(nullptr) || loaded.count(nullptr))
+    return false;
+  if ((int) loads.size() > vecMaxLoadStreams())
+    return false;
+
+  for (auto load : loads) {
+    auto loadBase = findBaseLocal(load->DEF(0));
+    if (!stored.count(loadBase))
+      continue;
+    bool sameLaneUpdate = false;
+    for (auto store : stores) {
+      if (findBaseLocal(store->DEF(1)) != loadBase)
+        continue;
+      if (load->DEF(0) == store->DEF(1) &&
+          load->getParent() == store->getParent() &&
+          memOrder[load] < memOrder[store]) {
+        sameLaneUpdate = true;
+        break;
+      }
+    }
+    if (!sameLaneUpdate)
+      return false;
+  }
+
+  std::unordered_set<Op*> phiset(phis.begin(), phis.end());
+  auto indexedBase = [&](Op *addr) -> Op* {
+    if (!isa<AddLOp>(addr))
+      return nullptr;
+    auto lhs = addr->DEF(0);
+    auto rhs = addr->DEF(1);
+    if (isScaleByFour(rhs, info->induction))
+      return findBaseLocal(lhs);
+    if (isScaleByFour(lhs, info->induction))
+      return findBaseLocal(rhs);
+    return nullptr;
+  };
+  for (auto addr : addrs)
+    if (!phiset.count(addr) && !indexedBase(addr))
+      return false;
+
+  Op *insertBefore = nullptr;
+  for (auto op : header->getOps()) {
+    if (!isa<PhiOp>(op)) {
+      insertBefore = op;
+      break;
+    }
+  }
+  if (!insertBefore)
+    return false;
+
+  Builder builder;
+  builder.setBeforeOp(insertBefore);
+  auto avl = builder.create<SubIOp>(vecValues({ info->stop, info->induction }));
+  auto vl = builder.create<VSetVLOp>(
+      Value::i32, vecValues({ avl }), { new VectorShapeAttr(32) });
+
+  std::vector<Op*> erased, created = { avl, vl };
+  std::unordered_map<Op*, Op*> opmap;
+  std::unordered_set<Op*> visited;
+  Value::Type vectorTy = Value::unit;
+  bool success = true;
+
+  auto remember = [&](Op *old, Op *op) {
+    opmap[old] = op;
+    created.push_back(op);
+    erased.push_back(old);
+  };
+
+  for (auto load : loads) {
+    auto loadVectorTy = scalableVectorTypeForScalar(load->getResultType());
+    if (loadVectorTy == Value::unit) {
+      success = false;
+      break;
+    }
+    if (vectorTy == Value::unit)
+      vectorTy = loadVectorTy;
+    if (vectorTy != loadVectorTy) {
+      success = false;
+      break;
+    }
+    visited.insert(load);
+    builder.setBeforeOp(load);
+    auto ld = builder.create<VScaleLoadOp>(
+        loadVectorTy, vecValues({ load->DEF(0), vl }),
+        { new VectorShapeAttr(32, true, false, false) });
+    remember(load, ld);
+  }
+
+  std::deque<Op*> queue(stores.begin(), stores.end());
+  while (success && !queue.empty()) {
+    auto x = queue.back();
+    queue.pop_back();
+    if (visited.count(x))
+      continue;
+
+    bool ready = true;
+    if (info->contains(x->getParent())) {
+      const std::vector<Value> waitlist = isa<StoreOp>(x)
+          ? std::vector<Value>{ x->getOperand(0) }
+          : x->getOperands();
+      for (auto operand : waitlist) {
+        auto def = operand.defining;
+        if (def && !visited.count(def) && info->contains(def->getParent()) &&
+            !isa<PhiOp>(def)) {
+          queue.push_back(def);
+          ready = false;
+        }
+      }
+      if (!ready) {
+        queue.push_front(x);
+        continue;
+      }
+    }
+
+    visited.insert(x);
+    builder.setBeforeOp(x);
+    switch (x->opid) {
+    case IntOp::id: {
+      if (vectorTy != Value::vscale_i32) { success = false; break; }
+      auto b = builder.create<VScaleBroadcastOp>(
+          vectorTy, vecValues({ x, vl }), { new VectorShapeAttr(32) });
+      created.push_back(b);
+      opmap[x] = b;
+      break;
+    }
+    case FloatOp::id: {
+      if (vectorTy != Value::vscale_f32) { success = false; break; }
+      auto b = builder.create<VScaleBroadcastOp>(
+          vectorTy, vecValues({ x, vl }), { new VectorShapeAttr(32) });
+      created.push_back(b);
+      opmap[x] = b;
+      break;
+    }
+    case LoadOp::id: {
+      if (info->contains(x->getParent())) {
+        success = false;
+        break;
+      }
+      opmap[x] = x;
+      break;
+    }
+    case StoreOp::id: {
+      auto value = x->DEF(0);
+      Op *vecValue = nullptr;
+      if (opmap.count(value)) {
+        vecValue = opmap[value];
+      } else if ((isa<IntOp>(value) && vectorTy == Value::vscale_i32) ||
+                 (isa<FloatOp>(value) && vectorTy == Value::vscale_f32) ||
+                 !info->contains(value->getParent())) {
+        vecValue = builder.create<VScaleBroadcastOp>(
+            vectorTy, vecValues({ value, vl }), { new VectorShapeAttr(32) });
+        created.push_back(vecValue);
+      }
+      if (!vecValue || vecValue->getResultType() != vectorTy) {
+        success = false;
+        break;
+      }
+      auto st = builder.create<VScaleStoreOp>(
+          vecValues({ vecValue, x->DEF(1), vl }),
+          { new VectorShapeAttr(32, true, false, false) });
+      remember(x, st);
+      break;
+    }
+    case AddIOp::id:
+    case SubIOp::id:
+    case MulIOp::id:
+    case AddFOp::id:
+    case SubFOp::id:
+    case MulFOp::id: {
+      auto a = x->DEF(0), b = x->DEF(1);
+      if (opmap.count(b) && !opmap.count(a) &&
+          (x->opid == AddIOp::id || x->opid == MulIOp::id ||
+           x->opid == AddFOp::id || x->opid == MulFOp::id))
+        std::swap(a, b);
+      Op *va = opmap.count(a) ? opmap[a] : nullptr;
+      Op *vb = opmap.count(b) ? opmap[b] : nullptr;
+      if (!va && info->contains(a->getParent())) { success = false; break; }
+      if (!vb && info->contains(b->getParent())) { success = false; break; }
+      if (!va) {
+        va = builder.create<VScaleBroadcastOp>(
+            vectorTy, vecValues({ a, vl }), { new VectorShapeAttr(32) });
+        created.push_back(va);
+      }
+      if (!vb) {
+        vb = builder.create<VScaleBroadcastOp>(
+            vectorTy, vecValues({ b, vl }), { new VectorShapeAttr(32) });
+        created.push_back(vb);
+      }
+      Op *vop = nullptr;
+      if (x->opid == AddIOp::id || x->opid == AddFOp::id)
+        vop = builder.create<VScaleAddOp>(
+            vectorTy, vecValues({ va, vb }), { new VectorShapeAttr(32) });
+      else if (x->opid == SubIOp::id || x->opid == SubFOp::id)
+        vop = builder.create<VScaleSubOp>(
+            vectorTy, vecValues({ va, vb }), { new VectorShapeAttr(32) });
+      else
+        vop = builder.create<VScaleMulOp>(
+            vectorTy, vecValues({ va, vb }), { new VectorShapeAttr(32) });
+      remember(x, vop);
+      break;
+    }
+    default:
+      success = false;
+      break;
+    }
+
+    if (success) {
+      for (auto user : x->getUses())
+        if (info->contains(user->getParent()))
+          queue.push_back(user);
+    }
+  }
+
+  if (!success || vectorTy == Value::unit) {
+    for (auto op : created) {
+      op->removeAllOperands();
+      op->erase();
+    }
+    return false;
+  }
+
+  auto latchVal = Op::getPhiFrom(info->induction, latch);
+  if (!latchVal || !isa<AddIOp>(latchVal)) {
+    for (auto op : created) {
+      op->removeAllOperands();
+      op->erase();
+    }
+    return false;
+  }
+  latchVal->setOperand(1, vl);
+
+  for (auto op : erased) {
+    op->replaceAllUsesWith(opmap[op]);
+    op->erase();
+  }
+
+  g_vecStats.vectorized++;
+  g_vecStats.scalableVectorized++;
+  g_vecStats.scalableMaskedTails++;
+  if (std::getenv("SISY_DUMP_VECTOR_PLAN")) {
+    std::cerr << "[vector-plan] rvv-vla loop=" << bbmap[header]
+              << " loads=" << loads.size()
+              << " stores=" << stores.size()
+              << " type=" << (vectorTy == Value::vscale_f32 ? "f32" : "i32")
+              << " tail=dynamic-vl\n";
+  }
+  return true;
+}
+
 } // namespace
 
 // We can't just use the `Base` pass,
@@ -398,6 +764,9 @@ Op *Vectorize::findBase(Op *op) {
 
 void Vectorize::runImpl(LoopInfo *info) {
   base.clear();
+
+  if (tryScalableRVVLoop(info))
+    return;
 
   if (info->latches.size() > 1)
     VECREJECT_KIND(rejectMultipleLatches, "multiple latches");
@@ -1144,6 +1513,9 @@ std::map<std::string, int> Vectorize::stats() {
   if (g_vecStats.rejectAddress)           out["reject-address"]        = g_vecStats.rejectAddress;
   if (g_vecStats.rejectStreams)           out["reject-streams"]        = g_vecStats.rejectStreams;
   if (g_vecStats.rejectOther)             out["reject-other"]          = g_vecStats.rejectOther;
+  if (g_vecStats.scalableVectorized)      out["rvv-vla-vectorized"]    = g_vecStats.scalableVectorized;
+  if (g_vecStats.scalableReductions)      out["rvv-vla-reductions"]    = g_vecStats.scalableReductions;
+  if (g_vecStats.scalableMaskedTails)     out["rvv-vla-masked-tails"]  = g_vecStats.scalableMaskedTails;
   return out;
 }
 

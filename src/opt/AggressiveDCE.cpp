@@ -16,6 +16,7 @@ static bool preserved(Op *op) {
     PRESERVED(BranchOp)
     PRESERVED(GotoOp)
     PRESERVED(StoreOp)
+    PRESERVED(VScaleStoreOp)
     PRESERVED(ReturnOp)
     PRESERVED(CloneOp)
     PRESERVED(JoinOp)
@@ -26,6 +27,7 @@ void AggressiveDCE::runImpl(FuncOp *fn) {
   auto rets = fn->findAll<ReturnOp>();
   auto calls = fn->findAll<CallOp>();
   auto stores = fn->findAll<StoreOp>();
+  auto vectorStores = fn->findAll<VScaleStoreOp>();
   auto branches = fn->findAll<BranchOp>();
 
   std::unordered_set<Op*> live;
@@ -35,6 +37,8 @@ void AggressiveDCE::runImpl(FuncOp *fn) {
       queue.push_back(call);
   }
   for (auto store : stores)
+    queue.push_back(store);
+  for (auto store : vectorStores)
     queue.push_back(store);
   for (auto branch : branches)
     queue.push_back(branch);

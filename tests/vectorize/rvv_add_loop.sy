@@ -3,6 +3,8 @@ int b[64];
 int c[64];
 
 int main() {
+  a[0] = getint();
+  b[0] = getint();
   int i = 0;
   while (i < 64) {
     c[i] = a[i] + b[i];

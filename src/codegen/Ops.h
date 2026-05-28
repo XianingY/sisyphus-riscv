@@ -119,6 +119,19 @@ OPVF(SubFVOp);
 OPVF(MulFVOp);
 OPVF(BroadcastFOp);
 
+// Scalable vector pseudo ops. These model RVV-style VLA vectors before target
+// lowering: VSetVLOp returns the runtime vector length for the current AVL,
+// loads/stores carry that VL operand for legality/debugging, and the vector
+// value type is not a fixed-width i128/f128 lane pack.
+OPE(VSetVLOp);
+OPE(VScaleLoadOp);
+OPBASE(Value::unit, VScaleStoreOp);
+OPE(VScaleAddOp);
+OPE(VScaleSubOp);
+OPE(VScaleMulOp);
+OPE(VScaleBroadcastOp);
+OPE(VScaleReduceAddOp);
+
 // ====== Multi-threaded ======
 
 OP(CloneOp);

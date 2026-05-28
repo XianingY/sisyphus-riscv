@@ -67,6 +67,18 @@ struct ReductionTilePlan {
   bool needsScratch = true;
 };
 
+struct ReductionKernelPlan {
+  int mr = 1;
+  int nr = 0;
+  int kc = 0;
+  int nc = 0;
+  int scratchElems = 0;
+  bool legal = false;
+  bool conditional = false;
+  bool inPlace = false;
+  bool needsScratch = true;
+};
+
 struct StencilBounds {
   std::string rowSpatial;
   std::string colSpatial;
@@ -88,6 +100,13 @@ int computeOptimalTileSize(TypeKind mainType, const Op *innerBody);
 ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
                                            TypeKind mainType,
                                            bool needsScratch);
+ReductionKernelPlan planReductionKernel(const Op *innerBody,
+                                        TypeKind mainType,
+                                        bool conditional,
+                                        bool inPlace,
+                                        int scratchElems,
+                                        bool dependenceSafe,
+                                        bool needsScratch);
 
 bool hirEnvEnabled(const char *name, bool fallback);
 int hirEnvInt(const char *name, int fallback);

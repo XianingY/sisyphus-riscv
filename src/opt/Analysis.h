@@ -141,13 +141,19 @@ public:
 // IR or behavior change.
 class ThinSummary : public Pass {
   int emittedFunctions = 0;
+  int importedFunctions = 0;
+  int linkedFunctions = 0;
 
 public:
   ThinSummary(ModuleOp *module): Pass(module) {}
 
   std::string name() override { return "thin-summary"; }
   std::map<std::string, int> stats() override {
-    return {{ "emitted", emittedFunctions }};
+    return {
+      { "emitted", emittedFunctions },
+      { "imported", importedFunctions },
+      { "linked", linkedFunctions },
+    };
   }
   void run() override;
 };

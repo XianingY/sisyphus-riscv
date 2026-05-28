@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -847,6 +848,18 @@ bool PolyhedralOptimizer::tryMonotoneGuardBoundTightening(
 
 void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
   stats.affineNestCandidates++;
+  affine::AffineNest nest;
+  bool haveNest = affine::collectAffineNest(op, nest, hirEnvInt("SISY_HIR_AFFINE_SCAN_DEPTH", 5),
+                                            /*allowGuards=*/ true);
+  if (haveNest && std::getenv("SISY_DUMP_AFFINE_NEST")) {
+    std::cerr << "[affine-nest] loops=" << nest.loops.size()
+              << " accesses=" << nest.accesses.size()
+              << " memory=" << nest.memory.size()
+              << " guards=" << nest.guards.size()
+              << " imperfect=" << (nest.imperfect ? 1 : 0)
+              << " symbolic=" << (nest.hasSymbolicAccesses ? 1 : 0)
+              << "\n";
+  }
 
   std::vector<CanonicalLoop> loops;
   Op *current = op;

@@ -11,7 +11,8 @@ std::map<std::string, int> RemoveEmptyLoop::stats() {
 #define PINNED(Ty) || isa<Ty>(op)
 static bool pinned(Op *op) {
   return (isa<CallOp>(op) && op->has<ImpureAttr>())
-    PINNED(StoreOp);
+    PINNED(StoreOp)
+    PINNED(VScaleStoreOp);
 }
 
 bool RemoveEmptyLoop::runImpl(LoopInfo *info) {

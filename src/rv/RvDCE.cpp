@@ -14,7 +14,8 @@ bool RvDCE::isImpure(Op *op) {
       isa<GetArgOp>(op) ||
       isa<BneOp>(op) || isa<BltOp>(op) ||
       isa<BgeOp>(op) || isa<BeqOp>(op) || isa<WriteRegOp>(op) ||
-      isa<StoreOp>(op) || isa<Vse32Op>(op) || isa<VsetvliOp>(op) || isa<RetOp>(op) ||
+      isa<StoreOp>(op) || isa<Vse32Op>(op) || isa<Vsse32Op>(op) ||
+      isa<VsetvliOp>(op) || isa<VsetvliResultOp>(op) || isa<RetOp>(op) ||
       isa<CallOp>(op))
     return true;
 

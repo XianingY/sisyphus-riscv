@@ -357,11 +357,13 @@ Op *tryForwardMemorySSALoad(Builder &builder, MemorySSA &mssa, LoadOp *load) {
 }
 
 std::map<std::string, int> DLE::stats() {
-  return {
-    { "removed-loads", elim },
-    { "memory-ssa-forwarded", memorySsaForwarded },
-    { "readonly-calls-retained", readonlyCallsRetained },
-  };
+  std::map<std::string, int> out;
+  out["removed-loads"] = elim;
+  if (memorySsaForwarded)
+    out["memory-ssa-forwarded"] = memorySsaForwarded;
+  if (readonlyCallsRetained)
+    out["readonly-calls-retained"] = readonlyCallsRetained;
+  return out;
 }
 
 void DLE::runImpl(Region *region) {

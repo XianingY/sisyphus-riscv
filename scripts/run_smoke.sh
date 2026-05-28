@@ -12,7 +12,17 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
-for case in "${CASE_DIR}"/*.sy; do
+cases=()
+while IFS= read -r rel_case; do
+  cases+=("${rel_case}")
+done < <(git -C "${ROOT_DIR}" ls-files 'tests/smoke/*.sy')
+if [[ ${#cases[@]} -eq 0 ]]; then
+  echo "no smoke tests found under ${CASE_DIR}"
+  exit 1
+fi
+
+for rel_case in "${cases[@]}"; do
+  case="${ROOT_DIR}/${rel_case}"
   base="$(basename "${case}" .sy)"
   echo "[smoke] ${base}"
   "${COMPILER}" "${case}" -S -o "${OUT_DIR}/${base}.rv.s" -O0 --target=riscv --verify-ir

@@ -29,6 +29,55 @@ using namespace smt;
 
 sys::Options opts;
 
+static void setEnvIfPresent(const char *name, const std::string &value) {
+  if (!value.empty())
+    setenv(name, value.c_str(), 1);
+}
+
+static std::vector<std::string> splitPathList(const std::string &raw) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : raw) {
+    if (c == ',' || c == ':') {
+      if (!cur.empty())
+        out.push_back(cur);
+      cur.clear();
+      continue;
+    }
+    cur.push_back(c);
+  }
+  if (!cur.empty())
+    out.push_back(cur);
+  return out;
+}
+
+static int thinLinkOnly(const sys::Options &opts) {
+  std::ofstream os(opts.thinLinkOut);
+  if (!os) {
+    std::cerr << "cannot open thin-link output\n";
+    return 1;
+  }
+
+  os << "# sisyphus thin linked summary v1\n";
+  os << "# input_summaries=" << opts.thinSummaryIn << "\n";
+  std::unordered_set<std::string> seen;
+  for (const auto &path : splitPathList(opts.thinSummaryIn)) {
+    std::ifstream is(path);
+    if (!is) {
+      std::cerr << "cannot open thin summary input: " << path << "\n";
+      return 1;
+    }
+    std::string line;
+    while (std::getline(is, line)) {
+      if (line.empty() || line[0] == '#')
+        continue;
+      if (seen.insert(line).second)
+        os << line << "\n";
+    }
+  }
+  return 0;
+}
+
 void removeDuplicates(std::vector<Atomic>& clause) {
   std::sort(clause.begin(), clause.end());
   auto last = std::unique(clause.begin(), clause.end());
@@ -162,6 +211,20 @@ void bv(const sys::Options &opts) {
 int main(int argc, char **argv) {
   opts = sys::parseArgs(argc, argv);
 
+  setEnvIfPresent("SISY_THIN_SUMMARY_DUMP", opts.thinSummaryOut);
+  setEnvIfPresent("SISY_THIN_SUMMARY_IMPORT", opts.thinSummaryIn);
+  setEnvIfPresent("SISY_THIN_LINK_OUT", opts.thinLinkOut);
+  setEnvIfPresent("SISY_PROFILE_GENERATE", opts.profileGenerate);
+  setEnvIfPresent("SISY_PROFILE", opts.profileUse.empty() ? opts.fdoUse : opts.profileUse);
+  if (opts.enableRVV)
+    setenv("SISY_ENABLE_RVV", "1", 1);
+  if (opts.rv)
+    setenv("SISY_TARGET_RISCV", "1", 1);
+  if (opts.arm)
+    setenv("SISY_TARGET_ARM", "1", 1);
+  if (opts.disableSMTSynth)
+    setenv("SISY_ENABLE_SMT_SYNTH", "0", 1);
+
   // Test for submodules: bitvector SMT solver, and CDCL SAT solver.
   if (opts.bv) {
     bv(opts);
@@ -171,6 +234,9 @@ int main(int argc, char **argv) {
     sat();
     return 0;
   }
+
+  if (opts.inputFile.empty() && !opts.thinLinkOut.empty())
+    return thinLinkOnly(opts);
 
   // Read input file.
   std::ifstream ifs(opts.inputFile);

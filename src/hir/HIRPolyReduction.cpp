@@ -3,6 +3,8 @@
 
 #include "HIRAffine.h"
 
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -420,13 +422,13 @@ bool PolyhedralOptimizer::tryReductionMicroTile(Op *block, size_t initIndex,
     return false;
 
   const int scratchElems = dimsIt->second[jDim];
-  constexpr int kMaxScratchElems = 1 << 16;
-  if (scratchElems <= 0 || scratchElems > kMaxScratchElems)
+  if (scratchElems <= 0)
     return false;
 
   const bool inPlace =
       containsArrayAccessTo(pat.kReductionStmt, pat.destStore->symbol);
-  if (!privatizedReductionLegal(pat, jDim, globalArrays)) {
+  const bool depSafe = privatizedReductionLegal(pat, jDim, globalArrays);
+  if (!depSafe) {
     stats.reductionMicroTileRejectDependence++;
     return false;
   }
@@ -438,25 +440,18 @@ bool PolyhedralOptimizer::tryReductionMicroTile(Op *block, size_t initIndex,
     return false;
   }
 
-  ReductionTilePlan plan = computeReductionTilePlan(
-      pat.kReductionStmt, detectMainType(pat.kReductionStmt), true);
-  if (conditional) {
-    // Conditional lanes carry their guard, compare, and selected update
-    // temporaries at once.  Keep the default intentionally narrow; wider
-    // lanes are only available through explicit A/B environment overrides.
-    int requestedNr = hirEnvInt("SISY_HIR_COND_MICRO_NR", 2);
-    int requestedKc = hirEnvInt("SISY_HIR_COND_MICRO_KC", 32);
-    if (requestedNr < 2 || requestedNr > 4 || requestedKc < 8 ||
-        requestedKc > 64) {
-      stats.reductionMicroTileRejectPressure++;
-      return false;
-    }
-    plan.mr = 1;
-    plan.nr = requestedNr;
-    plan.kc = requestedKc;
-    plan.nc = requestedNr;
+  ReductionKernelPlan plan = planReductionKernel(
+      pat.kReductionStmt, detectMainType(pat.kReductionStmt), conditional,
+      inPlace, scratchElems, depSafe, true);
+  if (std::getenv("SISY_DUMP_REDUCTION_KERNEL")) {
+    std::cerr << "[reduction-kernel] legal=" << (plan.legal ? 1 : 0)
+              << " conditional=" << (plan.conditional ? 1 : 0)
+              << " inplace=" << (plan.inPlace ? 1 : 0)
+              << " mr=" << plan.mr << " nr=" << plan.nr
+              << " kc=" << plan.kc << " nc=" << plan.nc
+              << " scratch=" << plan.scratchElems << "\n";
   }
-  if (plan.nr < 2 || plan.kc < 2) {
+  if (!plan.legal) {
     stats.reductionMicroTileRejectPressure++;
     return false;
   }

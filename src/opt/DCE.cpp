@@ -57,7 +57,8 @@ std::map<std::string, int> DCE::stats() {
 }
 
 bool DCE::isImpure(Op *op) {
-  if (isa<StoreOp>(op) || isa<ReturnOp>(op) || isa<GetArgOp>(op) ||
+  if (isa<StoreOp>(op) || isa<VScaleStoreOp>(op) ||
+      isa<ReturnOp>(op) || isa<GetArgOp>(op) ||
       isa<BranchOp>(op) || isa<GotoOp>(op) ||
       isa<ProceedOp>(op) || isa<BreakOp>(op) ||
       isa<ContinueOp>(op) || isa<ForOp>(op) ||

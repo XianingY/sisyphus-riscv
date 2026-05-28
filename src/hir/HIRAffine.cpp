@@ -1814,6 +1814,27 @@ bool collectAffineNest(const Op *op, AffineNest &nest, int maxDepth,
     innerBody = nest.loops.back().body;
   if (innerBody) {
     nest.accesses = collectArrayAccesses(innerBody, ivs);
+    for (const Access &access : nest.accesses) {
+      MemoryAccess mem;
+      mem.op = access.op;
+      mem.base = access.base;
+      mem.indices = access.indices;
+      mem.isWrite = access.isStore;
+      mem.isAffine = true;
+      if (!access.indices.empty()) {
+        const Expr &last = access.indices.back();
+        for (const auto &iv : ivs) {
+          auto it = last.coeffs.find(iv);
+          if (it != last.coeffs.end() && it->second.constant != 0 &&
+              it->second.symbols.empty()) {
+            mem.isStrided = true;
+            mem.strideBytes = it->second.constant * 4;
+            mem.isContiguous = mem.strideBytes == 4;
+          }
+        }
+      }
+      nest.memory.push_back(mem);
+    }
     collectSideEffects(innerBody, nest.effects);
     for (const Access &acc : nest.accesses) {
       for (const Expr &idx : acc.indices) {
@@ -1825,6 +1846,55 @@ bool collectAffineNest(const Op *op, AffineNest &nest, int maxDepth,
     }
   }
   return !nest.loops.empty();
+}
+
+DependenceResult toDependenceResult(const PresburgerFusionResult &result) {
+  DependenceResult dep;
+  dep.status = result.safe ? DependenceStatus::Safe
+                           : (result.unknown ? DependenceStatus::Unknown
+                                             : DependenceStatus::Unsafe);
+  dep.queries = result.queries;
+  dep.noDeps = result.noReorderedDependence;
+  dep.mayDeps = result.mayReorderedDependence;
+  dep.unknown = result.unknown;
+  return dep;
+}
+
+DependenceResult toDependenceResult(const PresburgerInterchangeResult &result) {
+  DependenceResult dep;
+  dep.status = result.safe ? DependenceStatus::Safe
+                           : (result.unknown || result.projectionUnknown
+                                  ? DependenceStatus::Unknown
+                                  : DependenceStatus::Unsafe);
+  dep.queries = result.queries;
+  dep.noDeps = result.noViolatingDependence;
+  dep.mayDeps = result.mayViolatingDependence;
+  dep.unknown = result.unknown;
+  dep.projectedDims = result.projectedDims;
+  dep.projectionUnknown = result.projectionUnknown;
+  return dep;
+}
+
+DependenceResult fusionDependence(const Op *loopA, const Op *loopB,
+                                  const Op *initA, const Op *initB) {
+  return toDependenceResult(
+      fusionMemorySafePresburger(loopA, loopB, initA, initB));
+}
+
+DependenceResult interchangeDependence(const Op *outerLoop,
+                                       const Op *innerLoop,
+                                       const Op *outerInit,
+                                       const Op *innerInit) {
+  return toDependenceResult(interchangeMemorySafePresburger(
+      outerLoop, innerLoop, outerInit, innerInit));
+}
+
+DependenceResult permutationDependence(
+    const std::vector<const Op*> &loopOps,
+    const std::vector<const Op*> &initOps,
+    const std::vector<int> &permutation) {
+  return toDependenceResult(
+      permutationMemorySafePresburger(loopOps, initOps, permutation));
 }
 
 }  // namespace sys::hir::affine

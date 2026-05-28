@@ -125,8 +125,11 @@ RVOPF(FmvOp);
 
 // Vector Opcodes
 RVOPBASE(Value::unit, VsetvliOp);
+RVOPE(VsetvliResultOp);
 RVOPE(Vle32Op);
+RVOPE(Vlse32Op);
 RVOPBASE(Value::unit, Vse32Op);
+RVOPBASE(Value::unit, Vsse32Op);
 RVOPV(VaddvvOp);
 RVOPV(VsubvvOp);
 RVOPV(VmulvvOp);
@@ -135,6 +138,8 @@ RVOPFV(VfaddvvOp);
 RVOPFV(VfsubvvOp);
 RVOPFV(VfmulvvOp);
 RVOPFV(VfmvvfOp);
+RVOPE(VredsumOp);
+RVOPE(VfredsumOp);
 
 inline bool hasRd(Op *op) {
   return !(

@@ -128,13 +128,28 @@ void dumpOp(Op *op, std::ostream &os) {
     return;
   }
 
+  if (isa<VsetvliResultOp>(op)) {
+    os << "vsetvli " << RD(op) << ", " << RS(op) << ", e32, m1, ta, ma\n";
+    return;
+  }
+
   if (isa<Vle32Op>(op)) {
     os << "vle32.v " << RD(op) << ", (" << RS(op) << ")\n";
     return;
   }
 
+  if (isa<Vlse32Op>(op)) {
+    os << "vlse32.v " << RD(op) << ", (" << RS(op) << "), " << RS2(op) << "\n";
+    return;
+  }
+
   if (isa<Vse32Op>(op)) {
     os << "vse32.v " << RS(op) << ", (" << RS2(op) << ")\n";
+    return;
+  }
+
+  if (isa<Vsse32Op>(op)) {
+    os << "vsse32.v " << RS(op) << ", (" << RS2(op) << "), " << RD(op) << "\n";
     return;
   }
 
@@ -175,6 +190,16 @@ void dumpOp(Op *op, std::ostream &os) {
 
   if (isa<VfmvvfOp>(op)) {
     os << "vfmv.v.f " << RD(op) << ", " << RS(op) << "\n";
+    return;
+  }
+
+  if (isa<VredsumOp>(op)) {
+    os << "vredsum.vs " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
+    return;
+  }
+
+  if (isa<VfredsumOp>(op)) {
+    os << "vfredosum.vs " << RD(op) << ", " << RS(op) << ", " << RS2(op) << "\n";
     return;
   }
 
