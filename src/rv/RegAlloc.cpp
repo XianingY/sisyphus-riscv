@@ -351,6 +351,8 @@ std::map<std::string, int> RegAlloc::stats() {
     { "max-block-hotness", maxBlockHotness },
     { "live-range-splits", liveRangeSplits },
     { "rematerialized", rematerialized },
+    { "spill-loads", spillLoads },
+    { "spill-stores", spillStores },
   };
 }
 
@@ -1358,6 +1360,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   // Deal with spilled variables.
   std::vector<Op*> remove;
+  const bool enableRematerialization =
+      envEnabled("SISY_RV_ENABLE_REMATERIALIZATION", true);
   for (auto bb : region->getBlocks()) {
     int delta = 0;
     for (auto op : bb->getOps()) {
@@ -1376,7 +1380,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
       if (auto rd = op->find<SpilledRdAttr>()) {
         // We will rematerialize them at each use site.
-        if (rematerializableValue(rd->ref)) {
+        if (enableRematerialization && rematerializableValue(rd->ref)) {
           remove.push_back(op);
           continue;
         }
@@ -1388,8 +1392,10 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
         builder.setAfterOp(op);
         if (offset < delta)
           builder.create<FmvdxOp>({ RDC(Reg(delta - offset)), RSC(reg) });
-        else
+        else {
           emitStackStore(builder, reg, fp, offset);
+          spillStores++;
+        }
         op->add<RdAttr>(reg);
       }
 
@@ -1402,12 +1408,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
         builder.setBeforeOp(op);
         auto ref = rs->ref;
-        if (emitRematerializedValue(builder, ref, reg))
+        if (enableRematerialization && emitRematerializedValue(builder, ref, reg))
           rematerialized++;
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
-        else
+        else {
           emitStackLoad(builder, reg, ldty, offset, spillReg);
+          spillLoads++;
+        }
         op->add<RsAttr>(reg);
       }
 
@@ -1420,12 +1428,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
         builder.setBeforeOp(op);
         auto ref = rs2->ref;
-        if (emitRematerializedValue(builder, ref, reg))
+        if (enableRematerialization && emitRematerializedValue(builder, ref, reg))
           rematerialized++;
         else if (offset < delta)
           builder.create<FmvxdOp>({ RDC(reg), RSC(Reg(delta - offset)) });
-        else
+        else {
           emitStackLoad(builder, reg, ldty, offset, spillReg2);
+          spillLoads++;
+        }
         op->add<Rs2Attr>(reg);
       }
     }

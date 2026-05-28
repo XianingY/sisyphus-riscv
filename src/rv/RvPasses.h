@@ -67,6 +67,8 @@ class RegAlloc : public Pass {
   int maxBlockHotness = 0;
   int liveRangeSplits = 0;
   int rematerialized = 0;
+  int spillLoads = 0;
+  int spillStores = 0;
   bool fastMode;
 
   std::map<FuncOp*, std::set<Reg>> usedRegisters;
