@@ -176,7 +176,11 @@ Bitvector BvSolver::blastVar(const std::string &name) {
 }
 
 Bitvector BvSolver::blastLsh(const Bitvector &a, int x) {
-  Bitvector c(32); 
+  Bitvector c(32);
+  if (x <= 0)
+    return a;
+  if (x >= 32)
+    return Bitvector(32, _false);
   // Lower x bits are zero.
   for (int i = 0; i < x; i++)
     c[i] = _false;
@@ -184,6 +188,22 @@ Bitvector BvSolver::blastLsh(const Bitvector &a, int x) {
   for (int i = x; i < 32; i++)
     c[i] = a[i - x];
 
+  return c;
+}
+
+Bitvector BvSolver::blastRsh(const Bitvector &a, int x) {
+  if (x <= 0)
+    return a;
+  Bitvector c(32);
+  if (x >= 32) {
+    std::fill(c.begin(), c.end(), a[31]);
+    return c;
+  }
+
+  for (int i = 0; i < 32 - x; i++)
+    c[i] = a[i + x];
+  for (int i = 32 - x; i < 32; i++)
+    c[i] = a[31];
   return c;
 }
 
@@ -590,15 +610,21 @@ Bitvector BvSolver::blastOp(BvExpr *expr) {
   }
   case BvExpr::Lsh: {
     auto l = blastOp(expr->l);
+    if (!expr->r)
+      return cache[expr] = blastLsh(l, expr->vi);
     if (expr->r->ty == BvExpr::Const) {
-      int n = l.size();
-      Bitvector c(n);
-      int vi = expr->r->vi;
-      for (int i = vi; i < c.size(); i++)
-        c[i] = l[i - vi];
-      return cache[expr] = c;
+      return cache[expr] = blastLsh(l, expr->r->vi);
     };
     assert(false && "lsh nyi");
+    std::abort();
+  }
+  case BvExpr::Rsh: {
+    auto l = blastOp(expr->l);
+    if (!expr->r)
+      return cache[expr] = blastRsh(l, expr->vi);
+    if (expr->r->ty == BvExpr::Const)
+      return cache[expr] = blastRsh(l, expr->r->vi);
+    assert(false && "rsh nyi");
     std::abort();
   }
   case BvExpr::Extr: {

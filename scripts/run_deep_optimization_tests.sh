@@ -66,4 +66,7 @@ SISY_COMPARE_STEP_LIMIT=2000000000 "${COMPILER}" \
 polyhedral_log="${OUT_DIR}/polyhedral-deep.log"
 bash "${ROOT_DIR}/scripts/run_polyhedral_tests.sh" >"${polyhedral_log}" 2>&1
 
+smt_shift_log="${OUT_DIR}/smt-shift.log"
+bash "${ROOT_DIR}/scripts/run_smt_shift_tests.sh" >"${smt_shift_log}" 2>&1
+
 echo "Deep optimization tests passed."

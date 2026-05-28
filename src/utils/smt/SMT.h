@@ -59,6 +59,8 @@ class BvSolver {
   
   // Left shift by constant.
   Bitvector blastLsh(const Bitvector &a, int x);
+  // Arithmetic right shift by constant.
+  Bitvector blastRsh(const Bitvector &a, int x);
 
   // Absolute value.
   Bitvector blastAbs(const Bitvector &a);
