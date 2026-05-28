@@ -665,6 +665,10 @@ PipelinePlan configurePipeline(PassManager &pm, const Options &opts, PipelineMet
     break;
   }
 
+  // Optional thin-summary dump.  No-op unless SISY_THIN_SUMMARY_DUMP is set,
+  // so the default single-file compilation path is unchanged.
+  pm.addPass<sys::ThinSummary>();
+
   if (plan.useArmBackend)
     appendArmBackend(pm, opts, plan);
   if (plan.useRvBackend)

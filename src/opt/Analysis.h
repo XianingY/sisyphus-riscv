@@ -133,6 +133,25 @@ public:
   void run() override;
 };
 
+// Optional thin-summary dumper.  When SISY_THIN_SUMMARY_DUMP=<path> is set,
+// emits a structured text summary of each function (name, arity, ImpureAttr,
+// FunctionSummaryAttr fields, direct callees, estimated op count) usable as
+// the seed of a future cross-module thin-link pipeline (IPCP / IPDCE / inline
+// ranking).  When the env var is unset the pass is a no-op and produces no
+// IR or behavior change.
+class ThinSummary : public Pass {
+  int emittedFunctions = 0;
+
+public:
+  ThinSummary(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "thin-summary"; }
+  std::map<std::string, int> stats() override {
+    return {{ "emitted", emittedFunctions }};
+  }
+  void run() override;
+};
+
 // Mark functions that are called at most once.
 class AtMostOnce : public Pass {
 public:
