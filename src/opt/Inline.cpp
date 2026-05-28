@@ -275,10 +275,19 @@ void Inline::run() {
         if (isa<CallOp>(op))
           callcount++;
       }
-    if (opcount >= threshold)
+    int localThreshold = threshold;
+    if (envEnabled("SISY_INLINE_USE_FN_SUMMARY", false)) {
+      if (auto s = func->find<FunctionSummaryAttr>()) {
+        if (s->pure && s->norecurse && s->argWriteMask == 0) {
+          int boost = envIntClamped("SISY_INLINE_PURE_BOOST", 2, 1, 8);
+          localThreshold = threshold * boost;
+        }
+      }
+    }
+    if (opcount >= localThreshold)
       return false;
     // Functions with internal calls near threshold tend to bloat recursive workloads.
-    if (callcount > 0 && opcount * 5 >= threshold * 4)
+    if (callcount > 0 && opcount * 5 >= localThreshold * 4)
       return false;
 
     // Don't inline recursive functions here, otherwise this rewriter will loop forever.
