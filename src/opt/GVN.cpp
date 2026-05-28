@@ -384,3 +384,10 @@ void GVN::run() {
     return false;
   });
 }
+
+PreservedAnalyses GVN::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::cfg();
+}

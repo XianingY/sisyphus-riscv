@@ -1,4 +1,5 @@
 #include "Pass.h"
+#include "AnalysisManager.h"
 #include "../codegen/Attrs.h"
 
 using namespace sys;
@@ -70,6 +71,9 @@ std::vector<GlobalOp*> Pass::collectGlobals() {
 }
 
 DomTree Pass::getDomTree(Region *region) {
+  if (activeContext && activeContext->enabled())
+    return activeContext->analysis().getDomTree(region);
+
   region->updateDoms();
 
   DomTree tree;
@@ -78,6 +82,13 @@ DomTree Pass::getDomTree(Region *region) {
       tree[idom].push_back(bb);
   }
   return tree;
+}
+
+PreservedAnalyses Pass::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::none();
 }
 
 void Pass::cleanup() {

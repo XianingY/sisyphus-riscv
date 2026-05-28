@@ -19,6 +19,22 @@ public:
   void run() override;
 };
 
+class Legalize : public Pass {
+  int legal = 0;
+  int promoted = 0;
+  int split = 0;
+  int expanded = 0;
+  int custom = 0;
+  int illegal = 0;
+  int verifierErrors = 0;
+public:
+  Legalize(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "arm-legalize"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class StrengthReduct : public Pass {
   int convertedTotal = 0;
 

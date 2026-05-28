@@ -1,4 +1,5 @@
 #include "Passes.h"
+#include "AnalysisManager.h"
 #include "LoopPasses.h"
 
 using namespace sys;
@@ -180,11 +181,26 @@ void GCM::runImpl(Region *region, const LoopForest &forest) {
 // Global Code Motion, by Cliff Click
 void GCM::run() {
   LoopAnalysis loop(module);
-  loop.run();
-  auto forests = loop.getResult();
+  std::map<FuncOp*, LoopForest> localForests;
+  std::map<FuncOp*, LoopForest> *forests = nullptr;
+  if (context() && context()->enabled()) {
+    context()->analysis().ensureBlockFrequency();
+    forests = &context()->analysis().getLoopForests();
+  } else {
+    loop.run();
+    localForests = loop.getResult();
+    forests = &localForests;
+  }
   
   auto funcs = collectFuncs();
   
   for (auto func : funcs)
-    runImpl(func->getRegion(), forests[func]);
+    runImpl(func->getRegion(), (*forests)[func]);
+}
+
+PreservedAnalyses GCM::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::cfg();
 }

@@ -1,8 +1,10 @@
 #include "LoopPasses.h"
+#include "AnalysisManager.h"
 #include "MemorySSA.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <optional>
 
 using namespace sys;
@@ -576,9 +578,14 @@ void LICM::run() {
     auto region = func->getRegion();
     domtree = getDomTree(region);
 
-    MemorySSA mssaInstance(region);
-    mssaInstance.build();
-    this->mssa = &mssaInstance;
+    std::unique_ptr<MemorySSA> localMssa;
+    if (context() && context()->enabled()) {
+      this->mssa = &context()->analysis().getMemorySSA(region);
+    } else {
+      localMssa = std::make_unique<MemorySSA>(region);
+      localMssa->build();
+      this->mssa = localMssa.get();
+    }
 
     const auto &forest = forests[func];
     for (auto info : forest.getLoops()) {
@@ -599,9 +606,14 @@ void LICM::run() {
     auto region = func->getRegion();
     domtree = getDomTree(region);
 
-    MemorySSA mssaInstance(region);
-    mssaInstance.build();
-    this->mssa = &mssaInstance;
+    std::unique_ptr<MemorySSA> localMssa;
+    if (context() && context()->enabled()) {
+      this->mssa = &context()->analysis().getMemorySSA(region);
+    } else {
+      localMssa = std::make_unique<MemorySSA>(region);
+      localMssa->build();
+      this->mssa = localMssa.get();
+    }
 
     auto forest = forests[func];
     bool changed;
@@ -613,7 +625,13 @@ void LICM::run() {
         if (!info->getParent() && hoistSubloop(info)) {
           forest = loop.runImpl(region);
           domtree = getDomTree(region);
-          mssaInstance.build();
+          if (context() && context()->enabled()) {
+            context()->analysis().invalidateMemory(region, "licm-hoist-subloop");
+            this->mssa = &context()->analysis().getMemorySSA(region);
+          } else {
+            localMssa->build();
+            this->mssa = localMssa.get();
+          }
           changed = true;
           break;
         }
@@ -630,4 +648,11 @@ void LICM::run() {
       }
     } while (changed);
   }
+}
+
+PreservedAnalyses LICM::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::none();
 }

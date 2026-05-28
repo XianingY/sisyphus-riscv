@@ -21,6 +21,22 @@ public:
   void run() override;
 };
 
+class Legalize : public Pass {
+  int legal = 0;
+  int promoted = 0;
+  int split = 0;
+  int expanded = 0;
+  int custom = 0;
+  int illegal = 0;
+  int verifierErrors = 0;
+public:
+  Legalize(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "rv-legalize"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 class StrengthReduct : public Pass {
   int convertedTotal = 0;
 
@@ -69,6 +85,10 @@ class RegAlloc : public Pass {
   int rematerialized = 0;
   int spillLoads = 0;
   int spillStores = 0;
+  int dynamicSplits = 0;
+  int coalescedCopies = 0;
+  int splitBailouts = 0;
+  int spillAfterSplit = 0;
   bool fastMode;
 
   std::map<FuncOp*, std::set<Reg>> usedRegisters;

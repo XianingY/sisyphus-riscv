@@ -1,5 +1,6 @@
 #include "CleanupPasses.h"
 #include "Analysis.h"
+#include "AnalysisManager.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -411,13 +412,20 @@ void DSE::removeUnread(Op *op, const std::vector<Op*> &gets) {
   }
 
   // Hasn't been read; all stores can be removed.
-  for (auto x : stores)
+  for (auto x : stores) {
+    if (context() && context()->enabled())
+      context()->analysis().invalidateMemory(x->getParent()->getParent(),
+                                             "dse-remove-unread");
     x->erase();
+  }
 }
 
 void DSE::run() {
   ArrayStrideAnalysis(module).run();
-  Alias(module).run();
+  if (context() && context()->enabled())
+    context()->analysis().ensureAlias();
+  else
+    Alias(module).run();
   
   auto funcs = collectFuncs();
 
@@ -500,6 +508,17 @@ void DSE::run() {
   }
   
   elim += remove.size();
-  for (auto op : remove)
+  for (auto op : remove) {
+    if (context() && context()->enabled())
+      context()->analysis().invalidateMemory(op->getParent()->getParent(),
+                                             "dse-remove");
     op->erase();
+  }
+}
+
+PreservedAnalyses DSE::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::cfg();
 }

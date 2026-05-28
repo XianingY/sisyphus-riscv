@@ -88,6 +88,7 @@ public:
   void reset() { info = {}; }
 
   auto getResult() { return info; }
+  std::map<FuncOp*, LoopForest> &getResultRef() { return info; }
 };
 
 // Canonicalize loops. Ensures:
@@ -183,6 +184,7 @@ public:
 
   std::string name() override { return "scev"; }
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -209,6 +211,7 @@ public:
 
   std::string name() override { return "licm"; }
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 

@@ -16,6 +16,39 @@ using DomTree = std::unordered_map<BasicBlock*, std::vector<BasicBlock*>>;
 
 bool isExtern(const std::string &name);
 
+class PassContext;
+
+class PreservedAnalyses {
+  unsigned bits = 0;
+public:
+  enum Kind {
+    DomTreeAnalysis = 1 << 0,
+    LoopAnalysisResult = 1 << 1,
+    MemorySSAAnalysis = 1 << 2,
+    AliasAnalysisResult = 1 << 3,
+    BlockFrequencyAnalysis = 1 << 4,
+    AllAnalyses = DomTreeAnalysis | LoopAnalysisResult | MemorySSAAnalysis |
+                  AliasAnalysisResult | BlockFrequencyAnalysis,
+  };
+
+  PreservedAnalyses() = default;
+  explicit PreservedAnalyses(unsigned bits): bits(bits) {}
+
+  static PreservedAnalyses none() { return PreservedAnalyses(0); }
+  static PreservedAnalyses all() { return PreservedAnalyses(AllAnalyses); }
+  static PreservedAnalyses cfg() {
+    return PreservedAnalyses(DomTreeAnalysis | LoopAnalysisResult |
+                             AliasAnalysisResult | BlockFrequencyAnalysis);
+  }
+  static PreservedAnalyses memoryFacts() {
+    return PreservedAnalyses(MemorySSAAnalysis | AliasAnalysisResult);
+  }
+
+  bool preserves(Kind kind) const { return bits & kind; }
+  void preserve(Kind kind) { bits |= kind; }
+  unsigned raw() const { return bits; }
+};
+
 class Pass {
   template<typename F, typename Ret, typename A>
   static A helper(Ret (F::*)(A) const);
@@ -24,6 +57,7 @@ class Pass {
   using argument_t = decltype(helper(&F::operator()));
 protected:
   ModuleOp *module;
+  PassContext *activeContext = nullptr;
 
   template<class F>
   void runRewriter(Op *op, F rewriter) {
@@ -56,6 +90,7 @@ protected:
   std::map<std::string, FuncOp*> getFunctionMap();
   std::map<std::string, GlobalOp*> getGlobalMap();
   DomTree getDomTree(Region *region);
+  PassContext *context() const { return activeContext; }
 
   // Find the first op that isn't an AllocaOp.
   Op *nonalloca(Region *region);
@@ -67,6 +102,7 @@ public:
   virtual ~Pass() {}
   virtual std::string name() = 0;
   virtual std::map<std::string, int> stats() = 0;
+  virtual PreservedAnalyses run(PassContext &context);
   virtual void run() = 0;
 };
 

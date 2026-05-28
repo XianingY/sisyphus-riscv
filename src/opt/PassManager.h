@@ -2,6 +2,7 @@
 #define PASS_MANAGER_H
 
 #include "Pass.h"
+#include "AnalysisManager.h"
 #include "../main/Options.h"
 #include <memory>
 #include <ostream>
@@ -21,6 +22,7 @@ class PassManager {
   std::string truth;
 
   Options opts;
+  std::unique_ptr<AnalysisManager> analysisManager;
 public:
   PassManager(ModuleOp *module, const Options &opts);
 

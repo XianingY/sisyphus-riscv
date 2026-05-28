@@ -56,6 +56,7 @@ public:
 
   std::string name() override { return "dle"; }
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -88,6 +89,7 @@ public:
 
   std::string name() override { return "dse"; };
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 

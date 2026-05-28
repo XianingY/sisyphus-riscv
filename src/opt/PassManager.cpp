@@ -47,6 +47,16 @@ PassManager::PassManager(ModuleOp *module, const Options &opts):
   }
 }
 
+namespace {
+bool envEnabledPM(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
+}
+
 void PassManager::run() {
   pastFlatten = false;
   pastMem2Reg = false;
@@ -62,6 +72,14 @@ void PassManager::run() {
   }
   auto totalStart = std::chrono::steady_clock::now();
   double totalMs = 0.0;
+  bool analysisManagerEnabled =
+      envEnabledPM("SISY_ENABLE_ANALYSIS_MANAGER", true);
+  bool dumpAnalysisCache =
+      envEnabledPM("SISY_DUMP_ANALYSIS_CACHE", false);
+  analysisManager =
+      std::make_unique<AnalysisManager>(module, analysisManagerEnabled,
+                                        dumpAnalysisCache);
+  PassContext passContext(analysisManager.get());
 
   for (auto &passPtr : passes) {
     Pass *pass = passPtr.get();
@@ -95,8 +113,12 @@ void PassManager::run() {
     }
 
     auto passStart = std::chrono::steady_clock::now();
-    pass->run();
+    PreservedAnalyses preserved =
+        analysisManagerEnabled ? pass->run(passContext)
+                               : (pass->run(), PreservedAnalyses::none());
     pass->cleanup();
+    if (analysisManagerEnabled)
+      analysisManager->invalidate(preserved, pname);
     auto passEnd = std::chrono::steady_clock::now();
     auto passMs = std::chrono::duration<double, std::milli>(passEnd - passStart).count();
     totalMs += passMs;
@@ -164,6 +186,8 @@ void PassManager::run() {
     std::cerr << "[pass-timing] total-pass-time : " << totalMs << " ms\n";
     std::cerr << "[pass-timing] total-wall-time : " << wallMs << " ms\n";
   }
+  if (dumpAnalysisCache && analysisManager)
+    analysisManager->dumpStats(std::cerr);
 }
 
 void PassManager::dumpPipelineProfile(std::ostream &os) const {

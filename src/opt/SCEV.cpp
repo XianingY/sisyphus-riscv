@@ -1,4 +1,5 @@
 #include "LoopPasses.h"
+#include "AnalysisManager.h"
 #include "CleanupPasses.h"
 #include "Passes.h"
 #include "../utils/Matcher.h"
@@ -751,13 +752,21 @@ void SCEV::replaceAfter(LoopInfo *info) {
 
 void SCEV::run() {
   LoopAnalysis analysis(module);
-  analysis.run();
-  auto forests = analysis.getResult();
+  std::map<FuncOp*, LoopForest> localForests;
+  std::map<FuncOp*, LoopForest> *forests = nullptr;
+  if (context() && context()->enabled()) {
+    context()->analysis().ensureBlockFrequency();
+    forests = &context()->analysis().getLoopForests();
+  } else {
+    analysis.run();
+    localForests = analysis.getResult();
+    forests = &localForests;
+  }
 
   auto funcs = collectFuncs();
   
   for (auto func : funcs) {
-    const auto &forest = forests[func];
+    const auto &forest = (*forests)[func];
     auto region = func->getRegion();
     domtree = getDomTree(region);
 
@@ -769,11 +778,18 @@ void SCEV::run() {
 
   AggressiveDCE(module).run();
   for (auto func : funcs) {
-    const auto &forest = forests[func];
+    const auto &forest = (*forests)[func];
 
     for (auto loop : forest.getLoops()) {
       if (!loop->subloops.size())
         discardIv(loop);
     }
   }
+}
+
+PreservedAnalyses SCEV::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::cfg();
 }

@@ -52,6 +52,8 @@ size_t complexityScore(const PipelineMetrics &metrics) {
 
 void appendArmBackend(sys::PassManager &pm, const sys::Options &opts, const PipelinePlan &plan) {
   pm.addPass<sys::arm::Lower>();
+  if (getenvEnabled("SISY_ENABLE_MIR_LEGALIZER", true))
+    pm.addPass<sys::arm::Legalize>();
   pm.addPass<sys::arm::StrengthReduct>();
   pm.addPass<sys::arm::InstCombine>(plan.armInstCombineRounds);
   pm.addPass<sys::arm::ArmDCE>();
@@ -73,6 +75,8 @@ void appendArmBackend(sys::PassManager &pm, const sys::Options &opts, const Pipe
 
 void appendRvBackend(sys::PassManager &pm, const sys::Options &opts, const PipelinePlan &plan) {
   pm.addPass<sys::rv::Lower>();
+  if (getenvEnabled("SISY_ENABLE_MIR_LEGALIZER", true))
+    pm.addPass<sys::rv::Legalize>();
   if (getenvEnabled("SISY_RV_ENABLE_STRENGTH_REDUCT", true))
     pm.addPass<sys::rv::StrengthReduct>();
   if (getenvEnabled("SISY_RV_ENABLE_INST_COMBINE", true))

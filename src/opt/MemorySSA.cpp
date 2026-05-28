@@ -24,6 +24,8 @@ void MemorySSA::build() {
   opToAccess.clear();
   blockMemoryPhi.clear();
   blockExitDefs.clear();
+  dirty = false;
+  dirtyReason.clear();
 
   region->updateDoms();
   DomTree tree;
@@ -110,15 +112,26 @@ void MemorySSA::build() {
   }
 }
 
+void MemorySSA::markDirty(const std::string &reason) {
+  dirty = true;
+  dirtyReason = reason;
+}
+
 MemoryAccess *MemorySSA::getAccess(Op *op) {
+  if (dirty)
+    build();
   return opToAccess.count(op) ? opToAccess[op] : nullptr;
 }
 
 MemoryAccess *MemorySSA::getMemoryPhi(BasicBlock *bb) {
+  if (dirty)
+    build();
   return blockMemoryPhi.count(bb) ? blockMemoryPhi[bb] : nullptr;
 }
 
 MemoryAccess *MemorySSA::getReachingDef(MemoryAccess *useAccess) {
+  if (dirty)
+    build();
   if (!useAccess || useAccess->kind != MemoryAccessKind::Use) return nullptr;
 
   auto *def = useAccess->definingAccess;
@@ -129,6 +142,8 @@ MemoryAccess *MemorySSA::getReachingDef(MemoryAccess *useAccess) {
 }
 
 std::vector<MemoryAccess*> MemorySSA::getClobberingDefs(Op *memoryOp) {
+  if (dirty)
+    build();
   std::vector<MemoryAccess*> result;
   auto *access = getAccess(memoryOp);
   if (!access)
@@ -170,4 +185,41 @@ std::vector<MemoryAccess*> MemorySSA::getClobberingDefs(Op *memoryOp) {
   };
   visit(access->definingAccess);
   return result;
+}
+
+void MemorySSA::eraseMemoryOp(Op *op) {
+  if (!op)
+    return;
+  opToAccess.erase(op);
+  markDirty("erase-memory-op");
+}
+
+void MemorySSA::insertMemoryUse(Op *op) {
+  (void) op;
+  markDirty("insert-memory-use");
+}
+
+void MemorySSA::insertMemoryDef(Op *op) {
+  (void) op;
+  markDirty("insert-memory-def");
+}
+
+void MemorySSA::moveMemoryOpBefore(Op *op, Op *before) {
+  (void) op;
+  (void) before;
+  markDirty("move-memory-op");
+}
+
+void MemorySSA::replaceMemoryOp(Op *oldOp, Op *replacement) {
+  if (!oldOp || !replacement) {
+    markDirty("replace-memory-op");
+    return;
+  }
+  auto it = opToAccess.find(oldOp);
+  if (it != opToAccess.end()) {
+    it->second->op = replacement;
+    opToAccess[replacement] = it->second;
+    opToAccess.erase(it);
+  }
+  markDirty("replace-memory-op");
 }

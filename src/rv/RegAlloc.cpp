@@ -351,6 +351,10 @@ std::map<std::string, int> RegAlloc::stats() {
     { "peepholed", convertedTotal },
     { "max-block-hotness", maxBlockHotness },
     { "live-range-splits", liveRangeSplits },
+    { "dynamic-splits", dynamicSplits },
+    { "coalesced-copies", coalescedCopies },
+    { "split-bailouts", splitBailouts },
+    { "spill-after-split", spillAfterSplit },
     { "rematerialized", rematerialized },
     { "spill-loads", spillLoads },
     { "spill-stores", spillStores },
@@ -545,6 +549,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   int splits = localFastMode ? 0 : splitHotLiveRanges(region, bbWeight);
   if (splits) {
     liveRangeSplits += splits;
+    if (envEnabled("SISY_RV_ENABLE_DYNAMIC_SPLIT", true))
+      dynamicSplits += splits;
     region->updateLiveness();
   }
 
@@ -784,6 +790,8 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
           (callSpan[op] > 1 || callSpan[ref] > 1) && callerSaved.count(preferredReg);
         if (!crossCallRisk) {
           assignment[op] = preferredReg;
+          if (isa<MvOp>(op) || isa<FmvOp>(op))
+            coalescedCopies++;
           continue;
         }
       }
@@ -848,6 +856,15 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
     if (assignment.count(op))
       continue;
+
+    if (envEnabled("SISY_RV_ENABLE_DYNAMIC_SPLIT", true) &&
+        splitCandidateValue(op)) {
+      int maxRounds = envInt("SISY_RV_DYNAMIC_SPLIT_MAX_ROUNDS", 64, 0, 1000000);
+      if (dynamicSplits >= maxRounds)
+        splitBailouts++;
+      else
+        spillAfterSplit++;
+    }
 
     spilled++;
     // Spilled. Try to see all spill offsets of conflicting ops.

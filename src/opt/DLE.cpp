@@ -1,5 +1,8 @@
 #include "CleanupPasses.h"
+#include "AnalysisManager.h"
 #include "MemorySSA.h"
+
+#include <memory>
 
 using namespace sys;
 
@@ -509,19 +512,27 @@ void DLE::runImpl(Region *region) {
     }
   }
 
-  region->updateDoms();
-  MemorySSA memorySSA(region);
-  memorySSA.build();
+  std::unique_ptr<MemorySSA> localMemorySSA;
+  MemorySSA *memorySSA = nullptr;
+  if (context() && context()->enabled()) {
+    memorySSA = &context()->analysis().getMemorySSA(region);
+  } else {
+    region->updateDoms();
+    localMemorySSA = std::make_unique<MemorySSA>(region);
+    localMemorySSA->build();
+    memorySSA = localMemorySSA.get();
+  }
   for (auto bb : region->getBlocks()) {
     auto ops = bb->getOps();
     for (auto op : ops) {
       auto load = dyn_cast<LoadOp>(op);
       if (!load)
         continue;
-      auto replacement = tryForwardMemorySSALoad(builder, memorySSA, load);
+      auto replacement = tryForwardMemorySSALoad(builder, *memorySSA, load);
       if (!replacement)
         continue;
       load->replaceAllUsesWith(replacement);
+      memorySSA->eraseMemoryOp(load);
       load->erase();
       elim++;
       memorySsaForwarded++;
@@ -609,6 +620,13 @@ void DLE::runImpl(Region *region) {
         worklist.push_back(succ);
     }
   }
+}
+
+PreservedAnalyses DLE::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  return PreservedAnalyses::cfg();
 }
 
 void DLE::run() {

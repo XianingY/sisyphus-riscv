@@ -85,6 +85,7 @@ public:
     
   std::string name() override { return "gvn"; };
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
   void runImpl(Region *region);
 };
@@ -239,6 +240,7 @@ public:
 
   std::string name() override { return "gcm"; };
   std::map<std::string, int> stats() override { return {}; }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
