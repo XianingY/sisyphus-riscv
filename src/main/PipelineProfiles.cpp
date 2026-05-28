@@ -81,6 +81,10 @@ void appendRvBackend(sys::PassManager &pm, const sys::Options &opts, const Pipel
   pm.addPass<sys::GVN>();
   if (getenvEnabled("SISY_RV_ENABLE_SCHEDULE", true))
     pm.addPass<sys::rv::Schedule>();
+  // Cross-block superblock scheduling.  Off by default; opt in via
+  // SISY_RV_ENABLE_SUPERBLOCK=1.  Needs the prior BlockFrequency analysis to
+  // identify hot edges, so runs after Schedule and before RegAlloc.
+  pm.addPass<sys::rv::SuperblockSchedule>();
   pm.addPass<sys::rv::RegAlloc>(plan.backendFastMode);
   pm.addPass<sys::rv::Dump>(opts.outputFile);
 }

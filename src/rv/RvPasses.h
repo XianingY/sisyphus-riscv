@@ -87,6 +87,44 @@ public:
   void run() override;
 };
 
+// Pressure-aware superblock scheduling v1.
+//
+// Hoists pure / memory-load operations from a successor block B into its
+// single predecessor A across hot edges, when:
+//   - A's only successor is B and B's only predecessor is A (single-entry
+//     superblock fragment), reducing aliasing concerns to one block,
+//   - the candidate's defining operands all dominate the tail of A,
+//   - no may-alias store, call, or other pinned op sits between the candidate
+//     and A's terminator,
+//   - estimated live-out pressure of A stays within the budget.
+//
+// Stats expose how many candidates were considered and rejected for each
+// reason.  Disabled by default; enable via SISY_RV_ENABLE_SUPERBLOCK=1.
+class SuperblockSchedule : public Pass {
+  int hoisted = 0;
+  int rejectedShape = 0;
+  int rejectedAlias = 0;
+  int rejectedPressure = 0;
+  int rejectedDeps = 0;
+  int candidates = 0;
+
+public:
+  SuperblockSchedule(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "rv-superblock-schedule"; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "hoisted", hoisted },
+      { "candidates", candidates },
+      { "rejected-shape", rejectedShape },
+      { "rejected-alias", rejectedAlias },
+      { "rejected-pressure", rejectedPressure },
+      { "rejected-deps", rejectedDeps },
+    };
+  }
+  void run() override;
+};
+
 // Dumps the output.
 class Dump : public Pass {
   std::string out;
