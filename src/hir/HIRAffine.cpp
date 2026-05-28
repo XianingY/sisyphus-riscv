@@ -853,7 +853,9 @@ bool hasPermutationViolationByDirections(const pres::BasicSet &base,
                                          const std::vector<std::string> &xVars,
                                          const std::vector<std::string> &yVars,
                                          const std::vector<int> &permutation,
-                                         bool &unknown) {
+                                         bool &unknown,
+                                         int *projectedDims = nullptr,
+                                         int *projectionUnknown = nullptr) {
   pres::BasicSet queryBase = base;
   VarOrder queryVars = vars;
 
@@ -879,6 +881,10 @@ bool hasPermutationViolationByDirections(const pres::BasicSet &base,
         queryVars.add(var);
       for (const std::string &var : yVars)
         queryVars.add(var);
+      if (projectedDims)
+        *projectedDims += static_cast<int>(projectVars.size());
+    } else if (projectionUnknown) {
+      (*projectionUnknown)++;
     }
   }
 
@@ -1381,7 +1387,9 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
 
       bool unknown = false;
       if (hasPermutationViolationByDirections(base, vars, xVars, yVars,
-                                              permutation, unknown)) {
+                                              permutation, unknown,
+                                              &result.projectedDims,
+                                              &result.projectionUnknown)) {
         result.mayViolatingDependence++;
         return result;
       }

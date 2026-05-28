@@ -161,6 +161,8 @@ bool PolyhedralOptimizer::tryLoopInterchange3D(Op *block, size_t idx,
   stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
   stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
   stats.presburgerInterchangeUnknown += dep.unknown;
+  stats.presburgerProjectedDims += dep.projectedDims;
+  stats.presburgerUnknownBudget += dep.projectionUnknown;
   if (!dep.safe) {
     stats.interchange3DRejected++;
     stats.interchange3DRejectMemory++;
@@ -298,6 +300,8 @@ bool PolyhedralOptimizer::tryLoopInterchange(Op *block, size_t idx,
   stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
   stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
   stats.presburgerInterchangeUnknown += dep.unknown;
+  stats.presburgerProjectedDims += dep.projectedDims;
+  stats.presburgerUnknownBudget += dep.projectionUnknown;
   if (!dep.safe) {
     stats.interchangeRejected++;
     stats.interchangeRejectMemory++;
@@ -441,6 +445,8 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
   stats.presburgerInterchangeNoDeps += dep.noViolatingDependence;
   stats.presburgerInterchangeMayDeps += dep.mayViolatingDependence;
   stats.presburgerInterchangeUnknown += dep.unknown;
+  stats.presburgerProjectedDims += dep.projectedDims;
+  stats.presburgerUnknownBudget += dep.projectionUnknown;
   if (!dep.safe) {
     stats.unrollJamRejected++;
     stats.unrollJamRejectMemory++;

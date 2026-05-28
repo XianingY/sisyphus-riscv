@@ -22,6 +22,32 @@ using namespace sys::hir::detail;
 namespace {
 
 constexpr const char *kStencilSplitLoopMarker = "__hir_stencil_split_loop";
+constexpr const char *kRowStencilSplitLoopMarker = "__hir_row_stencil_split_loop";
+
+int countOpsForPressure(const Op *op) {
+  if (!op)
+    return 0;
+  int count = 1;
+  for (const auto &child : op->children)
+    count += countOpsForPressure(child.get());
+  return count;
+}
+
+bool findDirectCanonicalChildLoop(Op *body, CanonicalLoop &loop, Op *&whileOp) {
+  if (!body || body->kind != OpKind::Block)
+    return false;
+  for (auto &child : body->children) {
+    if (!child || child->kind != OpKind::While)
+      continue;
+    CanonicalLoop candidate;
+    if (matchCanonicalWhile(child.get(), candidate)) {
+      loop = candidate;
+      whileOp = child.get();
+      return true;
+    }
+  }
+  return false;
+}
 
 bool termVariesInLoop(const Op *op, const Op *body) {
   if (!op)
@@ -131,6 +157,51 @@ std::unique_ptr<Op> cloneReplacingGuardCond(const Op *op, const Op *guard,
   return out;
 }
 
+std::unique_ptr<Op> cloneRowBodyWithStencilColumnSplit(
+    const Op *rowBody, const Op *colWhileOp, const CanonicalLoop &colLoop,
+    const StencilBounds &bounds) {
+  if (!rowBody || rowBody->kind != OpKind::Block)
+    return nullptr;
+
+  auto out = makeBlock();
+  for (const auto &child : rowBody->children) {
+    if (child.get() != colWhileOp) {
+      out->children.push_back(cloneOp(child.get()));
+      continue;
+    }
+
+    auto leftBody = cloneOp(colLoop.body);
+    auto centerBody = cloneDroppingStencilGuard(colLoop.body, bounds.guardedIf);
+    auto rightBody = cloneOp(colLoop.body);
+    if (!leftBody || !centerBody || !rightBody)
+      return nullptr;
+
+    auto leftCond = makeLogicalAnd(
+        cloneOp(colWhileOp->children[0].get()),
+        makeCmp("<", makeLoad(colLoop.iv), makeLoad(bounds.pad)));
+    auto centerStop =
+        makeArith("-", cloneOp(bounds.bound), makeLoad(bounds.pad));
+    auto centerCond =
+        makeCmp("<", makeLoad(colLoop.iv), std::move(centerStop));
+    auto rightCond = cloneOp(colWhileOp->children[0].get());
+    if (!leftCond || !centerCond || !rightCond)
+      return nullptr;
+
+    auto leftLoop = makeWhile(std::move(leftCond), std::move(leftBody));
+    auto centerLoop = makeWhile(std::move(centerCond), std::move(centerBody));
+    auto rightLoop = makeWhile(std::move(rightCond), std::move(rightBody));
+    leftLoop->symbol = kRowStencilSplitLoopMarker;
+    centerLoop->symbol = kRowStencilSplitLoopMarker;
+    rightLoop->symbol = kRowStencilSplitLoopMarker;
+
+    out->children.push_back(std::move(leftLoop));
+    out->children.push_back(makeStore(colLoop.iv, makeLoad(bounds.pad)));
+    out->children.push_back(std::move(centerLoop));
+    out->children.push_back(std::move(rightLoop));
+  }
+  return out;
+}
+
 }  // namespace
 
 
@@ -184,6 +255,16 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
       for (size_t i = 0; i < block->children.size(); i++) {
         if (block->children[i] && block->children[i]->kind == OpKind::While &&
             tryLoopInterchange3D(block, i, stats)) {
+          changed = true;
+          i = 0;
+        }
+      }
+    }
+
+    if (hirEnvEnabled("SISY_HIR_ENABLE_ROW_STENCIL_INTERIOR", false)) {
+      for (size_t i = 0; i < block->children.size(); i++) {
+        if (block->children[i] && block->children[i]->kind == OpKind::While &&
+            tryRowStencilInteriorDispatch(block, i, stats)) {
           changed = true;
           i = 0;
         }
@@ -394,6 +475,153 @@ bool PolyhedralOptimizer::tryInvariantGuardHoist(Op *block, size_t idx,
   block->children[idx] =
       makeIf(std::move(invariantCond), std::move(thenBody), nullptr);
   stats.invariantGuardHoisted++;
+  return true;
+}
+
+bool PolyhedralOptimizer::tryRowStencilInteriorDispatch(Op *block, size_t idx,
+                                                        PolyhedralStats &stats) {
+  if (!block || idx >= block->children.size()) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectShape++;
+    return false;
+  }
+
+  Op *rowWhileOp = block->children[idx].get();
+  if (!rowWhileOp || rowWhileOp->kind != OpKind::While ||
+      rowWhileOp->symbol == kRowStencilSplitLoopMarker ||
+      rowWhileOp->symbol == kStencilSplitLoopMarker) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectShape++;
+    return false;
+  }
+
+  CanonicalLoop rowLoop;
+  if (!matchCanonicalWhile(rowWhileOp, rowLoop) || !rowLoop.body ||
+      rowLoop.body->kind != OpKind::Block || rowLoop.body->children.size() < 2) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectShape++;
+    return false;
+  }
+
+  Op *colWhileOp = nullptr;
+  CanonicalLoop colLoop;
+  if (!findDirectCanonicalChildLoop(rowLoop.body, colLoop, colWhileOp) ||
+      !colLoop.body || colLoop.body->kind != OpKind::Block ||
+      colWhileOp->symbol == kRowStencilSplitLoopMarker ||
+      colWhileOp->symbol == kStencilSplitLoopMarker) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectShape++;
+    return false;
+  }
+
+  std::unordered_map<std::string, const Op*> scalarInits;
+  collectScalarInitializers(rowLoop.body, scalarInits);
+
+  StencilBounds bounds;
+  if (!findStencilBoundsIf(colLoop.body, scalarInits, colLoop.iv, bounds)) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectBounds++;
+    return false;
+  }
+
+  if (bounds.rowSpatial != rowLoop.iv || bounds.colSpatial != colLoop.iv ||
+      bounds.pad.empty() || !bounds.bound || !bounds.guardedIf) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectBounds++;
+    return false;
+  }
+
+  if (bodyWritesScalar(rowLoop.body, bounds.pad) ||
+      scalarUsedBeforeRedef(block, idx + 1, rowLoop.iv)) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectBounds++;
+    return false;
+  }
+
+  // Avoid the old column-level dispatcher failure mode: if cloning the slow
+  // and fast bodies would create a large live range fan-out, leave the nest in
+  // its original guarded form.  The limit is intentionally conservative and
+  // tunable for A/B testing.
+  const int bodyOps = countOpsForPressure(rowLoop.body);
+  const int colOps = countOpsForPressure(colLoop.body);
+  const int pressureBudget =
+      hirEnvInt("SISY_HIR_ROW_STENCIL_PRESSURE_BUDGET", 200);
+  if (bodyOps + 2 * colOps > pressureBudget) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectPressure++;
+    stats.guardedScopRejectPressure++;
+    return false;
+  }
+
+  auto topBody = cloneOp(rowLoop.body);
+  auto middleBody =
+      cloneRowBodyWithStencilColumnSplit(rowLoop.body, colWhileOp, colLoop, bounds);
+  auto bottomBody = cloneOp(rowLoop.body);
+  if (!topBody || !middleBody || !bottomBody) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectShape++;
+    return false;
+  }
+
+  if (!hirEnvEnabled("SISY_HIR_ROW_STENCIL_THREE_LOOPS", false)) {
+    auto rowLower =
+        makeCmp("<=", makeLoad(bounds.pad), makeLoad(rowLoop.iv));
+    auto rowUpper = makeCmp("<", makeLoad(rowLoop.iv),
+                            makeArith("-", cloneOp(bounds.bound),
+                                      makeLoad(bounds.pad)));
+    auto rowInterior = makeLogicalAnd(std::move(rowLower), std::move(rowUpper));
+    if (!rowInterior) {
+      stats.rowStencilInteriorRejected++;
+      stats.rowStencilRejectShape++;
+      return false;
+    }
+
+    auto guardedBody = makeBlock();
+    guardedBody->children.push_back(
+        makeIf(std::move(rowInterior), std::move(middleBody), std::move(topBody)));
+    auto guardedLoop =
+        makeWhile(cloneOp(rowWhileOp->children[0].get()), std::move(guardedBody));
+    guardedLoop->symbol = kRowStencilSplitLoopMarker;
+    block->children[idx] = std::move(guardedLoop);
+    stats.rowStencilInteriorDispatched++;
+    stats.guardedScopApplied++;
+    return true;
+  }
+
+  auto topCond = makeLogicalAnd(
+      cloneOp(rowWhileOp->children[0].get()),
+      makeCmp("<", makeLoad(rowLoop.iv), makeLoad(bounds.pad)));
+  auto middleStop =
+      makeArith("-", cloneOp(bounds.bound), makeLoad(bounds.pad));
+  auto middleCond =
+      makeCmp("<", makeLoad(rowLoop.iv), std::move(middleStop));
+  auto bottomCond = cloneOp(rowWhileOp->children[0].get());
+  if (!topCond || !middleCond || !bottomCond) {
+    stats.rowStencilInteriorRejected++;
+    stats.rowStencilRejectShape++;
+    return false;
+  }
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(4);
+  auto topLoop = makeWhile(std::move(topCond), std::move(topBody));
+  auto middleLoop = makeWhile(std::move(middleCond), std::move(middleBody));
+  auto bottomLoop = makeWhile(std::move(bottomCond), std::move(bottomBody));
+  topLoop->symbol = kRowStencilSplitLoopMarker;
+  middleLoop->symbol = kRowStencilSplitLoopMarker;
+  bottomLoop->symbol = kRowStencilSplitLoopMarker;
+  replacement.push_back(std::move(topLoop));
+  replacement.push_back(makeStore(rowLoop.iv, makeLoad(bounds.pad)));
+  replacement.push_back(std::move(middleLoop));
+  replacement.push_back(std::move(bottomLoop));
+
+  auto first = block->children.begin() + static_cast<std::ptrdiff_t>(idx);
+  first = block->children.erase(first);
+  block->children.insert(first,
+                         std::make_move_iterator(replacement.begin()),
+                         std::make_move_iterator(replacement.end()));
+  stats.rowStencilInteriorDispatched++;
+  stats.guardedScopApplied++;
   return true;
 }
 
@@ -642,6 +870,11 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
     return;
   }
   if (hasUnsafeAffineScanControl(op)) {
+    std::vector<affine::Access> guardedAccesses = affine::collectArrayAccesses(op);
+    int rawAccesses = countArrayAccessOps(op);
+    if (rawAccesses > 0 && rawAccesses == (int)guardedAccesses.size()) {
+      stats.guardedScopCandidates++;
+    }
     stats.affineNestRejectedControl++;
     return;
   }

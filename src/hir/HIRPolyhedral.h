@@ -94,6 +94,8 @@ struct PolyhedralStats {
   int presburgerInterchangeNoDeps = 0;
   int presburgerInterchangeMayDeps = 0;
   int presburgerInterchangeUnknown = 0;
+  int presburgerProjectedDims = 0;
+  int presburgerUnknownBudget = 0;
   // Stats-only affine nest scanner. These counters do not enable rewrites.
   int affineNestCandidates = 0;
   int affineNestRejectedShape = 0;
@@ -102,12 +104,21 @@ struct PolyhedralStats {
   int affineNestPerfect2D = 0;
   int affineNestPerfect3D = 0;
   int matmulLikeCandidates = 0;
+  int guardedScopCandidates = 0;
+  int guardedScopApplied = 0;
+  int guardedScopRejected = 0;
+  int guardedScopRejectPressure = 0;
   // Stencil/conv-like boundary dispatch. This keeps the original boundary
   // guarded body as fallback and exposes an unchecked interior body.
   int stencilInteriorDispatched = 0;
   int stencilInteriorRejected = 0;
   int stencilInteriorRejectShape = 0;
   int stencilInteriorRejectBounds = 0;
+  int rowStencilInteriorDispatched = 0;
+  int rowStencilInteriorRejected = 0;
+  int rowStencilRejectShape = 0;
+  int rowStencilRejectBounds = 0;
+  int rowStencilRejectPressure = 0;
   // Hoist an invariant conjunct from a guarded inner loop when the loop has
   // no observable work outside that guard.
   int invariantGuardHoisted = 0;
@@ -162,6 +173,7 @@ private:
   // Loop fusion: merge two adjacent loops with identical bounds over same arrays.
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
+  bool tryRowStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryInvariantGuardHoist(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryMonotoneGuardBoundTightening(Op *block, size_t idx, PolyhedralStats &stats);

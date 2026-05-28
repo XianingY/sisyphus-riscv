@@ -39,6 +39,8 @@ struct PresburgerInterchangeResult {
   int noViolatingDependence = 0;
   int mayViolatingDependence = 0;
   int unknown = 0;
+  int projectedDims = 0;
+  int projectionUnknown = 0;
 };
 
 struct CanonicalLoop {
