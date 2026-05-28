@@ -152,6 +152,43 @@ public:
   void run() override;
 };
 
+// Static block-frequency / branch-probability analysis.
+//
+// Computes a per-BasicBlock frequency using loop-nest depth as the primary
+// signal (header back-edges detected via dominance).  When SISY_PROFILE is
+// set to a readable file of `funcname blockindex freq` lines, those entries
+// override the static estimate.  Stored in a singleton side-table to avoid
+// modifying BasicBlock; future consumers (RegAlloc spill weight, scheduler,
+// block layout) can call BlockFrequency::freqOf(bb).
+//
+// The pass never modifies IR.  Kill switch: SISY_ENABLE_BFI=0.
+class BlockFrequency : public Pass {
+  int hotBlocks = 0;
+  int coldBlocks = 0;
+  int profileEntries = 0;
+  int maxLoopDepth = 0;
+
+public:
+  BlockFrequency(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "block-frequency"; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "hot-blocks", hotBlocks },
+      { "cold-blocks", coldBlocks },
+      { "profile-entries", profileEntries },
+      { "max-loop-depth", maxLoopDepth },
+    };
+  }
+  void run() override;
+
+  // Returns a relative frequency for `bb`.  1.0 == straight-line entry-level
+  // estimate.  Returns 1.0 when no analysis has been run for this block.
+  static double freqOf(BasicBlock *bb);
+  static bool isCold(BasicBlock *bb);
+  static void clear();
+};
+
 // Mark functions that are called at most once.
 class AtMostOnce : public Pass {
 public:

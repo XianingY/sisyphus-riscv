@@ -665,6 +665,12 @@ PipelinePlan configurePipeline(PassManager &pm, const Options &opts, PipelineMet
     break;
   }
 
+  // Static block-frequency / branch-probability analysis.  Pure side-table
+  // population; no IR mutation.  Future consumers (RegAlloc spill weight,
+  // scheduler, layout) will read via BlockFrequency::freqOf().  Killable
+  // with SISY_ENABLE_BFI=0; profile import via SISY_PROFILE=<path>.
+  pm.addPass<sys::BlockFrequency>();
+
   // Optional thin-summary dump.  No-op unless SISY_THIN_SUMMARY_DUMP is set,
   // so the default single-file compilation path is unchanged.
   pm.addPass<sys::ThinSummary>();
