@@ -11,8 +11,10 @@ namespace sys::hir {
 struct PolyhedralStats {
   int reductionJammed = 0;
   int reductionPrivatized = 0;
+  int reductionRowJamConditional = 0;
   int reductionMicroTiled = 0;
   int reductionMicroTileInPlace = 0;
+  int reductionMicroTileConditional = 0;
   int reductionMicroTile3D = 0;
   int reductionMicroTileRejectDependence = 0;
   int reductionMicroTileRejectPressure = 0;

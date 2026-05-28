@@ -78,20 +78,70 @@ bool privatizedReductionLegal(
   return true;
 }
 
-std::unique_ptr<Op> cloneReductionStmtToScratch(const Op *op,
-                                                const ReductionPattern &pat,
-                                                const std::string &scratch) {
+bool hasArrayStore(const Op *op) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Store && op->children.size() > 1)
+    return true;
+  for (const auto &child : op->children)
+    if (hasArrayStore(child.get()))
+      return true;
+  return false;
+}
+
+bool scalarStoresOnlyAccumulator(const Op *op, const std::string &acc) {
+  if (!op)
+    return true;
+  if (op->kind == OpKind::Store && op->children.size() == 1 &&
+      op->symbol != acc)
+    return false;
+  for (const auto &child : op->children)
+    if (!scalarStoresOnlyAccumulator(child.get(), acc))
+      return false;
+  return true;
+}
+
+bool allArrayAccessesGlobal(
+    const Op *op, const std::unordered_set<std::string> &globalArrays) {
+  std::vector<affine::Access> accesses = affine::collectArrayAccesses(op);
+  for (const auto &access : accesses)
+    if (!globalArrays.count(access.base))
+      return false;
+  return true;
+}
+
+bool conditionalReductionMicroTileLegal(
+    const ReductionPattern &pat,
+    const std::unordered_set<std::string> &globalArrays) {
+  if (!pat.kReductionStmt || pat.kReductionStmt == pat.accUpdate)
+    return false;
+  if (!pat.destStore || containsArrayAccessTo(pat.kReductionStmt,
+                                              pat.destStore->symbol))
+    return false;
+  if (hasArrayStore(pat.kReductionStmt))
+    return false;
+  if (!scalarStoresOnlyAccumulator(pat.kReductionStmt, pat.acc))
+    return false;
+  if (!allArrayAccessesGlobal(pat.kReductionStmt, globalArrays))
+    return false;
+  return true;
+}
+
+std::unique_ptr<Op> cloneReductionStmtToScratchAt(const Op *op,
+                                                  const ReductionPattern &pat,
+                                                  const std::string &scratch,
+                                                  const Op *index) {
   if (!op)
     return nullptr;
   if (isScalarLoad(op, pat.acc))
-    return makeArrayLoadAt(scratch, makeLoad(pat.j), op->type);
+    return makeArrayLoadAt(scratch, cloneOp(index), op->type);
   if (op->kind == OpKind::Store && op->symbol == pat.acc && op->children.size() == 1) {
-    auto oldValue = makeArrayLoadAt(scratch, makeLoad(pat.j), op->type);
+    auto oldValue = makeArrayLoadAt(scratch, cloneOp(index), op->type);
     auto nextValue = cloneReplacingScalarLoad(op->children[0].get(), pat.acc,
                                               oldValue.get());
     if (!nextValue)
       return nullptr;
-    return makeArrayStoreAt(scratch, makeLoad(pat.j), std::move(nextValue),
+    return makeArrayStoreAt(scratch, cloneOp(index), std::move(nextValue),
                             op->type);
   }
 
@@ -105,8 +155,16 @@ std::unique_ptr<Op> cloneReductionStmtToScratch(const Op *op,
   out->floatValue = op->floatValue;
   out->arrayDims = op->arrayDims;
   for (const auto &child : op->children)
-    out->children.push_back(cloneReductionStmtToScratch(child.get(), pat, scratch));
+    out->children.push_back(
+        cloneReductionStmtToScratchAt(child.get(), pat, scratch, index));
   return out;
+}
+
+std::unique_ptr<Op> cloneReductionStmtToScratch(const Op *op,
+                                                const ReductionPattern &pat,
+                                                const std::string &scratch) {
+  auto index = makeLoad(pat.j);
+  return cloneReductionStmtToScratchAt(op, pat, scratch, index.get());
 }
 
 }  // namespace
@@ -372,16 +430,32 @@ bool PolyhedralOptimizer::tryReductionMicroTile(Op *block, size_t initIndex,
     stats.reductionMicroTileRejectDependence++;
     return false;
   }
-  // Conditional updates duplicate guard values and address temporaries for
-  // every lane.  Until the backend can keep that pressure bounded, retaining
-  // the scalar row-buffer form is preferable to introducing spills.
-  if (pat.kReductionStmt != pat.accUpdate) {
+  const bool conditional = pat.kReductionStmt != pat.accUpdate;
+  if (conditional &&
+      (!hirEnvEnabled("SISY_HIR_ENABLE_CONDITIONAL_REDUCTION_MICROTILE", false) ||
+       !conditionalReductionMicroTileLegal(pat, globalArrays))) {
     stats.reductionMicroTileRejectPressure++;
     return false;
   }
 
   ReductionTilePlan plan = computeReductionTilePlan(
       pat.kReductionStmt, detectMainType(pat.kReductionStmt), true);
+  if (conditional) {
+    // Conditional lanes carry their guard, compare, and selected update
+    // temporaries at once.  Keep the default intentionally narrow; wider
+    // lanes are only available through explicit A/B environment overrides.
+    int requestedNr = hirEnvInt("SISY_HIR_COND_MICRO_NR", 2);
+    int requestedKc = hirEnvInt("SISY_HIR_COND_MICRO_KC", 32);
+    if (requestedNr < 2 || requestedNr > 4 || requestedKc < 8 ||
+        requestedKc > 64) {
+      stats.reductionMicroTileRejectPressure++;
+      return false;
+    }
+    plan.mr = 1;
+    plan.nr = requestedNr;
+    plan.kc = requestedKc;
+    plan.nc = requestedNr;
+  }
   if (plan.nr < 2 || plan.kc < 2) {
     stats.reductionMicroTileRejectPressure++;
     return false;
@@ -521,6 +595,7 @@ bool PolyhedralOptimizer::tryReductionMicroTile(Op *block, size_t initIndex,
   block->children = std::move(replacement);
   stats.reductionMicroTiled++;
   stats.reductionMicroTileInPlace += inPlace ? 1 : 0;
+  stats.reductionMicroTileConditional += conditional ? 1 : 0;
   stats.microTileMrSum += plan.mr;
   stats.microTileNrSum += plan.nr;
   stats.microTileKcSum += plan.kc;
@@ -591,17 +666,61 @@ bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
     return false;
 
   auto innerJBody = makeBlock();
-  auto scratchUpdate = cloneReductionStmtToScratch(pat.kReductionStmt, pat, scratch);
-  if (!scratchUpdate)
-    return false;
-  innerJBody->children.push_back(std::move(scratchUpdate));
-  innerJBody->children.push_back(cloneOp(pat.jStep));
-  auto innerJLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
-                              std::move(innerJBody));
+  const bool inPlace =
+      containsArrayAccessTo(pat.kReductionStmt, pat.destStore->symbol);
+  const bool conditional = pat.kReductionStmt != pat.accUpdate;
+  const bool useConditionalRowJam =
+      conditional && !inPlace &&
+      hirEnvEnabled("SISY_HIR_ENABLE_CONDITIONAL_ROW_JAM", true) &&
+      conditionalReductionMicroTileLegal(pat, globalArrays);
+
+  std::unique_ptr<Op> innerJLoop;
+  std::unique_ptr<Op> tailJLoop;
+  if (useConditionalRowJam) {
+    constexpr int kRowJamFactor = 2;
+    for (int lane = 0; lane < kRowJamFactor; lane++) {
+      auto laneStmt = cloneReplacing(pat.kReductionStmt, {}, {{pat.j, lane}});
+      if (!laneStmt)
+        return false;
+      auto laneIndex = makeIndexWithOffset(pat.j, lane);
+      auto laneUpdate = cloneReductionStmtToScratchAt(
+          laneStmt.get(), pat, scratch, laneIndex.get());
+      if (!laneUpdate)
+        return false;
+      innerJBody->children.push_back(std::move(laneUpdate));
+    }
+    innerJBody->children.push_back(makeJamStep(pat.j, kRowJamFactor));
+    innerJLoop = makeWhile(
+        makeCmp("<",
+                makeArith("+", makeLoad(pat.j), makeConstInt(kRowJamFactor - 1)),
+                cloneOp(pat.jBound)),
+        std::move(innerJBody));
+
+    auto tailJBody = makeBlock();
+    auto scratchUpdate =
+        cloneReductionStmtToScratch(pat.kReductionStmt, pat, scratch);
+    if (!scratchUpdate)
+      return false;
+    tailJBody->children.push_back(std::move(scratchUpdate));
+    tailJBody->children.push_back(cloneOp(pat.jStep));
+    tailJLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                          std::move(tailJBody));
+  } else {
+    auto scratchUpdate =
+        cloneReductionStmtToScratch(pat.kReductionStmt, pat, scratch);
+    if (!scratchUpdate)
+      return false;
+    innerJBody->children.push_back(std::move(scratchUpdate));
+    innerJBody->children.push_back(cloneOp(pat.jStep));
+    innerJLoop = makeWhile(makeCmp("<", makeLoad(pat.j), cloneOp(pat.jBound)),
+                           std::move(innerJBody));
+  }
 
   auto kBody = makeBlock();
   kBody->children.push_back(cloneOp(block->children[initIndex].get()));
   kBody->children.push_back(std::move(innerJLoop));
+  if (tailJLoop)
+    kBody->children.push_back(std::move(tailJLoop));
   kBody->children.push_back(cloneOp(pat.kStep));
   auto kWhile = makeWhile(cloneOp(pat.kWhile->children[0].get()), std::move(kBody));
 
@@ -637,6 +756,7 @@ bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
 
   block->children = std::move(replacement);
   stats.reductionPrivatized++;
+  stats.reductionRowJamConditional += useConditionalRowJam ? 1 : 0;
   return true;
 }
 

@@ -172,11 +172,22 @@ in scalar registers while processing a `k` panel, and writes partial sums only
 at panel boundaries. The profitability gate rejects conditional updates that
 increase spill pressure on the current scalar backend.
 
+Conditional integer reductions use a narrower path by default. Instead of
+forcing a long-lived register panel, the row-scratch loop may be unrolled by a
+small lane factor when the update is out-of-place, has no array stores, and all
+array reads are affine globals. This keeps the original `k` order and contiguous
+row-buffer accesses while reducing loop-control overhead without adding spills.
+The heavier conditional panel path remains opt-in for A/B testing via
+`SISY_HIR_ENABLE_CONDITIONAL_REDUCTION_MICROTILE=1`.
+
 This transform is driven only by canonical loop shape, affine accesses,
 dependence legality, cache budget, and register-pressure estimates. It does
 not identify matrix test cases, dimensions, or algorithm names. Use
 `SISY_HIR_ENABLE_REDUCTION_MICROTILE=0` for bisection and
-`SISY_HIR_MICRO_NR` / `SISY_HIR_MICRO_KC` for cost-model experiments.
+`SISY_HIR_ENABLE_CONDITIONAL_ROW_JAM=0` to disable the conditional row-scratch
+unroll. `SISY_HIR_MICRO_NR` / `SISY_HIR_MICRO_KC` and
+`SISY_HIR_COND_MICRO_NR` / `SISY_HIR_COND_MICRO_KC` are reserved for cost-model
+experiments.
 
 ## 5. Environment Switches
 
