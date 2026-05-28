@@ -108,6 +108,11 @@ struct PolyhedralStats {
   int guardedScopApplied = 0;
   int guardedScopRejected = 0;
   int guardedScopRejectPressure = 0;
+  int guardedScopSymbolic = 0;
+  int symbolicAffineAccesses = 0;
+  int symbolicAffineRejectInvariant = 0;
+  int symbolicAffineCancelled = 0;
+  int symbolicPresburgerFallback = 0;
   // Stencil/conv-like boundary dispatch. This keeps the original boundary
   // guarded body as fallback and exposes an unchecked interior body.
   int stencilInteriorDispatched = 0;

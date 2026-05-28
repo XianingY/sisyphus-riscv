@@ -850,7 +850,8 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
 
   std::vector<CanonicalLoop> loops;
   Op *current = op;
-  for (int depth = 0; depth < 3; depth++) {
+  const int maxScanDepth = std::max(3, hirEnvInt("SISY_HIR_AFFINE_SCAN_DEPTH", 5));
+  for (int depth = 0; depth < maxScanDepth; depth++) {
     CanonicalLoop loop;
     if (!matchCanonicalWhile(current, loop)) {
       if (depth == 0) {
@@ -869,21 +870,42 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
     stats.affineNestRejectedShape++;
     return;
   }
+  std::unordered_set<std::string> loopIVs;
+  for (const auto &loop : loops)
+    loopIVs.insert(loop.iv);
   if (hasUnsafeAffineScanControl(op)) {
-    std::vector<affine::Access> guardedAccesses = affine::collectArrayAccesses(op);
+    std::vector<affine::Access> guardedAccesses =
+        affine::collectArrayAccesses(op, loopIVs);
     int rawAccesses = countArrayAccessOps(op);
     if (rawAccesses > 0 && rawAccesses == (int)guardedAccesses.size()) {
       stats.guardedScopCandidates++;
+      for (const auto &access : guardedAccesses) {
+        for (const auto &idx : access.indices) {
+          if (affine::hasSymbolicCoefficients(idx)) {
+            stats.guardedScopSymbolic++;
+            stats.symbolicAffineAccesses++;
+            break;
+          }
+        }
+      }
     }
     stats.affineNestRejectedControl++;
     return;
   }
 
   int rawAccesses = countArrayAccessOps(op);
-  std::vector<affine::Access> accesses = affine::collectArrayAccesses(op);
+  std::vector<affine::Access> accesses = affine::collectArrayAccesses(op, loopIVs);
   if (rawAccesses != (int) accesses.size()) {
     stats.affineNestRejectedAccess++;
     return;
+  }
+  for (const auto &access : accesses) {
+    for (const auto &idx : access.indices) {
+      if (affine::hasSymbolicCoefficients(idx)) {
+        stats.symbolicAffineAccesses++;
+        break;
+      }
+    }
   }
 
   if (loops.size() >= 2)

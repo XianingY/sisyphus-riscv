@@ -12,10 +12,20 @@
 
 namespace sys::hir::affine {
 
+struct Coeff {
+  int64_t constant = 0;
+  std::map<std::string, int64_t> symbols;
+
+  bool isZero() const { return constant == 0 && symbols.empty(); }
+};
+
+bool operator==(const Coeff &lhs, const Coeff &rhs);
+bool operator!=(const Coeff &lhs, const Coeff &rhs);
+
 struct Expr {
   bool valid = false;
   int64_t constant = 0;
-  std::map<std::string, int64_t> coeffs;
+  std::map<std::string, Coeff> coeffs;
 };
 
 struct Access {
@@ -51,8 +61,13 @@ struct CanonicalLoop {
 };
 
 Expr analyzeExpr(const Op *op);
+Expr analyzeExpr(const Op *op, const std::unordered_set<std::string> &loopIVs);
 bool matchCanonicalLoop(const Op *op, CanonicalLoop &loop);
 std::vector<Access> collectArrayAccesses(const Op *op);
+std::vector<Access> collectArrayAccesses(const Op *op,
+                                         const std::unordered_set<std::string> &loopIVs);
+bool hasSymbolicCoefficients(const Expr &expr);
+bool coeffIsConstant(const Expr &expr, const std::string &symbol, int64_t value);
 
 bool exprUsesAny(const Expr &expr, const std::unordered_set<std::string> &symbols);
 bool opWritesAnyScalarUsedBy(const Op *op, const Op *expr);

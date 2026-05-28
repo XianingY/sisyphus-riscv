@@ -444,6 +444,11 @@ int main(int argc, char **argv) {
                       << " guarded-scop-applied=" << stats.guardedScopApplied
                       << " guarded-scop-rejected=" << stats.guardedScopRejected
                       << " guarded-scop-reject-pressure=" << stats.guardedScopRejectPressure
+                      << " guarded-scop-symbolic=" << stats.guardedScopSymbolic
+                      << " symbolic-affine-accesses=" << stats.symbolicAffineAccesses
+                      << " symbolic-affine-reject-invariant=" << stats.symbolicAffineRejectInvariant
+                      << " symbolic-affine-cancelled=" << stats.symbolicAffineCancelled
+                      << " symbolic-presburger-fallback=" << stats.symbolicPresburgerFallback
                       << " stencil-interior-dispatched=" << stats.stencilInteriorDispatched
                       << " stencil-interior-rejected=" << stats.stencilInteriorRejected
                       << " stencil-interior-reject-shape=" << stats.stencilInteriorRejectShape

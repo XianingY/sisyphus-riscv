@@ -1401,9 +1401,13 @@ Op *findSingleDirectInnerWhile(Op *body) {
 }
 
 bool accessMentions(const affine::Access &access, const std::string &symbol) {
-  for (const auto &idx : access.indices)
+  for (const auto &idx : access.indices) {
     if (idx.coeffs.count(symbol))
       return true;
+    for (const auto &[_, coeff] : idx.coeffs)
+      if (coeff.symbols.count(symbol))
+        return true;
+  }
   return false;
 }
 
@@ -1414,6 +1418,10 @@ bool accessMentionsPair(const affine::Access &access, const std::string &a,
   for (const auto &idx : access.indices) {
     hasA = hasA || idx.coeffs.count(a);
     hasB = hasB || idx.coeffs.count(b);
+    for (const auto &[_, coeff] : idx.coeffs) {
+      hasA = hasA || coeff.symbols.count(a);
+      hasB = hasB || coeff.symbols.count(b);
+    }
   }
   return hasA && hasB;
 }

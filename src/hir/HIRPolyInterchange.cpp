@@ -107,7 +107,8 @@ bool PolyhedralOptimizer::tryLoopInterchange3D(Op *block, size_t idx,
   }
 
   int rawAccesses = countArrayAccessOps(inner.body);
-  std::vector<affine::Access> accesses = affine::collectArrayAccesses(inner.body);
+  std::vector<affine::Access> accesses =
+      affine::collectArrayAccesses(inner.body, loopIVs);
   if (rawAccesses != (int) accesses.size()) {
     stats.interchange3DRejected++;
     stats.interchange3DRejectAccess++;
@@ -256,8 +257,10 @@ bool PolyhedralOptimizer::tryLoopInterchange(Op *block, size_t idx,
     return false;
   }
 
+  std::unordered_set<std::string> loopIVs = {outer.iv, inner.iv};
   int rawAccesses = countArrayAccessOps(inner.body);
-  std::vector<affine::Access> accesses = affine::collectArrayAccesses(inner.body);
+  std::vector<affine::Access> accesses =
+      affine::collectArrayAccesses(inner.body, loopIVs);
   if (rawAccesses != (int) accesses.size()) {
     stats.interchangeRejected++;
     stats.interchangeRejectAccess++;
@@ -283,7 +286,6 @@ bool PolyhedralOptimizer::tryLoopInterchange(Op *block, size_t idx,
     return false;
   }
 
-  std::unordered_set<std::string> loopIVs = {outer.iv, inner.iv};
   if (affine::exprUsesAny(outerInitExpr, loopIVs) ||
       affine::exprUsesAny(innerInitExpr, loopIVs) ||
       affine::exprUsesAny(outerBoundExpr, loopIVs) ||
@@ -401,8 +403,10 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
     return false;
   }
 
+  std::unordered_set<std::string> loopIVs = {outer.iv, inner.iv};
   int rawAccesses = countArrayAccessOps(inner.body);
-  std::vector<affine::Access> accesses = affine::collectArrayAccesses(inner.body);
+  std::vector<affine::Access> accesses =
+      affine::collectArrayAccesses(inner.body, loopIVs);
   if (rawAccesses != (int) accesses.size()) {
     stats.unrollJamRejected++;
     stats.unrollJamRejectAccess++;
@@ -428,7 +432,6 @@ bool PolyhedralOptimizer::tryLoopUnrollJam(Op *block, size_t idx,
     return false;
   }
 
-  std::unordered_set<std::string> loopIVs = {outer.iv, inner.iv};
   if (affine::exprUsesAny(outerInitExpr, loopIVs) ||
       affine::exprUsesAny(innerInitExpr, loopIVs) ||
       affine::exprUsesAny(outerBoundExpr, loopIVs) ||

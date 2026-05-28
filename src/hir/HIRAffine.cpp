@@ -3,17 +3,58 @@
 #include "../utils/presburger/BasicSet.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
 
 namespace sys::hir::affine {
 
+bool operator==(const Coeff &lhs, const Coeff &rhs) {
+  return lhs.constant == rhs.constant && lhs.symbols == rhs.symbols;
+}
+
+bool operator!=(const Coeff &lhs, const Coeff &rhs) {
+  return !(lhs == rhs);
+}
+
 namespace {
+
+Coeff constantCoeff(int64_t value) {
+  Coeff coeff;
+  coeff.constant = value;
+  return coeff;
+}
+
+Coeff scaleCoeff(Coeff coeff, int64_t factor) {
+  coeff.constant *= factor;
+  for (auto &[_, value] : coeff.symbols)
+    value *= factor;
+  for (auto it = coeff.symbols.begin(); it != coeff.symbols.end();) {
+    if (it->second == 0)
+      it = coeff.symbols.erase(it);
+    else
+      ++it;
+  }
+  return coeff;
+}
+
+void addCoeff(Coeff &lhs, const Coeff &rhs, int64_t sign = 1) {
+  lhs.constant += sign * rhs.constant;
+  for (const auto &[sym, coeff] : rhs.symbols)
+    lhs.symbols[sym] += sign * coeff;
+  for (auto it = lhs.symbols.begin(); it != lhs.symbols.end();) {
+    if (it->second == 0)
+      it = lhs.symbols.erase(it);
+    else
+      ++it;
+  }
+}
 
 void normalize(Expr &expr) {
   for (auto it = expr.coeffs.begin(); it != expr.coeffs.end();) {
-    if (it->second == 0)
+    if (it->second.isZero())
       it = expr.coeffs.erase(it);
     else
       ++it;
@@ -36,7 +77,7 @@ Expr symbolExpr(const std::string &symbol) {
     return invalidExpr();
   Expr expr;
   expr.valid = true;
-  expr.coeffs[symbol] = 1;
+  expr.coeffs[symbol] = constantCoeff(1);
   return expr;
 }
 
@@ -45,7 +86,7 @@ Expr addExpr(Expr lhs, const Expr &rhs, int64_t sign = 1) {
     return invalidExpr();
   lhs.constant += sign * rhs.constant;
   for (const auto &[sym, coeff] : rhs.coeffs)
-    lhs.coeffs[sym] += sign * coeff;
+    addCoeff(lhs.coeffs[sym], coeff, sign);
   normalize(lhs);
   return lhs;
 }
@@ -55,7 +96,7 @@ Expr scaleExpr(Expr expr, int64_t factor) {
     return invalidExpr();
   expr.constant *= factor;
   for (auto &[_, coeff] : expr.coeffs)
-    coeff *= factor;
+    coeff = scaleCoeff(coeff, factor);
   normalize(expr);
   return expr;
 }
@@ -104,7 +145,43 @@ bool matchStepStore(const Op *op, const std::string &iv, int64_t expectedStep) {
           isScalarLoad(rhs->children[1].get(), iv));
 }
 
-void collectArrayAccessesImpl(const Op *op, std::vector<Access> &out) {
+using BindingMap = std::unordered_map<std::string, const Op *>;
+
+void collectAffineVarDecls(const Op *op,
+                           const std::unordered_set<std::string> &loopIVs,
+                           BindingMap &bindings) {
+  if (!op)
+    return;
+  const Op *unwrapped = unwrapSingleDecl(op);
+  if (unwrapped && unwrapped->kind == OpKind::VarDecl &&
+      !unwrapped->symbol.empty() && unwrapped->children.size() == 1 &&
+      unwrapped->children[0]) {
+    if (!loopIVs.count(unwrapped->symbol))
+      bindings.emplace(unwrapped->symbol, unwrapped->children[0].get());
+  }
+  for (const auto &child : op->children)
+    collectAffineVarDecls(child.get(), loopIVs, bindings);
+}
+
+bool containsStoreTo(const Op *op, const std::string &symbol) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Store && op->symbol == symbol)
+    return true;
+  for (const auto &child : op->children)
+    if (containsStoreTo(child.get(), symbol))
+      return true;
+  return false;
+}
+
+Expr analyzeExprImpl(const Op *op,
+                     const std::unordered_set<std::string> &loopIVs,
+                     const BindingMap &bindings,
+                     std::unordered_set<std::string> &visiting);
+
+void collectArrayAccessesImpl(const Op *op, std::vector<Access> &out,
+                              const std::unordered_set<std::string> &loopIVs,
+                              const BindingMap &bindings) {
   if (!op)
     return;
 
@@ -120,7 +197,8 @@ void collectArrayAccessesImpl(const Op *op, std::vector<Access> &out) {
     access.indices.reserve(indexCount);
     bool valid = true;
     for (size_t i = 0; i < indexCount; i++) {
-      Expr idx = analyzeExpr(op->children[i].get());
+      std::unordered_set<std::string> visiting;
+      Expr idx = analyzeExprImpl(op->children[i].get(), loopIVs, bindings, visiting);
       valid = valid && idx.valid;
       access.indices.push_back(std::move(idx));
     }
@@ -129,16 +207,16 @@ void collectArrayAccessesImpl(const Op *op, std::vector<Access> &out) {
   }
 
   for (const auto &child : op->children)
-    collectArrayAccessesImpl(child.get(), out);
+    collectArrayAccessesImpl(child.get(), out, loopIVs, bindings);
 }
 
 Expr renameExpr(Expr expr, const std::unordered_map<std::string, std::string> &renames) {
   if (!expr.valid)
     return invalidExpr();
-  std::map<std::string, int64_t> renamed;
+  std::map<std::string, Coeff> renamed;
   for (const auto &[sym, coeff] : expr.coeffs) {
     auto it = renames.find(sym);
-    renamed[it == renames.end() ? sym : it->second] += coeff;
+    addCoeff(renamed[it == renames.end() ? sym : it->second], coeff);
   }
   expr.coeffs = std::move(renamed);
   normalize(expr);
@@ -167,9 +245,13 @@ bool accessPairSameIteration(const Access &a, const Access &b,
 bool exprMentionsAny(const Expr &expr, const std::unordered_set<std::string> &symbols) {
   if (!expr.valid)
     return true;
-  for (const auto &[sym, _] : expr.coeffs)
+  for (const auto &[sym, coeff] : expr.coeffs) {
     if (symbols.count(sym))
       return true;
+    for (const auto &[coeffSym, _] : coeff.symbols)
+      if (symbols.count(coeffSym))
+        return true;
+  }
   return false;
 }
 
@@ -197,15 +279,28 @@ enum class ReorderedDep {
 };
 
 using CoeffMap = std::map<std::string, int64_t>;
+using ParamCoeffMap = std::map<std::string, Coeff>;
 
-void addSeparatedExpr(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
+void addSeparatedExpr(ParamCoeffMap &coeffs, int64_t &constant, const Expr &expr,
                       int64_t sign, const std::string &iv,
                       const std::string &separatedIV) {
   constant += sign * expr.constant;
   for (const auto &[sym, coeff] : expr.coeffs) {
     const std::string &target = sym == iv ? separatedIV : sym;
-    coeffs[target] += sign * coeff;
+    addCoeff(coeffs[target], coeff, sign);
   }
+}
+
+bool materializeConstantCoeffMap(const ParamCoeffMap &paramCoeffs,
+                                 CoeffMap &coeffs) {
+  coeffs.clear();
+  for (const auto &[sym, coeff] : paramCoeffs) {
+    if (!coeff.symbols.empty())
+      return false;
+    if (coeff.constant != 0)
+      coeffs[sym] += coeff.constant;
+  }
+  return true;
 }
 
 bool makePresburgerRow(const CoeffMap &coeffs, int64_t constant,
@@ -343,10 +438,13 @@ ReorderedDep reorderedDependenceViaPresburger(const Access &a, const Access &b,
 
   std::vector<std::vector<int>> equalityRows;
   for (size_t i = 0; i < a.indices.size(); i++) {
-    CoeffMap coeffs;
+    ParamCoeffMap paramCoeffs;
     int64_t constant = 0;
-    addSeparatedExpr(coeffs, constant, a.indices[i], 1, aIV, "__a_iter");
-    addSeparatedExpr(coeffs, constant, b.indices[i], -1, bIV, "__b_iter");
+    addSeparatedExpr(paramCoeffs, constant, a.indices[i], 1, aIV, "__a_iter");
+    addSeparatedExpr(paramCoeffs, constant, b.indices[i], -1, bIV, "__b_iter");
+    CoeffMap coeffs;
+    if (!materializeConstantCoeffMap(paramCoeffs, coeffs))
+      return ReorderedDep::Unknown;
 
     std::vector<int> row;
     if (!makePresburgerRow(coeffs, constant, iterVars, iterVarCount, row))
@@ -481,11 +579,22 @@ bool addAffineEqZeroConstraint(pres::BasicSet &set, const VarOrder &vars,
 void collectExprSymbols(const Expr &expr, std::unordered_set<std::string> &out) {
   if (!expr.valid)
     return;
-  for (const auto &[sym, _] : expr.coeffs)
+  for (const auto &[sym, coeff] : expr.coeffs) {
     out.insert(sym);
+    for (const auto &[coeffSym, _] : coeff.symbols)
+      out.insert(coeffSym);
+  }
 }
 
-void addExprToCoeffs(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
+bool addMappedCoeff(CoeffMap &coeffs, const std::string &mapped,
+                    const Coeff &coeff, int64_t sign) {
+  if (!coeff.symbols.empty())
+    return false;
+  coeffs[mapped] += sign * coeff.constant;
+  return true;
+}
+
+bool addExprToCoeffs(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
                      int64_t sign, const std::string &outerIV,
                      const std::string &innerIV, const std::string &outerVar,
                      const std::string &innerVar,
@@ -501,11 +610,13 @@ void addExprToCoeffs(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
       auto it = paramRenames.find(sym);
       mapped = (it == paramRenames.end()) ? sym : it->second;
     }
-    coeffs[mapped] += sign * coeff;
+    if (!addMappedCoeff(coeffs, mapped, coeff, sign))
+      return false;
   }
+  return true;
 }
 
-void addExprToCoeffsND(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
+bool addExprToCoeffsND(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
                        int64_t sign, const std::vector<std::string> &ivs,
                        const std::vector<std::string> &iterVars,
                        const std::unordered_map<std::string, std::string> &paramRenames) {
@@ -522,8 +633,10 @@ void addExprToCoeffsND(CoeffMap &coeffs, int64_t &constant, const Expr &expr,
       auto it = paramRenames.find(sym);
       mapped = (it == paramRenames.end()) ? sym : it->second;
     }
-    coeffs[mapped] += sign * coeff;
+    if (!addMappedCoeff(coeffs, mapped, coeff, sign))
+      return false;
   }
+  return true;
 }
 
 bool makeOrderRow(const VarOrder &vars,
@@ -900,25 +1013,119 @@ bool hasPermutationViolationByDirections(const pres::BasicSet &base,
   return false;
 }
 
-}  // namespace
+bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
 
-Expr analyzeExpr(const Op *op) {
+bool exprToCoeff(const Expr &expr, Coeff &out) {
+  if (!expr.valid)
+    return false;
+  out.constant = expr.constant;
+  out.symbols.clear();
+  for (const auto &[sym, coeff] : expr.coeffs) {
+    if (!coeff.symbols.empty())
+      return false;
+    out.symbols[sym] += coeff.constant;
+  }
+  for (auto it = out.symbols.begin(); it != out.symbols.end();) {
+    if (it->second == 0)
+      it = out.symbols.erase(it);
+    else
+      ++it;
+  }
+  return true;
+}
+
+bool exprMentionsLoopIV(const Expr &expr,
+                        const std::unordered_set<std::string> &loopIVs) {
+  if (!expr.valid)
+    return false;
+  for (const auto &[sym, coeff] : expr.coeffs) {
+    if (loopIVs.count(sym))
+      return true;
+    for (const auto &[coeffSym, _] : coeff.symbols)
+      if (loopIVs.count(coeffSym))
+        return true;
+  }
+  return false;
+}
+
+std::string productSymbol(std::string a, std::string b) {
+  if (b < a)
+    std::swap(a, b);
+  return "__hir_symmul(" + a + "," + b + ")";
+}
+
+Expr multiplyByInvariant(const Expr &term, const Expr &invariant,
+                         const std::unordered_set<std::string> &loopIVs) {
+  if (exprMentionsLoopIV(invariant, loopIVs))
+    return invalidExpr();
+  Coeff invariantCoeff;
+  if (!exprToCoeff(invariant, invariantCoeff))
+    return invalidExpr();
+  if (!exprMentionsLoopIV(term, loopIVs))
+    return invalidExpr();
+
+  Expr out;
+  out.valid = true;
+
+  out.constant = term.constant * invariantCoeff.constant;
+  for (const auto &[sym, value] : invariantCoeff.symbols)
+    out.coeffs[sym].constant += term.constant * value;
+
+  for (const auto &[termSym, termCoeff] : term.coeffs) {
+    if (!termCoeff.symbols.empty())
+      return invalidExpr();
+    if (loopIVs.count(termSym)) {
+      Coeff result;
+      result.constant = termCoeff.constant * invariantCoeff.constant;
+      for (const auto &[sym, value] : invariantCoeff.symbols)
+        result.symbols[sym] += termCoeff.constant * value;
+      addCoeff(out.coeffs[termSym], result);
+      continue;
+    }
+    out.coeffs[termSym].constant += termCoeff.constant * invariantCoeff.constant;
+    for (const auto &[sym, value] : invariantCoeff.symbols)
+      out.coeffs[productSymbol(termSym, sym)].constant += termCoeff.constant * value;
+  }
+
+  normalize(out);
+  return out;
+}
+
+Expr analyzeExprImpl(const Op *op,
+                     const std::unordered_set<std::string> &loopIVs,
+                     const BindingMap &bindings,
+                     std::unordered_set<std::string> &visiting) {
   if (!op)
     return invalidExpr();
 
   if (op->kind == OpKind::ConstInt && op->hasIntValue)
     return constantExpr(op->intValue);
 
-  if (op->kind == OpKind::Load && op->children.empty())
+  if (op->kind == OpKind::Load && op->children.empty()) {
+    auto it = bindings.find(op->symbol);
+    if (it != bindings.end() && !visiting.count(op->symbol)) {
+      visiting.insert(op->symbol);
+      Expr inlined = analyzeExprImpl(it->second, loopIVs, bindings, visiting);
+      visiting.erase(op->symbol);
+      if (inlined.valid)
+        return inlined;
+    }
     return symbolExpr(op->symbol);
+  }
 
   if (op->kind != OpKind::Arith || op->children.size() != 2)
     return invalidExpr();
 
   const Op *lhsOp = op->children[0].get();
   const Op *rhsOp = op->children[1].get();
-  Expr lhs = analyzeExpr(lhsOp);
-  Expr rhs = analyzeExpr(rhsOp);
+  Expr lhs = analyzeExprImpl(lhsOp, loopIVs, bindings, visiting);
+  Expr rhs = analyzeExprImpl(rhsOp, loopIVs, bindings, visiting);
 
   if (op->symbol == "+")
     return addExpr(std::move(lhs), rhs);
@@ -931,9 +1138,29 @@ Expr analyzeExpr(const Op *op) {
       return scaleExpr(std::move(rhs), lhsConst);
     if (isConstInt(rhsOp, rhsConst))
       return scaleExpr(std::move(lhs), rhsConst);
+    if (!loopIVs.empty() &&
+        envEnabled("SISY_HIR_ENABLE_SYMBOLIC_AFFINE", true)) {
+      if (exprMentionsLoopIV(lhs, loopIVs) && !exprMentionsLoopIV(rhs, loopIVs))
+        return multiplyByInvariant(lhs, rhs, loopIVs);
+      if (exprMentionsLoopIV(rhs, loopIVs) && !exprMentionsLoopIV(lhs, loopIVs))
+        return multiplyByInvariant(rhs, lhs, loopIVs);
+    }
   }
 
   return invalidExpr();
+}
+
+}  // namespace
+
+Expr analyzeExpr(const Op *op) {
+  static const std::unordered_set<std::string> noLoopIVs;
+  return analyzeExpr(op, noLoopIVs);
+}
+
+Expr analyzeExpr(const Op *op, const std::unordered_set<std::string> &loopIVs) {
+  BindingMap bindings;
+  std::unordered_set<std::string> visiting;
+  return analyzeExprImpl(op, loopIVs, bindings, visiting);
 }
 
 bool matchCanonicalLoop(const Op *op, CanonicalLoop &loop) {
@@ -960,9 +1187,38 @@ bool matchCanonicalLoop(const Op *op, CanonicalLoop &loop) {
 }
 
 std::vector<Access> collectArrayAccesses(const Op *op) {
+  static const std::unordered_set<std::string> noLoopIVs;
+  return collectArrayAccesses(op, noLoopIVs);
+}
+
+std::vector<Access> collectArrayAccesses(const Op *op,
+                                         const std::unordered_set<std::string> &loopIVs) {
   std::vector<Access> accesses;
-  collectArrayAccessesImpl(op, accesses);
+  BindingMap bindings;
+  collectAffineVarDecls(op, loopIVs, bindings);
+  for (auto it = bindings.begin(); it != bindings.end();) {
+    if (containsStoreTo(op, it->first))
+      it = bindings.erase(it);
+    else
+      ++it;
+  }
+  collectArrayAccessesImpl(op, accesses, loopIVs, bindings);
   return accesses;
+}
+
+bool hasSymbolicCoefficients(const Expr &expr) {
+  if (!expr.valid)
+    return false;
+  for (const auto &[_, coeff] : expr.coeffs)
+    if (!coeff.symbols.empty())
+      return true;
+  return false;
+}
+
+bool coeffIsConstant(const Expr &expr, const std::string &symbol, int64_t value) {
+  auto it = expr.coeffs.find(symbol);
+  return it != expr.coeffs.end() && it->second.symbols.empty() &&
+         it->second.constant == value;
 }
 
 bool exprUsesAny(const Expr &expr, const std::unordered_set<std::string> &symbols) {
@@ -1008,10 +1264,10 @@ PresburgerFusionResult fusionMemorySafePresburger(const Op *loopAOp, const Op *l
   std::optional<int64_t> initB = constIntValue(initBOp);
   std::optional<int64_t> boundA = constIntValue(loopA.bound);
   std::optional<int64_t> boundB = constIntValue(loopB.bound);
-  std::vector<Access> aAccesses = collectArrayAccesses(loopA.body);
-  std::vector<Access> bAccesses = collectArrayAccesses(loopB.body);
   std::unordered_map<std::string, std::string> renameBToA = {{loopB.iv, loopA.iv}};
   std::unordered_set<std::string> loopIVs = {loopA.iv, loopB.iv};
+  std::vector<Access> aAccesses = collectArrayAccesses(loopA.body, loopIVs);
+  std::vector<Access> bAccesses = collectArrayAccesses(loopB.body, loopIVs);
 
   for (const Access &a : aAccesses) {
     for (const Access &b : bAccesses) {
@@ -1084,7 +1340,7 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoopO
     return result;
   }
 
-  std::vector<Access> accesses = collectArrayAccesses(inner.body);
+  std::vector<Access> accesses = collectArrayAccesses(inner.body, ivs);
   if (accesses.empty()) {
     result.safe = true;
     return result;
@@ -1126,15 +1382,17 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoopO
     CoeffMap coeffs;
     int64_t constant = 0;
     coeffs[iVar] = 1;
-    addExprToCoeffs(coeffs, constant, outerInit, -1,
-                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addExprToCoeffs(coeffs, constant, outerInit, -1,
+                         outer.iv, inner.iv, outerVar, innerVar, paramRenames))
+      return false;
     if (!addConstraint(set, vars, coeffs, constant))
       return false;
     coeffs.clear();
     constant = -1;
     coeffs[iVar] = -1;
-    addExprToCoeffs(coeffs, constant, outerBound, 1,
-                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addExprToCoeffs(coeffs, constant, outerBound, 1,
+                         outer.iv, inner.iv, outerVar, innerVar, paramRenames))
+      return false;
     if (!addConstraint(set, vars, coeffs, constant))
       return false;
 
@@ -1142,15 +1400,17 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoopO
     coeffs.clear();
     constant = 0;
     coeffs[jVar] = 1;
-    addExprToCoeffs(coeffs, constant, innerInit, -1,
-                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addExprToCoeffs(coeffs, constant, innerInit, -1,
+                         outer.iv, inner.iv, outerVar, innerVar, paramRenames))
+      return false;
     if (!addConstraint(set, vars, coeffs, constant))
       return false;
     coeffs.clear();
     constant = -1;
     coeffs[jVar] = -1;
-    addExprToCoeffs(coeffs, constant, innerBound, 1,
-                    outer.iv, inner.iv, outerVar, innerVar, paramRenames);
+    if (!addExprToCoeffs(coeffs, constant, innerBound, 1,
+                         outer.iv, inner.iv, outerVar, innerVar, paramRenames))
+      return false;
     if (!addConstraint(set, vars, coeffs, constant))
       return false;
 
@@ -1180,10 +1440,13 @@ PresburgerInterchangeResult interchangeMemorySafePresburger(const Op *outerLoopO
       for (size_t dim = 0; dim < a.indices.size(); dim++) {
         CoeffMap coeffs;
         int64_t constant = 0;
-        addExprToCoeffs(coeffs, constant, a.indices[dim], 1,
-                        outer.iv, inner.iv, kI1, kJ1, paramRenames);
-        addExprToCoeffs(coeffs, constant, b.indices[dim], -1,
-                        outer.iv, inner.iv, kI2, kJ2, paramRenames);
+        if (!addExprToCoeffs(coeffs, constant, a.indices[dim], 1,
+                             outer.iv, inner.iv, kI1, kJ1, paramRenames) ||
+            !addExprToCoeffs(coeffs, constant, b.indices[dim], -1,
+                             outer.iv, inner.iv, kI2, kJ2, paramRenames)) {
+          result.unknown++;
+          return result;
+        }
         if (!addConstraint(base, vars, coeffs, constant)) {
           result.unknown++;
           return result;
@@ -1264,7 +1527,7 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
     }
   }
 
-  std::vector<Access> accesses = collectArrayAccesses(loops.back().body);
+  std::vector<Access> accesses = collectArrayAccesses(loops.back().body, ivSet);
   if (accesses.empty()) {
     result.safe = true;
     return result;
@@ -1309,16 +1572,18 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
     CoeffMap coeffs;
     int64_t constant = 0;
     coeffs[iterVars[dim]] = 1;
-    addExprToCoeffsND(coeffs, constant, initExprs[dim], -1,
-                      ivs, iterVars, paramRenames);
+    if (!addExprToCoeffsND(coeffs, constant, initExprs[dim], -1,
+                           ivs, iterVars, paramRenames))
+      return false;
     if (!addAffineGeZeroConstraint(set, vars, coeffs, constant))
       return false;
 
     coeffs.clear();
     constant = -1;
     coeffs[iterVars[dim]] = -1;
-    addExprToCoeffsND(coeffs, constant, boundExprs[dim], 1,
-                      ivs, iterVars, paramRenames);
+    if (!addExprToCoeffsND(coeffs, constant, boundExprs[dim], 1,
+                           ivs, iterVars, paramRenames))
+      return false;
     return addAffineGeZeroConstraint(set, vars, coeffs, constant);
   };
 
@@ -1347,10 +1612,13 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
       for (size_t dim = 0; dim < a.indices.size(); dim++) {
         CoeffMap coeffs;
         int64_t constant = 0;
-        addExprToCoeffsND(coeffs, constant, a.indices[dim], 1,
-                          ivs, xVars, paramRenames);
-        addExprToCoeffsND(coeffs, constant, b.indices[dim], -1,
-                          ivs, yVars, paramRenames);
+        if (!addExprToCoeffsND(coeffs, constant, a.indices[dim], 1,
+                               ivs, xVars, paramRenames) ||
+            !addExprToCoeffsND(coeffs, constant, b.indices[dim], -1,
+                               ivs, yVars, paramRenames)) {
+          result.unknown++;
+          return result;
+        }
         DeltaConstraintResult applied =
             applySameDimDeltaEquality(coeffs, constant, xVars, yVars, deltas);
         if (applied == DeltaConstraintResult::NoSolution) {

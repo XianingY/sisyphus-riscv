@@ -72,7 +72,7 @@ bool privatizedReductionLegal(
       return false;
     const affine::Expr &jExpr = access.indices[jDim];
     if (jExpr.coeffs.size() != 1 || !jExpr.coeffs.count(pat.j) ||
-        jExpr.coeffs.at(pat.j) != 1 || jExpr.constant != 0)
+        !affine::coeffIsConstant(jExpr, pat.j, 1) || jExpr.constant != 0)
       return false;
   }
   return true;
