@@ -1,9 +1,41 @@
 #include "LoopPasses.h"
 #include "MemorySSA.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 using namespace sys;
+
+namespace {
+
+bool envEnabledLicm(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0]) return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+}
+
+// Returns true if a CallOp must block loop hoisting (impure or unknown
+// callee).  Opt-in: when SISY_LICM_USE_FN_SUMMARY=1 and the callee has a
+// readonly FunctionSummary, the call is not considered blocking.
+bool callBlocksLoop(Op *call, ModuleOp *module) {
+  if (!isa<CallOp>(call)) return false;
+  if (!call->has<ImpureAttr>()) return false;
+  if (!envEnabledLicm("SISY_LICM_USE_FN_SUMMARY", false)) return true;
+
+  const auto &name = NAME(call);
+  for (auto op : module->getRegion()->getFirstBlock()->getOps()) {
+    if (!isa<FuncOp>(op)) continue;
+    if (NAME(op) != name) continue;
+    if (auto s = op->find<FunctionSummaryAttr>())
+      if (s->readonly)
+        return false;
+    break;
+  }
+  return true;
+}
+
+}
 
 std::map<std::string, int> LICM::stats() {
   return {
@@ -394,7 +426,7 @@ bool LICM::updateStores(LoopInfo *info, bool *storeHoistable) {
     for (auto op : bb->getOps()) {
       if (isa<StoreOp>(op))
         stores.push_back(op->DEF(1));
-      if (isa<CallOp>(op) && op->has<ImpureAttr>())
+      if (isa<CallOp>(op) && callBlocksLoop(op, module))
         impure = true;
     }
   }

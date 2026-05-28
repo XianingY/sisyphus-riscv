@@ -1,11 +1,45 @@
 #include "CleanupPasses.h"
 #include "Analysis.h"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <set>
 #include <unordered_set>
 
 using namespace sys;
+
+namespace {
+
+bool envEnabledDse(const char *n, bool d) {
+  const char *r = std::getenv(n);
+  if (!r || !r[0]) return d;
+  return std::strcmp(r, "0") != 0 && std::strcmp(r, "false") != 0;
+}
+
+// True when the call cannot observe-or-write the given address, so a
+// load-forward walk may safely skip past it.  Currently approximates as
+// "callee summary is readonly" (no writes), which is enough for the
+// load/store-back redundancy pattern; full noalias-vs-arg analysis would be
+// a stricter follow-up.
+bool callIsTransparentForLoad(Op *call, ModuleOp *module) {
+  if (!isa<CallOp>(call)) return false;
+  if (!call->has<ImpureAttr>()) return true;
+  if (!envEnabledDse("SISY_DSE_USE_FN_SUMMARY", false)) return false;
+
+  const auto &name = NAME(call);
+  for (auto op : module->getRegion()->getFirstBlock()->getOps()) {
+    if (!isa<FuncOp>(op)) continue;
+    if (NAME(op) != name) continue;
+    if (auto s = op->find<FunctionSummaryAttr>())
+      if (s->readonly)
+        return true;
+    break;
+  }
+  return false;
+}
+
+}
 
 std::map<std::string, int> DSE::stats() {
   return {
@@ -413,8 +447,10 @@ void DSE::run() {
     auto loadOp = cast<LoadOp>(load);
     auto loadAddr = load->DEF();
     for (auto runner = load->nextOp(); runner; runner = runner->nextOp()) {
-      if (isa<CallOp>(runner))
+      if (isa<CallOp>(runner)) {
+        if (callIsTransparentForLoad(runner, module)) continue;
         break;
+      }
       if (isa<LoadOp>(runner))
         continue;
       if (auto store = dyn_cast<StoreOp>(runner)) {
