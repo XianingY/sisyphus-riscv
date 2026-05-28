@@ -98,6 +98,33 @@ std::string ArgTypesAttr::toString() {
   return ss.str();
 }
 
+std::string FunctionSummaryAttr::toString() {
+  std::stringstream ss;
+  ss << "<summary = ";
+  bool first = true;
+  auto add = [&](const char *tag) {
+    if (!first) ss << ",";
+    ss << tag;
+    first = false;
+  };
+  if (pure) add("pure");
+  if (readonly) add("readonly");
+  if (norecurse) add("norecurse");
+  if (argReadMask) {
+    if (!first) ss << ",";
+    ss << "argRead=0x" << std::hex << argReadMask << std::dec;
+    first = false;
+  }
+  if (argWriteMask) {
+    if (!first) ss << ",";
+    ss << "argWrite=0x" << std::hex << argWriteMask << std::dec;
+    first = false;
+  }
+  if (first) ss << "none";
+  ss << ">";
+  return ss.str();
+}
+
 std::string CallerAttr::toString() {
   std::stringstream ss;
   if (!callers.size())

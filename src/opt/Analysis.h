@@ -106,6 +106,33 @@ public:
   void run() override;
 };
 
+// Computes a richer FunctionSummaryAttr (pure / readonly / norecurse +
+// argRead/argWrite bit masks) on every FuncOp.  Conservative: a property is
+// only set when proven.  Existing ImpureAttr is preserved; this pass never
+// removes it.  Killable via SISY_ENABLE_FN_SUMMARY=0.
+class FunctionSummary : public Pass {
+  int pureCount = 0;
+  int readonlyCount = 0;
+  int norecurseCount = 0;
+  int argReadCount = 0;
+  int argWriteCount = 0;
+
+public:
+  FunctionSummary(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "function-summary"; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "pure", pureCount },
+      { "readonly", readonlyCount },
+      { "norecurse", norecurseCount },
+      { "arg-read", argReadCount },
+      { "arg-write", argWriteCount },
+    };
+  }
+  void run() override;
+};
+
 // Mark functions that are called at most once.
 class AtMostOnce : public Pass {
 public:

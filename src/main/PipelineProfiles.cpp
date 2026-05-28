@@ -447,6 +447,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ true);
     pm.addPass<sys::EarlyConstFold>(/*beforePureness=*/ true);
     pm.addPass<sys::Pureness>();
+    pm.addPass<sys::FunctionSummary>();
     pm.addPass<sys::EarlyConstFold>(/*beforePureness=*/ false);
     pm.addPass<sys::TCO>();
     pm.addPass<sys::Remerge>();
@@ -457,6 +458,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ true);
     pm.addPass<sys::EarlyConstFold>(/*beforePureness=*/ true);
     pm.addPass<sys::Pureness>();
+    pm.addPass<sys::FunctionSummary>();
     pm.addPass<sys::EarlyConstFold>(/*beforePureness=*/ false);
     pm.addPass<sys::TCO>();
     pm.addPass<sys::Remerge>();

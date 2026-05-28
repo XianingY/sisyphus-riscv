@@ -124,6 +124,34 @@ public:
   AtMostOnceAttr *clone() override { return new AtMostOnceAttr; }
 };
 
+// Procedural semantic summary computed by the FunctionSummary pass.
+// All fields are conservative: a true bit means we have proven the property.
+class FunctionSummaryAttr : public AttrImpl<FunctionSummaryAttr, __LINE__> {
+public:
+  // No observable side effect (no store, no impure call, no global write,
+  // no I/O syscall, no clone/wake/join).  Implies readonly.
+  bool pure = false;
+  // Does not write to memory the caller can observe (globals or arg-pointed).
+  bool readonly = false;
+  // Function (transitively) does not call itself.
+  bool norecurse = false;
+  // For each argument index <64, true means the function reads through that
+  // pointer argument.  Non-pointer arguments are never marked.
+  uint64_t argReadMask = 0;
+  uint64_t argWriteMask = 0;
+
+  std::string toString() override;
+  FunctionSummaryAttr *clone() override {
+    auto a = new FunctionSummaryAttr;
+    a->pure = pure;
+    a->readonly = readonly;
+    a->norecurse = norecurse;
+    a->argReadMask = argReadMask;
+    a->argWriteMask = argWriteMask;
+    return a;
+  }
+};
+
 class ConstAttr : public AttrImpl<ConstAttr, __LINE__> {
 public:
   std::string toString() override { return "<const>"; }
