@@ -241,6 +241,11 @@ incrementally.
   `collectAffineNest` returns canonical loops, per-loop domain (iv, upper,
   step), innermost accesses with surrounding IVs, guards, and a coarse
   side-effect summary plus `imperfect`/`hasSymbolicAccesses` flags.
+  Current HIR pipeline passes (`HIRPolyInterchange`, `HIRPolyhedral`)
+  still use per-pass `matchCanonicalWhile` + `collectArrayAccesses` for
+  granular stats; migrating them to share one `AffineNest` per nest is a
+  follow-up refactor (correctness equivalence needs per-pass stat
+  reconciliation).
 - **Function summary** (`src/opt/FunctionSummary.cpp`): attaches
   `FunctionSummaryAttr { pure, readonly, norecurse, argReadMask,
   argWriteMask }`. Bits set only when proven. Kill switch:
