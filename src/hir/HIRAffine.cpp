@@ -174,6 +174,67 @@ bool containsStoreTo(const Op *op, const std::string &symbol) {
   return false;
 }
 
+void collectSideEffects(const Op *op, SideEffectSummary &effects) {
+  if (!op)
+    return;
+  switch (op->kind) {
+  case OpKind::Call:
+    effects.hasCall = true;
+    break;
+  case OpKind::Break:
+  case OpKind::Continue:
+    effects.hasBreakOrContinue = true;
+    break;
+  case OpKind::Return:
+    effects.hasReturn = true;
+    break;
+  case OpKind::Load:
+    if (!op->symbol.empty()) {
+      if (op->children.empty())
+        effects.scalarReads.insert(op->symbol);
+      else
+        effects.arrayReads.insert(op->symbol);
+    }
+    break;
+  case OpKind::Store:
+    if (!op->symbol.empty()) {
+      if (op->children.size() <= 1)
+        effects.scalarWrites.insert(op->symbol);
+      else
+        effects.arrayWrites.insert(op->symbol);
+    }
+    break;
+  case OpKind::VarDecl:
+    if (!op->symbol.empty() && op->arrayDims.empty())
+      effects.scalarWrites.insert(op->symbol);
+    break;
+  default:
+    break;
+  }
+  for (const auto &child : op->children)
+    collectSideEffects(child.get(), effects);
+}
+
+const Op *findFirstDirectInnerWhile(const Op *body) {
+  if (!body || body->kind != OpKind::Block)
+    return nullptr;
+  for (const auto &child : body->children) {
+    const Op *candidate = unwrapSingleDecl(child.get());
+    if (candidate && candidate->kind == OpKind::While)
+      return candidate;
+  }
+  return nullptr;
+}
+
+void collectGuards(const Op *op, std::vector<const Op*> &guards) {
+  if (!op)
+    return;
+  if (op->kind == OpKind::If && !op->children.empty())
+    guards.push_back(op->children[0].get());
+  for (const auto &child : op->children)
+    collectGuards(child.get(), guards);
+}
+
 Expr analyzeExprImpl(const Op *op,
                      const std::unordered_set<std::string> &loopIVs,
                      const BindingMap &bindings,
@@ -1671,6 +1732,99 @@ PresburgerInterchangeResult permutationMemorySafePresburger(
 
   result.safe = true;
   return result;
+}
+
+namespace {
+
+bool walkAffineNest(const Op *whileOp, AffineNest &nest,
+                    int depthLeft, bool allowGuards,
+                    std::unordered_set<std::string> &ivs) {
+  if (!whileOp || depthLeft <= 0)
+    return false;
+  CanonicalLoop loop;
+  if (!matchCanonicalLoop(whileOp, loop))
+    return false;
+  nest.loops.push_back(loop);
+
+  LoopDomain domain;
+  domain.iv = loop.iv;
+  domain.step = 1;
+  ivs.insert(loop.iv);
+  Expr upper = analyzeExpr(loop.bound, ivs);
+  domain.upper = upper;
+  domain.valid = upper.valid;
+  if (upper.valid)
+    for (const auto &[_, c] : upper.coeffs)
+      if (!c.symbols.empty()) { nest.hasSymbolicAccesses = true; break; }
+  nest.domains.push_back(domain);
+
+  const Op *body = loop.body;
+  if (!body || body->kind != OpKind::Block)
+    return true;
+
+  // Walk body: collect direct inner while if perfect nest, else mark imperfect.
+  const Op *inner = nullptr;
+  int innerCount = 0;
+  int nonStepStmts = 0;
+  for (size_t i = 0; i + 1 < body->children.size(); i++) {
+    const Op *child = unwrapSingleDecl(body->children[i].get());
+    if (!child) continue;
+    nonStepStmts++;
+    if (child->kind == OpKind::While) {
+      inner = child;
+      innerCount++;
+    } else if (allowGuards && child->kind == OpKind::If) {
+      // Search inside guard for an inner while.
+      if (!child->children.empty()) {
+        const Op *thenBlk = child->children.size() > 1 ? child->children[1].get() : nullptr;
+        const Op *guarded = findFirstDirectInnerWhile(thenBlk);
+        if (guarded) { inner = guarded; innerCount++; }
+      }
+    }
+  }
+
+  bool perfect = (innerCount <= 1) && (nonStepStmts == (inner ? 1 : 0));
+  if (!perfect)
+    nest.imperfect = true;
+
+  if (allowGuards)
+    collectGuards(body, nest.guards);
+
+  if (inner && depthLeft > 1) {
+    if (!walkAffineNest(inner, nest, depthLeft - 1, allowGuards, ivs)) {
+      // Inner failed to canonicalize; record body accesses and bail.
+    }
+  }
+
+  return true;
+}
+
+}  // namespace
+
+bool collectAffineNest(const Op *op, AffineNest &nest, int maxDepth,
+                       bool allowGuards) {
+  nest = AffineNest{};
+  std::unordered_set<std::string> ivs;
+  if (!walkAffineNest(op, nest, maxDepth, allowGuards, ivs))
+    return false;
+
+  // Innermost body for access/effect collection.
+  const Op *innerBody = nullptr;
+  if (!nest.loops.empty())
+    innerBody = nest.loops.back().body;
+  if (innerBody) {
+    nest.accesses = collectArrayAccesses(innerBody, ivs);
+    collectSideEffects(innerBody, nest.effects);
+    for (const Access &acc : nest.accesses) {
+      for (const Expr &idx : acc.indices) {
+        if (hasSymbolicCoefficients(idx)) {
+          nest.hasSymbolicAccesses = true;
+          break;
+        }
+      }
+    }
+  }
+  return !nest.loops.empty();
 }
 
 }  // namespace sys::hir::affine

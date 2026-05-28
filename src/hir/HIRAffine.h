@@ -60,9 +60,39 @@ struct CanonicalLoop {
   const Op *step = nullptr;
 };
 
+struct LoopDomain {
+  std::string iv;
+  Expr lower;
+  Expr upper;
+  int64_t step = 1;
+  bool valid = false;
+};
+
+struct SideEffectSummary {
+  bool hasCall = false;
+  bool hasBreakOrContinue = false;
+  bool hasReturn = false;
+  std::unordered_set<std::string> scalarReads;
+  std::unordered_set<std::string> scalarWrites;
+  std::unordered_set<std::string> arrayReads;
+  std::unordered_set<std::string> arrayWrites;
+};
+
+struct AffineNest {
+  std::vector<CanonicalLoop> loops;
+  std::vector<LoopDomain> domains;
+  std::vector<Access> accesses;
+  std::vector<const Op*> guards;
+  SideEffectSummary effects;
+  bool imperfect = false;
+  bool hasSymbolicAccesses = false;
+};
+
 Expr analyzeExpr(const Op *op);
 Expr analyzeExpr(const Op *op, const std::unordered_set<std::string> &loopIVs);
 bool matchCanonicalLoop(const Op *op, CanonicalLoop &loop);
+bool collectAffineNest(const Op *op, AffineNest &nest, int maxDepth = 5,
+                       bool allowGuards = true);
 std::vector<Access> collectArrayAccesses(const Op *op);
 std::vector<Access> collectArrayAccesses(const Op *op,
                                          const std::unordered_set<std::string> &loopIVs);
