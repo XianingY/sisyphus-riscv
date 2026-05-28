@@ -116,6 +116,34 @@ public:
   void run() override;
 };
 
+// Interprocedural constant propagation.  When every CallOp targeting a
+// non-entry function passes the same integer constant for argument i, replace
+// the corresponding GetArgOp(i) inside the callee with that IntOp.  No cloning
+// is performed; callsites are left unchanged so later DCE can sweep dead
+// argument computations.  Opt-in via SISY_ENABLE_IPCP=1.
+class IPConstProp : public Pass {
+  int functionsTouched = 0;
+  int argsReplaced = 0;
+  int callsitesConsidered = 0;
+  int rejectedNonConst = 0;
+  int rejectedNotI32 = 0;
+
+public:
+  IPConstProp(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "ipcp"; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "functions-touched", functionsTouched },
+      { "args-replaced", argsReplaced },
+      { "callsites-considered", callsitesConsidered },
+      { "rejected-non-const", rejectedNonConst },
+      { "rejected-not-i32", rejectedNotI32 },
+    };
+  }
+  void run() override;
+};
+
 class DeadGlobalStore : public Pass {
   int removed = 0;
   int deadGlobals = 0;

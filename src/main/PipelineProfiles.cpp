@@ -185,6 +185,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::GVN>();
       pm.addPass<sys::DCE>();
     }
+    // Interprocedural constant propagation.  Off by default; opt in via
+    // SISY_ENABLE_IPCP=1.  Pairs with ConstArgSpecialize but does not clone.
+    pm.addPass<sys::IPConstProp>();
     pm.addPass<sys::Inline>(/*inlineThreshold=*/ opts.inlineThreshold);
     pm.addPass<sys::DCE>();
     pm.addPass<sys::Localize>(/*beforeFlattenCFG=*/ false);
