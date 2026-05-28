@@ -1,7 +1,9 @@
 #include "LoopPasses.h"
+#include "AnalysisManager.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 using namespace sys;
 
@@ -972,16 +974,33 @@ void LoopInterchange::run() {
     if (env && env[0] && (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0))
         return;
 
-    LoopAnalysis analysis(module);
-    analysis.run();
-    auto forests = analysis.getResult();
+    std::map<FuncOp*, LoopForest> localForests;
+    std::map<FuncOp*, LoopForest> *forests = nullptr;
+    std::unique_ptr<LoopAnalysis> localAnalysis;
+    if (context() && context()->enabled()) {
+        forests = &context()->analysis().getLoopForests();
+    } else {
+        localAnalysis = std::make_unique<LoopAnalysis>(module);
+        localAnalysis->run();
+        localForests = localAnalysis->getResult();
+        forests = &localForests;
+    }
 
     for (auto func : collectFuncs()) {
-        auto& forest = forests[func];
+        auto& forest = (*forests)[func];
 
         for (auto loop : forest.getLoops()) {
             if (!loop->getParent())
                 runImpl(loop);
         }
     }
+}
+
+PreservedAnalyses LoopInterchange::run(PassContext &ctx) {
+    activeContext = &ctx;
+    int before = interchanged;
+    run();
+    activeContext = nullptr;
+    return interchanged == before ? PreservedAnalyses::all()
+                                  : PreservedAnalyses::none();
 }

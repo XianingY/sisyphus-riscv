@@ -107,6 +107,12 @@ int StrengthReduct::runImpl() {
     if (i < 0)
       return false;
 
+    if (i == 0) {
+      converted++;
+      builder.replace<LiOp>(op, { new IntAttr(0) });
+      return true;
+    }
+
     if (i == 1) {
       converted++;
       op->replaceAllUsesWith(x.defining);
@@ -368,6 +374,12 @@ int StrengthReduct::runImpl() {
     if (i < 0) {
       // x % i == x % -i always holds.
       V(y.defining) = -i;
+      return true;
+    }
+
+    if (i == 1) {
+      converted++;
+      builder.replace<LiOp>(op, { new IntAttr(0) });
       return true;
     }
 

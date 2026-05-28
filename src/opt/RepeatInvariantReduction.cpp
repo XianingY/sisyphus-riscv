@@ -1,7 +1,9 @@
 #include "LoopPasses.h"
+#include "AnalysisManager.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stack>
 #include <vector>
 
@@ -266,6 +268,108 @@ bool loopInvariantExpr(Op *op, const std::set<BasicBlock*> &blocks,
   return !exprDependsOnLoopValue(op, blocks, loopPhis, seen);
 }
 
+bool exprUsesValue(Op *op, Op *needle, std::set<Op*> &seen) {
+  if (!op || !needle)
+    return false;
+  if (op == needle)
+    return true;
+  if (seen.count(op))
+    return false;
+  seen.insert(op);
+  for (auto operand : op->getOperands())
+    if (exprUsesValue(operand.defining, needle, seen))
+      return true;
+  return false;
+}
+
+bool exprUsesValue(Op *op, Op *needle) {
+  std::set<Op*> seen;
+  return exprUsesValue(op, needle, seen);
+}
+
+bool repeatTermIndependent(Op *op, Op *acc, Op *localAcc, Op *repeatIv) {
+  return !exprUsesValue(op, acc) &&
+         (!localAcc || !exprUsesValue(op, localAcc)) &&
+         (!repeatIv || !exprUsesValue(op, repeatIv));
+}
+
+using AccKey = std::pair<Op*, Op*>;
+
+bool additiveAccumulatorValue(Op *value, Op *seed, Op *repeatIv,
+                              std::set<AccKey> &visiting);
+
+bool additiveStepFrom(Op *value, Op *localAcc, Op *seed, Op *repeatIv,
+                      std::set<AccKey> &visiting) {
+  if (!value || !localAcc)
+    return false;
+
+  if (isa<PhiOp>(value) && value->getOperandCount() == 1)
+    return additiveStepFrom(value->DEF(0), localAcc, seed, repeatIv, visiting);
+
+  if (isa<AddIOp>(value) && value->getOperandCount() == 2) {
+    auto lhs = value->DEF(0);
+    auto rhs = value->DEF(1);
+    return (lhs == localAcc && repeatTermIndependent(rhs, seed, localAcc, repeatIv)) ||
+           (rhs == localAcc && repeatTermIndependent(lhs, seed, localAcc, repeatIv));
+  }
+  if (isa<SubIOp>(value) && value->getOperandCount() == 2) {
+    auto lhs = value->DEF(0);
+    auto rhs = value->DEF(1);
+    return lhs == localAcc && repeatTermIndependent(rhs, seed, localAcc, repeatIv);
+  }
+
+  // Nested sub-loop LCSSA: an exit phi can represent "localAcc plus a pure
+  // loop-invariant delta".  Accept it when the nested accumulator is itself a
+  // linear additive chain seeded by localAcc.
+  if (isa<PhiOp>(value))
+    return additiveAccumulatorValue(value, localAcc, repeatIv, visiting);
+
+  return false;
+}
+
+bool additiveAccumulatorValue(Op *value, Op *seed, Op *repeatIv,
+                              std::set<AccKey> &visiting) {
+  if (!value || !seed)
+    return false;
+  if (value == seed)
+    return true;
+
+  AccKey key{ value, seed };
+  if (visiting.count(key))
+    return false;
+  visiting.insert(key);
+
+  if (isa<PhiOp>(value)) {
+    if (value->getOperandCount() == 1) {
+      bool ok = additiveAccumulatorValue(value->DEF(0), seed, repeatIv, visiting);
+      visiting.erase(key);
+      return ok;
+    }
+
+    bool hasSeedIncoming = false;
+    bool hasStepIncoming = false;
+    for (auto operand : value->getOperands()) {
+      auto def = operand.defining;
+      if (additiveAccumulatorValue(def, seed, repeatIv, visiting)) {
+        hasSeedIncoming = true;
+        continue;
+      }
+      if (additiveStepFrom(def, value, seed, repeatIv, visiting)) {
+        hasStepIncoming = true;
+        continue;
+      }
+      visiting.erase(key);
+      return false;
+    }
+    visiting.erase(key);
+    return hasSeedIncoming && hasStepIncoming;
+  }
+
+  bool ok = additiveStepFrom(value, seed, seed, repeatIv, visiting);
+  visiting.erase(key);
+  return ok;
+}
+
 std::set<Op*> collectPhis(const std::set<BasicBlock*> &blocks) {
   std::set<Op*> phis;
   for (auto bb : blocks)
@@ -274,29 +378,35 @@ std::set<Op*> collectPhis(const std::set<BasicBlock*> &blocks) {
   return phis;
 }
 
-bool additiveRepeatUpdate(Op *latchVal, Op *acc, const std::set<BasicBlock*> &blocks) {
+bool additiveRepeatUpdate(Op *latchVal, Op *acc, Op *repeatIv,
+                          const std::set<BasicBlock*> &blocks) {
   if (!latchVal || !acc)
     return false;
   // Look through trivial single-operand phis (LCSSA-style exit phis introduced
-  // by nested sub-loops).  Each strip step requires the phi to be outside the
-  // outer loop's blocks; otherwise it could be a real merge we must not skip.
-  if (envEnabled("SISY_REPEAT_REDUCTION_PEEL_LCSSA", false)) {
+  // by nested sub-loops).  Default-on: the follow-up additive-chain proof below
+  // still rejects non-linear or repeat-IV-dependent values.
+  if (envEnabled("SISY_REPEAT_REDUCTION_PEEL_LCSSA", true)) {
     std::set<Op*> seen;
     while (latchVal && isa<PhiOp>(latchVal) &&
            latchVal->getOperandCount() == 1 && !seen.count(latchVal)) {
-      auto bb = latchVal->getParent();
-      if (bb && blocks.count(bb)) break;
       seen.insert(latchVal);
       latchVal = latchVal->DEF(0);
     }
   }
+  std::set<AccKey> visiting;
+  if (additiveAccumulatorValue(latchVal, acc, repeatIv, visiting))
+    return true;
+
   auto loopPhis = collectPhis(blocks);
   auto invariant = [&](Op *op) { return loopInvariantExpr(op, blocks, loopPhis); };
   if (auto add = dyn_cast<AddIOp>(latchVal); add && add->getOperandCount() == 2)
-    return (add->DEF(0) == acc && invariant(add->DEF(1))) ||
-           (add->DEF(1) == acc && invariant(add->DEF(0)));
+    return (add->DEF(0) == acc && invariant(add->DEF(1)) &&
+            !exprUsesValue(add->DEF(1), repeatIv)) ||
+           (add->DEF(1) == acc && invariant(add->DEF(0)) &&
+            !exprUsesValue(add->DEF(0), repeatIv));
   if (auto sub = dyn_cast<SubIOp>(latchVal); sub && sub->getOperandCount() == 2)
-    return sub->DEF(0) == acc && invariant(sub->DEF(1));
+    return sub->DEF(0) == acc && invariant(sub->DEF(1)) &&
+           !exprUsesValue(sub->DEF(1), repeatIv);
   return false;
 }
 
@@ -384,7 +494,7 @@ bool reduceHeaderPattern(BasicBlock *header, int &reduced) {
 
   auto acc = candidates[0];
   auto [base, ignoredLatch] = phiIncomingByLatch(acc, latch);
-  if (!base || !additiveRepeatUpdate(ignoredLatch, acc, blocks))
+  if (!base || !additiveRepeatUpdate(ignoredLatch, acc, induction, blocks))
     return false;
 
   auto exit = ELSE(term);
@@ -476,7 +586,7 @@ bool RepeatInvariantReduction::runImpl(LoopInfo *loop) {
     return false;
 
   std::set<BasicBlock*> blocks(loop->getBlocks().begin(), loop->getBlocks().end());
-  if (!additiveRepeatUpdate(ignoredLatch, acc, blocks))
+  if (!additiveRepeatUpdate(ignoredLatch, acc, shape.induction, blocks))
     return false;
 
   // Make the repeat loop execute at most once. For the canonical start=0,
@@ -508,9 +618,19 @@ void RepeatInvariantReduction::run() {
   for (auto func : collectFuncs())
     func->getRegion()->updatePreds();
 
-  LoopAnalysis analysis(module);
-  analysis.run();
-  for (auto [func, forest] : analysis.getResult()) {
+  std::map<FuncOp*, LoopForest> localForests;
+  std::map<FuncOp*, LoopForest> *forests = nullptr;
+  std::unique_ptr<LoopAnalysis> localAnalysis;
+  if (context() && context()->enabled()) {
+    forests = &context()->analysis().getLoopForests();
+  } else {
+    localAnalysis = std::make_unique<LoopAnalysis>(module);
+    localAnalysis->run();
+    localForests = localAnalysis->getResult();
+    forests = &localForests;
+  }
+
+  for (auto [func, forest] : *forests) {
     (void) func;
     for (auto loop : forest.getLoops())
       runImpl(loop);
@@ -527,4 +647,14 @@ void RepeatInvariantReduction::run() {
         region->updatePreds();
     }
   }
+}
+
+PreservedAnalyses RepeatInvariantReduction::run(PassContext &ctx) {
+  activeContext = &ctx;
+  int before = reduced;
+  run();
+  activeContext = nullptr;
+  if (reduced == before)
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::cfg();
 }

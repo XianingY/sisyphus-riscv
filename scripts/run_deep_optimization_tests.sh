@@ -69,4 +69,7 @@ bash "${ROOT_DIR}/scripts/run_polyhedral_tests.sh" >"${polyhedral_log}" 2>&1
 smt_shift_log="${OUT_DIR}/smt-shift.log"
 bash "${ROOT_DIR}/scripts/run_smt_shift_tests.sh" >"${smt_shift_log}" 2>&1
 
+riscv_perf_guard_log="${OUT_DIR}/riscv-perf-guardrails.log"
+bash "${ROOT_DIR}/scripts/run_riscv_perf_compile_guardrails.sh" >"${riscv_perf_guard_log}" 2>&1
+
 echo "Deep optimization tests passed."

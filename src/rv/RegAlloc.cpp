@@ -356,6 +356,7 @@ std::map<std::string, int> RegAlloc::stats() {
     { "split-bailouts", splitBailouts },
     { "spill-after-split", spillAfterSplit },
     { "rematerialized", rematerialized },
+    { "remat-spill-slots", rematSpillSlots },
     { "spill-loads", spillLoads },
     { "spill-stores", spillStores },
   };
@@ -555,6 +556,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   }
 
   std::unordered_map<Op*, int> spillOffset;
+  std::unordered_set<Op*> rematSlotOnly;
   int currentOffset = STACKOFF(funcOp);
   if (currentOffset % 8 != 0)
     currentOffset = currentOffset / 8 * 8 + 8;
@@ -867,6 +869,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     }
 
     spilled++;
+    if (envEnabled("SISY_RV_ENABLE_REMATERIALIZATION", true) &&
+        rematerializableValue(op) && !vecreg(op->getResultType())) {
+      spillOffset[op] = currentOffset;
+      rematSlotOnly.insert(op);
+      rematSpillSlots++;
+      continue;
+    }
+
     // Spilled. Try to see all spill offsets of conflicting ops.
     int desired = currentOffset;
     if (vecreg(op->getResultType())) {
@@ -920,6 +930,14 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
           continue;
         if (op->getResultType() == Value::unit)
           continue;
+        if (envEnabled("SISY_RV_ENABLE_REMATERIALIZATION", true) &&
+            rematerializableValue(op) && !vecreg(op->getResultType())) {
+          spillOffset[op] = nextOffset;
+          rematSlotOnly.insert(op);
+          rematSpillSlots++;
+          spilled++;
+          continue;
+        }
         if (vecreg(op->getResultType())) {
           if (nextOffset % 16 != 0)
             nextOffset = (nextOffset / 16 + 1) * 16;
@@ -938,7 +956,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
 
   // Only a single register is spilled. Let's use s10.
   // Fast mode keeps spill semantics simple and uniform (stack-only).
-  if (!localFastMode && highest == currentOffset) {
+  if (!localFastMode && rematSlotOnly.empty() && highest == currentOffset) {
     for (auto [op, _] : spillOffset)
       assignment[op] = vecreg(op->getResultType()) ? vspillReg :
                        (fpreg(op->getResultType()) ? fspillReg : spillReg);
@@ -946,7 +964,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   }
 
   // Only 2 registers are spilled. Let's use s10 and s11..
-  if (!localFastMode && highest == currentOffset + 8) {
+  if (!localFastMode && rematSlotOnly.empty() && highest == currentOffset + 8) {
     for (auto [op, offset] : spillOffset) {
       auto fp = fpreg(op->getResultType());
       auto vec = vecreg(op->getResultType());
@@ -986,7 +1004,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   }
 
   // Allocate more stack space for it.
-  if (spillOffset.size())
+  if (spillOffset.size() && highest > currentOffset)
     STACKOFF(funcOp) = highest + 8;
 
   const auto getReg = [&](Op *op) {

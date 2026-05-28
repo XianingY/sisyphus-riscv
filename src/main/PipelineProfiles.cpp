@@ -251,7 +251,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (!opts.disableLoopRotate)
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
-    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", false))
+    if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_LOOP_RECONSTRUCTION", true))
+      pm.addPass<sys::LoopReconstruction>();
+    else if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_ROW_SCRATCH_MATMUL", false))
       pm.addPass<sys::RowScratchMatmul>();
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_MODULAR_AFFINE_LOOP", true)) {
       pm.addPass<sys::ModularAffineLoop>();

@@ -18,12 +18,14 @@ bool envEnabledLicm(const char *name, bool fallback) {
 }
 
 // Returns true if a CallOp must block loop hoisting (impure or unknown
-// callee).  Opt-in: when SISY_LICM_USE_FN_SUMMARY=1 and the callee has a
-// readonly FunctionSummary, the call is not considered blocking.
+// callee).  When the callee has a readonly FunctionSummary, the call is not
+// considered blocking.  This is still conservative for motion: impure calls
+// remain pinned by `pinned()`, but loop-invariant loads may move across calls
+// proven not to write memory.
 bool callBlocksLoop(Op *call, ModuleOp *module) {
   if (!isa<CallOp>(call)) return false;
   if (!call->has<ImpureAttr>()) return false;
-  if (!envEnabledLicm("SISY_LICM_USE_FN_SUMMARY", false)) return true;
+  if (!envEnabledLicm("SISY_LICM_USE_FN_SUMMARY", true)) return true;
 
   const auto &name = NAME(call);
   for (auto op : module->getRegion()->getFirstBlock()->getOps()) {

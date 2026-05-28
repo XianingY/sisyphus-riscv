@@ -181,11 +181,30 @@ class RowScratchMatmul : public Pass {
   int candidates = 0;
   int replaced = 0;
   int rejectedShape = 0;
+  bool force = false;
 public:
-  RowScratchMatmul(ModuleOp *module): Pass(module) {}
+  RowScratchMatmul(ModuleOp *module, bool force = false): Pass(module), force(force) {}
 
   std::string name() override { return "row-scratch-matmul"; }
   std::map<std::string, int> stats() override;
+  void run() override;
+};
+
+// Reconstructs imperfect affine reduction nests into a guarded row-scratch
+// form.  This is a legality-first entry point for matmul-like i-j-k nests:
+// the original loop remains as fallback when bounds/alias facts are not strong
+// enough, while the fast path performs scalar-to-row accumulation and loop
+// fission through the generic row-scratch helper.
+class LoopReconstruction : public Pass {
+  int candidates = 0;
+  int reconstructed = 0;
+  int rejectedShape = 0;
+public:
+  LoopReconstruction(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "loop-reconstruction"; }
+  std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
