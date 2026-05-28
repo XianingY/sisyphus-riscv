@@ -328,6 +328,7 @@ std::map<std::string, int> RegAlloc::stats() {
     { "peepholed", convertedTotal },
     { "max-block-hotness", maxBlockHotness },
     { "live-range-splits", liveRangeSplits },
+    { "rematerialized", rematerialized },
   };
 }
 
@@ -1328,6 +1329,7 @@ skip_prefer_assign:
         // We will rematerialize them later.
         if (isa<MovIOp>(rd->ref) || isa<AdrOp>(rd->ref)) {
           remove.push_back(op);
+          rematerialized++;
           continue;
         }
 
