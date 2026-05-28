@@ -97,3 +97,29 @@ Result sys::smt_prover::tryProveEqualI32(Op *a, Op *b) {
   bool sat = solver.infer(ne);
   return sat ? Result::NotEqual : Result::Equal;
 }
+
+bool sys::smt_prover::tryProveNonZeroI32(Op *cond) {
+  if (!cond || cond->getResultType() != Value::i32) return false;
+  ::smt::BvExprContext ctx;
+  Lowerer lo(ctx);
+  auto lc = lo.lower(cond);
+  if (!lc || !lo.ok()) return false;
+  ::smt::BvSolver solver;
+  auto zero = ctx.create(::smt::BvExpr::Const, 0);
+  auto eq = ctx.create(::smt::BvExpr::Eq, lc, zero);
+  // If `cond == 0` is unsatisfiable, the condition is non-zero for all inputs.
+  return !solver.infer(eq);
+}
+
+bool sys::smt_prover::tryProveZeroI32(Op *cond) {
+  if (!cond || cond->getResultType() != Value::i32) return false;
+  ::smt::BvExprContext ctx;
+  Lowerer lo(ctx);
+  auto lc = lo.lower(cond);
+  if (!lc || !lo.ok()) return false;
+  ::smt::BvSolver solver;
+  auto zero = ctx.create(::smt::BvExpr::Const, 0);
+  auto ne = ctx.create(::smt::BvExpr::Ne, lc, zero);
+  // If `cond != 0` is unsatisfiable, the condition is zero for all inputs.
+  return !solver.infer(ne);
+}

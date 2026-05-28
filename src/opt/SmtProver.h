@@ -21,6 +21,16 @@ enum class Result { Equal, NotEqual, Unknown };
 
 Result tryProveEqualI32(Op *a, Op *b);
 
+// Same supported op subset.  Returns true iff the solver proves that
+// `cond` evaluates to a non-zero value under every assignment of free
+// inputs.  Used by `SmtBranchPrune` to fold always-taken branches.  Any
+// op outside the supported subset yields `false` (treated as "unknown").
+bool tryProveNonZeroI32(Op *cond);
+
+// Returns true iff the solver proves `cond` evaluates to zero under
+// every assignment of free inputs.  Folds always-not-taken branches.
+bool tryProveZeroI32(Op *cond);
+
 }
 
 #endif

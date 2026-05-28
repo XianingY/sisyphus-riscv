@@ -131,6 +131,29 @@ public:
   void run() override;
 };
 
+// SMT-assisted branch pruning.  Visits every BranchOp whose condition was not
+// folded by SCCP, lowers the condition through `smt_prover` and asks the
+// bit-vector solver whether it is provably zero or non-zero for all inputs.
+// Only proven results trigger a fold; any unsupported op or solver bailout is
+// left alone.  Off by default; opt in via SISY_ENABLE_SMT_PATH_PRUNE=1.
+class SmtBranchPrune : public Pass {
+  int folded = 0;
+  int considered = 0;
+  int unsupported = 0;
+public:
+  SmtBranchPrune(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "smt-branch-prune"; }
+  std::map<std::string, int> stats() override {
+    return {
+      { "folded", folded },
+      { "considered", considered },
+      { "unsupported", unsupported },
+    };
+  }
+  void run() override;
+};
+
 class Reassociate : public Pass {
   int intReassociated = 0;
   int floatReassociated = 0;

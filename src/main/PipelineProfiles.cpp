@@ -203,6 +203,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DCE>();
       pm.addPass<sys::SimplifyCFG>();
     }
+    // SMT-assisted branch pruning.  No-op unless SISY_ENABLE_SMT_PATH_PRUNE=1.
+    pm.addPass<sys::SmtBranchPrune>();
+    pm.addPass<sys::DCE>();
     pm.addPass<sys::ArrayStrideAnalysis>();
     pm.addPass<sys::Alias>();
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
