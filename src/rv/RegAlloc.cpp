@@ -1,6 +1,7 @@
 #include "RvPasses.h"
 #include "Regs.h"
 #include "../backend/shared/RegAllocHotness.h"
+#include "../opt/Analysis.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -571,8 +572,18 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
     std::unordered_map<Op*, std::vector<Op*>> phiOperand;
 
   int currentPriority = 2;
+  const bool useBfiSpillWeight =
+      envEnabled("SISY_RV_ENABLE_BFI_SPILL_WEIGHT", false);
   for (auto bb : region->getBlocks()) {
     int localWeight = bbWeight[bb];
+    if (useBfiSpillWeight) {
+      // Bias toward the BFI estimate when it is more informative than the
+      // static loop-shape heuristic.  Capped to keep multiplication within
+      // 32-bit safe range.
+      double f = BlockFrequency::freqOf(bb);
+      int bfiW = (int) std::min<double>(f, 1e6);
+      localWeight = std::max(localWeight, bfiW);
+    }
     auto bumpPriority = [&](Op *x, int v) {
       auto it = priority.find(x);
       if (it == priority.end() || it->second < v)
