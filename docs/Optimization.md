@@ -230,3 +230,40 @@ default compliance boundary:
 
 If an idea from this list is revisited, it must be reframed as a general
 compiler transformation with a written proof and a conservative bailout path.
+
+## 7. Recent Additions (Off-by-Default Infrastructure)
+
+All entries below are passive infrastructure: default invocation produces
+byte-identical output. Each has an env kill switch so it can be enabled
+incrementally.
+
+- **HIR affine nest summaries** (`src/hir/HIRAffine.cpp`):
+  `collectAffineNest` returns canonical loops, per-loop domain (iv, upper,
+  step), innermost accesses with surrounding IVs, guards, and a coarse
+  side-effect summary plus `imperfect`/`hasSymbolicAccesses` flags.
+- **Function summary** (`src/opt/FunctionSummary.cpp`): attaches
+  `FunctionSummaryAttr { pure, readonly, norecurse, argReadMask,
+  argWriteMask }`. Bits set only when proven. Kill switch:
+  `SISY_ENABLE_FN_SUMMARY=0`.
+- **Thin summary dump** (`src/opt/ThinSummary.cpp`): emits per-function
+  summary to `$SISY_THIN_SUMMARY_DUMP`. No-op when unset. Seed for future
+  thin-link IPCP/IPDCE.
+- **Block frequency** (`src/opt/BlockFrequency.cpp`): static loop-depth
+  frequency in a singleton side table; `BlockFrequency::freqOf(bb)` /
+  `isCold(bb)`. Profile import via `$SISY_PROFILE`. Kill switch:
+  `SISY_ENABLE_BFI=0`.
+- **RV superblock schedule v1** (`src/rv/SuperblockSchedule.cpp`): hoists
+  pure RV loads across single-pred / single-succ hot edges, gated by
+  shape, dependency, `AliasAttr::neverAlias`, and pressure budget. Off by
+  default; enable via `SISY_RV_ENABLE_SUPERBLOCK=1`.
+- **SMT proof helper** (`src/opt/SmtProver.cpp`):
+  `smt_prover::tryProveEqualI32(a, b)` returns `Equal` / `NotEqual` /
+  `Unknown`. Consumers must treat `Unknown` as "do not fold".
+
+## 8. Compliance Boundary For New Infrastructure
+
+Every component in section 7 is gated such that default invocation
+produces byte-identical output to the prior commit. Defaults may flip
+only in a separate commit demonstrating correctness on the regression
+suite plus a measurable performance reason. Off-by-default switches must
+remain queryable as a kill switch.
