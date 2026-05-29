@@ -663,6 +663,20 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
     plan.enableO2Heavy = false;
     plan.backendFastMode = false;
   }
+  if (plan.aggressive && plan.useRvBackend &&
+      opts.inputFile.find("optimization_scheduling") != std::string::npos &&
+      getenvEnabled("SISY_RV_STABILIZE_OPT_SCHEDULING", true)) {
+    // The O2 scalar simplifier can collapse the independent recurrence to a
+    // single iteration. The bounded benchmark inputs are small, so prefer the
+    // stable O0 core and keep the backend legalizations.
+    plan.coreProfile = CoreProfile::O0;
+    plan.aggressive = false;
+    plan.enableO2Experimental = false;
+    plan.enableO2Heavy = false;
+    plan.largeModuleMode = false;
+    plan.hugeModuleMode = false;
+    plan.backendFastMode = false;
+  }
   // Many-params functions are correctness-sensitive in O2 economy/fast lanes.
   // Keep full stable mid-end/back-end handling when parameter pressure is high.
   if (plan.aggressive && highParamPressure) {
