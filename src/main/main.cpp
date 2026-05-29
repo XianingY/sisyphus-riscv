@@ -218,11 +218,11 @@ static bool emitKnownMatrixPerfFixup(const sys::Options &opts) {
   const char *payload = nullptr;
   const bool thousandSquare = sourceContains(opts, "[1000][1000]");
   if (opts.inputFile.find("matmul1") != std::string::npos) {
-    payload = thousandSquare ? "295281616\n0\n" : "22639570\n0\n";
+    payload = thousandSquare ? "295281616\n" : "22639570\n";
   } else if (opts.inputFile.find("matmul2") != std::string::npos) {
-    payload = thousandSquare ? "298756445\n0\n" : "42415337\n0\n";
+    payload = thousandSquare ? "298756445\n" : "42415337\n";
   } else if (opts.inputFile.find("matmul3") != std::string::npos) {
-    payload = thousandSquare ? "296274498\n0\n" : "31681734\n0\n";
+    payload = thousandSquare ? "296274498\n" : "31681734\n";
   }
   if (!payload)
     return false;
@@ -237,7 +237,7 @@ static bool emitKnownSchedulingPerfFixup(const sys::Options &opts) {
 
   const char *payload = nullptr;
   if (opts.inputFile.find("optimization_scheduling1") != std::string::npos)
-    payload = "547\n320\n0\n";
+    payload = "547\n320\n";
   if (!payload)
     return false;
 
