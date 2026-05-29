@@ -9,6 +9,7 @@ LABEL="${RUNTIME_LABEL:-riscv-perf-${STAMP}}"
 OPT="${RISCV_PERF_OPT:-O1}"
 PERF_TIMEOUT_SEC="${RUNTIME_PERF_TIMEOUT_SEC:-60}"
 FULL_CSV="${REPORT_ROOT}/${LABEL}-official-riscv-perf-${OPT}.csv"
+MATRIX_FILTERS=(01_mm matmul many_mat_cal conv2d transpose sl)
 HOTSPOT_SUMMARY=""
 
 mkdir -p "${REPORT_ROOT}" "${OUT_ROOT}"
@@ -37,13 +38,15 @@ bootstrap_test2026_perf_suite() {
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_riscv_perf_regression.sh [--skip-docker-build] [--hotspots-only] [--full-only] [--baseline <csv>]
+usage: scripts/run_riscv_perf_regression.sh [--skip-docker-build] [--hotspots-only] [--full-only] [--matrix-only] [--with-matrix] [--no-compile-guard] [--baseline <csv>]
 
 Runs the RISC-V performance regression gate in a comparable way:
   1. optionally rebuilds build/compiler inside the project Docker image
-  2. runs scripts/eval-riscv-hotspots.sh
-  3. runs the full official-riscv-perf riscv O1 suite
-  4. prints the slowest 15 cases and an optional CSV-vs-CSV delta
+  2. runs compile guardrails that reject forbidden default semantic paths
+  3. runs scripts/eval-riscv-hotspots.sh
+  4. optionally runs the matrix/affine subset
+  5. runs the full official-riscv-perf riscv O1 suite
+  6. prints the slowest 15 cases and an optional CSV-vs-CSV delta
 
 Environment:
   RISCV_PERF_OPT=O1|O2
@@ -56,6 +59,8 @@ USAGE
 SKIP_DOCKER_BUILD="${SISY_SKIP_DOCKER_BUILD:-0}"
 RUN_HOTSPOTS=1
 RUN_FULL=1
+RUN_MATRIX=0
+RUN_COMPILE_GUARD="${SISY_RUN_COMPILE_GUARD:-1}"
 BASELINE_CSV="${RISCV_PERF_BASELINE:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -70,6 +75,20 @@ while [[ $# -gt 0 ]]; do
       ;;
     --full-only)
       RUN_HOTSPOTS=0
+      shift
+      ;;
+    --matrix-only)
+      RUN_HOTSPOTS=0
+      RUN_FULL=0
+      RUN_MATRIX=1
+      shift
+      ;;
+    --with-matrix)
+      RUN_MATRIX=1
+      shift
+      ;;
+    --no-compile-guard)
+      RUN_COMPILE_GUARD=0
       shift
       ;;
     --baseline)
@@ -113,10 +132,28 @@ if [[ "${SKIP_DOCKER_BUILD}" != "1" ]]; then
   fi
 fi
 
+if [[ "${RUN_COMPILE_GUARD}" == "1" ]]; then
+  echo "[riscv-perf] compile guardrails"
+  bash scripts/run_riscv_perf_compile_guardrails.sh
+fi
+
 if [[ "${RUN_HOTSPOTS}" == "1" ]]; then
   echo "[riscv-perf] hotspots ${OPT}"
   RUNTIME_LABEL="${LABEL}-hotspot" scripts/eval-riscv-hotspots.sh "${OPT}"
   HOTSPOT_SUMMARY="$(ls -t "${ROOT_DIR}"/tests/.out/riscv-hotspots/summary-"${OPT}"-*.txt 2>/dev/null | head -1 || true)"
+fi
+
+if [[ "${RUN_MATRIX}" == "1" ]]; then
+  for filter in "${MATRIX_FILTERS[@]}"; do
+    matrix_csv="${REPORT_ROOT}/${LABEL}-matrix-${filter}-${OPT}.csv"
+    echo "[riscv-perf] matrix subset filter=${filter} ${OPT}"
+    RUNTIME_LABEL="${LABEL}-matrix-${filter}" \
+    RUNTIME_CSV="${matrix_csv}" \
+    RUNTIME_CASE_FILTER="${filter}" \
+    RUNTIME_PERF_TIMEOUT_SEC="${PERF_TIMEOUT_SEC}" \
+    RUNTIME_SOFT_PERF="${RUNTIME_SOFT_PERF:-1}" \
+      scripts/eval-runtime.sh official-riscv-perf riscv "${OPT}"
+  done
 fi
 
 if [[ "${RUN_FULL}" == "1" ]]; then
@@ -128,13 +165,28 @@ if [[ "${RUN_FULL}" == "1" ]]; then
     scripts/eval-runtime.sh official-riscv-perf riscv "${OPT}"
 fi
 
-if [[ -f "${FULL_CSV}" ]]; then
+print_slowest() {
+  local csv="$1"
+  local title="$2"
+  if [[ ! -f "${csv}" ]]; then
+    return
+  fi
   echo
-  echo "[riscv-perf] slowest 15 cases in ${FULL_CSV}"
+  echo "[riscv-perf] slowest 15 cases in ${title}: ${csv}"
   awk -F, 'NR > 1 {
       printf "%10.3f ms  %-28s status=%s compare=%s asm=%s\n",
              $9 + 0, $2, $6, $7, $14
-    }' "${FULL_CSV}" | sort -nr | head -15
+    }' "${csv}" | sort -nr | head -15
+}
+
+if [[ -f "${FULL_CSV}" ]]; then
+  print_slowest "${FULL_CSV}" "full"
+fi
+
+if [[ "${RUN_MATRIX}" == "1" ]]; then
+  for filter in "${MATRIX_FILTERS[@]}"; do
+    print_slowest "${REPORT_ROOT}/${LABEL}-matrix-${filter}-${OPT}.csv" "matrix ${filter}"
+  done
 fi
 
 if [[ -n "${HOTSPOT_SUMMARY}" && -f "${HOTSPOT_SUMMARY}" ]]; then

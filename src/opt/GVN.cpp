@@ -354,15 +354,9 @@ bool GVN::sinkPhiExpressions(Region *region) {
 // "Value Numbering", Briggs, 1997
 // Refer to figure 4.
 void GVN::runImpl(Region *region) {
-  region->updateDoms();
-
-  // Construct a dominator tree.
-  std::map<BasicBlock*, std::vector<BasicBlock*>> domtree;
-  for (auto bb : region->getBlocks()) {
-    if (bb->getIdom())
-      domtree[bb->getIdom()].push_back(bb);
-  }
-
+  Domtree domtree;
+  for (auto &[bb, children] : getDomTree(region))
+    domtree[bb] = children;
   dvnt(region->getFirstBlock(), domtree);
   sinkPhiExpressions(region);
 }

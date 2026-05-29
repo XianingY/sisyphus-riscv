@@ -124,13 +124,25 @@ void emitStackLoad(Builder &builder, Reg dst, Value::Type ty, int offset, Reg ad
 bool rematerializableValue(Op *op) {
   if (!op)
     return false;
+  // Constants and address loads are trivially rematerializable.
   if (isa<LiOp>(op) || isa<LaOp>(op))
     return true;
-  if (!isa<AddiOp>(op) || !op->has<RsAttr>() || !op->has<IntAttr>() ||
-      op->has<SpilledRsAttr>())
-    return false;
-  Reg base = RS(op);
-  return base == Reg::sp || base == Reg::zero;
+  // addi sp, offset  /  addi zero, imm  /  addi gp, offset are all cheap
+  // to rematerialize at the use site.  GP-relative offsets are common for
+  // global array base addresses in the SysY runtime.
+  if (isa<AddiOp>(op) && op->has<RsAttr>() && op->has<IntAttr>() &&
+      !op->has<SpilledRsAttr>()) {
+    Reg base = RS(op);
+    return base == Reg::sp || base == Reg::zero || base == Reg::gp;
+  }
+  // Shift-by-constant (slli/slliw with immediate) is rematerializable.
+  // This covers the i*4 / i*8 patterns produced by StrengthReduct for
+  // array indexing, which are extremely common in matrix loop bodies.
+  if ((isa<SlliwOp>(op) || isa<SlliOp>(op)) &&
+      op->has<IntAttr>() && op->getOperandCount() >= 1 &&
+      !op->has<SpilledRsAttr>())
+    return true;
+  return false;
 }
 
 bool emitRematerializedValue(Builder &builder, Op *ref, Reg dst) {
@@ -147,10 +159,21 @@ bool emitRematerializedValue(Builder &builder, Op *ref, Reg dst) {
   if (isa<AddiOp>(ref) && ref->has<RsAttr>() && ref->has<IntAttr>() &&
       !ref->has<SpilledRsAttr>()) {
     Reg base = RS(ref);
-    if (base == Reg::sp || base == Reg::zero) {
+    if (base == Reg::sp || base == Reg::zero || base == Reg::gp) {
       builder.create<AddiOp>({ RDC(dst), RSC(base), new IntAttr(V(ref)) });
       return true;
     }
+  }
+  // Shift-by-constant: slli/slliw with immediate operand.
+  if ((isa<SlliwOp>(ref) || isa<SlliOp>(ref)) &&
+      ref->has<IntAttr>() && ref->getOperandCount() >= 1 &&
+      !ref->has<SpilledRsAttr>()) {
+    Reg src = RS(ref);
+    if (isa<SlliwOp>(ref))
+      builder.create<SlliwOp>({ RDC(dst), RSC(src) }, { new IntAttr(V(ref)) });
+    else
+      builder.create<SlliOp>({ RDC(dst), RSC(src) }, { new IntAttr(V(ref)) });
+    return true;
   }
   return false;
 }

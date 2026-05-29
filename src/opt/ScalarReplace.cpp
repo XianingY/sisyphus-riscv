@@ -1,6 +1,7 @@
 #include "LoopPasses.h"
 #include "Passes.h"
 #include "CleanupPasses.h"
+#include "AnalysisManager.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -634,18 +635,39 @@ void ScalarReplace::run() {
         promote.run();
         DCE cleanup(module);
         cleanup.run();
+        if (context() && context()->enabled())
+            context()->analysis().invalidate(PreservedAnalyses::none(),
+                                             "scalar-replace-array-scalarization");
     }
 
-    LoopAnalysis analysis(module);
-    analysis.run();
-    auto forests = analysis.getResult();
+    std::map<FuncOp*, LoopForest> localForests;
+    std::map<FuncOp*, LoopForest> *forests = nullptr;
+    if (context() && context()->enabled())
+        forests = &context()->analysis().getLoopForests();
+    else {
+        LoopAnalysis analysis(module);
+        analysis.run();
+        localForests = analysis.getResult();
+        forests = &localForests;
+    }
 
     for (auto func : collectFuncs()) {
-        auto &forest = forests[func];
+        auto &forest = (*forests)[func];
 
         for (auto loop : forest.getLoops()) {
             if (!loop->getParent())
                 runImpl(loop);
         }
     }
+}
+
+PreservedAnalyses ScalarReplace::run(PassContext &ctx) {
+    activeContext = &ctx;
+    int beforePromoted = promoted;
+    int beforeArrays = arraysScalarized;
+    run();
+    activeContext = nullptr;
+    return (promoted == beforePromoted && arraysScalarized == beforeArrays)
+               ? PreservedAnalyses::all()
+               : PreservedAnalyses::cfg();
 }

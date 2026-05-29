@@ -201,7 +201,7 @@ important defaults as of this review:
 - `SISY_ENABLE_CACHED_PRECOMPUTE=false`
 - `SISY_ENABLE_SYNTH_CONST_ARRAY=false`
 - `SISY_ENABLE_ADVANCED_CONV2D=false`
-- `SISY_HIR_ENABLE_TILING=false`
+- `SISY_HIR_ENABLE_TILING=true`
 - `SISY_HIR_ENABLE_STENCIL_INTERIOR=false`
 - `SISY_HIR_ENABLE_FUSION=true`
 - `SISY_HIR_ENABLE_INTERCHANGE=true`
@@ -209,6 +209,12 @@ important defaults as of this review:
 - `SISY_HIR_ENABLE_REDUCTION_PRIVATIZE=true`
 - `SISY_HIR_ENABLE_REDUCTION_MICROTILE=true`
 - `SISY_HIR_ENABLE_INVARIANT_GUARD_HOIST=true`
+- `SISY_RV_ENABLE_SUPERBLOCK=true`
+- `SISY_RV_SUPERBLOCK_PRESSURE_BUDGET=20`
+- `SISY_RV_ENABLE_SCHEDULE=true`
+- `SISY_RV_SCHEDULE_HEIGHT_WEIGHT=5`
+- `SISY_RV_ENABLE_REMATERIALIZATION=true`
+- `SISY_RV_ENABLE_LIVE_RANGE_SPLIT=true`
 
 Always verify current defaults in `src/main/PipelineProfiles.cpp`,
 `src/hir/HIRPolyhedral.cpp`, and the pass implementation before relying on a

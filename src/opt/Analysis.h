@@ -18,6 +18,7 @@ public:
     
   std::string name() override { return "pureness"; };
   std::map<std::string, int> stats() override { return {}; }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -28,6 +29,7 @@ public:
     
   std::string name() override { return "call-graph"; };
   std::map<std::string, int> stats() override { return {}; }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -49,6 +51,7 @@ public:
       { "degraded-to-unknown", degradedToUnknown },
     };
   }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -103,6 +106,7 @@ public:
       { "classes", classes }
     };
   }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -130,6 +134,7 @@ public:
       { "arg-write", argWriteCount },
     };
   }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -155,6 +160,7 @@ public:
       { "linked", linkedFunctions },
     };
   }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -187,6 +193,7 @@ public:
     };
   }
   void run() override;
+  PreservedAnalyses run(PassContext &context) override;
 
   // Returns a relative frequency for `bb`.  1.0 == straight-line entry-level
   // estimate.  Returns 1.0 when no analysis has been run for this block.
@@ -202,6 +209,7 @@ public:
     
   std::string name() override { return "at-most-once"; };
   std::map<std::string, int> stats() override { return {}; }
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 

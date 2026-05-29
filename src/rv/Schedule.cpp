@@ -49,6 +49,8 @@ int envInt(const char *name, int fallback, int minValue, int maxValue) {
 }
 
 // Latency model for RV ops (cycles until result is available)
+// Tuned for U74/C906-class pipelines: FP add has 3-cycle latency (not 1),
+// and FP mul is 4 cycles.  Integer mul is 3 cycles on M-extension.
 int latency(Op *op) {
   if (isa<rv::LoadOp>(op) || isa<FldOp>(op))
     return 3;
@@ -58,6 +60,11 @@ int latency(Op *op) {
     return 20;
   if (isa<FmulOp>(op) || isa<FdivOp>(op))
     return 4;
+  // FP add/sub have ~3 cycle latency on typical RV FPU pipelines (FPU is
+  // usually pipelined but not fully bypassed).  Modeling this prevents the
+  // scheduler from back-to-backing fadd/fsub after their producers.
+  if (isa<FaddOp>(op) || isa<FsubOp>(op))
+    return 3;
   return 1;
 }
 
@@ -152,13 +159,27 @@ void Schedule::runImpl(BasicBlock *bb) {
   if (!term)
     return;
 
-  // Don't reorder blocks with calls or other pinned non-terminator ops at all.
-  // This also covers FP calls and implicit ABI constraints without needing a
-  // separate whole-block FP bailout.
-  for (auto op : bb->getOps()) {
-    if (op == term) continue;
-    if (isa<PhiOp>(op)) continue;
-    if (isPinned(op)) return;
+  // Don't reorder blocks with pinned ops (calls, branches, etc.) in the
+  // schedulable region.  However, calls that appear only at the very end of
+  // the block (after all other ops) are treated as part of the terminator
+  // region and do not prevent scheduling the preceding ops.  This is safe
+  // because the call's clobbered registers are already modeled by
+  // placeholders in RegAlloc, and moving earlier ops before the call does
+  // not change the call's semantics.
+  {
+    bool hasEarlyPinned = false;
+    bool seenNonPhiNonTerm = false;
+    for (auto op : bb->getOps()) {
+      if (op == term || isa<PhiOp>(op)) continue;
+      if (isPinned(op)) {
+        // If we have already seen a non-pinned, non-phi op, then this
+        // pinned op is "early" (interspersed with schedulable work).
+        if (seenNonPhiNonTerm) { hasEarlyPinned = true; break; }
+      } else {
+        seenNonPhiNonTerm = true;
+      }
+    }
+    if (hasEarlyPinned) return;
   }
 
   // Build dependence DAG.
@@ -168,7 +189,7 @@ void Schedule::runImpl(BasicBlock *bb) {
   std::unordered_map<Op*, std::vector<Op*>> memDeps; // op → ops it must come after
 
   for (auto op : bb->getOps()) {
-    if (op == term || isa<PhiOp>(op)) continue;
+    if (op == term || isa<PhiOp>(op) || isPinned(op)) continue;
 
     if (isLoad(op)) {
       // Load must come after any aliased store
@@ -198,7 +219,7 @@ void Schedule::runImpl(BasicBlock *bb) {
   std::unordered_set<Op*> schedulable;
 
   for (auto op : bb->getOps()) {
-    if (op == term || isa<PhiOp>(op)) continue;
+    if (op == term || isa<PhiOp>(op) || isPinned(op)) continue;
     orderedSchedulable.push_back(op);
     schedulable.insert(op);
   }
@@ -272,12 +293,14 @@ void Schedule::runImpl(BasicBlock *bb) {
   //   1. Operations whose operands are still in latency window get penalized
   //      (we want to wait for them)
   //   2. High-latency ops (loads, mul, div) get priority (start them early)
-  //   3. Stores prefer to be placed when their value is ready
-  //   4. Tie-break by original position to keep stable ordering
+  //   3. Ready-to-issue loads get extra bonus (prefetch early)
+  //   4. Stores prefer to be placed when their value is ready
+  //   5. Tie-break by original position to keep stable ordering
   auto goodness = [&](Op *op) -> int {
     int score = 0;
 
     // Penalty: if any operand was scheduled recently, this op stalls.
+    bool allOperandsReady = true;
     for (auto operand : op->getOperands()) {
       auto def = operand.defining;
       auto it = issueTime.find(def);
@@ -287,6 +310,7 @@ void Schedule::runImpl(BasicBlock *bb) {
         if (gap < needed) {
           // Each cycle short of latency costs us
           score -= (needed - gap) * 4;
+          allOperandsReady = false;
         }
       }
     }
@@ -298,8 +322,13 @@ void Schedule::runImpl(BasicBlock *bb) {
     int lat = latency(op);
     if (lat >= 3) score += lat * 2;
 
-    // Slight penalty for loads if we have many in-flight already (avoid stalls)
-    // Currently approximated by load latency bonus above.
+    // Extra bonus for loads whose address is ready: issuing them early
+    // hides load latency and gives the prefetcher more time.  This is
+    // especially important for matrix loops where address computation
+    // (addi/slli) completes early but the load result is on the critical
+    // path.
+    if (isLoad(op) && allOperandsReady)
+      score += 3;
 
     // Prefer earlier original position for stability.
     score -= origPos[op] / 100;
@@ -367,7 +396,7 @@ void Schedule::run() {
   if (!envEnabled("SISY_RV_ENABLE_SCHEDULE", true))
     return;
 
-  heightWeight = envInt("SISY_RV_SCHEDULE_HEIGHT_WEIGHT", 3, 0, 100);
+  heightWeight = envInt("SISY_RV_SCHEDULE_HEIGHT_WEIGHT", 5, 0, 100);
 
   for (auto func : collectFuncs()) {
     auto region = func->getRegion();

@@ -217,12 +217,15 @@ void SCEV::rewrite(BasicBlock *bb, LoopInfo *info) {
   // if the unrolled loop have a surrounding loop.
   // We don't want to assign a phi to each of them.
   // We use a threshold to guard against this.
+  // Raised from 4 to 8: matrix loops with unroll-and-jam commonly produce
+  // 6+ address recurrences (A[i][k], B[k][j], C[i][j] × unroll_factor),
+  // and the old threshold prevented SCEV from optimizing them.
   int sz = 0;
   for (auto c : candidates) {
     if (isa<AddLOp>(c))
       sz++;
   }
-  if (sz >= 4) {
+  if (sz >= 8) {
     for (auto op : candidates)
       nochange.insert(op);
     candidates.clear();

@@ -489,6 +489,7 @@ int main(int argc, char **argv) {
                       << " fusion-reject-scalar=" << stats.fusionRejectScalar
                       << " fusion-reject-memory=" << stats.fusionRejectMemory
                       << " forwarded-array-store-load=" << stats.forwardedArrayStoreLoads
+                      << " transpose-forwarded-loads=" << stats.transposeForwardedLoads
                       << " presburger-fusion-queries=" << stats.presburgerFusionQueries
                       << " presburger-fusion-no-deps=" << stats.presburgerFusionNoDeps
                       << " presburger-fusion-may-deps=" << stats.presburgerFusionMayDeps

@@ -86,6 +86,7 @@ struct PolyhedralStats {
   int fusionRejectScalar = 0;
   int fusionRejectMemory = 0;
   int forwardedArrayStoreLoads = 0;
+  int transposeForwardedLoads = 0;
   int presburgerFusionQueries = 0;
   int presburgerFusionNoDeps = 0;
   int presburgerFusionMayDeps = 0;
@@ -178,6 +179,7 @@ private:
   // Loop fusion: merge two adjacent loops with identical bounds over same arrays.
   bool tryLoopFusion(Op *block, size_t idx, PolyhedralStats &stats);
   bool forwardArrayStoreLoads(Op *block, PolyhedralStats &stats);
+  bool forwardTransposeLoads(Op *block, PolyhedralStats &stats);
   bool tryRowStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryStencilInteriorDispatch(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryInvariantGuardHoist(Op *block, size_t idx, PolyhedralStats &stats);

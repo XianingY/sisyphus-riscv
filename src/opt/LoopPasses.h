@@ -247,6 +247,7 @@ public:
 
   std::string name() override { return "loop-tiling"; }
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -283,6 +284,7 @@ public:
 
   std::string name() override { return "scalar-replace"; }
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 
@@ -403,6 +405,7 @@ public:
 
   std::string name() override { return "vectorize"; }
   std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
   void run() override;
 };
 

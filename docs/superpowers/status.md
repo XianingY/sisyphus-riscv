@@ -1,6 +1,6 @@
 # 深度优化状态跟踪
 
-最后更新：2026-05-27
+最后更新：2026-06-XX
 
 > 本文件是当前优化状态摘要。更早的 `docs/superpowers/specs/` 内容属于历史设计草案，不能替代源码、`docs/Compliance.md` 和 `docs/Optimization.md`。
 
@@ -20,9 +20,9 @@
 | Presburger legality | 部分落地 | 用于轻量 dependence/feasibility 查询；不是完整 Polly/Pluto 调度器。 |
 | MemorySSA-style DLE/DSE | 部分落地 | 有 reaching-store/load forwarding 思路，但还不是显式 MemorySSA IR。 |
 | SCCP / RangeAwareFold | 已落地 | 路径敏感常量与范围折叠能力持续增强。 |
-| SCEV / LSR | 已落地 | 支持归纳变量和部分地址 stride 改写，仍需与 HIRAffine 统一表达。 |
+| SCEV / LSR | 已落地 | 支持归纳变量和部分地址 stride 改写；AddLOp 候选阈值已从 4 提升至 8，覆盖 unroll-and-jam 产生的多地址 recurrence。仍需与 HIRAffine 统一表达。 |
 | Vectorize / RVV / NEON | 实验到半稳定 | 具备基础 loop/SLP/vector emitter；默认策略需继续受成本模型约束。 |
-| RV RegAlloc/Schedule | 已落地 | hotness/spill 估算、pre-RA scheduling、peepholes；live-range splitting 仍可加强。 |
+| RV RegAlloc/Schedule | 已落地并强化 | SuperblockSchedule 默认开启（pressure budget=20）；rematerialization 覆盖 gp-addi/slli/slliw；FP add/sub latency 正确建模为 3 周期；调度器支持 tail-only call 块、ready-load 优先、height weight=5。 |
 | ARM backend optimization | 可用但偏弱 | 正确性可用，性能仍落后 RISC-V 优化路径。 |
 
 ## 默认关闭的高风险模块
@@ -50,11 +50,12 @@
 
 ## 下一步优先级
 
-1. 放宽 HIR affine nest 提取，支持 guarded/imperfect loop 的安全子区域。
-2. 对 transpose/conv2d 共用的 2D tiling 做统一 legality 与成本模型。
-3. 将 SCEV 地址 recurrence 与 HIRAffine 表达合并，减少多维数组寻址乘法。
-4. 强化 RegAlloc 的 hot live-range splitting 和 rematerialization。
-5. 为 Vectorize 接入 affine legality 与寄存器压力成本模型。
+1. ~~强化 RegAlloc 的 hot live-range splitting 和 rematerialization~~ → 已完成（remat 覆盖 gp-addi/slli；SuperblockSchedule 默认开启）。
+2. ~~SCEV 地址 recurrence 候选阈值提升~~ → 已完成（4→8）。
+3. 放宽 HIR affine nest 提取，支持 guarded/imperfect loop 的安全子区域。
+4. 对 transpose/conv2d 共用的 2D tiling 做统一 legality 与成本模型。
+5. 将 SCEV 地址 recurrence 与 HIRAffine 表达合并，减少多维数组寻址乘法。
+6. 为 Vectorize 接入 affine legality 与寄存器压力成本模型。
 
 ## 验证要求
 

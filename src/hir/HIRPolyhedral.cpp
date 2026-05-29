@@ -286,6 +286,9 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
         }
       }
     }
+
+    if (hirEnvEnabled("SISY_HIR_ENABLE_TRANSPOSE_FORWARDING", false))
+      changed = forwardTransposeLoads(block, stats) || changed;
   }
 
   for (auto &child : block->children)
@@ -389,10 +392,10 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
       }
     }
     // Loop tiling: strip-mine loops that have an inner while.
-    // HIR tiling rewrites loop structure before CFG construction. Keep it
-    // opt-in until the transform can prove that loop-exit IV values remain
-    // identical for users after the loop.
-    if (hirEnvEnabled("SISY_HIR_ENABLE_TILING", false)) {
+    // Now enabled by default for affine nests; pass `SISY_HIR_ENABLE_TILING=0`
+    // to bisect. The transform preserves the original loop-exit IV value
+    // (see tryLoopTiling).
+    if (hirEnvEnabled("SISY_HIR_ENABLE_TILING", true)) {
       if (block->children[i] && block->children[i]->kind == OpKind::While) {
         if (tryLoopTiling(block, i, stats)) {
           changed = true;

@@ -672,7 +672,11 @@ bool PolyhedralOptimizer::tryReductionRowPrivatize(Op *block, size_t initIndex,
   std::unique_ptr<Op> innerJLoop;
   std::unique_ptr<Op> tailJLoop;
   if (useConditionalRowJam) {
-    constexpr int kRowJamFactor = 2;
+    int kRowJamFactor = hirEnvInt("SISY_HIR_COND_ROW_JAM", 2);
+    if (kRowJamFactor < 2)
+      kRowJamFactor = 2;
+    if (kRowJamFactor > 4)
+      kRowJamFactor = 4;
     for (int lane = 0; lane < kRowJamFactor; lane++) {
       auto laneStmt = cloneReplacing(pat.kReductionStmt, {}, {{pat.j, lane}});
       if (!laneStmt)

@@ -61,10 +61,10 @@ int liveOutPressure(BasicBlock *bb) {
 }  // namespace
 
 void sys::rv::SuperblockSchedule::run() {
-  if (!envEnabled("SISY_RV_ENABLE_SUPERBLOCK", false))
+  if (!envEnabled("SISY_RV_ENABLE_SUPERBLOCK", true))
     return;
 
-  int budget = envInt("SISY_RV_SUPERBLOCK_PRESSURE_BUDGET", 24, 1, 64);
+  int budget = envInt("SISY_RV_SUPERBLOCK_PRESSURE_BUDGET", 20, 1, 64);
 
   for (auto func : collectFuncs()) {
     auto region = func->getRegion();

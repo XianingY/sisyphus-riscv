@@ -1,4 +1,5 @@
 #include "LoopPasses.h"
+#include "AnalysisManager.h"
 #include "../utils/Matcher.h"
 #include <algorithm>
 #include <cstdlib>
@@ -32,6 +33,7 @@ namespace { struct VecStats {
   int scalableVectorized = 0;
   int scalableReductions = 0;
   int scalableMaskedTails = 0;
+  int slpPacked = 0;
 };
 static VecStats g_vecStats;
 }
@@ -375,7 +377,8 @@ void runSLPOnBlock(BasicBlock *bb) {
   for (int i = 0; i < (int) ops.size(); i++) {
     if (removed.count(ops[i]) || !isa<StoreOp>(ops[i]))
       continue;
-    trySLPStorePack(ops, order, i, removed);
+    if (trySLPStorePack(ops, order, i, removed))
+      g_vecStats.slpPacked++;
   }
 }
 
@@ -1516,19 +1519,27 @@ std::map<std::string, int> Vectorize::stats() {
   if (g_vecStats.scalableVectorized)      out["rvv-vla-vectorized"]    = g_vecStats.scalableVectorized;
   if (g_vecStats.scalableReductions)      out["rvv-vla-reductions"]    = g_vecStats.scalableReductions;
   if (g_vecStats.scalableMaskedTails)     out["rvv-vla-masked-tails"]  = g_vecStats.scalableMaskedTails;
+  if (g_vecStats.slpPacked)               out["slp-packed-stores"]      = g_vecStats.slpPacked;
   return out;
 }
 
 void Vectorize::run() {
   g_vecStats = VecStats{};
-  LoopAnalysis analysis(module);
-  analysis.run();
-  auto forests = analysis.getResult();
+  std::map<FuncOp*, LoopForest> localForests;
+  std::map<FuncOp*, LoopForest> *forests = nullptr;
+  if (context() && context()->enabled())
+    forests = &context()->analysis().getLoopForests();
+  else {
+    LoopAnalysis analysis(module);
+    analysis.run();
+    localForests = analysis.getResult();
+    forests = &localForests;
+  }
 
   auto funcs = collectFuncs();
   
   for (auto func : funcs) {
-    const auto &forest = forests[func];
+    const auto &forest = (*forests)[func];
 
     // Only vectorize innermost loops.
     for (auto loop : forest.getLoops()) {
@@ -1539,4 +1550,13 @@ void Vectorize::run() {
     for (auto bb : func->getRegion()->getBlocks())
       runSLPOnBlock(bb);
   }
+}
+
+PreservedAnalyses Vectorize::run(PassContext &ctx) {
+  activeContext = &ctx;
+  run();
+  activeContext = nullptr;
+  bool changed = g_vecStats.vectorized || g_vecStats.slpPacked ||
+                 g_vecStats.scalableVectorized;
+  return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

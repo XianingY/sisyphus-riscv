@@ -73,7 +73,7 @@ int computeOptimalJamFactor(const Op *innerBody, TypeKind mainType) {
   int usableRegs = (mainType == TypeKind::Float) ? kUsableFPRs : kUsableGPRs;
   int activeScalars = (mainType == TypeKind::Float) ? metrics.scalarFloatDefs : metrics.scalarIntDefs;
 
-  int bestFactor = 4;
+  int bestFactor = 1;
   for (int factor : {8, 7, 6, 4, 2}) {
     // Each jam lane keeps the active memory streams plus address/update
     // temporaries alive. Modeling those temporaries keeps the transform from
@@ -128,7 +128,7 @@ ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
   const int streamCount = std::max(2, readStreams + writeStreams);
   const int panelBudget = kL1DataCacheSize / 4;
   int cacheKc = panelBudget / std::max(elementBytes * streamCount * plan.nr, 1);
-  cacheKc = clampPow2(cacheKc, 8, 64);
+  cacheKc = clampPow2(cacheKc, 8, 32);
   plan.kc = hirEnvInt("SISY_HIR_MICRO_KC", cacheKc);
   if (plan.kc < 2) {
     plan.nr = 0;

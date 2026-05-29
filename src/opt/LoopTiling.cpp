@@ -1,4 +1,5 @@
 #include "LoopPasses.h"
+#include "AnalysisManager.h"
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -451,12 +452,20 @@ void LoopTiling::run() {
     for (auto func : collectFuncs())
       func->getRegion()->updatePreds();
 
-    LoopAnalysis analysis(module);
-    analysis.run();
+    std::map<FuncOp*, LoopForest> localForests;
+    std::map<FuncOp*, LoopForest> *forests = nullptr;
+    if (context() && context()->enabled())
+      forests = &context()->analysis().getLoopForests();
+    else {
+      LoopAnalysis analysis(module);
+      analysis.run();
+      localForests = analysis.getResult();
+      forests = &localForests;
+    }
 
     bool changed = false;
 
-    for (auto &[func, forest] : analysis.getResult()) {
+    for (auto &[func, forest] : *forests) {
       // Process innermost loops first: collect all candidate pairs.
       // A candidate is a 2-level nest where the inner has no subloops.
       for (auto loop : forest.getLoops()) {
@@ -545,9 +554,20 @@ void LoopTiling::run() {
       if (changed) break;
     }
 
+    if (changed && context() && context()->enabled())
+      context()->analysis().invalidate(PreservedAnalyses::none(),
+                                       "loop-tiling-internal");
     if (!changed) break;
   }
 
   for (auto func : collectFuncs())
     func->getRegion()->updatePreds();
+}
+
+PreservedAnalyses LoopTiling::run(PassContext &ctx) {
+  activeContext = &ctx;
+  int before = tiled;
+  run();
+  activeContext = nullptr;
+  return tiled == before ? PreservedAnalyses::all() : PreservedAnalyses::none();
 }

@@ -260,9 +260,17 @@ void DSE::runImpl(Region *region) {
     std::vector<Attr*> storeAttrs;
     if (first->has<SizeAttr>())
       storeAttrs.push_back(new SizeAttr(SIZE(first)));
-    builder.create<StoreOp>({ value, first->DEF(1) }, storeAttrs);
-    for (auto store : stores)
+    auto sunkStore = builder.create<StoreOp>({ value, first->DEF(1) }, storeAttrs);
+    MemorySSA *mssa = nullptr;
+    if (context() && context()->enabled()) {
+      mssa = &context()->analysis().getMemorySSA(region);
+      mssa->insertMemoryDef(sunkStore);
+    }
+    for (auto store : stores) {
+      if (mssa)
+        mssa->eraseMemoryOp(store);
       store->erase();
+    }
     sunk += static_cast<int>(stores.size()) - 1;
   }
 
@@ -375,6 +383,8 @@ void DSE::runImpl(Region *region) {
       continue;
 
     elim++;
+    if (context() && context()->enabled())
+      context()->analysis().getMemorySSA(region).eraseMemoryOp(store);
     store->erase();
   }
 }
@@ -414,8 +424,8 @@ void DSE::removeUnread(Op *op, const std::vector<Op*> &gets) {
   // Hasn't been read; all stores can be removed.
   for (auto x : stores) {
     if (context() && context()->enabled())
-      context()->analysis().invalidateMemory(x->getParent()->getParent(),
-                                             "dse-remove-unread");
+      context()->analysis().getMemorySSA(x->getParent()->getParent())
+          .eraseMemoryOp(x);
     x->erase();
   }
 }
@@ -510,8 +520,8 @@ void DSE::run() {
   elim += remove.size();
   for (auto op : remove) {
     if (context() && context()->enabled())
-      context()->analysis().invalidateMemory(op->getParent()->getParent(),
-                                             "dse-remove");
+      context()->analysis().getMemorySSA(op->getParent()->getParent())
+          .eraseMemoryOp(op);
     op->erase();
   }
 }
@@ -520,5 +530,7 @@ PreservedAnalyses DSE::run(PassContext &ctx) {
   activeContext = &ctx;
   run();
   activeContext = nullptr;
-  return PreservedAnalyses::cfg();
+  auto preserved = PreservedAnalyses::cfg();
+  preserved.preserve(PreservedAnalyses::MemorySSAAnalysis);
+  return preserved;
 }

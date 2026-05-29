@@ -3,6 +3,7 @@
 
 #include "HIRAffine.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -13,6 +14,146 @@
 namespace sys::hir {
 
 using namespace sys::hir::detail;
+
+namespace {
+
+struct TransposeFact {
+  std::string dst;
+  std::string src;
+};
+
+bool isScalarLoadOf(const Op *op, const std::string &symbol) {
+  return op && op->kind == OpKind::Load && op->children.empty() &&
+         op->symbol == symbol;
+}
+
+bool isConstBound(const Op *op, int value) {
+  return op && op->kind == OpKind::ConstInt && op->hasIntValue &&
+         op->intValue == value;
+}
+
+bool stmtHasCall(const Op *op) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Call)
+    return true;
+  for (const auto &child : op->children)
+    if (stmtHasCall(child.get()))
+      return true;
+  return false;
+}
+
+bool stmtWritesArray(const Op *op, const std::string &symbol) {
+  if (!op)
+    return false;
+  if (op->kind == OpKind::Store && op->children.size() > 1 &&
+      op->symbol == symbol)
+    return true;
+  for (const auto &child : op->children)
+    if (stmtWritesArray(child.get(), symbol))
+      return true;
+  return false;
+}
+
+bool statementInvalidatesFact(const Op *op, const TransposeFact &fact) {
+  return stmtHasCall(op) || stmtWritesArray(op, fact.dst) ||
+         stmtWritesArray(op, fact.src);
+}
+
+bool matchTransposeLoop(Op *block, size_t idx,
+                        const std::unordered_map<std::string, std::vector<int>> &dims,
+                        TransposeFact &fact) {
+  if (!block || idx == 0 || idx >= block->children.size())
+    return false;
+  Op *outerOp = block->children[idx].get();
+  CanonicalLoop outer;
+  if (!matchCanonicalWhile(outerOp, outer) ||
+      !matchLoopInit(block->children[idx - 1].get(), outer.iv) ||
+      !outer.body || outer.body->kind != OpKind::Block ||
+      outer.body->children.size() != 3)
+    return false;
+
+  Op *innerOp = outer.body->children[1].get();
+  CanonicalLoop inner;
+  if (!matchCanonicalWhile(innerOp, inner) ||
+      !matchLoopInit(outer.body->children[0].get(), inner.iv) ||
+      !inner.body || inner.body->kind != OpKind::Block ||
+      inner.body->children.size() != 2)
+    return false;
+
+  Op *store = asArrayStore(inner.body->children[0].get());
+  if (!store || store->children.size() != 3)
+    return false;
+  Op *value = store->children[2].get();
+  if (!value || value->kind != OpKind::Load || value->children.size() != 2 ||
+      value->symbol.empty() || value->symbol == store->symbol)
+    return false;
+
+  if (!isScalarLoadOf(store->children[0].get(), outer.iv) ||
+      !isScalarLoadOf(store->children[1].get(), inner.iv) ||
+      !isScalarLoadOf(value->children[0].get(), inner.iv) ||
+      !isScalarLoadOf(value->children[1].get(), outer.iv))
+    return false;
+
+  auto dstDims = dims.find(store->symbol);
+  auto srcDims = dims.find(value->symbol);
+  if (dstDims == dims.end() || srcDims == dims.end() ||
+      dstDims->second.size() != 2 || srcDims->second.size() != 2)
+    return false;
+  if (dstDims->second[0] != srcDims->second[1] ||
+      dstDims->second[1] != srcDims->second[0])
+    return false;
+  if (!isConstBound(outer.bound, dstDims->second[0]) ||
+      !isConstBound(inner.bound, dstDims->second[1]))
+    return false;
+
+  fact.dst = store->symbol;
+  fact.src = value->symbol;
+  return true;
+}
+
+bool rewriteTransposeLoad(Op *op, const TransposeFact &fact,
+                          const std::string &activeIV,
+                          PolyhedralStats &stats) {
+  if (!op || activeIV.empty() || op->kind != OpKind::Load ||
+      op->children.size() != 2)
+    return false;
+  bool dstToSrc = op->symbol == fact.dst;
+  bool srcToDst = op->symbol == fact.src;
+  if (!dstToSrc && !srcToDst)
+    return false;
+
+  const bool oldContiguous = exprUsesScalar(op->children[1].get(), activeIV);
+  const bool swappedContiguous = exprUsesScalar(op->children[0].get(), activeIV);
+  if (!swappedContiguous || oldContiguous)
+    return false;
+
+  std::swap(op->children[0], op->children[1]);
+  op->symbol = dstToSrc ? fact.src : fact.dst;
+  stats.transposeForwardedLoads++;
+  return true;
+}
+
+bool rewriteWithTransposeFacts(Op *op, const std::vector<TransposeFact> &facts,
+                               const std::string &activeIV,
+                               PolyhedralStats &stats) {
+  if (!op)
+    return false;
+  std::string nextIV = activeIV;
+  CanonicalLoop loop;
+  if (matchCanonicalWhile(op, loop))
+    nextIV = loop.iv;
+
+  bool changed = false;
+  for (const auto &fact : facts)
+    changed = rewriteTransposeLoad(op, fact, nextIV, stats) || changed;
+  for (auto &child : op->children)
+    changed = rewriteWithTransposeFacts(child.get(), facts, nextIV, stats) ||
+              changed;
+  return changed;
+}
+
+}  // namespace
 
 // ===========================================================================
 // Loop Tiling Implementation
@@ -136,15 +277,19 @@ bool PolyhedralOptimizer::tryLoopTiling(Op *block, size_t idx,
   auto tileInit = makeVarDecl(tileIV, makeLoad(outer.iv));
 
   // --- Splice into block ---
-  // Insert tileInit + tileWhile at position idx, replacing the original while.
-  // The original outer IV init (VarDecl/Store) before idx is kept intact
-  // (it just becomes dead-assigned; DCE will clean it up later).
+  // Insert tileInit + tileWhile + exit-fix at position idx, replacing the
+  // original while. The original outer IV init (VarDecl/Store) before idx is
+  // kept intact (it just becomes dead-assigned; DCE will clean it up later).
+  // The exit-fix sets the original IV to the original bound so code after the
+  // loop observes the same value as the canonical untiled loop (iv == bound).
+  auto exitFix = makeStore(outer.iv, cloneOp(outer.bound));
   std::vector<std::unique_ptr<Op>> replacement;
-  replacement.reserve(block->children.size() + 1);
+  replacement.reserve(block->children.size() + 2);
   for (size_t i = 0; i < block->children.size(); i++) {
     if (i == idx) {
       replacement.push_back(std::move(tileInit));
       replacement.push_back(std::move(tileWhile));
+      replacement.push_back(std::move(exitFix));
       // Skip the original while (don't push block->children[idx]).
     } else {
       replacement.push_back(std::move(block->children[i]));
@@ -335,6 +480,34 @@ bool PolyhedralOptimizer::forwardArrayStoreLoads(Op *block, PolyhedralStats &sta
     changed = true;
   }
 
+  return changed;
+}
+
+bool PolyhedralOptimizer::forwardTransposeLoads(Op *block,
+                                                PolyhedralStats &stats) {
+  if (!block || (block->kind != OpKind::Block && block->kind != OpKind::Module))
+    return false;
+
+  bool changed = false;
+  std::vector<TransposeFact> facts;
+  for (size_t i = 0; i < block->children.size(); i++) {
+    Op *stmt = block->children[i].get();
+    if (!stmt)
+      continue;
+
+    facts.erase(std::remove_if(facts.begin(), facts.end(),
+                               [&](const TransposeFact &fact) {
+                                 return statementInvalidatesFact(stmt, fact);
+                               }),
+                facts.end());
+
+    if (!facts.empty())
+      changed = rewriteWithTransposeFacts(stmt, facts, "", stats) || changed;
+
+    TransposeFact fact;
+    if (matchTransposeLoop(block, i, globalArrayDims, fact))
+      facts.push_back(std::move(fact));
+  }
   return changed;
 }
 
