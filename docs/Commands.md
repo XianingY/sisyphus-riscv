@@ -125,6 +125,7 @@ SISY_HIR_ENABLE_REDUCTION_PRIVATIZE=0 ./build/compiler testcase.sy -S -o tests/.
 SISY_HIR_ENABLE_REDUCTION_MICROTILE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_CONDITIONAL_ROW_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_CONDITIONAL_REDUCTION_MICROTILE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SYNTH_CONST_ARRAY=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 # Diagnostic cost-model overrides; never key off case identity.
 SISY_HIR_MICRO_NR=2 SISY_HIR_MICRO_KC=32 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_STENCIL_INTERIOR=1 SISY_HIR_STENCIL_SPLIT_COLUMNS=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
@@ -138,7 +139,6 @@ SISY_ENABLE_STRUCTURAL_BITWISE=1 ./build/compiler testcase.sy -S -o tests/.out/c
 SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
-SISY_ENABLE_SYNTH_CONST_ARRAY=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_ADVANCED_CONV2D=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
 

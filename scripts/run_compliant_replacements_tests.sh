@@ -56,11 +56,6 @@ const_stats="$("${COMPILER}" "${CASE_DIR}/const_array_scalar_replace.sy" -S \
 
 echo "${const_stats}"
 
-if grep -q '^synth-const-array:$' <<<"${const_stats}"; then
-  echo "SynthConstArray must stay opt-in; constant tables should use scalar replacement and SCCP" >&2
-  exit 1
-fi
-
 if ! grep -A3 '^inline-store:$' <<<"${const_stats}" | grep -Eq 'const-loads : [1-9]'; then
   echo "expected InlineStore to replace readonly constant-array loads with scalar constants" >&2
   exit 1

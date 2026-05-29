@@ -1,13 +1,13 @@
 # 深度优化状态跟踪
 
-最后更新：2026-06-XX
+最后更新：2026-05-30
 
 > 本文件是当前优化状态摘要。更早的 `docs/superpowers/specs/` 内容属于历史设计草案，不能替代源码、`docs/Compliance.md` 和 `docs/Optimization.md`。
 
 ## 当前总体结论
 
 - 默认优化路线已经从“语义识别替换”收敛到“通用编译器优化”。
-- 高风险 pass 默认关闭：`FunctionEquivalence`、`StructuralBitwise`、`StructuralModMul`、`RowScratchMatmul`、`Cached`、`SynthConstArray`、`AdvancedConv2DTransform`。
+- 高风险 pass 默认关闭：`FunctionEquivalence`、`StructuralBitwise`、`StructuralModMul`、`RowScratchMatmul`、`Cached`、`AdvancedConv2DTransform`；`SynthConstArray` 仅在已证明 readonly、affine index、全表验证的 source-constant synthesis 边界内默认允许。
 - 当前最稳的提分方向是 HIR affine/Presburger、MemorySSA-style 内存优化、SCEV/range、后端寄存器分配和调度。
 - RISC-V 目前是主力优化路径；ARM 分支仍需要同步更多后端和 HIR 侧收益。
 
@@ -34,7 +34,7 @@
 | `StructuralModMul` | 直接识别递归模乘并替换，风险高。 |
 | `RowScratchMatmul` | 替换矩阵循环为 helper，默认不作为合规路径。 |
 | `Cached` | 编译期预计算递归结果，有硬编码答案风险。 |
-| `SynthConstArray` | SMT 合成数组值，默认不启用。 |
+| `SynthConstArray` | 小型只读常量表表达式综合；默认仅允许全元素验证、无逃逸、affine index 的 RISC-V O1 路径。 |
 | `AdvancedConv2DTransform` | Winograd/im2col dispatcher 需要完整 affine/padding 合法性证明，否则不默认开启。 |
 
 ## 当前主要瓶颈与合规路线
@@ -44,7 +44,7 @@
 | `many_mat_cal` / `matmul` | 继续做 affine dependence、cache/register tiling、unroll-and-jam 成本模型、backend spill 控制。 |
 | `transpose` | 通用 2D cache tiling、stride-aware interchange、address recurrence、vector handoff。 |
 | `conv2d` | guarded/imperfect nest 提取、border peeling、interior 快路径、kernel 小常量循环展开，避免 conv-specific dispatcher。 |
-| `crc` / `huffman` | range 证明、parity select、spill-aware unroll、readonly load forwarding；不启用 bitwise 语义识别。 |
+| `crc` / `huffman` | range 证明、parity select、spill-aware unroll、readonly load forwarding、合规常量表综合；不启用 bitwise 语义识别。 |
 | `fft` | TCO、单路递归转循环、普通代数折叠、range 暴露 `/2` `%2`；不启用 modmul 识别。 |
 | `optimization_scheduling` | RegAlloc hotness、live-range splitting、rematerialization、pre-RA schedule，避免 recurrence 特判。 |
 

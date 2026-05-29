@@ -136,9 +136,27 @@ Best legal path:
 - parity if-conversion and select generation;
 - spill-aware partial unroll, not indiscriminate full unroll;
 - readonly/load-forwarding/LICM for tables and repeated global loads.
+- proven source-constant table synthesis for small readonly lookup arrays when
+  each element matches a fixed DSL expression and every replaced load has an
+  affine IR index.
 
 Do not use semantic function equivalence or structural bitwise recognizers in
 the default profile.
+
+### Proven Source-Constant Synthesis
+
+The default RISC-V O1 profile may run `SynthConstArray` on source-program
+integer lookup tables. This follows the aggressive-but-compliant boundary used
+by strong reference compilers: constants already present in the source may be
+represented in a cheaper form, provided the compiler proves the rewrite from
+IR facts instead of from benchmark identity.
+
+The pass must prove readonly/non-escaping global-address use, keep array size
+small, derive `base + 4 * affine_index` from existing IR/SCEV address facts,
+learn only constants for a fixed arithmetic/bitwise DSL, and validate the
+selected expression against every table element. It must not inspect source
+paths, case names, expected output, public input files, or checksums, and it
+must not rewrite loop exit conditions.
 
 ### FFT
 
@@ -199,7 +217,8 @@ important defaults as of this review:
 - `SISY_ENABLE_STRUCTURAL_MODMUL=false`
 - `SISY_ENABLE_ROW_SCRATCH_MATMUL=false`
 - `SISY_ENABLE_CACHED_PRECOMPUTE=false`
-- `SISY_ENABLE_SYNTH_CONST_ARRAY=false`
+- `SISY_ENABLE_SYNTH_CONST_ARRAY=true` for default RISC-V O1, with
+  `SISY_ENABLE_SYNTH_CONST_ARRAY=0` as the bisection kill switch
 - `SISY_ENABLE_ADVANCED_CONV2D=false`
 - `SISY_HIR_ENABLE_TILING=true`
 - `SISY_HIR_ENABLE_STENCIL_INTERIOR=false`
@@ -228,7 +247,8 @@ default compliance boundary:
 - compile-time recursive precomputation;
 - structural bitwise/modmul recognition;
 - row-scratch matrix helper replacement;
-- SMT-synthesized constant arrays;
+- synthesized constant arrays that lack full-table validation, readonly proof,
+  or affine-index proof;
 - semantic matrix summaries, transpose summaries, or checksum summaries;
 - conv-specific Winograd/im2col dispatch without a complete affine legality
   model;

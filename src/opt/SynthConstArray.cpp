@@ -1,8 +1,14 @@
 #include "SMTPasses.h"
 #include "LoopPasses.h"
 #include "../utils/Matcher.h"
+#include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace sys;
 using namespace smt;
@@ -169,13 +175,291 @@ SynthConstArray::SynthConstArray(ModuleOp *module): Pass(module) {
 
 namespace {
 
-Rule constIncr("(addl x 'a)");
-
 bool envEnabled(const char *name, bool fallback) {
   const char *raw = std::getenv(name);
   if (!raw || !raw[0])
     return fallback;
-  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
+
+int clampToInt(long long v) {
+  if (v > INT_MAX)
+    return INT_MAX;
+  if (v < INT_MIN)
+    return INT_MIN;
+  return (int) v;
+}
+
+struct LinearExpr {
+  long long constant = 0;
+  std::map<Op*, long long> terms;
+  bool valid = true;
+};
+
+void mergeLinear(LinearExpr &dst, const LinearExpr &src, long long scale = 1) {
+  if (!dst.valid || !src.valid)
+    return;
+  dst.constant += src.constant * scale;
+  for (auto [op, coeff] : src.terms)
+    dst.terms[op] += coeff * scale;
+}
+
+void canonicalizeLinear(LinearExpr &expr) {
+  for (auto it = expr.terms.begin(); it != expr.terms.end();) {
+    if (it->second == 0)
+      it = expr.terms.erase(it);
+    else
+      ++it;
+  }
+}
+
+bool collectLinear(Op *op, LinearExpr &out, std::unordered_set<Op*> &visiting) {
+  if (!out.valid || !op)
+    return out.valid = false;
+  if (isa<IntOp>(op)) {
+    out.constant += V(op);
+    return true;
+  }
+  if (visiting.count(op))
+    return out.valid = false;
+
+  visiting.insert(op);
+  bool ok = true;
+  if (isa<AddIOp>(op) || isa<AddLOp>(op) || isa<SubIOp>(op) || isa<SubLOp>(op)) {
+    LinearExpr lhs, rhs;
+    ok &= collectLinear(op->DEF(0), lhs, visiting);
+    ok &= collectLinear(op->DEF(1), rhs, visiting);
+    if (ok) {
+      mergeLinear(out, lhs);
+      mergeLinear(out, rhs, (isa<AddIOp>(op) || isa<AddLOp>(op)) ? 1 : -1);
+    }
+  } else if (isa<MinusOp>(op)) {
+    LinearExpr x;
+    ok &= collectLinear(op->DEF(), x, visiting);
+    if (ok)
+      mergeLinear(out, x, -1);
+  } else if (isa<MulIOp>(op) || isa<MulLOp>(op)) {
+    Op *lhs = op->DEF(0), *rhs = op->DEF(1);
+    if (isa<IntOp>(lhs) || isa<IntOp>(rhs)) {
+      int factor = isa<IntOp>(lhs) ? V(lhs) : V(rhs);
+      Op *other = isa<IntOp>(lhs) ? rhs : lhs;
+      LinearExpr x;
+      ok &= collectLinear(other, x, visiting);
+      if (ok)
+        mergeLinear(out, x, factor);
+    } else {
+      out.terms[op] += 1;
+    }
+  } else if (isa<PhiOp>(op) || op->getResultType() == Value::i32) {
+    out.terms[op] += 1;
+  } else {
+    ok = false;
+  }
+
+  visiting.erase(op);
+  if (!ok)
+    out.valid = false;
+  return out.valid;
+}
+
+bool divideByElementSize(LinearExpr &bytes) {
+  canonicalizeLinear(bytes);
+  if (bytes.constant % 4 != 0)
+    return false;
+  bytes.constant /= 4;
+  for (auto &[_, coeff] : bytes.terms) {
+    if (coeff % 4 != 0)
+      return false;
+    coeff /= 4;
+  }
+  canonicalizeLinear(bytes);
+  return true;
+}
+
+bool directIndexExpr(Op *addr, const std::string &global, LinearExpr &elems,
+                     std::unordered_set<Op*> &visiting) {
+  if (!addr || visiting.count(addr))
+    return false;
+  if (isa<GetGlobalOp>(addr))
+    return NAME(addr) == global;
+  if (!isa<AddLOp>(addr) && !isa<SubLOp>(addr))
+    return false;
+
+  visiting.insert(addr);
+  auto trySide = [&](int baseIdx, int offsetIdx, long long sign) {
+    LinearExpr baseElems;
+    std::unordered_set<Op*> nested;
+    if (!directIndexExpr(addr->DEF(baseIdx), global, baseElems, nested))
+      return false;
+    LinearExpr bytes;
+    std::unordered_set<Op*> linearVisiting;
+    if (!collectLinear(addr->DEF(offsetIdx), bytes, linearVisiting) ||
+        !divideByElementSize(bytes))
+      return false;
+    elems = baseElems;
+    mergeLinear(elems, bytes, sign);
+    canonicalizeLinear(elems);
+    return elems.valid;
+  };
+
+  bool ok = false;
+  if (isa<AddLOp>(addr))
+    ok = trySide(0, 1, 1) || trySide(1, 0, 1);
+  else
+    ok = trySide(0, 1, -1);
+  visiting.erase(addr);
+  return ok;
+}
+
+bool simpleAffineIndex(const LinearExpr &expr) {
+  int nonZeroTerms = 0;
+  for (auto [_, coeff] : expr.terms)
+    if (coeff != 0)
+      nonZeroTerms++;
+  return nonZeroTerms <= 1;
+}
+
+Op *buildIndexValue(Builder &builder, const LinearExpr &expr, Op *before) {
+  builder.setBeforeOp(before);
+  Op *acc = nullptr;
+  auto append = [&](Op *term) {
+    if (!acc)
+      acc = term;
+    else
+      acc = builder.create<AddIOp>(std::vector<Value>{ acc, term });
+  };
+
+  for (auto [term, coeff] : expr.terms) {
+    if (!coeff)
+      continue;
+    Op *scaled = term;
+    if (coeff != 1) {
+      auto c = builder.create<IntOp>({ new IntAttr(clampToInt(coeff)) });
+      scaled = builder.create<MulIOp>({ term, c });
+    }
+    append(scaled);
+  }
+  if (expr.constant != 0) {
+    auto c = builder.create<IntOp>({ new IntAttr(clampToInt(expr.constant)) });
+    append(c);
+  }
+  if (!acc)
+    acc = builder.create<IntOp>({ new IntAttr(0) });
+  return acc;
+}
+
+bool isPointerStep(Op *value, Op *phi, long long &stepBytes) {
+  if (!isa<AddLOp>(value) && !isa<SubLOp>(value))
+    return false;
+  if (value->DEF(0) == phi) {
+    if (!isa<IntOp>(value->DEF(1)))
+      return false;
+    stepBytes = isa<AddLOp>(value) ? V(value->DEF(1)) : -V(value->DEF(1));
+    return true;
+  }
+  if (isa<AddLOp>(value) && value->DEF(1) == phi && isa<IntOp>(value->DEF(0))) {
+    stepBytes = V(value->DEF(0));
+    return true;
+  }
+  return false;
+}
+
+Op *pointerPhiIndex(Op *phi, const std::string &global, Builder &builder,
+                    std::unordered_map<Op*, Op*> &cache) {
+  if (!isa<PhiOp>(phi) || phi->getOperandCount() != 2)
+    return nullptr;
+  if (cache.count(phi))
+    return cache[phi];
+
+  for (int latchIdx = 0; latchIdx < 2; ++latchIdx) {
+    long long stepBytes = 0;
+    auto latchValue = phi->DEF(latchIdx);
+    if (!isPointerStep(latchValue, phi, stepBytes) || stepBytes % 4 != 0)
+      continue;
+
+    int startIdx = 1 - latchIdx;
+    LinearExpr startElems;
+    std::unordered_set<Op*> visiting;
+    if (!directIndexExpr(phi->DEF(startIdx), global, startElems, visiting) ||
+        !startElems.valid || !startElems.terms.empty())
+      continue;
+
+    builder.setBeforeOp(phi->DEF(startIdx));
+    auto start = builder.create<IntOp>({ new IntAttr(clampToInt(startElems.constant)) });
+
+    builder.setBeforeOp(phi);
+    auto indexPhi = builder.create<PhiOp>({ start },
+                                          { new FromAttr(FROM(phi->getAttrs()[startIdx])) });
+    cache[phi] = indexPhi;
+
+    builder.setBeforeOp(latchValue);
+    auto step = builder.create<IntOp>({ new IntAttr(clampToInt(stepBytes / 4)) });
+    auto next = builder.create<AddIOp>({ indexPhi, step });
+    indexPhi->pushOperand(next);
+    indexPhi->add<FromAttr>(FROM(phi->getAttrs()[latchIdx]));
+    return indexPhi;
+  }
+  return nullptr;
+}
+
+Op *resolveIndexValue(Op *addr, const std::string &global, Op *before,
+                      Builder &builder, std::unordered_map<Op*, Op*> &phiCache) {
+  LinearExpr elems;
+  std::unordered_set<Op*> visiting;
+  if (directIndexExpr(addr, global, elems, visiting) && elems.valid &&
+      simpleAffineIndex(elems))
+    return buildIndexValue(builder, elems, before);
+
+  if (auto indexPhi = pointerPhiIndex(addr, global, builder, phiCache))
+    return indexPhi;
+
+  if (isa<AddLOp>(addr) || isa<SubLOp>(addr)) {
+    for (int phiIdx = 0; phiIdx < 2; ++phiIdx) {
+      if (isa<SubLOp>(addr) && phiIdx != 0)
+        continue;
+      auto indexPhi = pointerPhiIndex(addr->DEF(phiIdx), global, builder, phiCache);
+      if (!indexPhi)
+        continue;
+      LinearExpr bytes;
+      std::unordered_set<Op*> linearVisiting;
+      if (!collectLinear(addr->DEF(1 - phiIdx), bytes, linearVisiting) ||
+          !divideByElementSize(bytes))
+        continue;
+      LinearExpr elems2;
+      elems2.terms[indexPhi] = 1;
+      mergeLinear(elems2, bytes, isa<AddLOp>(addr) ? 1 : -1);
+      canonicalizeLinear(elems2);
+      if (simpleAffineIndex(elems2))
+        return buildIndexValue(builder, elems2, before);
+    }
+  }
+  return nullptr;
+}
+
+bool scanReadonlyUses(Op *root, std::vector<LoadOp*> &loads,
+                      std::unordered_set<Op*> &visited) {
+  if (!root || visited.count(root))
+    return true;
+  visited.insert(root);
+  auto uses = root->getUses();
+  for (auto use : uses) {
+    if (isa<LoadOp>(use) && use->DEF(0) == root) {
+      loads.push_back(cast<LoadOp>(use));
+      continue;
+    }
+    if (isa<StoreOp>(use))
+      return false;
+    if (isa<CallOp>(use) || isa<ReturnOp>(use))
+      return false;
+    if (isa<AddLOp>(use) || isa<SubLOp>(use) || isa<PhiOp>(use)) {
+      if (!scanReadonlyUses(use, loads, visited))
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 }
@@ -223,46 +507,50 @@ Op *SynthConstArray::reconstruct(smt::BvExpr *expr, Op *subscript, int c0, int c
 }
 
 void SynthConstArray::run() {
-  // Solver-synthesized formulas can look like benchmark-specific constant
-  // reconstruction, so keep this pass strict-mode opt-in only.
-  if (!envEnabled("SISY_ENABLE_SYNTH_CONST_ARRAY", false))
+  // Reference-compatible default: only source constants with a full-table
+  // proof may be synthesized, and every load still needs an affine IR index.
+  if (!envEnabled("SISY_ENABLE_SYNTH_CONST_ARRAY", true))
     return;
 
-  LoopAnalysis analysis(module);
-  analysis.run();
-  auto forests = analysis.getResult();
-
-  // Find out const arrays.
   auto gMap = getGlobalMap();
   auto gets = module->findAll<GetGlobalOp>();
-  for (auto get : gets) {
-    for (auto use : get->getUses()) {
-      if (isa<StoreOp>(use)) {
-        gMap.erase(NAME(get));
-        break;
-      }
-    }
-  }
+  std::unordered_map<Op*, Op*> pointerPhiCache;
 
-  // The remaining things in `gMap` are only read from,
-  // so they're const.
   for (auto [k, v] : gMap) {
     if (v->has<FloatArrayAttr>())
       continue;
 
-    // Only deal with integers.
     auto iarr = v->get<IntArrayAttr>();
     if (iarr->allZero)
       continue;
 
     auto ptr = iarr->vi;
     auto size = iarr->size;
-    if (size >= 256)
+    if (!ptr || size <= 0 || size > 256)
+      continue;
+    arraysConsidered++;
+
+    std::vector<LoadOp*> loads;
+    bool readonly = true;
+    for (auto get : gets) {
+      if (NAME(get) != k)
+        continue;
+      std::unordered_set<Op*> visited;
+      if (!scanReadonlyUses(get, loads, visited)) {
+        readonly = false;
+        break;
+      }
+    }
+    if (!readonly) {
+      rejectMutable++;
+      continue;
+    }
+    if (loads.empty())
       continue;
 
     // Try to work out a low-cost representation.
     BvExpr *correct = nullptr;
-    int c0, c1;
+    int c0 = 0, c1 = 0;
     for (auto expr : candidates) {
       // We need to ensure that for all `i <= size`, the expression is correct.
       // We use SMT solver to find out the constants.
@@ -296,100 +584,30 @@ void SynthConstArray::run() {
       }
     }
 
-    if (!correct)
+    if (!correct) {
+      rejectNoFormula++;
       continue;
-
-    // Now replace every load to this const array.
-    std::vector<Op*> getself;
-    for (auto get : gets) {
-      if (NAME(get) == k)
-        getself.push_back(get);
     }
 
-    for (auto get : getself) {
-      auto uses = get->getUses();
-      const auto &forest = forests[get->getParentOp<FuncOp>()];
-      for (auto use : uses) {
-        // Constant places should have been done elsewhere.
-        // We focus on loops.
-        if (!isa<PhiOp>(use))
-          continue;
-
-        auto parent = use->getParent();
-        // This phi is probably a loop header.
-        // The only place it can come from is SCEV.
-        LoopInfo *loop = nullptr;
-        for (auto l : forest.getLoops()) {
-          if (l->header == parent)
-            loop = l;
-        }
-        if (!loop)
-          continue;
-
-        auto latch = loop->getLatch();
-        auto latchval = Op::getPhiFrom(use, latch);
-        int latchidx = latchval != use->DEF(0);
-
-        // We don't know whether preheader exists currently.
-        auto preval = use->DEF(1 - latchidx);
-        auto from = FROM(use->getAttrs()[1 - latchidx]);
-
-        // This latchval should be an addition of fixed step.
-        if (!constIncr.match(latchval))
-          continue;
-
-        auto step = V(constIncr.extract("'a"));
-        
-        // If there's no induction variable, then we synthesize one.
-        auto induction = loop->getInduction();
-        if (!induction) {
-          // Add a zero from preheader.
-          builder.setBeforeOp(preval);
-          auto zero = builder.create<IntOp>({ new IntAttr(0) });
-
-          builder.setBeforeOp(use);
-          auto phi = builder.create<PhiOp>({ zero }, { new FromAttr(from) });
-
-          builder.setBeforeOp(latchval);
-          // Step of arrays will be sizeof(int) times larger.
-          auto cstep = builder.create<IntOp>({ new IntAttr(step / 4) });
-          auto incr = builder.create<AddIOp>({ phi, cstep });
-          phi->pushOperand(incr);
-          phi->add<FromAttr>(latch);
-
-          induction = phi;
-
-          // Replace branch condition.
-          auto term = latch->getLastOp();
-          if (isa<BranchOp>(term) && isa<LtOp>(term->DEF())) {
-            auto cond = term->DEF();
-            auto stop = cond->DEF(1);
-
-            // Create a new stop value for the induction variable.
-            builder.setAfterOp(stop);
-            auto diff = builder.create<SubLOp>({ stop->getResult(), preval });
-            auto four = builder.create<IntOp>({ new IntAttr(4) });
-            auto cstop = builder.create<DivIOp>({ diff, four });
-
-            // Change the condition.
-            builder.setBeforeOp(cond);
-            auto lt = builder.create<LtOp>({ incr, cstop });
-            term->setOperand(0, lt);
-          }
-        }
-
-        // Find all loads related to induction variable.
-        // TODO: also deal with things like `x[i + 'a]`.
-        auto phiuses = use->getUses();
-        for (auto phiuse : phiuses) {
-          if (isa<LoadOp>(phiuse)) {
-            // Substitute this with a reconstruction.
-            auto op = reconstruct(correct, induction, c0, c1);
-            phiuse->replaceAllUsesWith(op);
-            phiuse->erase();
-          }
-        }
+    bool synthesizedThisArray = false;
+    auto snapshot = loads;
+    for (auto load : snapshot) {
+      if (!load || !load->getParent())
+        continue;
+      auto index = resolveIndexValue(load->DEF(0), k, load, builder, pointerPhiCache);
+      if (!index) {
+        rejectNonAffineIndex++;
+        continue;
       }
+
+      builder.setBeforeOp(load);
+      auto replacement = reconstruct(correct, index, c0, c1);
+      load->replaceAllUsesWith(replacement);
+      load->erase();
+      loadsReplaced++;
+      synthesizedThisArray = true;
     }
+    if (synthesizedThisArray)
+      arraysSynthesized++;
   }
 }

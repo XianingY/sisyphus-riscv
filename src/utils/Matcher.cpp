@@ -302,6 +302,7 @@ int Rule::evalExpr(Expr *expr) {
   EVAL_BINARY("ne", !=);
   EVAL_BINARY("and", &);
   EVAL_BINARY("or", |);
+  EVAL_BINARY("xor", ^);
   EVAL_BINARY("lsh", <<);
   EVAL_BINARY("rsh", >>);
 
@@ -321,6 +322,11 @@ int Rule::evalExpr(Expr *expr) {
     if (!a)
       failed = true;
     return 0;
+  }
+  if (opname == "!xor") {
+    int a = evalExpr(list->elements[1]);
+    int b = evalExpr(list->elements[2]);
+    return a ^ b;
   }
 
   std::cerr << "unknown opname: " << opname << "\n";
@@ -411,6 +417,7 @@ Op *Rule::buildExpr(Expr *expr) {
   BUILD_BINARY("mod", ModIOp);
   BUILD_BINARY("and", AndIOp);
   BUILD_BINARY("or", OrIOp);
+  BUILD_BINARY("xor", XorIOp);
   BUILD_BINARY("eq", EqOp);
   BUILD_BINARY("ne", NeOp);
   BUILD_BINARY("le", LeOp);

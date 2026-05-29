@@ -1,0 +1,13 @@
+const int lut[8] = {11, -3, 29, 4, 17, 2, 31, -8};
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 8) {
+    sum = sum + lut[i];
+    i = i + 1;
+  }
+  putint(sum);
+  putch(10);
+  return 0;
+}

@@ -39,23 +39,69 @@ require_absent() {
   fi
 }
 
+require_stat() {
+  local haystack="$1"
+  local pass="$2"
+  local pattern="$3"
+  local message="$4"
+  if ! grep -A10 "^${pass}:$" <<<"${haystack}" | grep -Eq "${pattern}"; then
+    echo "${message}" >&2
+    exit 1
+  fi
+}
+
 o1_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o1.rv.s" \
   -O1 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
 
 echo "${o1_stats}"
 
 require_present "${o1_stats}" "\\[hir-poly\\]" \
-  "expected HIR polyhedral optimizer stats in strict default O1"
+  "expected HIR polyhedral optimizer stats in reference-compliant default O1"
 require_present "${o1_stats}" "^runtime-memoize:" \
-  "expected runtime memoization pass to remain in strict default O1"
+  "expected runtime memoization pass to remain in reference-compliant default O1"
 require_absent "${o1_stats}" "^function-equivalence:" \
-  "semantic function equivalence replacement must be opt-in under strict defaults"
+  "semantic function equivalence replacement must be opt-in under reference-compliant defaults"
 require_absent "${o1_stats}" "^structural-bitwise:" \
-  "structural bitwise recognizer must be opt-in under strict defaults"
+  "structural bitwise recognizer must be opt-in under reference-compliant defaults"
 require_absent "${o1_stats}" "^structural-modmul:" \
-  "structural modular multiplication recognizer must be opt-in under strict defaults"
+  "structural modular multiplication recognizer must be opt-in under reference-compliant defaults"
 require_absent "${o1_stats}" "^row-scratch-matmul:" \
-  "row-scratch matrix helper replacement must be opt-in under strict defaults"
+  "row-scratch matrix helper replacement must be opt-in under reference-compliant defaults"
+require_absent "${o1_stats}" "^cached:" \
+  "compile-time recursive precompute cache must be opt-in under reference-compliant defaults"
+
+synth_positive="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_positive.sy" \
+  -S -o "${OUT_DIR}/synth_const_array_positive.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/synth_const_array_positive.out" \
+  2>&1 >/dev/null)"
+echo "${synth_positive}"
+require_stat "${synth_positive}" "synth-const-array" "arrays-synthesized : [1-9]" \
+  "expected proven source-constant arrays to synthesize under reference-compliant O1"
+require_stat "${synth_positive}" "synth-const-array" "loads-replaced : [1-9]" \
+  "expected proven source-constant array loads to be replaced under reference-compliant O1"
+
+synth_mutable="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_mutable_negative.sy" \
+  -S -o "${OUT_DIR}/synth_const_array_mutable_negative.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/synth_const_array_mutable_negative.out" \
+  2>&1 >/dev/null)"
+echo "${synth_mutable}"
+require_stat "${synth_mutable}" "synth-const-array" "loads-replaced : 0" \
+  "mutable or escaping arrays must not be synthesized"
+require_stat "${synth_mutable}" "synth-const-array" "reject-mutable : [1-9]" \
+  "expected mutable global-array rejection to be reported"
+
+synth_nonformula="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_nonformula_negative.sy" \
+  -S -o "${OUT_DIR}/synth_const_array_nonformula_negative.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/synth_const_array_nonformula_negative.out" \
+  2>&1 >/dev/null)"
+echo "${synth_nonformula}"
+require_stat "${synth_nonformula}" "synth-const-array" "loads-replaced : 0" \
+  "arrays outside the formula DSL must not be synthesized"
+require_stat "${synth_nonformula}" "synth-const-array" "reject-no-formula : [1-9]" \
+  "expected no-formula global-array rejection to be reported"
 
 o2_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o2.rv.s" \
   -O2 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
@@ -63,11 +109,11 @@ o2_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o2.rv.s" \
 echo "${o2_stats}"
 
 require_absent "${o2_stats}" "^function-equivalence:" \
-  "semantic function equivalence replacement must be opt-in under strict default O2"
+  "semantic function equivalence replacement must be opt-in under reference-compliant default O2"
 require_absent "${o2_stats}" "^cached:" \
-  "compile-time recursive precompute cache must be opt-in under strict defaults"
+  "compile-time recursive precompute cache must be opt-in under reference-compliant defaults"
 require_absent "${o2_stats}" "^synth-const-array:" \
-  "SMT synthesized constant arrays must be opt-in under strict defaults"
+  "O2 heavy synthesized constant-array path remains opt-in outside the O1 target profile"
 
 check_no_fixed_output() {
   local src="$1"
@@ -98,4 +144,4 @@ check_no_fixed_output \
   "${OUT_DIR}/optimization_scheduling1.rv.s" \
   "optimization_scheduling1"
 
-echo "Strict compliance default-pass tests passed."
+echo "Reference-compliant default-pass tests passed."

@@ -48,7 +48,6 @@ for src in "${cases[@]}"; do
   fi
 
   for forbidden in \
-    'synth-const-array' \
     'cached' \
     'function-equivalence' \
     'structural-bitwise' \

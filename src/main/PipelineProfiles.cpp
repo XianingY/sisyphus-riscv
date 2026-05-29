@@ -341,6 +341,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::BoundsCheck>();
       pm.addPass<sys::SimplifyCFG>();
     }
+    if (opts.rv && !aggressive &&
+        getenvEnabled("SISY_ENABLE_SYNTH_CONST_ARRAY", true))
+      pm.addPass<sys::SynthConstArray>();
     pm.addPass<sys::AggressiveDCE>();
     // Re-canonicalize and re-rotate just-in-time before the late Vectorize
     // pass. Earlier passes (LICM, ScalarReplace, ConstLoopUnroll, post-unroll

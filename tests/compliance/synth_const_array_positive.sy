@@ -1,0 +1,15 @@
+const int add_lut[8] = {3, 4, 5, 6, 7, 8, 9, 10};
+const int xor_lut[8] = {5, 4, 7, 6, 1, 0, 3, 2};
+const int and_lut[8] = {0, 1, 2, 3, 0, 1, 2, 3};
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 8) {
+    sum = sum + add_lut[i] + xor_lut[i] + and_lut[i];
+    i = i + 1;
+  }
+  putint(sum);
+  putch(10);
+  return 0;
+}
