@@ -587,7 +587,6 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   const bool hitHugeScore = score >= hugeScoreThreshold;
   const bool highParamPressure =
       plan.metrics.maxGetArgArity > 8 || plan.metrics.getArgCount >= 256 ||
-      (plan.metrics.moduleOpCount >= 1000 && plan.metrics.callLikeCount >= 8) ||
       opts.inputFile.find("39_fp_params") != std::string::npos;
   // O1 also needs a conservative lane for very branch/call-heavy functional
   // programs. These stress late CFG and backend allocation without helping
