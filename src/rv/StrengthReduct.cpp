@@ -430,11 +430,15 @@ int StrengthReduct::runImpl() {
     //   %quot = x / y
     //   %mul = %quot * y
     //   x - %mul
-    converted++;
-    builder.setBeforeOp(op);
-    auto quot = builder.create<DivwOp>(op->getOperands(), op->getAttrs());
-    auto mul = builder.create<MulwOp>({ quot, y });
-    builder.replace<SubwOp>(op, { x, mul });
+    if (false) {
+      converted++;
+      builder.setBeforeOp(op);
+      auto quot = builder.create<DivwOp>(op->getOperands(), op->getAttrs());
+      auto mul = builder.create<MulwOp>({ quot, y });
+      builder.replace<SubwOp>(op, { x, mul });
+
+      return false;
+    }
 
     return false;
   });

@@ -50,7 +50,7 @@ emit_suite_cases() {
       "${suite}" "${tier}" "${kind}" "${case_id}" \
       "$(abs_path "${src}")" "$(abs_path "${in_file}")" "$(abs_path "${out_file}")" "${enabled}" \
       >>"${OUT_CSV}"
-  done < <(find "${root}" -type f -name '*.sy' -print0 | sort -z)
+  done < <(find -L "${root}" -type f -name '*.sy' -print0 | sort -z)
 }
 
 emit_suite_cases "official-functional" "hard" "functional"
