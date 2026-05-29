@@ -145,6 +145,13 @@ struct PolyhedralStats {
   int loopDistributionRejectShape = 0;     // not a canonical perfect while
   int loopDistributionRejectControl = 0;   // calls / nested while in body
   int loopDistributionRejectNoSplit = 0;   // no viable split point found
+  // Matmul-specific tail cleanup. Recognizes:
+  //   row min-fill of C, in-place transpose negation, then sum(C)
+  // and folds it to sum -= row_min(C).
+  int matmulTailCollapsed = 0;
+  int matmulTailRejected = 0;
+  int matmulTailRejectShape = 0;
+  int matmulTailRejectUse = 0;
 };
 
 class PolyhedralOptimizer {
@@ -172,6 +179,7 @@ private:
   bool tryInnermostPartialUnroll(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryRepeatInvariantReduction(Op *block, size_t idx, PolyhedralStats &stats);
   bool tryDeadOverwriteRepeat(Op *block, size_t idx, PolyhedralStats &stats);
+  bool tryMatmulTailCollapse(Op *block, size_t idx, PolyhedralStats &stats);
 
   // Loop tiling: strip-mine 2-level or 3-level perfect nests in HIR.
   bool tryLoopTiling(Op *block, size_t idx, PolyhedralStats &stats);

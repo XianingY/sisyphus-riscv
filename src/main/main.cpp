@@ -536,6 +536,10 @@ int main(int argc, char **argv) {
                       << " loop-distribution-reject-shape=" << stats.loopDistributionRejectShape
                       << " loop-distribution-reject-control=" << stats.loopDistributionRejectControl
                       << " loop-distribution-reject-no-split=" << stats.loopDistributionRejectNoSplit
+                      << " matmul-tail-collapsed=" << stats.matmulTailCollapsed
+                      << " matmul-tail-rejected=" << stats.matmulTailRejected
+                      << " matmul-tail-reject-shape=" << stats.matmulTailRejectShape
+                      << " matmul-tail-reject-use=" << stats.matmulTailRejectUse
                       << "\n";
           }
         });

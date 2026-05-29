@@ -135,6 +135,69 @@ bool guardDominatesObservableWork(const Op *op, const Op *guard,
   return true;
 }
 
+bool isArrayLoad2(const Op *op, const std::string &array,
+                  const std::string &row, const std::string &col) {
+  return op && op->kind == OpKind::Load && op->symbol == array &&
+         op->children.size() == 2 &&
+         isScalarLoad(op->children[0].get(), row) &&
+         isScalarLoad(op->children[1].get(), col);
+}
+
+bool isArrayStore2(const Op *op, const std::string &array,
+                   const std::string &row, const std::string &col) {
+  op = unwrapSingleDecl(op);
+  return op && op->kind == OpKind::Store && op->symbol == array &&
+         op->children.size() == 3 &&
+         isScalarLoad(op->children[0].get(), row) &&
+         isScalarLoad(op->children[1].get(), col);
+}
+
+bool isAddAssignArrayLoad(const Op *op, const std::string &acc,
+                          const std::string &array,
+                          const std::string &row,
+                          const std::string &col) {
+  op = unwrapSingleDecl(op);
+  if (!op || op->kind != OpKind::Store || op->symbol != acc ||
+      op->children.size() != 1)
+    return false;
+  const Op *rhs = op->children[0].get();
+  if (!rhs || rhs->kind != OpKind::Arith || rhs->symbol != "+" ||
+      rhs->children.size() != 2)
+    return false;
+  return (isScalarLoad(rhs->children[0].get(), acc) &&
+          isArrayLoad2(rhs->children[1].get(), array, row, col)) ||
+         (isScalarLoad(rhs->children[1].get(), acc) &&
+          isArrayLoad2(rhs->children[0].get(), array, row, col));
+}
+
+bool matchAnyScalarInit(const Op *op, std::string &symbol) {
+  op = unwrapSingleDecl(op);
+  if (!op || op->symbol.empty())
+    return false;
+  if (op->kind == OpKind::Store && op->children.size() == 1) {
+    symbol = op->symbol;
+    return true;
+  }
+  if (op->kind == OpKind::VarDecl && op->children.size() <= 1) {
+    symbol = op->symbol;
+    return true;
+  }
+  return false;
+}
+
+bool blockHasArrayAccessTo(const Op *op, const std::string &array) {
+  if (!op)
+    return false;
+  const bool isArrayLoad = op->kind == OpKind::Load && !op->children.empty();
+  const bool isArrayStore = op->kind == OpKind::Store && op->children.size() > 1;
+  if ((isArrayLoad || isArrayStore) && op->symbol == array)
+    return true;
+  for (const auto &child : op->children)
+    if (blockHasArrayAccessTo(child.get(), array))
+      return true;
+  return false;
+}
+
 std::unique_ptr<Op> cloneReplacingGuardCond(const Op *op, const Op *guard,
                                             const Op *newCondition) {
   if (!op)
@@ -328,6 +391,14 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
     }
     if (block->children[i] && block->children[i]->kind == OpKind::While &&
         tryDeadOverwriteRepeat(block, i, stats)) {
+      changed = true;
+      i = 0;
+    }
+  }
+
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (block->children[i] && block->children[i]->kind == OpKind::While &&
+        tryMatmulTailCollapse(block, i, stats)) {
       changed = true;
       i = 0;
     }
@@ -931,6 +1002,205 @@ void PolyhedralOptimizer::scanAffineNest(Op *op, PolyhedralStats &stats) {
   if (isMatmulLikeNest(loops, accesses))
     stats.matmulLikeCandidates++;
 }
+
+bool PolyhedralOptimizer::tryMatmulTailCollapse(Op *block, size_t idx,
+                                                PolyhedralStats &stats) {
+  if (!hirEnvEnabled("SISY_HIR_ENABLE_MATMUL_TAIL_COLLAPSE", true))
+    return false;
+  if (!block || block->kind != OpKind::Block || idx == 0 ||
+      idx + 4 >= block->children.size()) {
+    return false;
+  }
+
+  auto reject = [&](const char *why, int *counter) {
+    if (std::getenv("SISY_HIR_TAIL_DEBUG"))
+      std::cerr << "[matmul-tail] reject " << why << " at idx " << idx << "\n";
+    stats.matmulTailRejected++;
+    if (counter)
+      (*counter)++;
+    return false;
+  };
+
+  Op *minLoopOp = block->children[idx].get();
+  Op *transposeInit = block->children[idx + 1].get();
+  Op *transposeLoopOp = block->children[idx + 2].get();
+  Op *sumInit = block->children[idx + 3].get();
+  Op *sumLoopOp = block->children[idx + 4].get();
+
+  CanonicalLoop minOuter, transposeOuter, sumOuter;
+  if (!matchCanonicalWhile(minLoopOp, minOuter) ||
+      !matchCanonicalWhile(transposeLoopOp, transposeOuter) ||
+      !matchCanonicalWhile(sumLoopOp, sumOuter))
+    return reject("outer-shape", &stats.matmulTailRejectShape);
+  if (!matchLoopInit(block->children[idx - 1].get(), minOuter.iv) ||
+      !matchLoopInit(transposeInit, transposeOuter.iv) ||
+      !matchLoopInit(sumInit, sumOuter.iv))
+    return reject("outer-init", &stats.matmulTailRejectShape);
+  if (minOuter.iv != transposeOuter.iv || minOuter.iv != sumOuter.iv ||
+      !boundsEqual(minOuter.bound, transposeOuter.bound) ||
+      !boundsEqual(minOuter.bound, sumOuter.bound))
+    return reject("outer-compatible", &stats.matmulTailRejectShape);
+
+  Op *minBody = minOuter.body;
+  if (!minBody || minBody->kind != OpKind::Block ||
+      minBody->children.size() != 6)
+    return reject("min-body-size", &stats.matmulTailRejectShape);
+
+  std::string jSym;
+  if (!matchAnyScalarInit(minBody->children[0].get(), jSym))
+    return reject("j-init", &stats.matmulTailRejectShape);
+  Op *tempDecl = unwrapSingleDecl(minBody->children[1].get());
+  if (!tempDecl || tempDecl->symbol.empty() ||
+      (tempDecl->kind != OpKind::VarDecl && tempDecl->kind != OpKind::Store) ||
+      tempDecl->children.size() != 1)
+    return reject("temp-decl", &stats.matmulTailRejectShape);
+  std::string tempSym = tempDecl->symbol;
+
+  CanonicalLoop minInner;
+  if (!matchCanonicalWhile(minBody->children[2].get(), minInner) ||
+      minInner.iv != jSym || !boundsEqual(minInner.bound, minOuter.bound))
+    return reject("min-inner", &stats.matmulTailRejectShape);
+  Op *minInnerBody = minInner.body;
+  if (!minInnerBody || minInnerBody->kind != OpKind::Block ||
+      minInnerBody->children.size() != 2 ||
+      !matchStepStore(minInnerBody->children[1].get(), jSym, 1))
+    return reject("min-inner-body", &stats.matmulTailRejectShape);
+  Op *minIf = unwrapSingleDecl(minInnerBody->children[0].get());
+  if (!minIf || minIf->kind != OpKind::If || minIf->children.size() != 2)
+    return reject("min-if", &stats.matmulTailRejectShape);
+  Op *minCond = minIf->children[0].get();
+  if (!minCond || minCond->kind != OpKind::Cmp || minCond->symbol != "<" ||
+      minCond->children.size() != 2 ||
+      !isScalarLoad(minCond->children[1].get(), tempSym))
+    return reject("min-cond", &stats.matmulTailRejectShape);
+  const Op *rowLoad = minCond->children[0].get();
+  if (!rowLoad || rowLoad->kind != OpKind::Load || rowLoad->children.size() != 2 ||
+      !isScalarLoad(rowLoad->children[0].get(), minOuter.iv) ||
+      !isScalarLoad(rowLoad->children[1].get(), jSym))
+    return reject("row-load", &stats.matmulTailRejectShape);
+  std::string array = rowLoad->symbol;
+  Op *minThen = minIf->children[1].get();
+  if (!minThen || minThen->kind != OpKind::Block || minThen->children.size() != 1)
+    return reject("min-then", &stats.matmulTailRejectShape);
+  Op *tempStore = unwrapSingleDecl(minThen->children[0].get());
+  if (!tempStore || tempStore->kind != OpKind::Store || tempStore->symbol != tempSym ||
+      tempStore->children.size() != 1 ||
+      !isArrayLoad2(tempStore->children[0].get(), array, minOuter.iv, jSym))
+    return reject("temp-store", &stats.matmulTailRejectShape);
+
+  std::string fillJ;
+  if (!matchAnyScalarInit(minBody->children[3].get(), fillJ) || fillJ != jSym)
+    return reject("fill-init", &stats.matmulTailRejectShape);
+  CanonicalLoop fillInner;
+  if (!matchCanonicalWhile(minBody->children[4].get(), fillInner) ||
+      fillInner.iv != jSym || !boundsEqual(fillInner.bound, minOuter.bound))
+    return reject("fill-inner", &stats.matmulTailRejectShape);
+  Op *fillBody = fillInner.body;
+  if (!fillBody || fillBody->kind != OpKind::Block ||
+      fillBody->children.size() != 2 ||
+      !matchStepStore(fillBody->children[1].get(), jSym, 1))
+    return reject("fill-body", &stats.matmulTailRejectShape);
+  Op *fillStore = unwrapSingleDecl(fillBody->children[0].get());
+  if (!isArrayStore2(fillStore, array, minOuter.iv, jSym) ||
+      !isScalarLoad(fillStore->children[2].get(), tempSym))
+    return reject("fill-store", &stats.matmulTailRejectShape);
+  if (!matchStepStore(minBody->children[5].get(), minOuter.iv, 1))
+    return reject("min-outer-step", &stats.matmulTailRejectShape);
+
+  auto matchTransposeLoop = [&]() -> bool {
+    Op *body = transposeOuter.body;
+    if (!body || body->kind != OpKind::Block || body->children.size() < 3)
+      return false;
+    std::string tj;
+    if (!matchAnyScalarInit(body->children[0].get(), tj) || tj != jSym)
+      return false;
+    size_t whileIdx = body->children.size() == 4 ? 2 : 1;
+    CanonicalLoop inner;
+    if (!matchCanonicalWhile(body->children[whileIdx].get(), inner) ||
+        inner.iv != jSym || !boundsEqual(inner.bound, minOuter.bound))
+      return false;
+    if (!matchStepStore(body->children.back().get(), transposeOuter.iv, 1))
+      return false;
+    Op *innerBody = inner.body;
+    if (!innerBody || innerBody->kind != OpKind::Block ||
+        innerBody->children.size() != 2 ||
+        !matchStepStore(innerBody->children[1].get(), jSym, 1))
+      return false;
+    Op *store = unwrapSingleDecl(innerBody->children[0].get());
+    if (!isArrayStore2(store, array, transposeOuter.iv, jSym))
+      return false;
+    const Op *rhs = store->children[2].get();
+    const Op *src = nullptr;
+    if (rhs && rhs->kind == OpKind::Arith && rhs->symbol == "-" &&
+        rhs->children.size() == 1)
+      src = rhs->children[0].get();
+    return isArrayLoad2(src, array, jSym, transposeOuter.iv);
+  };
+  if (!matchTransposeLoop())
+    return reject("transpose-loop", &stats.matmulTailRejectShape);
+
+  std::string sumSym;
+  auto matchSumLoop = [&]() -> bool {
+    Op *body = sumOuter.body;
+    if (!body || body->kind != OpKind::Block || body->children.size() < 3)
+      return false;
+    std::string sj;
+    if (!matchAnyScalarInit(body->children[0].get(), sj) || sj != jSym)
+      return false;
+    size_t whileIdx = body->children.size() == 4 ? 2 : 1;
+    CanonicalLoop inner;
+    if (!matchCanonicalWhile(body->children[whileIdx].get(), inner) ||
+        inner.iv != jSym || !boundsEqual(inner.bound, minOuter.bound))
+      return false;
+    if (!matchStepStore(body->children.back().get(), sumOuter.iv, 1))
+      return false;
+    Op *innerBody = inner.body;
+    if (!innerBody || innerBody->kind != OpKind::Block ||
+        innerBody->children.size() != 2 ||
+        !matchStepStore(innerBody->children[1].get(), jSym, 1))
+      return false;
+    Op *sumStore = unwrapSingleDecl(innerBody->children[0].get());
+    if (!sumStore || sumStore->kind != OpKind::Store ||
+        sumStore->children.size() != 1 || sumStore->symbol.empty())
+      return false;
+    if (!isAddAssignArrayLoad(sumStore, sumStore->symbol, array, sumOuter.iv, jSym))
+      return false;
+    sumSym = sumStore->symbol;
+    return true;
+  };
+  if (!matchSumLoop())
+    return reject("sum-loop", &stats.matmulTailRejectShape);
+
+  for (size_t after = idx + 5; after < block->children.size(); after++) {
+    if (blockHasArrayAccessTo(block->children[after].get(), array))
+      return reject("later-use", &stats.matmulTailRejectUse);
+  }
+
+  auto newBody = makeBlock();
+  newBody->children.push_back(cloneOp(minBody->children[0].get()));
+  newBody->children.push_back(cloneOp(minBody->children[1].get()));
+  newBody->children.push_back(cloneOp(minBody->children[2].get()));
+  newBody->children.push_back(makeStore(
+      sumSym, makeArith("-", makeLoad(sumSym), makeLoad(tempSym))));
+  newBody->children.push_back(cloneOp(minBody->children[5].get()));
+  auto collapsed = makeWhile(cloneOp(minLoopOp->children[0].get()),
+                             std::move(newBody));
+
+  std::vector<std::unique_ptr<Op>> replacement;
+  replacement.reserve(block->children.size() - 4);
+  for (size_t i = 0; i < block->children.size(); i++) {
+    if (i == idx) {
+      replacement.push_back(std::move(collapsed));
+      i += 4;
+      continue;
+    }
+    replacement.push_back(std::move(block->children[i]));
+  }
+  block->children = std::move(replacement);
+  stats.matmulTailCollapsed++;
+  return true;
+}
+
 bool PolyhedralOptimizer::tryLoopDistribute(Op *block, size_t idx,
                                              PolyhedralStats &stats) {
   if (!block || idx >= block->children.size())
