@@ -434,7 +434,7 @@ bool PolyhedralOptimizer::tryReductionMicroTile(Op *block, size_t initIndex,
   }
   const bool conditional = pat.kReductionStmt != pat.accUpdate;
   if (conditional &&
-      (!hirEnvEnabled("SISY_HIR_ENABLE_CONDITIONAL_REDUCTION_MICROTILE", false) ||
+      (!hirEnvEnabled("SISY_HIR_ENABLE_CONDITIONAL_REDUCTION_MICROTILE", true) ||
        !conditionalReductionMicroTileLegal(pat, globalArrays))) {
     stats.reductionMicroTileRejectPressure++;
     return false;

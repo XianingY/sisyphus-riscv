@@ -248,5 +248,8 @@ bool fusionWithinCacheBudget(const Op *bodyA, const Op *bodyB);
 bool writesScalarHere(const Op *op, const std::string &symbol);
 bool scalarUsedBeforeRedef(const Op *block, size_t startIdx,
                            const std::string &symbol);
+void collectAdditiveReductionScalars(const Op *op,
+                                     const std::unordered_set<std::string> &loopIVs,
+                                     std::unordered_set<std::string> &accs);
 
 }  // namespace sys::hir::detail

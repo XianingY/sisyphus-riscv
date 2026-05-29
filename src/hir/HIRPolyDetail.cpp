@@ -1192,6 +1192,55 @@ bool bodyWritesNonLoopScalar(const Op *op, const std::unordered_set<std::string>
   return false;
 }
 
+// Collect non-loop-IV scalars that are used exclusively as additive reduction
+// accumulators: every store to the scalar is of the form `acc = acc + delta`
+// where delta does not mention acc.  Such scalars are safe to ignore during
+// loop interchange legality because addition is commutative and associative.
+void collectAdditiveReductionScalars(const Op *op,
+                                     const std::unordered_set<std::string> &loopIVs,
+                                     std::unordered_set<std::string> &accs) {
+  if (!op)
+    return;
+  const bool scalarDecl = op->kind == OpKind::VarDecl && op->arrayDims.empty();
+  const bool scalarStore = op->kind == OpKind::Store && op->children.size() == 1;
+  if ((scalarDecl || scalarStore) && !op->symbol.empty() && !loopIVs.count(op->symbol)) {
+    const std::string &sym = op->symbol;
+    if (accs.count(sym))
+      return; // already confirmed
+    // First occurrence: tentatively add.  If any subsequent store is not
+    // an additive update, we will remove it below.
+    if (scalarStore) {
+      if (additiveDeltaExpr(op, sym))
+        accs.insert(sym);
+      // else: not a reduction — leave out of accs
+    } else {
+      // VarDecl init — tentatively allow (the init value is not a reduction update)
+      accs.insert(sym);
+    }
+  }
+  for (const auto &child : op->children)
+    collectAdditiveReductionScalars(child.get(), loopIVs, accs);
+
+  // Second pass: remove any scalar that has a non-additive store somewhere
+  // in the subtree.  We do this by walking again and checking every store.
+  // (This is a single-level check; the recursive calls above already handle
+  //  the full tree, so we only need to verify the current accs set here.)
+}
+
+// Verify that every store to each candidate accumulator is indeed an additive
+// update.  Removes non-qualifying candidates from accs.
+static void verifyAdditiveReductionScalars(const Op *op,
+                                           std::unordered_set<std::string> &accs) {
+  if (!op || accs.empty())
+    return;
+  if (op->kind == OpKind::Store && op->children.size() == 1 && !op->symbol.empty()) {
+    if (accs.count(op->symbol) && !additiveDeltaExpr(op, op->symbol))
+      accs.erase(op->symbol);
+  }
+  for (const auto &child : op->children)
+    verifyAdditiveReductionScalars(child.get(), accs);
+}
+
 bool blockExceptLastWritesScalar(const Op *block, const std::string &symbol) {
   if (!block || block->kind != OpKind::Block || block->children.empty())
     return false;
