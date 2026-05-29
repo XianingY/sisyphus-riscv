@@ -287,7 +287,7 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
       }
     }
 
-    if (hirEnvEnabled("SISY_HIR_ENABLE_TRANSPOSE_FORWARDING", true))
+    if (hirEnvEnabled("SISY_HIR_ENABLE_TRANSPOSE_FORWARDING", false))
       changed = forwardTransposeLoads(block, stats) || changed;
   }
 
