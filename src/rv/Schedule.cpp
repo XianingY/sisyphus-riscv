@@ -96,6 +96,7 @@ bool isPinned(Op *op) {
          isa<BltOp>(op) || isa<BgeOp>(op) ||
          isa<BleOp>(op) || isa<BgtOp>(op) ||
          isa<WriteRegOp>(op) || isa<ReadRegOp>(op) ||
+         isa<SubSpOp>(op) ||
          isa<VsetvliOp>(op) || isa<VsetvliResultOp>(op) ||
          isa<PlaceHolderOp>(op);
 }

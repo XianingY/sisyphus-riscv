@@ -770,6 +770,14 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   if (unroll <= 1)
     return false;
 
+  // The full-unroll side-loop rewriter clones the header/latch region and then
+  // patches the original latch into the clone chain. Single-block loops have
+  // header == latch; rewriting them through this path can collapse the cloned
+  // body into an unconditional self-loop after later CFG cleanup. Leave those
+  // loops to the guarded factor-unroll path or keep them compact.
+  if (header == latch)
+    return false;
+
   // Guardrail: keep duplicated loop body within a bounded growth budget.
   // Relaxed for better performance on small tight loops.
   int estimatedGrowth = loopsize * (unroll - 1);

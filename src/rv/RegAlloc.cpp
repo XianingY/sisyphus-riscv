@@ -456,15 +456,28 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   const int regcountf = isLeaf ? leafRegCntf : normalRegCntf;
   const int regcountv = isLeaf ? leafRegCntv : normalRegCntv;
 
+  auto funcOp = region->getParent();
   int opCount = 0;
   for (auto bb : region->getBlocks()) { opCount += bb->getOps().size(); }
-  bool localFastMode = fastMode || (opCount > 3000);
+  bool recursiveFunction = false;
+  if (funcOp && funcOp->has<NameAttr>()) {
+    const auto &funcName = NAME(funcOp);
+    for (auto call : funcOp->findAll<CallOp>()) {
+      if (call && call->has<NameAttr>() && NAME(call) == funcName) {
+        recursiveFunction = true;
+        break;
+      }
+    }
+  }
+  int fastThreshold = envInt("SISY_RV_FAST_RA_OP_THRESHOLD", 3000, 1, 100000000);
+  bool localFastMode = fastMode || (opCount > fastThreshold);
+  if (recursiveFunction &&
+      opCount <= envInt("SISY_RV_RECURSIVE_FULL_RA_OP_LIMIT", 60000, 1, 100000000))
+    localFastMode = fastMode;
 
   Builder builder;
   
   std::unordered_map<Op*, Reg> assignment;
-
-  auto funcOp = region->getParent();
 
   // First of all, add 35 precolored placeholders before each call.
   // This denotes that a CallOp clobbers those registers.

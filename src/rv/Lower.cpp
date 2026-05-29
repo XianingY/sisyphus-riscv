@@ -4,8 +4,41 @@
 #include "../codegen/CodeGen.h"
 #include "../codegen/Attrs.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
+
 using namespace sys::rv;
 using namespace sys;
+
+namespace {
+bool envEnabled(const char *name, bool fallback = true) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0])
+    return fallback;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+      std::strcmp(v, "FALSE") == 0)
+    return false;
+  return true;
+}
+
+bool dependsOnSpRead(Op *op, std::unordered_set<Op*> &seen) {
+  if (!op || !seen.insert(op).second)
+    return false;
+  if (isa<ReadRegOp>(op) && REG(op) == Reg::sp)
+    return true;
+  for (auto operand : op->getOperands()) {
+    if (dependsOnSpRead(operand.defining, seen))
+      return true;
+  }
+  return false;
+}
+
+bool dependsOnSpRead(Op *op) {
+  std::unordered_set<Op*> seen;
+  return dependsOnSpRead(op, seen);
+}
+}
 
 // Combines all alloca's into a SubSpOp.
 // Also rewrites load/stores with sp-offset.
@@ -368,6 +401,8 @@ void Lower::run() {
   });
 
   auto setVL4Before = [&](Op *op) {
+    if (!envEnabled("SISY_ENABLE_RVV", false))
+      return;
     if (op->has<VectorShapeAttr>() && VSHAPE(op)->scalable)
       return;
     builder.setBeforeOp(op);
@@ -460,6 +495,22 @@ void Lower::run() {
     auto size = op->has<SizeAttr>() ? SIZE(op) : 4;
     auto valueTy = op->DEF(0)->getResultType();
     if ((valueTy == Value::i128 || valueTy == Value::f128) && size == 16) {
+      if (!envEnabled("SISY_ENABLE_RVV", false)) {
+        Op *splat = op->DEF(0);
+        if ((valueTy == Value::f128 && isa<VfmvvfOp>(splat)) ||
+            (valueTy == Value::i128 && isa<VmvvxOp>(splat))) {
+          builder.setBeforeOp(op);
+          Value scalar = splat->getOperand(0);
+          Value addr = op->getOperand(1);
+          for (int lane = 0; lane < 4; lane++) {
+            auto store = builder.create<sys::rv::StoreOp>(
+                { scalar, addr }, { new SizeAttr(4) });
+            store->add<IntAttr>(lane * 4);
+          }
+          op->erase();
+          return true;
+        }
+      }
       setVL4Before(op);
       builder.replace<Vse32Op>(op, op->getOperands(), op->getAttrs());
       return true;
@@ -501,7 +552,11 @@ void Lower::run() {
 
     auto freezeArgIfSp = [&](Value arg) -> Value {
       auto *def = arg.defining;
-      if (!def || !isa<ReadRegOp>(def) || REG(def) != Reg::sp)
+      if (!def)
+        return arg;
+      if (def->getResultType() == Value::f32)
+        return arg;
+      if (!dependsOnSpRead(def))
         return arg;
       // Snapshot stack-pointer based arguments before call-frame adjustment.
       auto zero = builder.create<ReadRegOp>(Value::i32, { new RegAttr(Reg::zero) });
