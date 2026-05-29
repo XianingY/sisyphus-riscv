@@ -170,9 +170,9 @@ bool emitRematerializedValue(Builder &builder, Op *ref, Reg dst) {
       !ref->has<SpilledRsAttr>()) {
     Reg src = RS(ref);
     if (isa<SlliwOp>(ref))
-      builder.create<SlliwOp>({ RDC(dst), RSC(src) }, { new IntAttr(V(ref)) });
+      builder.create<SlliwOp>({ RDC(dst), RSC(src), new IntAttr(V(ref)) });
     else
-      builder.create<SlliOp>({ RDC(dst), RSC(src) }, { new IntAttr(V(ref)) });
+      builder.create<SlliOp>({ RDC(dst), RSC(src), new IntAttr(V(ref)) });
     return true;
   }
   return false;
