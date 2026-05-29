@@ -354,6 +354,20 @@ bool PolyhedralOptimizer::optimizeBlock(Op *block, PolyhedralStats &stats) {
       changed = forwardTransposeLoads(block, stats) || changed;
   }
 
+  if (block->kind == OpKind::Block || block->kind == OpKind::Module) {
+    // Fold invariant outer repeats before recursive descent. Inner-loop tiling
+    // can introduce clamp temporaries and guards that obscure the simple
+    // "repeat the same read-only reduction R times" shape used by matrix
+    // score kernels such as many_mat_cal.
+    for (size_t i = 0; i < block->children.size(); i++) {
+      if (block->children[i] && block->children[i]->kind == OpKind::While &&
+          tryRepeatInvariantReduction(block, i, stats)) {
+        changed = true;
+        i = 0;
+      }
+    }
+  }
+
   for (auto &child : block->children)
     changed = optimizeBlock(child.get(), stats) || changed;
 

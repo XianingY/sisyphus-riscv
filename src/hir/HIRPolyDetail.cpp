@@ -1323,6 +1323,8 @@ bool repeatBodyLegalImpl(const Op *op, const std::unordered_set<std::string> &lo
     if (loopIVs.count(op->symbol)) {
       if (op->symbol == repeatIV && !matchStepStore(const_cast<Op*>(op), repeatIV, 1))
         return false;
+      if (op->symbol != repeatIV && exprUsesScalar(op->children[0].get(), repeatIV))
+        return false;
     } else {
       const Op *delta = additiveDeltaExpr(op, acc.empty() ? op->symbol : acc);
       if (!delta)
