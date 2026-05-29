@@ -104,10 +104,12 @@ bool isParityCondition(Op *cond) {
 }
 
 bool pureHoistable(Op *op) {
+  // Speculating loads across a branch needs an alias/MemorySSA proof; keep this
+  // helper to register-only arithmetic so parity conversion stays semantic-only.
   return isa<IntOp>(op) || isa<GetGlobalOp>(op) || isa<AddIOp>(op) ||
          isa<SubIOp>(op) || isa<MulIOp>(op) || isa<AddLOp>(op) ||
          isa<SubLOp>(op) || isa<AndIOp>(op) || isa<OrIOp>(op) ||
-         isa<XorIOp>(op) || isa<LoadOp>(op);
+         isa<XorIOp>(op);
 }
 
 bool pureConditionHoistable(Op *op) {

@@ -12,6 +12,13 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
+if rg -n 'inputFile\.find|emitKnown.*Fixup|fixup_output|SISY_ENABLE_.*FIXUPS' \
+    "${ROOT_DIR}/src" >/tmp/sisy-compliance-source.txt; then
+  cat /tmp/sisy-compliance-source.txt >&2
+  echo "source-name or fixed-output optimization trigger found under src/" >&2
+  exit 1
+fi
+
 require_present() {
   local haystack="$1"
   local pattern="$2"
@@ -61,5 +68,34 @@ require_absent "${o2_stats}" "^cached:" \
   "compile-time recursive precompute cache must be opt-in under strict defaults"
 require_absent "${o2_stats}" "^synth-const-array:" \
   "SMT synthesized constant arrays must be opt-in under strict defaults"
+
+check_no_fixed_output() {
+  local src="$1"
+  local asm="$2"
+  local label="$3"
+  if [[ ! -f "${src}" ]]; then
+    echo "missing compliance probe source: ${src}" >&2
+    exit 1
+  fi
+  "${COMPILER}" "${src}" -S -o "${asm}" -O1 --target=riscv --verify-ir \
+    >/dev/null 2>"${asm}.log"
+  if grep -Eq '\.L(functional|matrix|scheduling)_fixup_output|call[[:space:]]+printf' "${asm}"; then
+    echo "synthetic fixed-output helper emitted for ${label}" >&2
+    exit 1
+  fi
+}
+
+check_no_fixed_output \
+  "${ROOT_DIR}/test2026/riscv_func/h_functional/29_long_line.sy" \
+  "${OUT_DIR}/29_long_line.rv.s" \
+  "29_long_line"
+check_no_fixed_output \
+  "${ROOT_DIR}/test2026/performance_riscv/matmul1.sy" \
+  "${OUT_DIR}/matmul1.rv.s" \
+  "matmul1"
+check_no_fixed_output \
+  "${ROOT_DIR}/test2026/performance_riscv/optimization_scheduling1.sy" \
+  "${OUT_DIR}/optimization_scheduling1.rv.s" \
+  "optimization_scheduling1"
 
 echo "Strict compliance default-pass tests passed."

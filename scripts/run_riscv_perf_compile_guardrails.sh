@@ -3,12 +3,23 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPILER="${ROOT_DIR}/build/compiler"
-CASE_DIR="${ROOT_DIR}/test2026/performance"
+CASE_DIR="${SISY_RISCV_PERF_CASE_DIR:-${ROOT_DIR}/test2026/performance_riscv}"
 OUT_DIR="${ROOT_DIR}/tests/.out/riscv-perf-compile"
 mkdir -p "${OUT_DIR}"
 
 if [[ ! -x "${COMPILER}" ]]; then
   echo "compiler not found at ${COMPILER}; run scripts/build.sh first" >&2
+  exit 1
+fi
+if [[ ! -d "${CASE_DIR}" ]]; then
+  echo "RISC-V performance case dir not found: ${CASE_DIR}" >&2
+  exit 1
+fi
+
+if rg -n 'inputFile\.find|emitKnown.*Fixup|fixup_output|SISY_ENABLE_.*FIXUPS' \
+    "${ROOT_DIR}/src" >/tmp/sisy-riscv-guard-source.txt; then
+  cat /tmp/sisy-riscv-guard-source.txt >&2
+  echo "source-name or fixed-output optimization trigger found under src/" >&2
   exit 1
 fi
 
@@ -29,6 +40,10 @@ for src in "${cases[@]}"; do
 
   if grep -Eq '\bvsetvli\b|\bvle[0-9]+\.v\b|\bvse[0-9]+\.v\b' "${asm}"; then
     echo "default RISC-V path emitted RVV instructions for ${name}; use --enable-rvv for RVV" >&2
+    exit 1
+  fi
+  if grep -Eq '\.L(functional|matrix|scheduling)_fixup_output|call[[:space:]]+printf' "${asm}"; then
+    echo "default RISC-V path emitted a synthetic fixed-output helper for ${name}" >&2
     exit 1
   fi
 

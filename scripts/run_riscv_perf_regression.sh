@@ -18,7 +18,9 @@ bootstrap_test2026_perf_suite() {
   if [[ -n "${SISY_OFFICIAL_SUITE_ROOT:-}" ]]; then
     return
   fi
-  if [[ -d "${ROOT_DIR}/test/official" || ! -d "${ROOT_DIR}/test2026/performance" ]]; then
+  local local_riscv_perf_dir="${SISY_RISCV_PERF_CASE_DIR:-${ROOT_DIR}/test2026/performance_riscv}"
+  local default_official_riscv_perf="${ROOT_DIR}/test/official/official-riscv-perf"
+  if [[ -d "${default_official_riscv_perf}" || ! -d "${local_riscv_perf_dir}" ]]; then
     return
   fi
 
@@ -31,7 +33,7 @@ bootstrap_test2026_perf_suite() {
     "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-final-perf"
   if [[ ! -e "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf/.sisy-source" ]]; then
     rm -rf "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf"
-    cp -R "${ROOT_DIR}/test2026/performance" "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf"
+    cp -R "${local_riscv_perf_dir}" "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf"
     : >"${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf/.sisy-source"
   fi
 }

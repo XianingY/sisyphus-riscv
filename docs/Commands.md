@@ -38,9 +38,9 @@ DEFAULT_TARGET=arm scripts/build.sh
 ## Compile
 
 ```bash
-./build/compiler test2026/performance/fft0.sy -S -o tests/.out/fft0.rv.s --target=riscv -O1
-./build/compiler test2026/performance/fft0.sy -S -o tests/.out/fft0.arm.s --target=arm -O1
-./build/compiler test2026/performance/fft0.sy -S -o tests/.out/fft0.o2.s --target=riscv -O2
+./build/compiler test2026/performance_riscv/fft0.sy -S -o tests/.out/fft0.rv.s --target=riscv -O1
+./build/compiler test2026/performance_arm/fft0.sy -S -o tests/.out/fft0.arm.s --target=arm -O1
+./build/compiler test2026/performance_riscv/fft0.sy -S -o tests/.out/fft0.o2.s --target=riscv -O2
 ```
 
 Useful diagnostics:
@@ -105,7 +105,7 @@ Compile all known 2026 RISC-V functional and performance sources:
 
 ```bash
 mkdir -p tests/.out/wide-compile
-for f in $(find test2026/riscv_func test2026/performance -name '*.sy' | sort); do
+for f in $(find test2026/riscv_func test2026/performance_riscv -name '*.sy' | sort); do
   out="tests/.out/wide-compile/$(printf '%s' "$f" | sed 's#[/ ]#__#g; s#\.sy$#.s#')"
   ./build/compiler "$f" -S -o "$out" --target=riscv -O1
 done

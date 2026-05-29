@@ -122,7 +122,8 @@ void appendCoreO0(sys::PassManager &pm) {
 
 void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const PipelinePlan &plan) {
   const bool forceStableManyParams =
-      opts.rv && opts.inputFile.find("39_fp_params") != std::string::npos;
+      opts.rv &&
+      (plan.metrics.maxGetArgArity > 8 || plan.metrics.getArgCount >= 256);
   const bool aggressive = plan.aggressive && !forceStableManyParams;
   const bool enableO2Experimental =
       plan.enableO2Experimental && !forceStableManyParams;
@@ -586,8 +587,7 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
   const bool hitHugeOps = plan.metrics.moduleOpCount >= hugeOpThreshold;
   const bool hitHugeScore = score >= hugeScoreThreshold;
   const bool highParamPressure =
-      plan.metrics.maxGetArgArity > 8 || plan.metrics.getArgCount >= 256 ||
-      opts.inputFile.find("39_fp_params") != std::string::npos;
+      plan.metrics.maxGetArgArity > 8 || plan.metrics.getArgCount >= 256;
   // O1 also needs a conservative lane for very branch/call-heavy functional
   // programs. These stress late CFG and backend allocation without helping
   // dense-kernel performance, so keep the optimized O1 path for normal modules
@@ -661,20 +661,6 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
     plan.aggressive = false;
     plan.enableO2Experimental = false;
     plan.enableO2Heavy = false;
-    plan.backendFastMode = false;
-  }
-  if (plan.aggressive && plan.useRvBackend &&
-      opts.inputFile.find("optimization_scheduling") != std::string::npos &&
-      getenvEnabled("SISY_RV_STABILIZE_OPT_SCHEDULING", true)) {
-    // The O2 scalar simplifier can collapse the independent recurrence to a
-    // single iteration. The bounded benchmark inputs are small, so prefer the
-    // stable O0 core and keep the backend legalizations.
-    plan.coreProfile = CoreProfile::O0;
-    plan.aggressive = false;
-    plan.enableO2Experimental = false;
-    plan.enableO2Heavy = false;
-    plan.largeModuleMode = false;
-    plan.hugeModuleMode = false;
     plan.backendFastMode = false;
   }
   // Many-params functions are correctness-sensitive in O2 economy/fast lanes.

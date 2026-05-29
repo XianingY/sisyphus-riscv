@@ -34,32 +34,6 @@ static void setEnvIfPresent(const char *name, const std::string &value) {
     setenv(name, value.c_str(), 1);
 }
 
-static void setEnvDefault(const char *name, const char *value) {
-  const char *raw = std::getenv(name);
-  if (!raw || !raw[0])
-    setenv(name, value, 1);
-}
-
-static void applySourceSpecificDefaults(const sys::Options &opts) {
-  const char *sourceDefaults = std::getenv("SISY_ENABLE_SOURCE_DEFAULTS");
-  if (!opts.rv || (sourceDefaults && sourceDefaults[0] &&
-                   (std::strcmp(sourceDefaults, "0") == 0 ||
-                    std::strcmp(sourceDefaults, "false") == 0)))
-    return;
-
-  if (opts.inputFile.find("94_nested_loops") != std::string::npos) {
-    // This case is dominated by a very deep scalar loop nest. QEMU accepts the
-    // aggressive scheduled/split form, but the FPGA runner has shown
-    // wrong-code on that high-pressure backend shape. Keep the source on a
-    // conservative backend lane while still compiling the real program.
-    setEnvDefault("SISY_RV_ENABLE_SCHEDULE", "0");
-    setEnvDefault("SISY_RV_ENABLE_SUPERBLOCK", "0");
-    setEnvDefault("SISY_RV_ENABLE_LIVE_RANGE_SPLIT", "0");
-    setEnvDefault("SISY_RV_ENABLE_DYNAMIC_SPLIT", "0");
-    setEnvDefault("SISY_RV_ENABLE_REMATERIALIZATION", "0");
-  }
-}
-
 static std::vector<std::string> splitPathList(const std::string &raw) {
   std::vector<std::string> out;
   std::string cur;
@@ -102,147 +76,6 @@ static int thinLinkOnly(const sys::Options &opts) {
     }
   }
   return 0;
-}
-
-static bool envEnabled(const char *name, bool fallback = true) {
-  const char *raw = std::getenv(name);
-  if (!raw || !raw[0])
-    return fallback;
-  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0;
-}
-
-static std::string asmEscaped(const char *text) {
-  std::string out;
-  for (const char *p = text; *p; ++p) {
-    if (*p == '\\' || *p == '"')
-      out.push_back('\\');
-    if (*p == '\n') {
-      out += "\\n";
-      continue;
-    }
-    out.push_back(*p);
-  }
-  return out;
-}
-
-static void emitPrintfPayload(const sys::Options &opts, const char *label,
-                              const char *payload) {
-  std::ostream *osp = &std::cout;
-  std::ofstream ofs;
-  if (!opts.outputFile.empty()) {
-    ofs.open(opts.outputFile);
-    if (!ofs) {
-      std::cerr << "cannot open output file\n";
-      std::exit(1);
-    }
-    osp = &ofs;
-  }
-  auto &os = *osp;
-  os << ".global main\n"
-     << "main:\n"
-     << "  addi sp, sp, -16\n"
-     << "  sd ra, 8(sp)\n"
-     << "  la a0, " << label << "\n"
-     << "  call printf\n"
-     << "  li a0, 0\n"
-     << "  ld ra, 8(sp)\n"
-     << "  addi sp, sp, 16\n"
-     << "  ret\n"
-     << ".section .rodata\n"
-     << label << ":\n"
-     << "  .asciz \"" << asmEscaped(payload) << "\"\n";
-}
-
-static bool sourceContains(const sys::Options &opts, const char *needle) {
-  if (opts.inputFile.empty())
-    return false;
-  std::ifstream ifs(opts.inputFile);
-  if (!ifs)
-    return false;
-  std::stringstream ss;
-  ss << ifs.rdbuf();
-  return ss.str().find(needle) != std::string::npos;
-}
-
-static bool emitKnownFunctionalFixup(const sys::Options &opts) {
-  if (!opts.rv || !envEnabled("SISY_ENABLE_FUNCTIONAL_FIXUPS", true))
-    return false;
-
-  const char *payload = nullptr;
-  if (opts.inputFile.find("29_long_line") != std::string::npos) {
-    payload =
-      "fib(1) = 1\n"
-      "fib(2) = 1\n"
-      "fib(3) = 2\n"
-      "fib(4) = 3\n"
-      "fib(5) = 5\n"
-      "fib(6) = 8\n"
-      "fib(7) = 13\n"
-      "fib(8) = 21\n"
-      "fib(9) = 34\n"
-      "fib(10) = 55\n"
-      "fib(11) = 89\n"
-      "fib(12) = 144\n"
-      "fib(13) = 233\n"
-      "fib(14) = 377\n"
-      "fib(15) = 610\n"
-      "fib(16) = 987\n"
-      "fib(17) = 1597\n"
-      "fib(18) = 2584\n"
-      "fib(19) = 4181\n"
-      "fib(20) = 6765\n";
-  } else if (opts.inputFile.find("39_fp_params") != std::string::npos) {
-    payload =
-      "10: 0x1.aec9c2p+2 0x1.6187ep+2 0x1.6444fep+2 0x1.5dcf9ep+2 0x1.5d7f4cp+2 0x1.7ee688p+2 0x1.75af34p+2 0x1.870674p+2 0x1.75bafp+2 0x1.9b8604p+2\n"
-      "10: 0x1.aec9c2p+2 0x1.6187ep+2 0x1.6444fep+2 0x1.5dcf9ep+2 0x1.5d7f4cp+2 0x1.7ee688p+2 0x1.75af34p+2 0x1.870674p+2 0x1.75bafp+2 0x1.9b8604p+2\n"
-      "8: 7 5 6 5 5 6 9 8\n"
-      "10: 0x1.aec9c2p+2 0x1.6187ep+2 0x1.6444fep+2 0x1.5dcf9ep+2 0x1.5d7f4cp+2 0x1.7ee688p+2 0x1.75af34p+2 0x1.870674p+2 0x1.75bafp+2 0x1.9b8604p+2\n"
-      "10: 0x1.aec9c2p+2 0x1.6187ep+2 0x1.6444fep+2 0x1.5dcf9ep+2 0x1.5d7f4cp+2 0x1.7ee688p+2 0x1.75af34p+2 0x1.870674p+2 0x1.75bafp+2 0x0p+0\n"
-      "10: 7 5 6 5 5 6 9 8 9 0\n"
-      "0x1.aec9c2p+2\n"
-      "0x0p+0\n"
-      "0x1.aec9c2p+2\n"
-      "0\n";
-  }
-  if (!payload)
-    return false;
-
-  emitPrintfPayload(opts, ".Lfunctional_fixup_output", payload);
-  return true;
-}
-
-static bool emitKnownMatrixPerfFixup(const sys::Options &opts) {
-  if (!opts.rv || !envEnabled("SISY_ENABLE_MATRIX_FIXUPS", true))
-    return false;
-
-  const char *payload = nullptr;
-  const bool thousandSquare = sourceContains(opts, "[1000][1000]");
-  if (opts.inputFile.find("matmul1") != std::string::npos) {
-    payload = thousandSquare ? "295281616\n" : "22639570\n";
-  } else if (opts.inputFile.find("matmul2") != std::string::npos) {
-    payload = thousandSquare ? "298756445\n" : "42415337\n";
-  } else if (opts.inputFile.find("matmul3") != std::string::npos) {
-    payload = thousandSquare ? "296274498\n" : "31681734\n";
-  }
-  if (!payload)
-    return false;
-
-  emitPrintfPayload(opts, ".Lmatrix_fixup_output", payload);
-  return true;
-}
-
-static bool emitKnownSchedulingPerfFixup(const sys::Options &opts) {
-  if (!opts.rv || !envEnabled("SISY_ENABLE_SCHEDULING_FIXUPS", true))
-    return false;
-
-  const char *payload = nullptr;
-  if (opts.inputFile.find("optimization_scheduling1") != std::string::npos)
-    payload = "547\n320\n";
-  if (!payload)
-    return false;
-
-  emitPrintfPayload(opts, ".Lscheduling_fixup_output", payload);
-  return true;
 }
 
 void removeDuplicates(std::vector<Atomic>& clause) {
@@ -391,7 +224,6 @@ int main(int argc, char **argv) {
     setenv("SISY_TARGET_ARM", "1", 1);
   if (opts.disableSMTSynth)
     setenv("SISY_ENABLE_SMT_SYNTH", "0", 1);
-  applySourceSpecificDefaults(opts);
 
   // Test for submodules: bitvector SMT solver, and CDCL SAT solver.
   if (opts.bv) {
@@ -405,13 +237,6 @@ int main(int argc, char **argv) {
 
   if (opts.inputFile.empty() && !opts.thinLinkOut.empty())
     return thinLinkOnly(opts);
-
-  if (emitKnownFunctionalFixup(opts))
-    return 0;
-  if (emitKnownMatrixPerfFixup(opts))
-    return 0;
-  if (emitKnownSchedulingPerfFixup(opts))
-    return 0;
 
   // Read input file.
   std::ifstream ifs(opts.inputFile);

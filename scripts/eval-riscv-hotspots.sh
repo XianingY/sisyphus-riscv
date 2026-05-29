@@ -19,7 +19,10 @@ if [[ "${OPT}" != "O1" && "${OPT}" != "O2" ]]; then
   exit 1
 fi
 
-if [[ -z "${SISY_OFFICIAL_SUITE_ROOT:-}" && ! -d "${ROOT_DIR}/test/official" && -d "${ROOT_DIR}/test2026/performance" ]]; then
+LOCAL_RISCV_PERF_DIR="${SISY_RISCV_PERF_CASE_DIR:-${ROOT_DIR}/test2026/performance_riscv}"
+DEFAULT_OFFICIAL_RISCV_PERF="${ROOT_DIR}/test/official/official-riscv-perf"
+
+if [[ -z "${SISY_OFFICIAL_SUITE_ROOT:-}" && ! -d "${DEFAULT_OFFICIAL_RISCV_PERF}" && -d "${LOCAL_RISCV_PERF_DIR}" ]]; then
   export SISY_OFFICIAL_SUITE_ROOT="${ROOT_DIR}/tests/.out/test2026-perf-suite-root"
   mkdir -p \
     "${SISY_OFFICIAL_SUITE_ROOT}/official-functional" \
@@ -29,7 +32,7 @@ if [[ -z "${SISY_OFFICIAL_SUITE_ROOT:-}" && ! -d "${ROOT_DIR}/test/official" && 
     "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-final-perf"
   if [[ ! -e "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf/.sisy-source" ]]; then
     rm -rf "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf"
-    cp -R "${ROOT_DIR}/test2026/performance" "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf"
+    cp -R "${LOCAL_RISCV_PERF_DIR}" "${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf"
     : >"${SISY_OFFICIAL_SUITE_ROOT}/official-riscv-perf/.sisy-source"
   fi
 fi

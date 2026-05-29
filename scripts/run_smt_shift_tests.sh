@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPILER="${ROOT_DIR}/build/compiler"
-CASE_DIR="${ROOT_DIR}/test2026/performance"
+CASE_DIR="${SISY_RISCV_PERF_CASE_DIR:-${ROOT_DIR}/test2026/performance_riscv}"
 OUT_DIR="${ROOT_DIR}/tests/.out/smt_shift"
 mkdir -p "${OUT_DIR}"
 
