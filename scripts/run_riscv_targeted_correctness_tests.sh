@@ -45,6 +45,8 @@ require_stat "${select_negative}" "select" "raised-selects : 0" \
 
 perf_cases=(
   matmul1 matmul2 matmul3
+  many_mat_cal-1 many_mat_cal-2 many_mat_cal-3
+  optimization_scheduling1 optimization_scheduling2 optimization_scheduling3
   01_mm1 01_mm2 01_mm3
   conv2d-1 conv2d-2 conv2d-3
   crc1 crc2 crc3
@@ -73,7 +75,10 @@ for case in "${perf_cases[@]}"; do
 done
 
 if [[ "${SISY_TARGETED_COMPARE_PERF:-0}" == "1" ]]; then
-  for case in crc1 conv2d-1 transpose0 sl1; do
+  for case in \
+    crc1 conv2d-1 transpose0 sl1 \
+    many_mat_cal-1 many_mat_cal-2 many_mat_cal-3 \
+    optimization_scheduling1 optimization_scheduling2 optimization_scheduling3; do
     src="${ROOT_DIR}/test2026/performance_riscv/${case}.sy"
     out="${ROOT_DIR}/test2026/performance_riscv/${case}.out"
     in="${ROOT_DIR}/test2026/performance_riscv/${case}.in"

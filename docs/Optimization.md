@@ -240,6 +240,9 @@ important defaults as of this review:
   lowering is experimental and requires both RVV enablement and this explicit
   strided-vector switch.  The default RISC-V O1 profile must remain `rv64gc`
   scalar code.
+- `SISY_ENABLE_CFG_BOUNDS_CHECK=false`; CFG-level bounds-branch elimination is
+  still experimental and remains opt-in until it can prove multi-predecessor
+  rotated-loop exits without path-sensitive phi loss.
 - `SISY_SYNTH_CONST_ARRAY_MAX=4096` caps the default source-constant table
   synthesis budget, including input-independent initialization loops
 - `SISY_ENABLE_FINAL_ITER_COLLAPSE=true` enables the narrow IR-proven

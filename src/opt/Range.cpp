@@ -456,6 +456,7 @@ void Range::postdom(Region *region) {
 void Range::split(Region *region) {
   Builder builder;
 
+  region->updatePreds();
   for (auto bb : region->getBlocks()) {
     if (!bb || bb->getOpCount() == 0)
       continue;
@@ -479,6 +480,17 @@ void Range::split(Region *region) {
     // as latch jumps to header but it doesn't dominate header.
     if (!bb->dominates(bb1) || !bb->dominates(bb2))
       continue;
+    auto canSplitEdge = [&](BasicBlock *succ) {
+      return succ && succ->preds.size() == 1 && *succ->preds.begin() == bb;
+    };
+    bool split1 = canSplitEdge(bb1);
+    bool split2 = canSplitEdge(bb2);
+    // The split values below are represented as one-incoming phis.  That is
+    // only valid for split edges.  A rotated loop guard can dominate its loop
+    // exit while the exit still also has a latch predecessor; skip only that
+    // multi-predecessor successor instead of disabling the other edge.
+    if (!split1 && !split2)
+      continue;
 
     auto splitValue = [&](Op *x) {
       if (!x || isa<IntOp>(x))
@@ -486,43 +498,45 @@ void Range::split(Region *region) {
 
       // Have a look whether we've already split it first.
       // Don't do it repeatedly.
-      int found = 0;
-      auto bb1phis = bb1->getPhis();
-      for (auto phi : bb1phis) {
-        if (phi->getOperandCount() == 1 && phi->DEF() == x) {
-          found++;
-          break;
+      auto findExisting = [&](BasicBlock *succ) -> Op* {
+        for (auto phi : succ->getPhis()) {
+          if (phi->getOperandCount() == 1 && phi->DEF() == x) {
+            return phi;
+          }
         }
-      }
-      auto bb2phis = bb2->getPhis();
-      for (auto phi : bb2phis) {
-        if (phi->getOperandCount() == 1 && phi->DEF() == x) {
-          found++;
-          break;
-        }
-      }
-      if (found == 2)
-        return;
+        return nullptr;
+      };
 
-      // Now give a phi for both successors.
-      builder.setToBlockStart(bb1);
-      auto x1 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
-      builder.setToBlockStart(bb2);
-      auto x2 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
+      Op *x1 = nullptr;
+      Op *x2 = nullptr;
+      if (split1) {
+        x1 = findExisting(bb1);
+        if (!x1) {
+          builder.setToBlockStart(bb1);
+          x1 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
+        }
+      }
+      if (split2) {
+        x2 = findExisting(bb2);
+        if (!x2) {
+          builder.setToBlockStart(bb2);
+          x2 = builder.create<PhiOp>({ x }, { new FromAttr(bb) });
+        }
+      }
 
       // Rename operations.
       auto uses = x->getUses();
       for (auto use : uses) {
-        if (use == x1 || use == x2)
+        if ((x1 && use == x1) || (x2 && use == x2))
           continue;
 
         auto parent = use->getParent();
         // Both branch get to here; use the original `x` instead.
         if (parent->postDominates(bb1) && parent->postDominates(bb2))
           continue;
-        if (bb1->dominates(parent))
+        if (x1 && bb1->dominates(parent))
           use->replaceOperand(x, x1);
-        if (bb2->dominates(parent))
+        if (x2 && bb2->dominates(parent))
           use->replaceOperand(x, x2);
       }
     };

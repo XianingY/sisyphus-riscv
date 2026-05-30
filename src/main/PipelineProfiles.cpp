@@ -345,7 +345,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if (enableVectorize && getenvEnabled("SISY_ENABLE_EARLY_VECTORIZE", true))
       pm.addPass<sys::Vectorize>();
     pm.addPass<sys::SCEV>();
-    if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", true)) {
+    if (opts.rv && getenvEnabled("SISY_ENABLE_CFG_BOUNDS_CHECK", false)) {
       pm.addPass<sys::BoundsCheck>();
       pm.addPass<sys::SimplifyCFG>();
     }

@@ -140,6 +140,7 @@ SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/ca
 SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_ADVANCED_CONV2D=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_CFG_BOUNDS_CHECK=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
 
 Do not use the strict-mode switches as submission defaults without updating
