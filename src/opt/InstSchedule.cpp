@@ -1,5 +1,6 @@
 #include "LowerPasses.h"
 #include "Analysis.h"
+#include "../backend/shared/TargetCostModel.h"
 #include <climits>
 #include <cstdlib>
 #include <list>
@@ -144,6 +145,9 @@ void InstSchedule::runImpl(BasicBlock *bb) {
   }
 
   // Now do a list scheduling.
+  TargetCostModel costModel = TargetCostModel::forCurrentTarget();
+  const int loadUseDelay = costModel.loadUseDelay();
+  const int multiplyUseDelay = costModel.multiplyUseDelay();
 
   // The amount of ops that this one is waiting for.
   std::unordered_map<Op*, int> degree;
@@ -173,9 +177,9 @@ void InstSchedule::runImpl(BasicBlock *bb) {
     for (int i = 0; i < op->getOperandCount(); i++) {
       auto def = op->DEF(i);
 
-      // Wait 2 instructions for load.
       auto defTime = time.find(def);
-      if (defTime != time.end() && isa<LoadOp>(def) && index - defTime->second <= 2) {
+      if (defTime != time.end() && isa<LoadOp>(def) &&
+          index - defTime->second <= loadUseDelay) {
         result--;
       }
 
@@ -183,7 +187,7 @@ void InstSchedule::runImpl(BasicBlock *bb) {
       // fill it. This is a scheduling heuristic only; dependencies still
       // control correctness.
       if (defTime != time.end() && (isa<MulIOp>(def) || isa<MulLOp>(def)) &&
-          index - defTime->second <= 3) {
+          index - defTime->second <= multiplyUseDelay) {
         result--;
       }
     }

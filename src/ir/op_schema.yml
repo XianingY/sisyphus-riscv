@@ -1,0 +1,121 @@
+ops:
+  - name: addi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Commutative, Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldAddI
+  - name: andi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Commutative, Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldAndI
+  - name: constant
+    dialect: arith
+    operands: []
+    results: [result]
+    attrs: [value]
+    traits: [Pure]
+    verify: verifyConstantAttr
+    fold: foldConstant
+  - name: muli
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Commutative, Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldMulI
+  - name: select
+    dialect: arith
+    operands: [cond, true_value, false_value]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifySelect
+    fold: foldSelect
+  - name: subi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldSubI
+  - name: alloca
+    dialect: memref
+    operands: []
+    results: [memref]
+    attrs: [type]
+    traits: [MemoryEffect]
+    verify: verifyMemRefTypeAttr
+    fold: foldNone
+  - name: global
+    dialect: memref
+    operands: []
+    results: [memref]
+    attrs: [type, symbol]
+    traits: [MemoryEffect]
+    verify: verifyMemRefGlobal
+    fold: foldNone
+  - name: load
+    dialect: memref
+    operands: [base, index]
+    results: [value]
+    attrs: []
+    traits: [MemoryEffect]
+    verify: verifyMemRefLoad
+    fold: foldNone
+  - name: store
+    dialect: memref
+    operands: [value, base, index]
+    results: []
+    attrs: []
+    traits: [MemoryEffect]
+    verify: verifyMemRefStore
+    fold: foldNone
+  - name: br
+    dialect: scf
+    operands: [cond]
+    results: []
+    attrs: [dest]
+    traits: [BranchLike, Terminator]
+    verify: verifyBranch
+    fold: foldNone
+  - name: for
+    dialect: scf
+    operands: [lower, upper, step]
+    results: []
+    attrs: []
+    traits: [HasRegion, LoopLike]
+    verify: verifyForLike
+    fold: foldNone
+  - name: if
+    dialect: scf
+    operands: [cond]
+    results: []
+    attrs: []
+    traits: [HasRegion]
+    verify: verifyIfRegions
+    fold: foldNone
+  - name: return
+    dialect: scf
+    operands: [variadic]
+    results: []
+    attrs: []
+    traits: [Terminator]
+    verify: verifyReturn
+    fold: foldNone
+  - name: while
+    dialect: scf
+    operands: [cond]
+    results: []
+    attrs: []
+    traits: [HasRegion, LoopLike]
+    verify: verifyWhileRegions
+    fold: foldNone

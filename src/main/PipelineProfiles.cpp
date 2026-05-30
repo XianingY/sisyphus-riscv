@@ -2,7 +2,10 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <iostream>
 #include <sstream>
+#include <vector>
 
 #include "../opt/Passes.h"
 #include "../opt/LoopPasses.h"
@@ -39,6 +42,53 @@ bool getenvEnabled(const char *name, bool fallback) {
   if (std::strcmp(raw, "0") == 0 || std::strcmp(raw, "false") == 0)
     return false;
   return true;
+}
+
+std::vector<std::string> splitPipelineText(const std::string &text) {
+  std::vector<std::string> tokens;
+  std::string current;
+  for (char c : text) {
+    if (c == ',') {
+      if (!current.empty())
+        tokens.push_back(current);
+      current.clear();
+      continue;
+    }
+    if (!std::isspace((unsigned char) c))
+      current.push_back(c);
+  }
+  if (!current.empty())
+    tokens.push_back(current);
+  return tokens;
+}
+
+void appendTextPipeline(sys::PassManager &pm, const std::string &text) {
+  if (text.empty())
+    return;
+  for (const auto &token : splitPipelineText(text)) {
+    if (token == "pattern-canonicalize")
+      pm.addPass<sys::PatternCanonicalize>();
+    else if (token == "regular-fold")
+      pm.addPass<sys::RegularFold>();
+    else if (token == "dce")
+      pm.addPass<sys::DCE>();
+    else if (token == "simplify-cfg")
+      pm.addPass<sys::SimplifyCFG>();
+    else if (token == "select")
+      pm.addPass<sys::Select>();
+    else if (token == "gvn")
+      pm.addPass<sys::GVN>();
+    else if (token == "mem2reg")
+      pm.addPass<sys::Mem2Reg>();
+    else if (token == "sccp")
+      pm.addPass<sys::SCCP>();
+    else if (token == "inst-schedule")
+      pm.addPass<sys::InstSchedule>();
+    else {
+      std::cerr << "error: unknown pass in --pass-pipeline: '" << token << "'\n";
+      std::exit(1);
+    }
+  }
 }
 
 size_t complexityScore(const PipelineMetrics &metrics) {
@@ -112,6 +162,8 @@ void appendCoreO0(sys::PassManager &pm) {
     pm.addPass<sys::DCE>();
     pm.addPass<sys::SimplifyCFG>();
   }
+  if (getenvEnabled("SISY_ENABLE_PATTERN_CANONICALIZE", false))
+    pm.addPass<sys::PatternCanonicalize>();
   pm.addPass<sys::RegularFold>();
   pm.addPass<sys::DCE>();
   pm.addPass<sys::SimplifyCFG>();
@@ -217,6 +269,8 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::DCE>();
       pm.addPass<sys::SimplifyCFG>();
     }
+    if (getenvEnabled("SISY_ENABLE_PATTERN_CANONICALIZE", false))
+      pm.addPass<sys::PatternCanonicalize>();
     // SMT-assisted branch pruning.  No-op unless SISY_ENABLE_SMT_PATH_PRUNE=1.
     pm.addPass<sys::SmtBranchPrune>();
     if (!opts.disableSMTSynth)
@@ -710,6 +764,7 @@ PipelinePlan selectPlan(const Options &opts, PipelineMetrics metrics) {
 
 PipelinePlan configurePipeline(PassManager &pm, const Options &opts, PipelineMetrics metrics) {
   auto plan = selectPlan(opts, metrics);
+  appendTextPipeline(pm, opts.passPipeline);
   switch (plan.coreProfile) {
   case CoreProfile::O0:
     appendCoreO0(pm);

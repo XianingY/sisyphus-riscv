@@ -1,0 +1,9 @@
+ops:
+  - name: addi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, MagicTrait]
+    verify: verifySameIntegerOperands
+    fold: foldAddI

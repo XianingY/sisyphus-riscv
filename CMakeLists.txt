@@ -66,6 +66,10 @@ if(BUILD_TESTING)
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_memoryssa_tests.sh"
   )
   add_test(
+    NAME mlir_infra_smoke
+    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_mlir_infra_tests.sh"
+  )
+  add_test(
     NAME regalloc_hotness_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_regalloc_hotness_tests.sh"
   )

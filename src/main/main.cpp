@@ -20,6 +20,7 @@
 #include "../hir/HIRCanonicalize.h"
 #include "../hir/HIRPolyhedral.h"
 #include "../pass/PassRegistry.h"
+#include "../ir/OpDescriptor.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
 #include "../utils/smt/SMT.h"
@@ -224,6 +225,18 @@ int main(int argc, char **argv) {
     setenv("SISY_TARGET_ARM", "1", 1);
   if (opts.disableSMTSynth)
     setenv("SISY_ENABLE_SMT_SYNTH", "0", 1);
+  if (opts.dumpAnalysisCache)
+    setenv("SISY_DUMP_ANALYSIS_CACHE", "1", 1);
+
+  if (opts.dumpOpDescriptors) {
+    std::string error;
+    if (!sys::ir::OpDescriptorTable::verify(&error)) {
+      std::cerr << "op descriptor verification failed: " << error << "\n";
+      return 1;
+    }
+    sys::ir::OpDescriptorTable::dump(std::cout);
+    return 0;
+  }
 
   // Test for submodules: bitvector SMT solver, and CDCL SAT solver.
   if (opts.bv) {

@@ -17,6 +17,21 @@ DomTree buildDomTreeFor(Region *region) {
   return tree;
 }
 
+LegacyAffineNestSummary buildLegacyAffineNestSummary(ModuleOp *module) {
+  LegacyAffineNestSummary summary;
+  for (auto op : module->findAll<ForOp>())
+    (void) op, summary.loops++;
+  for (auto op : module->findAll<WhileOp>())
+    (void) op, summary.loops++;
+  for (auto op : module->findAll<LoadOp>())
+    (void) op, summary.loads++;
+  for (auto op : module->findAll<StoreOp>())
+    (void) op, summary.stores++;
+  for (auto op : module->findAll<BranchOp>())
+    (void) op, summary.branches++;
+  return summary;
+}
+
 } // namespace
 
 AnalysisManager::AnalysisManager(ModuleOp *module, bool enabled, bool dump):
@@ -89,6 +104,42 @@ void AnalysisManager::ensureBlockFrequency() {
   blockFrequencyStat.buildCount++;
 }
 
+DataLayout &AnalysisManager::getDataLayout() {
+  if (enabled && dataLayoutValid && dataLayout) {
+    dataLayoutStat.hitCount++;
+    return *dataLayout;
+  }
+  dataLayout = std::make_unique<DataLayout>(8);
+  dataLayoutValid = true;
+  dataLayoutStat.buildCount++;
+  return *dataLayout;
+}
+
+LegacyAffineNestSummary &AnalysisManager::getLegacyAffineNestSummary() {
+  if (enabled && affineNestValid && affineNest) {
+    affineNestStat.hitCount++;
+    return *affineNest;
+  }
+  affineNest = std::make_unique<LegacyAffineNestSummary>(
+      buildLegacyAffineNestSummary(module));
+  affineNestValid = true;
+  affineNestStat.buildCount++;
+  return *affineNest;
+}
+
+MemRefAliasAnalysis &AnalysisManager::getMemRefAlias() {
+  if (enabled && memRefAliasValid && memRefAlias) {
+    memRefAliasStat.hitCount++;
+    return *memRefAlias;
+  }
+  ensureAlias();
+  memRefAlias = std::make_unique<MemRefAliasAnalysis>(module, getDataLayout());
+  memRefAlias->build();
+  memRefAliasValid = true;
+  memRefAliasStat.buildCount++;
+  return *memRefAlias;
+}
+
 void AnalysisManager::invalidate(const PreservedAnalyses &pa,
                                  const std::string &passName) {
   if (!enabled)
@@ -126,6 +177,24 @@ void AnalysisManager::invalidate(const PreservedAnalyses &pa,
       noteInvalid(blockFrequencyStat, reason);
     blockFrequencyValid = false;
   }
+  if (!pa.preserves(PreservedAnalyses::DataLayoutAnalysis)) {
+    if (dataLayoutValid)
+      noteInvalid(dataLayoutStat, reason);
+    dataLayoutValid = false;
+    dataLayout.reset();
+  }
+  if (!pa.preserves(PreservedAnalyses::AffineNestAnalysis)) {
+    if (affineNestValid)
+      noteInvalid(affineNestStat, reason);
+    affineNestValid = false;
+    affineNest.reset();
+  }
+  if (!pa.preserves(PreservedAnalyses::MemRefAliasAnalysis)) {
+    if (memRefAliasValid)
+      noteInvalid(memRefAliasStat, reason);
+    memRefAliasValid = false;
+    memRefAlias.reset();
+  }
 }
 
 void AnalysisManager::invalidateMemory(Region *region,
@@ -155,6 +224,9 @@ void AnalysisManager::dumpStats(std::ostream &os) const {
   dumpOne("loop", loopStat);
   dumpOne("alias", aliasStat);
   dumpOne("block-frequency", blockFrequencyStat);
+  dumpOne("data-layout", dataLayoutStat);
+  dumpOne("affine-nest", affineNestStat);
+  dumpOne("memref-alias", memRefAliasStat);
   int idx = 0;
   for (const auto &[_, cache] : doms)
     dumpOne("domtree." + std::to_string(idx++), cache.stat);

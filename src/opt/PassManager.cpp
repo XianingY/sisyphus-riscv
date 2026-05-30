@@ -186,8 +186,12 @@ void PassManager::run() {
     std::cerr << "[pass-timing] total-pass-time : " << totalMs << " ms\n";
     std::cerr << "[pass-timing] total-wall-time : " << wallMs << " ms\n";
   }
-  if (dumpAnalysisCache && analysisManager)
+  if (dumpAnalysisCache && analysisManager) {
+    analysisManager->getDataLayout();
+    analysisManager->getLegacyAffineNestSummary();
+    analysisManager->getMemRefAlias();
     analysisManager->dumpStats(std::cerr);
+  }
 }
 
 void PassManager::dumpPipelineProfile(std::ostream &os) const {

@@ -4,6 +4,8 @@
 #include "Pass.h"
 #include "LoopPasses.h"
 #include "MemorySSA.h"
+#include "DataLayout.h"
+#include "MemRefAnalysis.h"
 
 #include <map>
 #include <memory>
@@ -17,6 +19,24 @@ struct AnalysisCacheStat {
   int buildCount = 0;
   int hitCount = 0;
   std::string invalidateReason;
+};
+
+enum class AnalysisKey {
+  DomTree,
+  LoopForest,
+  MemorySSA,
+  Alias,
+  BlockFrequency,
+  DataLayout,
+  AffineNest,
+  MemRefAlias,
+};
+
+struct LegacyAffineNestSummary {
+  int loops = 0;
+  int loads = 0;
+  int stores = 0;
+  int branches = 0;
 };
 
 class AnalysisManager {
@@ -44,6 +64,15 @@ class AnalysisManager {
   AnalysisCacheStat aliasStat;
   bool blockFrequencyValid = false;
   AnalysisCacheStat blockFrequencyStat;
+  std::unique_ptr<DataLayout> dataLayout;
+  bool dataLayoutValid = false;
+  AnalysisCacheStat dataLayoutStat;
+  std::unique_ptr<LegacyAffineNestSummary> affineNest;
+  bool affineNestValid = false;
+  AnalysisCacheStat affineNestStat;
+  std::unique_ptr<MemRefAliasAnalysis> memRefAlias;
+  bool memRefAliasValid = false;
+  AnalysisCacheStat memRefAliasStat;
 
   void noteInvalid(AnalysisCacheStat &stat, const std::string &reason);
 
@@ -57,6 +86,9 @@ public:
   MemorySSA &getMemorySSA(Region *region);
   void ensureAlias();
   void ensureBlockFrequency();
+  DataLayout &getDataLayout();
+  LegacyAffineNestSummary &getLegacyAffineNestSummary();
+  MemRefAliasAnalysis &getMemRefAlias();
 
   void invalidate(const PreservedAnalyses &pa, const std::string &passName);
   void invalidateMemory(Region *region, const std::string &reason);

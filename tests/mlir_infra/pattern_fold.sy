@@ -1,0 +1,14 @@
+int main() {
+  int x = 40;
+  int y = x + 0;
+  int z = y * 1;
+  int w = z + 0;
+  if (1) {
+    w = w + 2;
+  } else {
+    w = w + 100;
+  }
+  putint(w);
+  putch(10);
+  return 0;
+}

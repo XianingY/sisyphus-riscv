@@ -12,13 +12,14 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
-stats="$(SISY_DUMP_ANALYSIS_CACHE=1 "${COMPILER}" "${CASE}" -S \
+stats="$("${COMPILER}" "${CASE}" -S \
   -o "${OUT_DIR}/basic.default.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats \
+  --dump-analysis-cache 2>&1 >/dev/null)"
 
 echo "${stats}"
 
-for fact in loop alias block-frequency domtree memoryssa; do
+for fact in loop alias block-frequency data-layout affine-nest memref-alias domtree memoryssa; do
   if ! grep -q "\\[analysis-cache\\] ${fact}" <<<"${stats}"; then
     echo "expected analysis cache stats for ${fact}" >&2
     exit 1

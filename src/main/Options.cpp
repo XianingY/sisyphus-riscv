@@ -41,6 +41,8 @@ Options::Options() {
   bv = false;
   enableRVV = false;
   disableSMTSynth = false;
+  dumpAnalysisCache = false;
+  dumpOpDescriptors = false;
   inlineThreshold = 200;
   lateInlineThreshold = 200;
   inlineThresholdExplicit = false;
@@ -191,6 +193,8 @@ Options sys::parseArgs(int argc, char **argv) {
     PARSEOPT("--verify", verify);
     PARSEOPT("--verify-ir", verify);
     PARSEOPT("--dump-pass-timing", dumpPassTiming);
+    PARSEOPT("--dump-analysis-cache", dumpAnalysisCache);
+    PARSEOPT("--dump-op-descriptors", dumpOpDescriptors);
     PARSEOPT("--enable-experimental", enableExperimental);
     PARSEOPT("--disable-o2-experimental", disableO2Experimental);
     PARSEOPT("--enable-hir-pipeline", enableHIRPipeline);
@@ -268,6 +272,19 @@ Options sys::parseArgs(int argc, char **argv) {
       opts.fdoUse = argv[i] + 10;
       continue;
     }
+    if (strcmp(argv[i], "--pass-pipeline") == 0) {
+      opts.passPipeline = requireValue(i, "--pass-pipeline");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--pass-pipeline=", 16) == 0) {
+      opts.passPipeline = argv[i] + 16;
+      if (opts.passPipeline.empty()) {
+        std::cerr << "error: --pass-pipeline requires value\n";
+        exit(1);
+      }
+      continue;
+    }
     PARSEOPT("--dump-hir", dumpHIR);
     PARSEOPT("--dump-cfg", dumpCFG);
     PARSEOPT("--verify-hir", verifyHIR);
@@ -341,13 +358,15 @@ Options sys::parseArgs(int argc, char **argv) {
       opts.disableLoopRotate = true;
   }
 
-  if (opts.inputFile.empty() && !opts.bv && !opts.sat && opts.thinLinkOut.empty()) {
+  if (opts.inputFile.empty() && !opts.bv && !opts.sat &&
+      opts.thinLinkOut.empty() && !opts.dumpOpDescriptors) {
     std::cerr
       << "usage: compiler <input.sy> -S -o <output.s> [-O0|-O1|-O2] [--target=riscv|arm]\n"
       << "       [--inline-threshold=N] [--late-inline-threshold=N]\n"
       << "       [--disable-o2-experimental]\n"
       << "       [--thin-summary-out=<path>] [--thin-summary-in=<path>] [--thin-link-out=<path>]\n"
       << "       [--profile-generate=<path>] [--profile-use=<path>] [--fdo-use=<path>]\n"
+      << "       [--pass-pipeline=<comma-separated-passes>] [--dump-analysis-cache] [--dump-op-descriptors]\n"
       << "       [--enable-rvv] [--disable-smt-synth]\n"
       << "       [--enable-hir-pipeline|--disable-hir-pipeline|--use-legacy-codegen|--force-dialect-codegen]\n"
       << "       [--dialect-fallback-report=stderr|<path>]\n"

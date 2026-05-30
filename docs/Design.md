@@ -140,3 +140,10 @@ default.
 - `scripts/eval-vs-biframe.sh` reports `pass_rate`, ratio metrics and staged thresholds against local biframe
 - `--verify-ir` runs IR verifier after SSA phase
 - `--dump-pass-timing` provides per-pass timing for optimization tuning
+## LLVM/MLIR-Style Infrastructure
+
+The compiler now carries a shadow MLIR-style infrastructure layer documented in
+`docs/MLIRRoadmap.md`: restricted YAML op descriptors, generated descriptor
+tables, opt-in greedy canonicalization patterns, typed analysis-cache keys,
+MemRef alias side tables, and a target cost model. These pieces are deliberately
+introduced without changing the default RISC-V O1 legality boundary.

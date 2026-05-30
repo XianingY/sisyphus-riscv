@@ -277,6 +277,22 @@ public:
   void run() override;
 };
 
+class PatternCanonicalize : public Pass {
+  int attempts = 0;
+  int rewrites = 0;
+  int iterations = 0;
+  int rejected = 0;
+  int convergenceBailouts = 0;
+
+public:
+  PatternCanonicalize(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "pattern-canonicalize"; }
+  std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
+  void run() override;
+};
+
 class FunctionEquivalence : public Pass {
   int classified = 0;
   int replaced = 0;

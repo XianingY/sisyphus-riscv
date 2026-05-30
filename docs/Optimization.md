@@ -350,3 +350,11 @@ produces byte-identical output to the prior commit. Defaults may flip
 only in a separate commit demonstrating correctness on the regression
 suite plus a measurable performance reason. Off-by-default switches must
 remain queryable as a kill switch.
+## Shadow Pattern and Analysis Layer
+
+`PatternCanonicalize` is the first opt-in consumer of the new MLIR-like rewrite
+framework. It handles only local, pure algebraic canonicalizations and keeps
+`RegularFold` as the production fallback. The new DataLayout, AffineNest summary,
+MemRefAlias, and TargetCostModel layers are analysis contracts for future
+matrix/stencil/table optimizations; default O1 remains conservative until each
+consumer passes targeted compare gates.

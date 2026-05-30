@@ -36,10 +36,13 @@ struct Options {
     option sat : 1;
     option enableRVV : 1;
     option disableSMTSynth : 1;
+    option dumpAnalysisCache : 1;
+    option dumpOpDescriptors : 1;
   };
 
   std::string inputFile;
   std::string outputFile;
+  std::string passPipeline;
   std::string printAfter;
   std::string printBefore;
   std::string compareWith;

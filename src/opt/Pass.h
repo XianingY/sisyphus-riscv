@@ -27,8 +27,13 @@ public:
     MemorySSAAnalysis = 1 << 2,
     AliasAnalysisResult = 1 << 3,
     BlockFrequencyAnalysis = 1 << 4,
+    DataLayoutAnalysis = 1 << 5,
+    AffineNestAnalysis = 1 << 6,
+    MemRefAliasAnalysis = 1 << 7,
     AllAnalyses = DomTreeAnalysis | LoopAnalysisResult | MemorySSAAnalysis |
-                  AliasAnalysisResult | BlockFrequencyAnalysis,
+                  AliasAnalysisResult | BlockFrequencyAnalysis |
+                  DataLayoutAnalysis | AffineNestAnalysis |
+                  MemRefAliasAnalysis,
   };
 
   PreservedAnalyses() = default;
@@ -38,10 +43,12 @@ public:
   static PreservedAnalyses all() { return PreservedAnalyses(AllAnalyses); }
   static PreservedAnalyses cfg() {
     return PreservedAnalyses(DomTreeAnalysis | LoopAnalysisResult |
-                             AliasAnalysisResult | BlockFrequencyAnalysis);
+                             AliasAnalysisResult | BlockFrequencyAnalysis |
+                             DataLayoutAnalysis | MemRefAliasAnalysis);
   }
   static PreservedAnalyses memoryFacts() {
-    return PreservedAnalyses(MemorySSAAnalysis | AliasAnalysisResult);
+    return PreservedAnalyses(MemorySSAAnalysis | AliasAnalysisResult |
+                             DataLayoutAnalysis | MemRefAliasAnalysis);
   }
 
   bool preserves(Kind kind) const { return bits & kind; }
