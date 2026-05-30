@@ -309,6 +309,8 @@ class RepeatInvariantReduction : public Pass {
   int noShape = 0;
   int impureBody = 0;
   int badInductionUse = 0;
+  int finalIterationCollapsed = 0;
+  int finalIterationRejected = 0;
 
   bool runImpl(LoopInfo *info);
 public:

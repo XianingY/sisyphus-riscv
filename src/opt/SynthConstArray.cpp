@@ -21,8 +21,14 @@ SynthConstArray::SynthConstArray(ModuleOp *module): Pass(module) {
   auto _c0 = ctx.create(BvExpr::Var, "c0");
   auto _c1 = ctx.create(BvExpr::Var, "c1");
   // === Manually added ===
-  candidates.reserve(150);
+  candidates.reserve(170);
   candidates.push_back(_x);
+  candidates.push_back(ctx.create(BvExpr::Mul, _x, _c0));
+  for (int shift = 1; shift <= 4; shift++) {
+    auto c = ctx.create(BvExpr::Const, shift);
+    candidates.push_back(ctx.create(BvExpr::Lsh, _x, c));
+    candidates.push_back(ctx.create(BvExpr::Rsh, _x, c));
+  }
   // === Done ===
   candidates.push_back(ctx.create(BvExpr::Add, _x, _x));
   candidates.push_back(ctx.create(BvExpr::Add, _x, _c0));
@@ -183,12 +189,298 @@ bool envEnabled(const char *name, bool fallback) {
          std::strcmp(raw, "FALSE") != 0;
 }
 
+int envPositive(const char *name, int fallback, int minv, int maxv) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  char *end = nullptr;
+  long v = std::strtol(raw, &end, 10);
+  if ((end && *end) || v < minv || v > maxv)
+    return fallback;
+  return (int) v;
+}
+
 int clampToInt(long long v) {
   if (v > INT_MAX)
     return INT_MAX;
   if (v < INT_MIN)
     return INT_MIN;
   return (int) v;
+}
+
+enum class FormulaKind {
+  Candidate,
+  Affine,
+  Bitwise,
+  Mod,
+};
+
+struct Formula {
+  BvExpr *expr = nullptr;
+  int c0 = 0;
+  int c1 = 0;
+  FormulaKind kind = FormulaKind::Candidate;
+  bool sourceInit = false;
+};
+
+struct InitProof {
+  Formula formula;
+  FuncOp *func = nullptr;
+  BasicBlock *domBlock = nullptr;
+  Op *domPoint = nullptr;
+};
+
+bool isIntValue(Op *op, int value) {
+  return op && isa<IntOp>(op) && V(op) == value;
+}
+
+Op *stripSinglePhi(Op *op) {
+  std::set<Op*> seen;
+  while (op && isa<PhiOp>(op) && op->getOperandCount() == 1 && !seen.count(op)) {
+    seen.insert(op);
+    op = op->DEF(0);
+  }
+  return op;
+}
+
+bool opBefore(Op *a, Op *b) {
+  if (!a || !b || a->getParent() != b->getParent())
+    return false;
+  for (auto op : a->getParent()->getOps()) {
+    if (op == a)
+      return true;
+    if (op == b)
+      return false;
+  }
+  return false;
+}
+
+bool initDominatesUse(FuncOp *initFunc, BasicBlock *domBlock, Op *domPoint, Op *use) {
+  if (!initFunc || !use || use->getParentOp<FuncOp>() != initFunc)
+    return false;
+  if (domPoint) {
+    auto pointBlock = domPoint->getParent();
+    auto useBlock = use->getParent();
+    if (pointBlock == useBlock)
+      return opBefore(domPoint, use);
+    return pointBlock && pointBlock->dominates(useBlock);
+  }
+  return domBlock && domBlock->dominates(use->getParent());
+}
+
+bool evalConstExpr(Op *op, int &out, int depth = 0) {
+  if (!op || depth > 16)
+    return false;
+  if (isa<IntOp>(op)) {
+    out = V(op);
+    return true;
+  }
+
+  int lhs = 0, rhs = 0;
+  if (isa<AddIOp>(op) || isa<AddLOp>(op) || isa<SubIOp>(op) || isa<SubLOp>(op) ||
+      isa<MulIOp>(op) || isa<MulLOp>(op) || isa<DivIOp>(op) || isa<ModIOp>(op) ||
+      isa<AndIOp>(op) || isa<OrIOp>(op) || isa<XorIOp>(op) ||
+      isa<LShiftOp>(op) || isa<RShiftOp>(op)) {
+    if (!evalConstExpr(op->DEF(0), lhs, depth + 1) ||
+        !evalConstExpr(op->DEF(1), rhs, depth + 1))
+      return false;
+    if (isa<AddIOp>(op) || isa<AddLOp>(op))
+      out = lhs + rhs;
+    else if (isa<SubIOp>(op) || isa<SubLOp>(op))
+      out = lhs - rhs;
+    else if (isa<MulIOp>(op) || isa<MulLOp>(op))
+      out = lhs * rhs;
+    else if (isa<DivIOp>(op)) {
+      if (rhs == 0)
+        return false;
+      out = lhs / rhs;
+    } else if (isa<ModIOp>(op)) {
+      if (rhs == 0)
+        return false;
+      out = lhs % rhs;
+    } else if (isa<AndIOp>(op))
+      out = lhs & rhs;
+    else if (isa<OrIOp>(op))
+      out = lhs | rhs;
+    else if (isa<XorIOp>(op))
+      out = lhs ^ rhs;
+    else if (isa<LShiftOp>(op)) {
+      if (rhs < 0 || rhs >= 31)
+        return false;
+      out = lhs << rhs;
+    } else {
+      if (rhs < 0 || rhs >= 31)
+        return false;
+      out = lhs >> rhs;
+    }
+    return true;
+  }
+  return false;
+}
+
+struct ExprBuild {
+  BvExpr *expr = nullptr;
+  bool usesX = false;
+  FormulaKind kind = FormulaKind::Affine;
+  int cost = 0;
+};
+
+FormulaKind mergeKind(FormulaKind a, FormulaKind b) {
+  if (a == FormulaKind::Mod || b == FormulaKind::Mod)
+    return FormulaKind::Mod;
+  if (a == FormulaKind::Bitwise || b == FormulaKind::Bitwise)
+    return FormulaKind::Bitwise;
+  return FormulaKind::Affine;
+}
+
+bool translateInitExpr(BvExprContext &ctx, Op *op, Op *iv, ExprBuild &out, int depth = 0) {
+  if (!op || depth > 12)
+    return false;
+  if (op == iv) {
+    out.expr = ctx.create(BvExpr::Var, "x");
+    out.usesX = true;
+    out.kind = FormulaKind::Affine;
+    out.cost = 0;
+    return true;
+  }
+  int constant = 0;
+  if (evalConstExpr(op, constant)) {
+    out.expr = ctx.create(BvExpr::Const, constant);
+    out.usesX = false;
+    out.kind = FormulaKind::Affine;
+    out.cost = 0;
+    return true;
+  }
+
+  auto binary = [&](BvExpr::Type ty, FormulaKind kind) {
+    ExprBuild lhs, rhs;
+    if (!translateInitExpr(ctx, op->DEF(0), iv, lhs, depth + 1) ||
+        !translateInitExpr(ctx, op->DEF(1), iv, rhs, depth + 1))
+      return false;
+    if ((ty == BvExpr::Mul || ty == BvExpr::Div || ty == BvExpr::Mod ||
+         ty == BvExpr::Lsh || ty == BvExpr::Rsh) &&
+        rhs.usesX)
+      return false;
+    if ((ty == BvExpr::Div || ty == BvExpr::Mod) && rhs.expr->ty == BvExpr::Const &&
+        rhs.expr->vi == 0)
+      return false;
+    if ((ty == BvExpr::Lsh || ty == BvExpr::Rsh) &&
+        (rhs.expr->ty != BvExpr::Const || rhs.expr->vi < 0 || rhs.expr->vi >= 31))
+      return false;
+    out.expr = ctx.create(ty, lhs.expr, rhs.expr);
+    out.usesX = lhs.usesX || rhs.usesX;
+    out.kind = mergeKind(mergeKind(lhs.kind, rhs.kind), kind);
+    out.cost = lhs.cost + rhs.cost + 1;
+    return out.cost <= 6;
+  };
+
+  if (isa<AddIOp>(op) || isa<AddLOp>(op))
+    return binary(BvExpr::Add, FormulaKind::Affine);
+  if (isa<SubIOp>(op) || isa<SubLOp>(op))
+    return binary(BvExpr::Sub, FormulaKind::Affine);
+  if (isa<MulIOp>(op) || isa<MulLOp>(op))
+    return binary(BvExpr::Mul, FormulaKind::Affine);
+  if (isa<DivIOp>(op))
+    return binary(BvExpr::Div, FormulaKind::Affine);
+  if (isa<ModIOp>(op))
+    return binary(BvExpr::Mod, FormulaKind::Mod);
+  if (isa<AndIOp>(op))
+    return binary(BvExpr::And, FormulaKind::Bitwise);
+  if (isa<OrIOp>(op))
+    return binary(BvExpr::Or, FormulaKind::Bitwise);
+  if (isa<XorIOp>(op))
+    return binary(BvExpr::Xor, FormulaKind::Bitwise);
+  if (isa<LShiftOp>(op))
+    return binary(BvExpr::Lsh, FormulaKind::Affine);
+  if (isa<RShiftOp>(op))
+    return binary(BvExpr::Rsh, FormulaKind::Affine);
+  return false;
+}
+
+bool validateFormula(BvExpr *expr, const std::vector<int> &values) {
+  BvSolver solver;
+  for (int i = 0; i < (int) values.size(); i++) {
+    if (solver.eval(expr, { { "x", i } }) != values[i])
+      return false;
+  }
+  return true;
+}
+
+Formula findPeriodicFormula(BvExprContext &ctx, const std::vector<int> &values) {
+  Formula result;
+  auto x = ctx.create(BvExpr::Var, "x");
+  for (int mod = 2; mod <= 32 && mod <= (int) values.size(); mod++) {
+    int plusC = values[0];
+    bool plus = true;
+    for (int i = 0; i < (int) values.size(); i++) {
+      if ((i % mod) + plusC != values[i]) {
+        plus = false;
+        break;
+      }
+    }
+    if (plus) {
+      auto m = ctx.create(BvExpr::Const, mod);
+      auto c = ctx.create(BvExpr::Const, plusC);
+      result.expr = ctx.create(BvExpr::Add, ctx.create(BvExpr::Mod, x, m), c);
+      result.kind = FormulaKind::Mod;
+      return result;
+    }
+
+    int minusC = -values[0];
+    bool minus = true;
+    for (int i = 0; i < (int) values.size(); i++) {
+      if ((i % mod) - minusC != values[i]) {
+        minus = false;
+        break;
+      }
+    }
+    if (minus) {
+      auto m = ctx.create(BvExpr::Const, mod);
+      auto c = ctx.create(BvExpr::Const, minusC);
+      result.expr = ctx.create(BvExpr::Sub, ctx.create(BvExpr::Mod, x, m), c);
+      result.kind = FormulaKind::Mod;
+      return result;
+    }
+  }
+  return result;
+}
+
+Formula findFormulaForValues(BvExprContext &ctx,
+                             const std::vector<BvExpr*> &candidates,
+                             const std::vector<int> &values) {
+  Formula result;
+  int size = (int) values.size();
+  for (auto expr : candidates) {
+    BvSolver solver;
+    int i = size / 2;
+    solver.assign("x", i);
+    auto vi = ctx.create(BvExpr::Const, values[i]);
+    auto eq = ctx.create(BvExpr::Eq, expr, vi);
+    if (!solver.infer(eq))
+      continue;
+
+    bool good = true;
+    for (int i = 0; i < size; i++) {
+      if (solver.eval(expr, { { "x", i } }) != values[i]) {
+        good = false;
+        break;
+      }
+    }
+    if (!good)
+      continue;
+
+    result.expr = expr;
+    if (solver.has("c0"))
+      result.c0 = solver.extract("c0");
+    if (solver.has("c1"))
+      result.c1 = solver.extract("c1");
+    result.kind = FormulaKind::Candidate;
+    return result;
+  }
+  Formula periodic = findPeriodicFormula(ctx, values);
+  if (periodic.expr && validateFormula(periodic.expr, values))
+    return periodic;
+  return result;
 }
 
 struct LinearExpr {
@@ -437,8 +729,9 @@ Op *resolveIndexValue(Op *addr, const std::string &global, Op *before,
   return nullptr;
 }
 
-bool scanReadonlyUses(Op *root, std::vector<LoadOp*> &loads,
-                      std::unordered_set<Op*> &visited) {
+bool scanGlobalUses(Op *root, std::vector<LoadOp*> &loads,
+                    std::vector<StoreOp*> &stores,
+                    std::unordered_set<Op*> &visited) {
   if (!root || visited.count(root))
     return true;
   visited.insert(root);
@@ -448,12 +741,16 @@ bool scanReadonlyUses(Op *root, std::vector<LoadOp*> &loads,
       loads.push_back(cast<LoadOp>(use));
       continue;
     }
-    if (isa<StoreOp>(use))
-      return false;
+    if (auto store = dyn_cast<StoreOp>(use)) {
+      if (store->getOperandCount() != 2 || store->DEF(1) != root)
+        return false;
+      stores.push_back(store);
+      continue;
+    }
     if (isa<CallOp>(use) || isa<ReturnOp>(use))
       return false;
     if (isa<AddLOp>(use) || isa<SubLOp>(use) || isa<PhiOp>(use)) {
-      if (!scanReadonlyUses(use, loads, visited))
+      if (!scanGlobalUses(use, loads, stores, visited))
         return false;
       continue;
     }
@@ -462,10 +759,177 @@ bool scanReadonlyUses(Op *root, std::vector<LoadOp*> &loads,
   return true;
 }
 
+LoopInfo *findStoreLoop(StoreOp *store, const std::map<FuncOp*, LoopForest> &forests) {
+  if (!store)
+    return nullptr;
+  auto func = store->getParentOp<FuncOp>();
+  auto it = forests.find(func);
+  if (it == forests.end())
+    return nullptr;
+  LoopInfo *best = nullptr;
+  for (auto loop : it->second.getLoops()) {
+    if (!loop->contains(store->getParent()))
+      continue;
+    if (!best || loop->getBlocks().size() < best->getBlocks().size())
+      best = loop;
+  }
+  return best;
+}
+
+bool simpleLoopCoversArray(LoopInfo *loop, Op *iv, int size) {
+  if (!loop || !iv || loop->latches.size() != 1 || loop->exits.size() != 1)
+    return false;
+  if (loop->getInduction() && loop->getInduction() != iv)
+    return false;
+  auto start = stripSinglePhi(loop->getStart());
+  if (!isIntValue(start, 0))
+    return false;
+  if (!isIntValue(stripSinglePhi(loop->getStop()), size))
+    return false;
+  if (!isIntValue(stripSinglePhi(loop->getStepOp()), 1))
+    return false;
+  return true;
+}
+
+bool onlyInitLoopStoreToGlobal(const std::vector<StoreOp*> &stores, LoopInfo *loop) {
+  if (!loop)
+    return false;
+  for (auto store : stores)
+    if (!loop->contains(store->getParent()))
+      return false;
+  return true;
+}
+
+bool proveInitLoopFormula(BvExprContext &ctx, const std::string &global, int size,
+                          const std::vector<StoreOp*> &stores,
+                          const std::map<FuncOp*, LoopForest> &forests,
+                          InitProof &proof) {
+  if (stores.size() != 1)
+    return false;
+  auto store = stores[0];
+  auto loop = findStoreLoop(store, forests);
+  if (!loop || !onlyInitLoopStoreToGlobal(stores, loop))
+    return false;
+
+  LinearExpr elems;
+  std::unordered_set<Op*> visiting;
+  if (!directIndexExpr(store->DEF(1), global, elems, visiting) || !elems.valid ||
+      elems.constant != 0 || elems.terms.size() != 1)
+    return false;
+
+  Op *iv = elems.terms.begin()->first;
+  if (elems.terms.begin()->second != 1 || !isa<PhiOp>(iv))
+    return false;
+  if (!simpleLoopCoversArray(loop, iv, size))
+    return false;
+
+  ExprBuild built;
+  if (!translateInitExpr(ctx, store->DEF(0), iv, built) || !built.expr || !built.usesX)
+    return false;
+  // Evaluate the whole source initialization domain. The formula was produced
+  // directly from the store expression, so this is a totality check rather than
+  // a comparison against hidden data.
+  BvSolver solver;
+  for (int i = 0; i < size; i++)
+    (void) solver.eval(built.expr, { { "x", i } });
+
+  proof.formula.expr = built.expr;
+  proof.formula.kind = built.kind;
+  proof.formula.sourceInit = true;
+  proof.func = store->getParentOp<FuncOp>();
+  proof.domBlock = loop->getExit();
+  proof.domPoint = nullptr;
+  return true;
+}
+
+bool proveUnrolledStoreTable(BvExprContext &ctx,
+                             const std::vector<BvExpr*> &candidates,
+                             const std::string &global, int size,
+                             const std::vector<StoreOp*> &stores,
+                             InitProof &proof) {
+  if (stores.empty() || (int) stores.size() != size)
+    return false;
+  FuncOp *func = stores[0]->getParentOp<FuncOp>();
+  BasicBlock *block = stores[0]->getParent();
+  std::vector<int> values(size, 0);
+  std::vector<char> seen(size, 0);
+
+  for (auto store : stores) {
+    if (store->getParentOp<FuncOp>() != func || store->getParent() != block)
+      return false;
+    LinearExpr elems;
+    std::unordered_set<Op*> visiting;
+    if (!directIndexExpr(store->DEF(1), global, elems, visiting) || !elems.valid ||
+        !elems.terms.empty() || elems.constant < 0 || elems.constant >= size)
+      return false;
+    int value = 0;
+    if (!evalConstExpr(store->DEF(0), value))
+      return false;
+    int idx = (int) elems.constant;
+    if (seen[idx])
+      return false;
+    seen[idx] = 1;
+    values[idx] = value;
+  }
+  for (char x : seen)
+    if (!x)
+      return false;
+
+  auto formula = findFormulaForValues(ctx, candidates, values);
+  if (!formula.expr)
+    return false;
+
+  Op *last = stores[0];
+  for (auto store : stores)
+    if (opBefore(last, store))
+      last = store;
+
+  proof.formula = formula;
+  proof.formula.sourceInit = true;
+  proof.func = func;
+  proof.domPoint = last;
+  proof.domBlock = nullptr;
+  return true;
+}
+
+bool allLoadSitesAfterInit(const std::vector<LoadOp*> &loads, const InitProof &proof,
+                           ModuleOp *module) {
+  if (!proof.func)
+    return false;
+  for (auto load : loads) {
+    if (!load || !load->getParent())
+      return false;
+    auto loadFunc = load->getParentOp<FuncOp>();
+    if (loadFunc == proof.func) {
+      if (!initDominatesUse(proof.func, proof.domBlock, proof.domPoint, load))
+        return false;
+      continue;
+    }
+
+    bool hasDominatedCall = false;
+    for (auto call : module->findAll<CallOp>()) {
+      if (NAME(call) != NAME(loadFunc))
+        continue;
+      if (call->getParentOp<FuncOp>() == loadFunc)
+        continue;
+      if (call->getParentOp<FuncOp>() != proof.func)
+        return false;
+      if (!initDominatesUse(proof.func, proof.domBlock, proof.domPoint, call))
+        return false;
+      hasDominatedCall = true;
+    }
+    if (!hasDominatedCall)
+      return false;
+  }
+  return true;
+}
+
 }
 
 Op *SynthConstArray::reconstruct(smt::BvExpr *expr, Op *subscript, int c0, int c1) {
   switch (expr->ty) {
+  case BvExpr::Const:
+    return builder.create<IntOp>({ new IntAttr(expr->vi) });
   case BvExpr::Var:
     if (expr->name == "x")
       return subscript;
@@ -500,6 +964,31 @@ Op *SynthConstArray::reconstruct(smt::BvExpr *expr, Op *subscript, int c0, int c
     Value r = reconstruct(expr->r, subscript, c0, c1);
     return builder.create<XorIOp>({ l, r });
   }
+  case BvExpr::Mul: {
+    Value l = reconstruct(expr->l, subscript, c0, c1);
+    Value r = reconstruct(expr->r, subscript, c0, c1);
+    return builder.create<MulIOp>({ l, r });
+  }
+  case BvExpr::Div: {
+    Value l = reconstruct(expr->l, subscript, c0, c1);
+    Value r = reconstruct(expr->r, subscript, c0, c1);
+    return builder.create<DivIOp>({ l, r });
+  }
+  case BvExpr::Mod: {
+    Value l = reconstruct(expr->l, subscript, c0, c1);
+    Value r = reconstruct(expr->r, subscript, c0, c1);
+    return builder.create<ModIOp>({ l, r });
+  }
+  case BvExpr::Lsh: {
+    Value l = reconstruct(expr->l, subscript, c0, c1);
+    Value r = reconstruct(expr->r, subscript, c0, c1);
+    return builder.create<LShiftOp>({ l, r });
+  }
+  case BvExpr::Rsh: {
+    Value l = reconstruct(expr->l, subscript, c0, c1);
+    Value r = reconstruct(expr->r, subscript, c0, c1);
+    return builder.create<RShiftOp>({ l, r });
+  }
   default:
     assert(false);
     std::abort();
@@ -514,77 +1003,66 @@ void SynthConstArray::run() {
 
   auto gMap = getGlobalMap();
   auto gets = module->findAll<GetGlobalOp>();
+  LoopAnalysis analysis(module);
+  analysis.run();
+  auto forests = analysis.getResult();
   std::unordered_map<Op*, Op*> pointerPhiCache;
+  const int maxArraySize = envPositive("SISY_SYNTH_CONST_ARRAY_MAX", 4096, 1, 65536);
 
   for (auto [k, v] : gMap) {
     if (v->has<FloatArrayAttr>())
       continue;
 
     auto iarr = v->get<IntArrayAttr>();
-    if (iarr->allZero)
-      continue;
-
     auto ptr = iarr->vi;
     auto size = iarr->size;
-    if (!ptr || size <= 0 || size > 256)
+    if (size <= 0 || size > maxArraySize)
       continue;
     arraysConsidered++;
 
     std::vector<LoadOp*> loads;
-    bool readonly = true;
+    std::vector<StoreOp*> stores;
+    bool knownUses = true;
     for (auto get : gets) {
       if (NAME(get) != k)
         continue;
       std::unordered_set<Op*> visited;
-      if (!scanReadonlyUses(get, loads, visited)) {
-        readonly = false;
+      if (!scanGlobalUses(get, loads, stores, visited)) {
+        knownUses = false;
         break;
       }
     }
-    if (!readonly) {
+    if (!knownUses) {
       rejectMutable++;
       continue;
     }
     if (loads.empty())
       continue;
 
-    // Try to work out a low-cost representation.
-    BvExpr *correct = nullptr;
-    int c0 = 0, c1 = 0;
-    for (auto expr : candidates) {
-      // We need to ensure that for all `i <= size`, the expression is correct.
-      // We use SMT solver to find out the constants.
-
-      // Solvers cannot be reused currently. Don't know how to improve it.
-      BvSolver solver;
-      // Find out the constants by assigning some value to `i`.
-      int i = size / 2;
-      solver.assign("x", i);
-      auto vi = ctx.create(BvExpr::Const, ptr[i]);
-      auto eq = ctx.create(BvExpr::Eq, expr, vi);
-
-      // Validate that every element is correct.
-      if (!solver.infer(eq))
+    Formula formula;
+    InitProof initProof;
+    if (stores.empty()) {
+      if (!ptr || iarr->allZero)
         continue;
-
-      bool good = true;
-      for (int i = 0; i < size; i++) {
-        if (solver.eval(expr, { { "x", i } }) != ptr[i]) {
-          good = false;
-          break;
+      std::vector<int> values(ptr, ptr + size);
+      formula = findFormulaForValues(ctx, candidates, values);
+    } else {
+      if (proveInitLoopFormula(ctx, k, size, stores, forests, initProof) ||
+          proveUnrolledStoreTable(ctx, candidates, k, size, stores, initProof)) {
+        if (!allLoadSitesAfterInit(loads, initProof, module)) {
+          initLoopRejected++;
+          continue;
         }
-      }
-      if (good) {
-        correct = expr;
-        if (solver.has("c0"))
-          c0 = solver.extract("c0");
-        if (solver.has("c1"))
-          c1 = solver.extract("c1");
-        break;
+        formula = initProof.formula;
+        sourceInitTables++;
+      } else {
+        initLoopRejected++;
+        rejectMutable++;
+        continue;
       }
     }
 
-    if (!correct) {
+    if (!formula.expr) {
       rejectNoFormula++;
       continue;
     }
@@ -601,13 +1079,20 @@ void SynthConstArray::run() {
       }
 
       builder.setBeforeOp(load);
-      auto replacement = reconstruct(correct, index, c0, c1);
+      auto replacement = reconstruct(formula.expr, index, formula.c0, formula.c1);
       load->replaceAllUsesWith(replacement);
       load->erase();
       loadsReplaced++;
       synthesizedThisArray = true;
     }
-    if (synthesizedThisArray)
+    if (synthesizedThisArray) {
       arraysSynthesized++;
+      if (formula.kind == FormulaKind::Mod)
+        formulaMod++;
+      else if (formula.kind == FormulaKind::Bitwise)
+        formulaBitwise++;
+      else
+        formulaAffine++;
+    }
   }
 }

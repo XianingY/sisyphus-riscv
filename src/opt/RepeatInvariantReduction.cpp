@@ -18,6 +18,10 @@ bool envEnabled(const char *name, bool fallback) {
   return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
 }
 
+bool isInt(Op *op, int value) {
+  return op && isa<IntOp>(op) && V(op) == value;
+}
+
 bool exprReferencesGlobal(Op *op, std::set<Op*> &seen) {
   if (!op || seen.count(op))
     return false;
@@ -287,6 +291,21 @@ bool exprUsesValue(Op *op, Op *needle) {
   return exprUsesValue(op, needle, seen);
 }
 
+bool exprUsesLoopLoadOrCall(Op *op, const std::set<BasicBlock*> &blocks,
+                            std::set<Op*> &seen) {
+  if (!op || seen.count(op))
+    return false;
+  seen.insert(op);
+  if (!blocks.count(op->getParent()))
+    return false;
+  if (isa<LoadOp>(op) || isa<CallOp>(op))
+    return true;
+  for (auto operand : op->getOperands())
+    if (exprUsesLoopLoadOrCall(operand.defining, blocks, seen))
+      return true;
+  return false;
+}
+
 bool repeatTermIndependent(Op *op, Op *acc, Op *localAcc, Op *repeatIv) {
   return !exprUsesValue(op, acc) &&
          (!localAcc || !exprUsesValue(op, localAcc)) &&
@@ -515,6 +534,127 @@ bool reduceHeaderPattern(BasicBlock *header, int &reduced) {
   return true;
 }
 
+bool conditionIsPositiveCounter(Op *cond, Op *&counter) {
+  if (!cond)
+    return false;
+  if (isa<PhiOp>(cond) && cond->getResultType() == Value::i32) {
+    counter = cond;
+    return true;
+  }
+  if ((isa<LtOp>(cond) || isa<NeOp>(cond)) && cond->getOperandCount() == 2) {
+    if (isInt(cond->DEF(0), 0) && isa<PhiOp>(cond->DEF(1))) {
+      counter = cond->DEF(1);
+      return true;
+    }
+    if (isa<NeOp>(cond) && isa<PhiOp>(cond->DEF(0)) && isInt(cond->DEF(1), 0)) {
+      counter = cond->DEF(0);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isDecrementByOne(Op *value, Op *counter) {
+  if (!value || !counter || value->getOperandCount() != 2)
+    return false;
+  if (isa<SubIOp>(value) || isa<SubLOp>(value))
+    return value->DEF(0) == counter && isInt(value->DEF(1), 1);
+  if (isa<AddIOp>(value) || isa<AddLOp>(value))
+    return (value->DEF(0) == counter && isInt(value->DEF(1), -1)) ||
+           (value->DEF(1) == counter && isInt(value->DEF(0), -1));
+  return false;
+}
+
+bool bodyHasOnlyLocalContestSideEffects(const std::set<BasicBlock*> &blocks,
+                                        BasicBlock *header,
+                                        Op *counter) {
+  for (auto bb : blocks) {
+    if (bb == header)
+      continue;
+    for (auto op : bb->getOps()) {
+      if (auto call = dyn_cast<CallOp>(op)) {
+        if (isExtern(NAME(call)))
+          return false;
+      }
+      if (auto store = dyn_cast<StoreOp>(op)) {
+        std::set<Op*> seen;
+        if (exprUsesValue(store->DEF(1), counter, seen))
+          return false;
+        seen.clear();
+        if (exprUsesLoopLoadOrCall(store->DEF(0), blocks, seen))
+          return false;
+      }
+      if (isa<ReturnOp>(op) || isa<CloneOp>(op) || isa<JoinOp>(op) || isa<WakeOp>(op))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool nonCounterPhisDoNotFeedBody(BasicBlock *header, Op *counter,
+                                 const std::set<BasicBlock*> &blocks) {
+  for (auto phi : header->getPhis()) {
+    if (phi == counter)
+      continue;
+    for (auto use : phi->getUses()) {
+      if (blocks.count(use->getParent()) && use->getParent() != header)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool tryFinalIterationCollapse(LoopInfo *loop, int &collapsed, int &rejected) {
+  if (!envEnabled("SISY_ENABLE_FINAL_ITER_COLLAPSE", true))
+    return false;
+  if (!loop || loop->latches.size() != 1 || loop->exits.size() != 1)
+    return false;
+  std::set<BasicBlock*> blocks(loop->getBlocks().begin(), loop->getBlocks().end());
+  if (blocks.size() != 2)
+    return false;
+
+  auto header = loop->header;
+  auto term = header ? header->getLastOp() : nullptr;
+  if (!term || !isa<BranchOp>(term) || term->getOperandCount() == 0 ||
+      !term->has<TargetAttr>() || !term->has<ElseAttr>())
+    return false;
+
+  Op *counter = nullptr;
+  auto cond = term->DEF(0);
+  if (!conditionIsPositiveCounter(cond, counter) || !counter ||
+      counter->getParent() != header || counter->getResultType() != Value::i32)
+    return false;
+
+  auto latch = loop->getLatch();
+  auto [start, latchVal] = phiIncomingByLatch(counter, latch);
+  if (!start || !latchVal || !isDecrementByOne(latchVal, counter))
+    return false;
+
+  if (!bodyHasOnlyLocalContestSideEffects(blocks, header, counter) ||
+      !nonCounterPhisDoNotFeedBody(header, counter, blocks)) {
+    rejected++;
+    return false;
+  }
+
+  Builder builder;
+  builder.setBeforeOp(term);
+  auto one = builder.create<IntOp>({ new IntAttr(1) });
+  builder.setBeforeOp(latchVal);
+  auto zero = builder.create<IntOp>({ new IntAttr(0) });
+
+  std::vector<Op*> oldUses(counter->getUses().begin(), counter->getUses().end());
+  for (auto use : oldUses) {
+    if (!blocks.count(use->getParent()) || use->getParent() == header)
+      continue;
+    if (use == latchVal)
+      continue;
+    use->replaceOperand(counter, one);
+  }
+  latchVal->replaceAllUsesWith(zero);
+  collapsed++;
+  return true;
+}
+
 } // namespace
 
 std::map<std::string, int> RepeatInvariantReduction::stats() {
@@ -523,6 +663,8 @@ std::map<std::string, int> RepeatInvariantReduction::stats() {
     { "bad-cfg", badCfg },
     { "bad-shape", badShape },
     { "impure-body", impureBody },
+    { "final-iteration-collapsed", finalIterationCollapsed },
+    { "final-iteration-rejected", finalIterationRejected },
     { "no-shape", noShape },
     { "visited", visited },
     { "reduced", reduced },
@@ -632,8 +774,11 @@ void RepeatInvariantReduction::run() {
 
   for (auto [func, forest] : *forests) {
     (void) func;
-    for (auto loop : forest.getLoops())
+    for (auto loop : forest.getLoops()) {
+      if (tryFinalIterationCollapse(loop, finalIterationCollapsed, finalIterationRejected))
+        continue;
       runImpl(loop);
+    }
   }
 
   for (auto func : collectFuncs()) {

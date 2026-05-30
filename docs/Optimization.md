@@ -219,6 +219,11 @@ important defaults as of this review:
 - `SISY_ENABLE_CACHED_PRECOMPUTE=false`
 - `SISY_ENABLE_SYNTH_CONST_ARRAY=true` for default RISC-V O1, with
   `SISY_ENABLE_SYNTH_CONST_ARRAY=0` as the bisection kill switch
+- `SISY_SYNTH_CONST_ARRAY_MAX=4096` caps the default source-constant table
+  synthesis budget, including input-independent initialization loops
+- `SISY_ENABLE_FINAL_ITER_COLLAPSE=true` enables the narrow IR-proven
+  countdown-loop final-iteration collapse used for overwrite-style repeats;
+  loops whose stores depend on loop-local loads or call results are rejected
 - `SISY_ENABLE_ADVANCED_CONV2D=false`
 - `SISY_HIR_ENABLE_TILING=true`
 - `SISY_HIR_ENABLE_STENCIL_INTERIOR=false`

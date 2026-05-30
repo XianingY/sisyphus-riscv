@@ -1,0 +1,13 @@
+int g;
+
+int main() {
+  int n = getint();
+  g = 0;
+  while (n > 0) {
+    g = g + 1;
+    n = n - 1;
+  }
+  putint(g);
+  putch(10);
+  return 0;
+}

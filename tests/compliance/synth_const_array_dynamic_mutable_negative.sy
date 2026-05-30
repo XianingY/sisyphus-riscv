@@ -1,0 +1,22 @@
+int table[8];
+
+int main() {
+  int i = 0;
+  while (i < 8) {
+    table[i] = 17 + i;
+    i = i + 1;
+  }
+
+  table[3] = 99;
+
+  i = 0;
+  int sum = 0;
+  while (i < 8) {
+    sum = sum + table[i];
+    i = i + 1;
+  }
+
+  putint(sum);
+  putch(10);
+  return 0;
+}

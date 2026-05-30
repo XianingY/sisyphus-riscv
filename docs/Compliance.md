@@ -13,6 +13,12 @@ transformation over the program IR. It must not depend on benchmark identity,
 source filename, output hash, public input data, final answer shape, or a magic
 combination of constants that only describes one contest case.
 
+Public performance sources may be used to choose engineering priorities and
+test coverage. They must not become compiler triggers. A targeted optimization
+is acceptable only when it fires from source-visible IR facts, such as an
+affine loop, a complete initialization domain, a readonly table, or a proven
+overwrite/reduction recurrence.
+
 Acceptable triggers are program properties such as:
 
 - dominance, SSA use-def facts, constant values from the source program, and
@@ -54,29 +60,40 @@ These are the preferred places to improve performance:
   rematerialization, instruction scheduling, target peepholes, address-mode
   folding, and legal strength reduction.
 - Proven source-constant synthesis: replacing loads from source-program
-  readonly integer constant tables with a cheaper expression is allowed when
-  the table is small, every element is validated against the chosen expression,
-  all reachable uses prove no stores, unknown aliases, or address escape, and
+  readonly integer constant tables, or tables built by a complete
+  input-independent initialization loop, with a cheaper expression is allowed
+  when the table domain is fully proven, the expression is derived from source
+  constants/IVs, every reachable use is known, later mutation is rejected, and
   each replaced load has an IR-derived affine index. This is a data-layout
   optimization over constants already present in the program, not output
   synthesis.
+- Proven overwrite repeat collapse: countdown loops may be reduced to their
+  final iteration only when the loop-carried counter is the sole body-visible
+  loop phi, externally visible calls are absent, direct stores do not address
+  by the counter, and stored values do not depend on loop-local loads or call
+  results. Memory accumulation and partial update loops must remain unchanged.
 
 ## Proven Source-Constant Synthesis
 
 `SynthConstArray` is default-allowed for the RISC-V O1 profile after hardening.
 Its legality boundary is intentionally narrow:
 
-- only integer global arrays with at most 256 elements are considered;
-- every reachable use of the global address must be a load or a proven address
-  calculation feeding loads; stores, calls, returns, and unknown address uses
-  reject the array;
+- only integer global arrays within `SISY_SYNTH_CONST_ARRAY_MAX` are considered;
+- every reachable use of the global address must be a load, a store belonging
+  to one proven initialization region, or a proven address calculation feeding
+  those operations; calls, returns, address escape, and unknown uses reject the
+  array;
+- source initialization may be a full `0..N-1` affine loop or a fully unrolled
+  store sequence that dominates all loads/calls reaching load functions;
+- any store outside the proven initialization region rejects the array;
 - the load address must be `base + 4 * affine_index`, with `affine_index`
   limited to `i`, `i + c`, or `i * scale + c` as derived from the existing IR;
 - the candidate expression must come from the fixed arithmetic/bitwise DSL
-  (`x`, `x +/- c`, `c - x`, `x & c`, `x | c`, `x ^ c`, and two-operation
-  combinations);
+  (`x`, `x +/- c`, `c - x`, small constant multiply/shift/modulo, `x & c`,
+  `x | c`, `x ^ c`, and bounded low-cost combinations);
 - solver inference may choose constants, but the final decision must validate
-  every element in the source table;
+  every element in literal source tables; initialization-derived formulas must
+  evaluate over the entire initialized domain before any load is replaced;
 - the pass must not rewrite loop branch conditions, change control flow, use
   expected output, inspect public inputs, or key off source path/function/case
   names.

@@ -44,7 +44,7 @@ require_stat() {
   local pass="$2"
   local pattern="$3"
   local message="$4"
-  if ! grep -A10 "^${pass}:$" <<<"${haystack}" | grep -Eq "${pattern}"; then
+  if ! grep -A16 "^${pass}:$" <<<"${haystack}" | grep -Eq "${pattern}"; then
     echo "${message}" >&2
     exit 1
   fi
@@ -81,6 +81,28 @@ require_stat "${synth_positive}" "synth-const-array" "arrays-synthesized : [1-9]
 require_stat "${synth_positive}" "synth-const-array" "loads-replaced : [1-9]" \
   "expected proven source-constant array loads to be replaced under reference-compliant O1"
 
+synth_dynamic="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_dynamic_init.sy" \
+  -S -o "${OUT_DIR}/synth_const_array_dynamic_init.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/synth_const_array_dynamic_init.out" \
+  2>&1 >/dev/null)"
+echo "${synth_dynamic}"
+require_stat "${synth_dynamic}" "synth-const-array" "source-init-tables : [1-9]" \
+  "expected deterministic source-initialized tables to be accepted"
+require_stat "${synth_dynamic}" "synth-const-array" "loads-replaced : [1-9]" \
+  "expected source-initialized table loads to be replaced"
+
+synth_dynamic_mod="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_dynamic_mod.sy" \
+  -S -o "${OUT_DIR}/synth_const_array_dynamic_mod.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/synth_const_array_dynamic_mod.out" \
+  2>&1 >/dev/null)"
+echo "${synth_dynamic_mod}"
+require_stat "${synth_dynamic_mod}" "synth-const-array" "formula-mod : [1-9]" \
+  "expected small modulo source-initialized table formulas to be recognized"
+require_stat "${synth_dynamic_mod}" "synth-const-array" "loads-replaced : [1-9]" \
+  "expected modulo source-initialized table loads to be replaced"
+
 synth_mutable="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_mutable_negative.sy" \
   -S -o "${OUT_DIR}/synth_const_array_mutable_negative.rv.s" \
   -O1 --target=riscv --verify-ir --stats \
@@ -92,6 +114,17 @@ require_stat "${synth_mutable}" "synth-const-array" "loads-replaced : 0" \
 require_stat "${synth_mutable}" "synth-const-array" "reject-mutable : [1-9]" \
   "expected mutable global-array rejection to be reported"
 
+synth_dynamic_mutable="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_dynamic_mutable_negative.sy" \
+  -S -o "${OUT_DIR}/synth_const_array_dynamic_mutable_negative.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/synth_const_array_dynamic_mutable_negative.out" \
+  2>&1 >/dev/null)"
+echo "${synth_dynamic_mutable}"
+require_stat "${synth_dynamic_mutable}" "synth-const-array" "loads-replaced : 0" \
+  "source-initialized arrays mutated after initialization must not be synthesized"
+require_stat "${synth_dynamic_mutable}" "synth-const-array" "reject-mutable : [1-9]" \
+  "expected post-init mutation rejection to be reported"
+
 synth_nonformula="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/synth_const_array_nonformula_negative.sy" \
   -S -o "${OUT_DIR}/synth_const_array_nonformula_negative.rv.s" \
   -O1 --target=riscv --verify-ir --stats \
@@ -102,6 +135,16 @@ require_stat "${synth_nonformula}" "synth-const-array" "loads-replaced : 0" \
   "arrays outside the formula DSL must not be synthesized"
 require_stat "${synth_nonformula}" "synth-const-array" "reject-no-formula : [1-9]" \
   "expected no-formula global-array rejection to be reported"
+
+final_iter_accum="$("${COMPILER}" "${ROOT_DIR}/tests/compliance/final_iteration_memory_accum_negative.sy" \
+  -S -o "${OUT_DIR}/final_iteration_memory_accum_negative.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/tests/compliance/final_iteration_memory_accum_negative.out" \
+  -i "${ROOT_DIR}/tests/compliance/final_iteration_memory_accum_negative.in" \
+  2>&1 >/dev/null)"
+echo "${final_iter_accum}"
+require_stat "${final_iter_accum}" "repeat-invariant-reduction" "final-iteration-collapsed : 0" \
+  "memory accumulation loops must not be collapsed to the final iteration"
 
 o2_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o2.rv.s" \
   -O2 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
