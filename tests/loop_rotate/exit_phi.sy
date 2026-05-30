@@ -1,0 +1,12 @@
+int main() {
+  int n = getint();
+  int i = 0;
+  int last = 123;
+  while (i < n) {
+    last = i + 7;
+    i = i + 1;
+  }
+  putint(last);
+  putch(10);
+  return 0;
+}

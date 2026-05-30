@@ -4,7 +4,7 @@ This document records how Sisyphus optimizations are designed, enabled, and
 validated. It complements `docs/Compliance.md`; if there is any conflict, the
 compliance policy wins.
 
-Last reviewed: 2026-05-27.
+Last reviewed: 2026-05-30.
 
 ## 1. Default Profile Philosophy
 
@@ -34,6 +34,13 @@ These are appropriate for default use when verifier and regression checks pass:
   `GVN`, `DCE`, `AggressiveDCE`, `SimplifyCFG`, and `Select`.
 - Alias-aware `DSE`/`DLE`, load forwarding, readonly call handling, and LICM.
 - `SCEV` and ordinary loop strength reduction.
+- Hardened `LoopRotate` for default scalar RISC-V O1.  It rewrites canonical
+  positive-step while loops into a guarded do-while form only after
+  LoopSimplify/LCSSA-style canonicalization, keeps a single-edge loop preheader,
+  repairs exit phis for zero-trip semantics, and leaves calls in place.  The
+  current default legality gate intentionally excludes loops containing stores
+  until the downstream rotated-loop consumers have a per-store
+  guaranteed-execution proof.
 - HIR affine transforms: fusion, interchange, reduction privatization,
   invariant guard hoisting, partial unroll, and unroll-and-jam when dependence
   analysis proves legality.
@@ -219,6 +226,12 @@ important defaults as of this review:
 - `SISY_ENABLE_CACHED_PRECOMPUTE=false`
 - `SISY_ENABLE_SYNTH_CONST_ARRAY=true` for default RISC-V O1, with
   `SISY_ENABLE_SYNTH_CONST_ARRAY=0` as the bisection kill switch
+- `SISY_ENABLE_LOOP_ROTATE=true` for default scalar RISC-V O1, with
+  `SISY_ENABLE_LOOP_ROTATE=0` as the bisection kill switch.  The public CLI
+  controls `--disable-loop-rotate` and `--enable-loop-rotate` remain available.
+- `SISY_ENABLE_UNROLL_INTERNAL_ROTATE=false`; the old unroll-local rotation
+  helpers remain available for experiments but are not part of the default
+  correctness envelope.
 - `SISY_SYNTH_CONST_ARRAY_MAX=4096` caps the default source-constant table
   synthesis budget, including input-independent initialization loops
 - `SISY_ENABLE_FINAL_ITER_COLLAPSE=true` enables the narrow IR-proven

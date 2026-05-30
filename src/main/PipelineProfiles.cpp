@@ -252,8 +252,17 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     if ((aggressive || enableO1LiteTail) && !economyMode)
       pm.addPass<sys::Reassociate>();
 
+    auto enableLoopRotate = [&]() {
+      if (forceStableManyParams || opts.disableLoopRotate)
+        return false;
+      if (!opts.loopRotateExplicit && opts.rv &&
+          !getenvEnabled("SISY_ENABLE_LOOP_ROTATE", true))
+        return false;
+      return true;
+    };
+
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-    if (!opts.disableLoopRotate && !forceStableManyParams)
+    if (enableLoopRotate())
       pm.addPass<sys::LoopRotate>();
     pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_LOOP_RECONSTRUCTION", true))
@@ -329,8 +338,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
                           o2VectorDefaults || polyVectorize);
     if (polyVectorize && getenvEnabled("SISY_POLY_VECTORIZE_ROTATE", true)) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      if ((!opts.disableLoopRotate || !opts.loopRotateExplicit) &&
-          !forceStableManyParams)
+      if (enableLoopRotate())
         pm.addPass<sys::LoopRotate>(/*allowCanonicalizedHeaders=*/ true);
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
     }
@@ -352,8 +360,7 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
     // as "latch terminator is not branch" without this step.
     if (enableVectorize && getenvEnabled("SISY_ENABLE_LATE_LOOP_ROTATE", true)) {
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ true);
-      if ((!opts.disableLoopRotate || !opts.loopRotateExplicit) &&
-          !forceStableManyParams)
+      if (enableLoopRotate())
         pm.addPass<sys::LoopRotate>(/*allowCanonicalizedHeaders=*/ true);
       pm.addPass<sys::CanonicalizeLoop>(/*lcssa=*/ false);
     }

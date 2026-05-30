@@ -62,7 +62,8 @@ The key architectural split is intentional:
 
 - Structured CFG optimization: const fold, inlining, loop cleanup, memory tidy, scalar transforms
 - FlattenCFG + SSA conversion (Mem2Reg)
-- Alias + DSE + DLE + DAE + GVN + LICM + loop canonicalization
+- Alias + DSE + DLE + DAE + GVN + LoopSimplify-style canonicalization,
+  hardened LoopRotate, LICM, and loop transforms
 - Late inline and cleanup rounds
 - Final schedule + target backend passes
 
@@ -73,7 +74,9 @@ The key architectural split is intentional:
 - Select stage: enable `Range + RangeAwareFold + Splice` by default
 - Tail stage: add one more `CanonicalizeLoop -> LICM -> SCEV -> GVN -> RegularFold`
 - `Cached` remains experimental-only (`--enable-experimental`)
-- Defaults: inline/late-inline thresholds are `256/256` unless explicitly overridden; loop-rotate is off by default for O1/O2 (can be manually enabled)
+- Defaults: inline/late-inline thresholds are `256/256` unless explicitly overridden.
+  RISC-V O1 enables hardened LoopRotate by default; `--disable-loop-rotate`
+  or `SISY_ENABLE_LOOP_ROTATE=0` disables the default path for bisection.
 
 ### Compliance Boundary In The Pipeline
 
@@ -85,6 +88,11 @@ experiments, not architectural requirements. The intended optimization stack is:
   guarded-loop simplification, and optional tiling after dependence proof.
 - CFG/mid-end: SSA, MemorySSA-style load/store reasoning, alias analysis, LICM,
   DSE/DLE, SCCP/range folds, SCEV, inlining, and select conversion.
+- Loop mid-end: canonical loop preheaders, guarded do-while rotation,
+  LCSSA-compatible exit-phi repair, and LICM load motion only from blocks
+  proven to execute after the guard.  Default RISC-V O1 rotation currently
+  skips store-containing loops; store motion still requires a stronger
+  guaranteed-execution proof than the loop guard alone provides.
 - Backend: target lowering, instruction scheduling, hotness-aware register
   allocation, rematerialization-friendly decisions, and peepholes.
 

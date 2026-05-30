@@ -555,7 +555,8 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
     return false;
 
   if (!loop->getInduction()) {
-    if (!tryRotateConstantCountdownLoop(loop))
+    if (!envEnabled("SISY_ENABLE_UNROLL_INTERNAL_ROTATE", false) ||
+        !tryRotateConstantCountdownLoop(loop))
       return false;
     rotatedForUnroll++;
   }
@@ -568,7 +569,8 @@ bool ConstLoopUnroll::runImpl(LoopInfo *loop) {
   auto latch = loop->getLatch();
   // The loop is not rotated. Don't unroll it.
   if (!isa<BranchOp>(latch->getLastOp())) {
-    if (tryRotateSmallConstantLoop(loop)) {
+    if (envEnabled("SISY_ENABLE_UNROLL_INTERNAL_ROTATE", false) &&
+        tryRotateSmallConstantLoop(loop)) {
       rotatedForUnroll++;
       preheader = loop->preheader;
     }
@@ -837,6 +839,8 @@ bool ConstLoopUnroll::tryFactorUnroll(LoopInfo *loop, int factor) {
 
   auto exit = loop->getExit();
   if (exit->preds.size() > 2)
+    return false;
+  if (!exit->getPhis().empty())
     return false;
 
   int loopsize = 0;

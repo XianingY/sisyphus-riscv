@@ -108,7 +108,12 @@ public:
 };
 
 class LoopRotate : public Pass {
+  int candidates = 0;
   int rotated = 0;
+  int rejectShape = 0;
+  int rejectPhi = 0;
+  int rejectIV = 0;
+  int guardSplit = 0;
   std::set<BasicBlock*> skipHeaders;
   bool allowCanonicalizedHeaders = false;
 

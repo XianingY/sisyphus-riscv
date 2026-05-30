@@ -285,9 +285,38 @@ bool loopKnownToRunOnce(LoopInfo *info) {
   return info->contains(taken);
 }
 
+bool loopHasRotatedLatch(LoopInfo *info) {
+  if (!info || info->latches.empty())
+    return false;
+  for (auto latch : info->latches) {
+    if (!latch || !isa<BranchOp>(latch->getLastOp()))
+      return false;
+  }
+  return true;
+}
+
+bool blockGuaranteedAfterRotatedEntry(LoopInfo *info, BasicBlock *bb) {
+  if (!loopHasRotatedLatch(info) || !bb || !info->contains(bb))
+    return false;
+
+  // The rotated guard only proves that the loop header is entered once.  A
+  // conditional sub-block is guaranteed only when every path to a latch or
+  // side exit passes through it.
+  if (bb == info->header)
+    return true;
+
+  for (auto latch : info->latches)
+    if (!bb->dominates(latch))
+      return false;
+  for (auto exiting : info->exitings)
+    if (!bb->dominates(exiting))
+      return false;
+  return true;
+}
+
 bool canSpeculateLoadFromBlock(LoopInfo *info, BasicBlock *bb, bool speculativeLoads) {
   if (speculativeLoads)
-    return true;
+    return blockGuaranteedAfterRotatedEntry(info, bb);
 
   // Non-rotated loops may skip the body entirely.  Hoisting a load from such a
   // body is only safe when the canonical loop is known to execute once and has
@@ -414,14 +443,12 @@ bool LICM::updateStores(LoopInfo *info, bool *storeHoistable) {
   if (!preheader)
     return false;
 
-  bool rotated = true;
-  for (auto latch : info->latches) {
-    auto term = latch->getLastOp();
-    if (!isa<BranchOp>(term))
-      rotated = false;
-  }
+  // Store motion is intentionally stricter than load motion.  A rotated latch
+  // proves loop entry, not that an arbitrary store block executes on all paths.
+  // Keep stores pinned unless a future per-store guaranteed-execution proof is
+  // added.
   if (storeHoistable)
-    *storeHoistable = rotated;
+    *storeHoistable = false;
 
   // Record all stores in the loop.
   stores.clear();
@@ -446,11 +473,12 @@ void LICM::runImpl(LoopInfo *info) {
   bool storeHoistable = false;
   if (!updateStores(info, &storeHoistable))
     return;
+  bool speculativeLoads = loopHasRotatedLatch(info);
 
   // Mark invariants inside the loop, and try hoisting it out.
   // We must traverse through domtree to preserve def-use chain.
   auto header = info->header;
-  hoistVariant(info, header, storeHoistable, storeHoistable);
+  hoistVariant(info, header, storeHoistable, speculativeLoads);
 }
 
 bool LICM::hoistSubloop(LoopInfo *outer) {

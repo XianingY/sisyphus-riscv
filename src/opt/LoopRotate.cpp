@@ -11,12 +11,13 @@ static void postorder(LoopInfo *loop, std::vector<LoopInfo*> &loops) {
 
 std::map<std::string, int> LoopRotate::stats() {
   return {
-    { "rotated-loops", rotated }
+    { "candidates", candidates },
+    { "rotated-loops", rotated },
+    { "reject-shape", rejectShape },
+    { "reject-phi", rejectPhi },
+    { "reject-iv", rejectIV },
+    { "guard-split", guardSplit }
   };
-}
-
-static bool isConstInt(Op *op, int value) {
-  return isa<IntOp>(op) && V(op) == value;
 }
 
 static bool inferInductionForRotate(LoopInfo *info) {
@@ -35,7 +36,7 @@ static bool inferInductionForRotate(LoopInfo *info) {
     if (!start || !latchVal || !addi.match(latchVal, { { "x", phi } }))
       continue;
     auto step = addi.extract("y");
-    if (!isConstInt(step, 1))
+    if (!isa<IntOp>(step) || V(step) <= 0)
       continue;
 
     auto term = info->header->getLastOp();
@@ -59,16 +60,22 @@ static bool inferInductionForRotate(LoopInfo *info) {
 void LoopRotate::runImpl(LoopInfo *info) {
   if (!allowCanonicalizedHeaders && skipHeaders.count(info->header))
     return;
-  if (info->latches.size() != 1)
+  candidates++;
+  if (info->latches.size() != 1 || info->exits.size() != 1 ||
+      info->exitings.size() != 1) {
+    rejectShape++;
     return;
-  if (!inferInductionForRotate(info))
+  }
+  if (!inferInductionForRotate(info)) {
+    rejectIV++;
     return;
-  if (info->exits.size() != 1)
-    return;
+  }
   for (auto bb : info->getBlocks()) {
     for (auto op : bb->getOps()) {
-      if (isa<CallOp>(op))
+      if (isa<StoreOp>(op)) {
+        rejectShape++;
         return;
+      }
     }
   }
 
@@ -83,37 +90,52 @@ void LoopRotate::runImpl(LoopInfo *info) {
   Rule br("(br (lt i x))"), brle("(br (le i x))");
   bool le = false;
   if (!br.match(term, { { "i", induction } })) {
-    if (!brle.match(term, { { "i", induction } }))
+    if (!brle.match(term, { { "i", induction } })) {
+      rejectShape++;
       return;
+    }
     le = true;
   }
-  if (ELSE(term) != exit)
+  if (ELSE(term) != exit || !info->contains(TARGET(term)) ||
+      *info->exitings.begin() != header) {
+    rejectShape++;
     return;
+  }
 
   auto latch = info->getLatch();
-  auto latchterm = latch->getLastOp();
-  if (!isa<GotoOp>(latchterm))
+  if (latch == header) {
+    rejectShape++;
     return;
+  }
+  auto latchterm = latch->getLastOp();
+  if (!isa<GotoOp>(latchterm) || !latchterm->has<TargetAttr>() ||
+      TARGET(latchterm) != header) {
+    rejectShape++;
+    return;
+  }
 
   // Now replace the preheader's condition with (%0 < %1).
   Builder builder;
 
   auto preheader = info->preheader;
   auto preterm = preheader->getLastOp();
-  if (!isa<GotoOp>(preterm))
+  if (!isa<GotoOp>(preterm) || !preterm->has<TargetAttr>() ||
+      TARGET(preterm) != header) {
+    rejectShape++;
     return;
+  }
   
   auto upper = le ? brle.extract("x") : br.extract("x");
   auto upperFrom = upper->getParent();
   if (!upperFrom->dominates(header) || upperFrom == header) {
-    if (!isa<IntOp>(upper))
+    if (!isa<IntOp>(upper)) {
+      rejectIV++;
       return;
+    }
 
     // We can hoist that constant out of loop.
     upper->moveBefore(preterm);
   }
-
-  rotated++;
 
   auto headerPhis = header->getPhis();
   std::map<Op*, Op*> valueMap, initMap;
@@ -123,8 +145,10 @@ void LoopRotate::runImpl(LoopInfo *info) {
     const auto &ops = phi->getOperands();
     const auto &attrs = phi->getAttrs();
     
-    if (attrs.size() != 2)
+    if (attrs.size() != 2 || ops.size() != 2) {
+      rejectPhi++;
       return;
+    }
     
     auto bb1 = cast<FromAttr>(attrs[0])->bb;
     if (bb1 == latch) {
@@ -137,9 +161,18 @@ void LoopRotate::runImpl(LoopInfo *info) {
       valueMap[phi] = ops[1].defining;
       initMap[phi] = ops[0].defining;
     }
+
+    if (!valueMap.count(phi) ||
+        !((bb1 == latch && bb2 == preheader) ||
+          (bb2 == latch && bb1 == preheader))) {
+      rejectPhi++;
+      return;
+    }
   }
-  if (!valueMap.count(induction))
+  if (!valueMap.count(induction)) {
+    rejectIV++;
     return;
+  }
 
   // Be conservative: only rotate when exit phis fed from header are direct
   // header-phi values that we can rewrite consistently.
@@ -147,12 +180,35 @@ void LoopRotate::runImpl(LoopInfo *info) {
   for (auto phi : exitPhis) {
     const auto &ops = phi->getOperands();
     const auto &attrs = phi->getAttrs();
+    bool hasHeaderIncoming = false;
     for (size_t i = 0; i < ops.size(); i++) {
       if (cast<FromAttr>(attrs[i])->bb != header)
         continue;
+      hasHeaderIncoming = true;
       auto def = ops[i].defining;
-      if (!valueMap.count(def) || !initMap.count(def))
+      if (!valueMap.count(def) || !initMap.count(def)) {
+        rejectPhi++;
         return;
+      }
+    }
+    if (!hasHeaderIncoming) {
+      rejectPhi++;
+      return;
+    }
+  }
+
+  // Split the old preheader into a zero-trip guard plus a single-edge
+  // loop preheader.  This keeps LoopAnalysis/LICM in LoopSimplify-style form:
+  // guard -> prebody -> header, and guard -> exit.
+  auto region = header->getParent();
+  auto prebody = region->insert(header);
+  builder.setToBlockEnd(prebody);
+  builder.create<GotoOp>({ new TargetAttr(header) });
+
+  for (auto phi : headerPhis) {
+    for (auto attr : phi->getAttrs()) {
+      if (cast<FromAttr>(attr)->bb == preheader)
+        cast<FromAttr>(attr)->bb = prebody;
     }
   }
 
@@ -162,7 +218,7 @@ void LoopRotate::runImpl(LoopInfo *info) {
     cmp = builder.create<LeOp>({ (Value) info->getStart(), upper });
   else
     cmp = builder.create<LtOp>({ (Value) info->getStart(), upper });
-  builder.replace<BranchOp>(preterm, { cmp }, { new TargetAttr(header), new ElseAttr(exit) });
+  builder.replace<BranchOp>(preterm, { cmp }, { new TargetAttr(prebody), new ElseAttr(exit) });
 
   // Replace the branch at header with a goto.
   auto target = TARGET(term);
@@ -197,6 +253,9 @@ void LoopRotate::runImpl(LoopInfo *info) {
       }
     }
   }
+
+  guardSplit++;
+  rotated++;
 }
 
 void LoopRotate::run() {

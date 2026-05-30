@@ -1,0 +1,18 @@
+int g;
+
+int effect(int x) {
+  putint(999);
+  return x;
+}
+
+int main() {
+  int i = 0;
+  int n = 0;
+  while (i < n) {
+    g = effect(i);
+    i = i + 1;
+  }
+  putint(g);
+  putch(10);
+  return 0;
+}

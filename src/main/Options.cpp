@@ -337,7 +337,7 @@ Options sys::parseArgs(int argc, char **argv) {
       opts.lateInlineThreshold = 200;
   }
   if (!opts.loopRotateExplicit) {
-    if (opts.o1)
+    if (opts.o1 && !opts.rv)
       opts.disableLoopRotate = true;
   }
 
