@@ -501,10 +501,21 @@ void promoteCandidate(const ScalarCandidate &candidate, LoopInfo *info) {
     auto *lcssaPhi = builder.create<PhiOp>();
     lcssaPhi->setResultType(resultType);
 
-    // Add incoming edges from all exiting blocks.
-    for (auto *exiting : info->exitings) {
-        lcssaPhi->pushOperand(phi);
-        lcssaPhi->add<FromAttr>(exiting);
+    // Add incoming edges from every predecessor of the exit block.  Rotated or
+    // guarded loops can reach the exit without entering the loop; those
+    // zero-trip edges must forward the original memory value, otherwise the
+    // sunk store would use a loop-header phi that does not dominate that path.
+    for (auto *pred : exit->preds) {
+        if (info->contains(pred)) {
+            lcssaPhi->pushOperand(phi);
+            lcssaPhi->add<FromAttr>(pred);
+            continue;
+        }
+
+        builder.setBeforeOp(pred->getLastOp());
+        auto *edgeLoad = builder.create<LoadOp>(resultType, { addr }, { new SizeAttr(size) });
+        lcssaPhi->pushOperand(edgeLoad);
+        lcssaPhi->add<FromAttr>(pred);
     }
 
     // Insert the store after all phis in the exit block (including our new LCSSA phi).
@@ -601,22 +612,23 @@ void ScalarReplace::runImpl(LoopInfo *info) {
     if (info->latches.size() != 1)
         return;
 
-    // Task 4.2: Find load/store pairs to loop-invariant addresses.
-    auto candidates = collectCandidates(info);
-    detected += candidates.size();
+    for (int budget = 0; budget < 8; budget++) {
+        // Recollect after each promotion: the transform erases loads/stores, so
+        // candidates captured before a previous promotion may point at stale IR.
+        auto candidates = collectCandidates(info);
+        detected += candidates.size();
 
-    // Task 4.3: Filter candidates by alias safety.
-    // Remove candidates where another store in the loop may alias the target address.
-    std::vector<ScalarCandidate> safeCandidates;
-    for (auto &candidate : candidates) {
-        if (isAliasSafe(candidate, info))
-            safeCandidates.push_back(candidate);
-    }
-    candidates = std::move(safeCandidates);
+        ScalarCandidate *chosen = nullptr;
+        for (auto &candidate : candidates) {
+            if (isAliasSafe(candidate, info)) {
+                chosen = &candidate;
+                break;
+            }
+        }
+        if (!chosen)
+            return;
 
-    // Task 4.4: Promote safe candidates to scalar registers.
-    for (auto &candidate : candidates) {
-        promoteCandidate(candidate, info);
+        promoteCandidate(*chosen, info);
         promoted++;
     }
 }

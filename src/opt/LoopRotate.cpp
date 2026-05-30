@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 using namespace sys;
 
@@ -68,6 +69,16 @@ static bool inferInductionForRotate(LoopInfo *info) {
   return false;
 }
 
+static BasicBlock *effectiveUseBlock(Op *value, Op *use) {
+  if (!isa<PhiOp>(use))
+    return use->getParent();
+  for (size_t i = 0; i < use->getOperands().size(); i++) {
+    if (use->getOperand(i).defining == value)
+      return cast<FromAttr>(use->getAttrs()[i])->bb;
+  }
+  return use->getParent();
+}
+
 void LoopRotate::runImpl(LoopInfo *info) {
   if (!allowCanonicalizedHeaders && skipHeaders.count(info->header))
     return;
@@ -81,12 +92,37 @@ void LoopRotate::runImpl(LoopInfo *info) {
     rejectIV++;
     return;
   }
+  bool hasStore = false;
+  bool hasCall = false;
   for (auto bb : info->getBlocks()) {
     for (auto op : bb->getOps()) {
-      if (isa<StoreOp>(op) &&
-          !envEnabled("SISY_ENABLE_LOOP_ROTATE_STORES", false)) {
-        rejectShape++;
-        return;
+      hasStore |= isa<StoreOp>(op);
+      hasCall |= isa<CallOp>(op);
+    }
+  }
+  if (hasStore) {
+    if (!envEnabled("SISY_ENABLE_LOOP_ROTATE_STORES", true)) {
+      rejectShape++;
+      return;
+    }
+    if (hasCall) {
+      rejectShape++;
+      return;
+    }
+    if (info->getBlocks().size() > 2) {
+      rejectShape++;
+      return;
+    }
+    if (!info->getExit()->getPhis().empty()) {
+      rejectPhi++;
+      return;
+    }
+    if (auto func = dyn_cast<FuncOp>(info->header->getParent()->getParent())) {
+      for (auto call : func->findAll<CallOp>()) {
+        if (!isExtern(NAME(call))) {
+          rejectShape++;
+          return;
+        }
       }
     }
   }
@@ -186,9 +222,12 @@ void LoopRotate::runImpl(LoopInfo *info) {
     return;
   }
 
+  std::set<Op*> exitPhiSet;
   // Be conservative: only rotate when exit phis fed from header are direct
   // header-phi values that we can rewrite consistently.
   auto exitPhis = exit->getPhis();
+  for (auto phi : exitPhis)
+    exitPhiSet.insert(phi);
   for (auto phi : exitPhis) {
     const auto &ops = phi->getOperands();
     const auto &attrs = phi->getAttrs();
@@ -206,6 +245,37 @@ void LoopRotate::runImpl(LoopInfo *info) {
     if (!hasHeaderIncoming) {
       rejectPhi++;
       return;
+    }
+  }
+
+  std::map<Op*, std::vector<Op*>> directOutsideUses;
+  for (auto phi : headerPhis) {
+    std::vector<Op*> uses(phi->getUses().begin(), phi->getUses().end());
+    for (auto use : uses) {
+      if (exitPhiSet.count(use))
+        continue;
+      auto useBlock = effectiveUseBlock(phi, use);
+      if (info->contains(useBlock))
+        continue;
+      // Phi edge uses outside the loop require edge-specific repair.  Keep the
+      // default store-rotation path focused on ordinary LCSSA direct users.
+      if (isa<PhiOp>(use)) {
+        rejectPhi++;
+        return;
+      }
+      if (!exit->dominates(use->getParent())) {
+        rejectPhi++;
+        return;
+      }
+      directOutsideUses[phi].push_back(use);
+    }
+  }
+  if (!directOutsideUses.empty()) {
+    for (auto pred : exit->preds) {
+      if (pred != header) {
+        rejectPhi++;
+        return;
+      }
     }
   }
 
@@ -262,6 +332,24 @@ void LoopRotate::runImpl(LoopInfo *info) {
         phi->pushOperand(initMap.count(def) ? initMap[def] : def);
         phi->add<FromAttr>(preheader);
         break;
+      }
+    }
+  }
+
+  // Header phis may be used directly after the loop.  After rotation the exit
+  // has a zero-trip edge from the guard, so those uses need an explicit final
+  // value phi: latch value for executed loops, initial value for zero-trip.
+  for (auto &[headerPhi, uses] : directOutsideUses) {
+    builder.setToBlockStart(exit);
+    auto finalPhi = builder.create<PhiOp>();
+    finalPhi->pushOperand(valueMap[headerPhi]);
+    finalPhi->add<FromAttr>(latch);
+    finalPhi->pushOperand(initMap[headerPhi]);
+    finalPhi->add<FromAttr>(preheader);
+    for (auto use : uses) {
+      for (size_t i = 0; i < use->getOperands().size(); i++) {
+        if (use->getOperand(i).defining == headerPhi)
+          use->setOperand(i, finalPhi);
       }
     }
   }

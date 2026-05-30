@@ -37,10 +37,11 @@ These are appropriate for default use when verifier and regression checks pass:
 - Hardened `LoopRotate` for default scalar RISC-V O1.  It rewrites canonical
   positive-step while loops into a guarded do-while form only after
   LoopSimplify/LCSSA-style canonicalization, keeps a single-edge loop preheader,
-  repairs exit phis for zero-trip semantics, and leaves calls in place.  The
-  current default legality gate intentionally excludes loops containing stores
-  until the downstream rotated-loop consumers have a per-store
-  guaranteed-execution proof.
+  repairs exit phis for zero-trip semantics, and leaves calls/stores in place.
+  Store-containing loops are now enabled by default for straight-line,
+  no-internal-call, no-exit-phi loop shapes so MatMul/Conv2D-style inner loops
+  can expose the single-backedge hot path without feeding complex conditional
+  store CFGs to downstream passes.
 - HIR affine transforms: fusion, interchange, reduction privatization,
   invariant guard hoisting, partial unroll, and unroll-and-jam when dependence
   analysis proves legality.
@@ -232,10 +233,10 @@ important defaults as of this review:
 - `SISY_ENABLE_UNROLL_INTERNAL_ROTATE=false`; the old unroll-local rotation
   helpers remain available for experiments but are not part of the default
   correctness envelope.
-- `SISY_ENABLE_LOOP_ROTATE_STORES=false`; store-containing loop rotation is
-  available only for explicit experiments such as RVV vectorization tests.  The
-  default scalar RISC-V O1 route keeps those loops unrotated until downstream
-  passes have stronger store-path proofs.
+- `SISY_ENABLE_LOOP_ROTATE_STORES=true`; store-containing loop rotation is part
+  of the default scalar RISC-V O1 route for straight-line proven-safe store
+  loops, with `SISY_ENABLE_LOOP_ROTATE_STORES=0` retained as the bisection kill
+  switch.
 - `SISY_ENABLE_RVV_STRIDED=false`; RVV strided `vlse32.v`/`vsse32.v`
   lowering is experimental and requires both RVV enablement and this explicit
   strided-vector switch.  The default RISC-V O1 profile must remain `rv64gc`

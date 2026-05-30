@@ -1,0 +1,12 @@
+int a[8];
+
+int main() {
+  int i = 0;
+  while (i < 8) {
+    a[i] = i + 3;
+    i = i + 1;
+  }
+  putint(a[7]);
+  putch(10);
+  return 0;
+}
