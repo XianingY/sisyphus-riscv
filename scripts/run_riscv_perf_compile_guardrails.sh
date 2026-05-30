@@ -60,4 +60,45 @@ for src in "${cases[@]}"; do
   done
 done
 
+compare_cases=(
+  conv2d-1
+  h-8-01
+)
+compare_timeout="${SISY_RISCV_GUARD_COMPARE_TIMEOUT:-120}"
+
+for name in "${compare_cases[@]}"; do
+  src="${CASE_DIR}/${name}.sy"
+  input="${CASE_DIR}/${name}.in"
+  expect="${CASE_DIR}/${name}.out"
+  asm="${OUT_DIR}/${name}.compare.rv.s"
+  log="${OUT_DIR}/${name}.compare.log"
+  if [[ ! -f "${src}" || ! -f "${input}" || ! -f "${expect}" ]]; then
+    echo "guardrail compare case is missing files: ${name}" >&2
+    exit 1
+  fi
+
+  echo "[riscv-guard] compare ${name}"
+  if ! timeout "${compare_timeout}" "${COMPILER}" "${src}" -S -o "${asm}" \
+      -O1 --target=riscv --verify-ir --compare "${expect}" -i "${input}" \
+      >"${log}" 2>&1; then
+    cat "${log}" >&2
+    echo "default RISC-V O1 compare failed for ${name}" >&2
+    exit 1
+  fi
+
+  if [[ "${SISY_RISCV_GUARD_CHECK_STORE_ROTATE:-0}" == "1" ]]; then
+    opt_log="${OUT_DIR}/${name}.store-rotate.compare.log"
+    set +e
+    SISY_ENABLE_LOOP_ROTATE_STORES=1 timeout "${compare_timeout}" \
+      "${COMPILER}" "${src}" -S -o "${OUT_DIR}/${name}.store-rotate.rv.s" \
+      -O1 --target=riscv --verify-ir --compare "${expect}" -i "${input}" \
+      >"${opt_log}" 2>&1
+    opt_rc=$?
+    set -e
+    if [[ "${opt_rc}" -ne 0 ]]; then
+      echo "[riscv-guard] warning: store-loop rotation opt-in compare failed for ${name}; default path remains guarded" >&2
+    fi
+  fi
+done
+
 echo "RISC-V performance compile guardrails passed (${#cases[@]} cases)."

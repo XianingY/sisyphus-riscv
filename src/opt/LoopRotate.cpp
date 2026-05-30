@@ -101,7 +101,7 @@ void LoopRotate::runImpl(LoopInfo *info) {
     }
   }
   if (hasStore) {
-    if (!envEnabled("SISY_ENABLE_LOOP_ROTATE_STORES", true)) {
+    if (!envEnabled("SISY_ENABLE_LOOP_ROTATE_STORES", false)) {
       rejectShape++;
       return;
     }

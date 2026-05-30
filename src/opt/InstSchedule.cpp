@@ -22,6 +22,59 @@ int instScheduleMaxOps() {
   return (int) parsed;
 }
 
+bool validateLocalSchedule(
+    BasicBlock *bb,
+    const std::unordered_set<Op*> &scheduled,
+    const std::unordered_map<Op*, std::vector<Op*>> &memDeps) {
+  if (!bb)
+    return false;
+
+  std::unordered_map<Op*, int> position;
+  int index = 0;
+  for (auto op : bb->getOps())
+    position[op] = index++;
+
+  for (auto op : scheduled) {
+    auto opIt = position.find(op);
+    if (opIt == position.end())
+      return false;
+    int opPos = opIt->second;
+
+    for (auto operand : op->getOperands()) {
+      Op *def = operand.defining;
+      if (!def || def == op)
+        return false;
+      if (def->getParent() != bb || isa<PhiOp>(def))
+        continue;
+      auto defIt = position.find(def);
+      if (defIt == position.end())
+        return false;
+      if (defIt->second >= opPos)
+        return false;
+    }
+
+    auto depsIt = memDeps.find(op);
+    if (depsIt == memDeps.end())
+      continue;
+    for (auto dep : depsIt->second) {
+      if (!dep || dep->getParent() != bb)
+        continue;
+      auto depIt = position.find(dep);
+      if (depIt == position.end())
+        return false;
+      if (depIt->second >= opPos)
+        return false;
+    }
+  }
+
+  return true;
+}
+
+void restoreLocalOrder(const std::vector<Op*> &order, Op *term) {
+  for (auto op : order)
+    op->moveBefore(term);
+}
+
 }
 
 void InstSchedule::runImpl(BasicBlock *bb) {
@@ -212,8 +265,14 @@ void InstSchedule::runImpl(BasicBlock *bb) {
   if (!changed)
     return;
 
+  std::unordered_set<Op*> scheduled(newOrder.begin(), newOrder.end());
   for (auto op : newOrder)
     op->moveBefore(term);
+
+  if (!validateLocalSchedule(bb, scheduled, memDeps)) {
+    restoreLocalOrder(allowedOrder, term);
+    return;
+  }
 }
 
 void InstSchedule::run() {

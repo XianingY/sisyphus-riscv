@@ -67,20 +67,20 @@ store_stats="$("${COMPILER}" "${CASE_DIR}/store_loop.sy" -S \
 printf '%s\n' "${store_stats}" >"${OUT_DIR}/store_loop.stats"
 grep -A6 '^loop-rotate:$' "${OUT_DIR}/store_loop.stats" || true
 
-if ! grep -A8 '^loop-rotate:$' <<<"${store_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
-  echo "expected default RISC-V O1 to rotate canonical store loops" >&2
+if grep -A8 '^loop-rotate:$' <<<"${store_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
+  echo "default RISC-V O1 should not rotate store loops; use SISY_ENABLE_LOOP_ROTATE_STORES=1 to opt in" >&2
   exit 1
 fi
 
-store_off_stats="$(SISY_ENABLE_LOOP_ROTATE_STORES=0 "${COMPILER}" "${CASE_DIR}/store_loop.sy" -S \
-  -o "${OUT_DIR}/store_loop.no-store-rotate.rv.s" \
+store_on_stats="$(SISY_ENABLE_LOOP_ROTATE_STORES=1 "${COMPILER}" "${CASE_DIR}/store_loop.sy" -S \
+  -o "${OUT_DIR}/store_loop.store-rotate.rv.s" \
   -O1 --target=riscv --verify-ir --stats \
   --compare "${CASE_DIR}/store_loop.out" \
   2>&1 >/dev/null)"
-printf '%s\n' "${store_off_stats}" >"${OUT_DIR}/store_loop.no-store-rotate.stats"
+printf '%s\n' "${store_on_stats}" >"${OUT_DIR}/store_loop.store-rotate.stats"
 
-if grep -A8 '^loop-rotate:$' <<<"${store_off_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
-  echo "SISY_ENABLE_LOOP_ROTATE_STORES=0 should prevent store-loop rotation" >&2
+if ! grep -A8 '^loop-rotate:$' <<<"${store_on_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
+  echo "SISY_ENABLE_LOOP_ROTATE_STORES=1 should opt canonical store loops into rotation" >&2
   exit 1
 fi
 

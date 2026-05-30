@@ -77,6 +77,9 @@ The key architectural split is intentional:
 - Defaults: inline/late-inline thresholds are `256/256` unless explicitly overridden.
   RISC-V O1 enables hardened LoopRotate by default; `--disable-loop-rotate`
   or `SISY_ENABLE_LOOP_ROTATE=0` disables the default path for bisection.
+  Store-containing loop rotation is kept behind
+  `SISY_ENABLE_LOOP_ROTATE_STORES=1` until MemorySSA and guaranteed-execute
+  checks can discharge conditional store cases.
 
 ### Compliance Boundary In The Pipeline
 
@@ -86,6 +89,10 @@ experiments, not architectural requirements. The intended optimization stack is:
 
 - HIR: affine loop legality, reduction privatization, fusion/interchange,
   guarded-loop simplification, and optional tiling after dependence proof.
+  `AffineNestAnalysis` is the shared MLIR-like side table for loop domain,
+  access-rank, contiguity/stride, side-effect, reduction, and pressure summaries;
+  individual Linalg/Stenciling transforms should consume it instead of
+  reimplementing case-specific shape tests.
 - CFG/mid-end: SSA, MemorySSA-style load/store reasoning, alias analysis, LICM,
   DSE/DLE, SCCP/range folds, SCEV, inlining, and select conversion.
 - Loop mid-end: canonical loop preheaders, guarded do-while rotation,

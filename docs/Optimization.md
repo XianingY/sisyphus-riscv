@@ -38,10 +38,9 @@ These are appropriate for default use when verifier and regression checks pass:
   positive-step while loops into a guarded do-while form only after
   LoopSimplify/LCSSA-style canonicalization, keeps a single-edge loop preheader,
   repairs exit phis for zero-trip semantics, and leaves calls/stores in place.
-  Store-containing loops are now enabled by default for straight-line,
-  no-internal-call, no-exit-phi loop shapes so MatMul/Conv2D-style inner loops
-  can expose the single-backedge hot path without feeding complex conditional
-  store CFGs to downstream passes.
+  Store-containing loops remain opt-in until the MemorySSA/guaranteed-execute
+  contract can prove all downstream consumers preserve conditional store
+  semantics; the default route favors PE/AC stability over extra rotation.
 - HIR affine transforms: fusion, interchange, reduction privatization,
   invariant guard hoisting, partial unroll, and unroll-and-jam when dependence
   analysis proves legality.
@@ -233,10 +232,10 @@ important defaults as of this review:
 - `SISY_ENABLE_UNROLL_INTERNAL_ROTATE=false`; the old unroll-local rotation
   helpers remain available for experiments but are not part of the default
   correctness envelope.
-- `SISY_ENABLE_LOOP_ROTATE_STORES=true`; store-containing loop rotation is part
-  of the default scalar RISC-V O1 route for straight-line proven-safe store
-  loops, with `SISY_ENABLE_LOOP_ROTATE_STORES=0` retained as the bisection kill
-  switch.
+- `SISY_ENABLE_LOOP_ROTATE_STORES=false`; store-containing loop rotation is an
+  explicit experiment (`SISY_ENABLE_LOOP_ROTATE_STORES=1`) while the default
+  scalar RISC-V O1 route keeps `conv2d`/Nussinov-style conditional store loops
+  on the conservative path.
 - `SISY_ENABLE_RVV_STRIDED=false`; RVV strided `vlse32.v`/`vsse32.v`
   lowering is experimental and requires both RVV enablement and this explicit
   strided-vector switch.  The default RISC-V O1 profile must remain `rv64gc`
