@@ -127,21 +127,14 @@ bool rematerializableValue(Op *op) {
   // Constants and address loads are trivially rematerializable.
   if (isa<LiOp>(op) || isa<LaOp>(op))
     return true;
-  // addi sp, offset  /  addi zero, imm  /  addi gp, offset are all cheap
-  // to rematerialize at the use site.  GP-relative offsets are common for
-  // global array base addresses in the SysY runtime.
+  // Only position-stable addi forms are safe to rematerialize at the use site.
+  // A saved stack-pointer snapshot is not stable across outgoing call-frame
+  // adjustments, so do not rebuild sp-relative values here.
   if (isa<AddiOp>(op) && op->has<RsAttr>() && op->has<IntAttr>() &&
       !op->has<SpilledRsAttr>()) {
     Reg base = RS(op);
-    return base == Reg::sp || base == Reg::zero || base == Reg::gp;
+    return base == Reg::zero || base == Reg::gp;
   }
-  // Shift-by-constant (slli/slliw with immediate) is rematerializable.
-  // This covers the i*4 / i*8 patterns produced by StrengthReduct for
-  // array indexing, which are extremely common in matrix loop bodies.
-  if ((isa<SlliwOp>(op) || isa<SlliOp>(op)) &&
-      op->has<IntAttr>() && op->getOperandCount() >= 1 &&
-      !op->has<SpilledRsAttr>())
-    return true;
   return false;
 }
 
@@ -159,21 +152,10 @@ bool emitRematerializedValue(Builder &builder, Op *ref, Reg dst) {
   if (isa<AddiOp>(ref) && ref->has<RsAttr>() && ref->has<IntAttr>() &&
       !ref->has<SpilledRsAttr>()) {
     Reg base = RS(ref);
-    if (base == Reg::sp || base == Reg::zero || base == Reg::gp) {
+    if (base == Reg::zero || base == Reg::gp) {
       builder.create<AddiOp>({ RDC(dst), RSC(base), new IntAttr(V(ref)) });
       return true;
     }
-  }
-  // Shift-by-constant: slli/slliw with immediate operand.
-  if ((isa<SlliwOp>(ref) || isa<SlliOp>(ref)) &&
-      ref->has<IntAttr>() && ref->getOperandCount() >= 1 &&
-      !ref->has<SpilledRsAttr>()) {
-    Reg src = RS(ref);
-    if (isa<SlliwOp>(ref))
-      builder.create<SlliwOp>({ RDC(dst), RSC(src), new IntAttr(V(ref)) });
-    else
-      builder.create<SlliOp>({ RDC(dst), RSC(src), new IntAttr(V(ref)) });
-    return true;
   }
   return false;
 }
