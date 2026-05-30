@@ -18,6 +18,12 @@ struct OpDescriptor {
   const char *foldHook;
   const char *const *traits;
   std::size_t traitCount;
+  const char *const *operandNames;
+  std::size_t operandNameCount;
+  const char *const *resultNames;
+  std::size_t resultNameCount;
+  const char *const *attrNames;
+  std::size_t attrNameCount;
 };
 
 class OpDescriptorTable {

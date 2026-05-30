@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstdint>
 #include <map>
+#include <utility>
 
 namespace sys {
 
@@ -62,6 +63,21 @@ public:
   std::string toString() override;
   VectorShapeAttr *clone() override {
     return new VectorShapeAttr(elemBits, scalable, masked, strided);
+  }
+};
+
+class LocationAttr : public AttrImpl<LocationAttr, __LINE__> {
+public:
+  std::string file;
+  int line;
+  int column;
+
+  LocationAttr(std::string file = "unknown", int line = 0, int column = 0):
+    file(std::move(file)), line(line), column(column) {}
+
+  std::string toString() override;
+  LocationAttr *clone() override {
+    return new LocationAttr(file, line, column);
   }
 };
 

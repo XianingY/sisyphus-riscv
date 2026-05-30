@@ -87,6 +87,12 @@ std::string VectorShapeAttr::toString() {
   return ss.str();
 }
 
+std::string LocationAttr::toString() {
+  std::stringstream ss;
+  ss << "<loc = \"" << file << "\":" << line << ":" << column << ">";
+  return ss.str();
+}
+
 std::string ArgTypesAttr::toString() {
   std::stringstream ss;
   ss << "<arg_types = ";

@@ -20,9 +20,12 @@
 #include "../hir/HIRCanonicalize.h"
 #include "../hir/HIRPolyhedral.h"
 #include "../pass/PassRegistry.h"
+#include "../ir/DialectConversion.h"
+#include "../ir/IRContext.h"
 #include "../ir/OpDescriptor.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
+#include "../opt/ScopedPassManager.h"
 #include "../utils/smt/SMT.h"
 #include "../parse/CompileError.h"
 
@@ -77,6 +80,20 @@ static int thinLinkOnly(const sys::Options &opts) {
     }
   }
   return 0;
+}
+
+static const char *legacyTypeName(sys::Value::Type type) {
+  switch (type) {
+  case sys::Value::unit: return "unit";
+  case sys::Value::i32: return "i32";
+  case sys::Value::i64: return "i64";
+  case sys::Value::f32: return "f32";
+  case sys::Value::i128: return "i128";
+  case sys::Value::f128: return "f128";
+  case sys::Value::vscale_i32: return "vscale_i32";
+  case sys::Value::vscale_f32: return "vscale_f32";
+  }
+  return "unknown";
 }
 
 void removeDuplicates(std::vector<Atomic>& clause) {
@@ -235,6 +252,37 @@ int main(int argc, char **argv) {
       return 1;
     }
     sys::ir::OpDescriptorTable::dump(std::cout);
+    return 0;
+  }
+
+  if (opts.dumpIRContext) {
+    sys::ir::IRContext::global().dump(std::cout);
+    return 0;
+  }
+
+  if (opts.dumpPassScopes) {
+    std::string error;
+    if (!sys::ScopedPassRegistry::verify(&error)) {
+      std::cerr << "scoped pass registry verification failed: " << error << "\n";
+      return 1;
+    }
+    sys::ScopedPassRegistry::dump(std::cout);
+    return 0;
+  }
+
+  if (opts.dumpDialectConversion) {
+    sys::ir::DialectConversionDriver::dumpStandardScalarLegality(std::cout);
+    return 0;
+  }
+
+  if (opts.dumpBlockArguments) {
+    sys::ModuleOp module;
+    auto *bb = module.createFirstBlock();
+    auto &arg = bb->addArgument(sys::Value::i32, "iv");
+    std::cout << "[block-arg] count=" << bb->getArguments().size()
+              << " first=" << arg.name
+              << " index=" << arg.index
+              << " type=" << legacyTypeName(arg.type) << "\n";
     return 0;
   }
 

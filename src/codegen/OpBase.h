@@ -8,6 +8,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../utils/DynamicCast.h"
@@ -35,6 +36,18 @@ public:
   bool operator>(Value x) const { return defining > x.defining; }
   bool operator<=(Value x) const { return defining <= x.defining; }
   bool operator>=(Value x) const { return defining >= x.defining; }
+};
+
+struct BlockArgument {
+  BasicBlock *owner = nullptr;
+  int index = -1;
+  Value::Type type = Value::unit;
+  std::string name;
+
+  BlockArgument() = default;
+  BlockArgument(BasicBlock *owner, int index, Value::Type type,
+                std::string name = ""):
+    owner(owner), index(index), type(type), name(std::move(name)) {}
 };
 
 class Region {
@@ -93,6 +106,7 @@ public:
 class SimplifyCFG;
 class BasicBlock {
   std::list<Op*> ops;
+  std::vector<BlockArgument> arguments;
   Region *parent;
   Region::iterator place;
   // Note these are dominatORs, which mean `this` is dominatED by the elements.
@@ -120,6 +134,9 @@ public:
     parent(parent), place(place) {}
 
   auto &getOps() { return ops; }
+  const auto &getArguments() const { return arguments; }
+  BlockArgument &addArgument(Value::Type type, const std::string &name = "");
+  void clearArguments() { arguments.clear(); }
   int getOpCount() { return ops.size(); }
   Op *getFirstOp() const { return *ops.begin(); }
   Op *getLastOp() const { return *--ops.end(); }

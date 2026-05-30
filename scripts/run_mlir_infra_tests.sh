@@ -11,9 +11,21 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
-"${ROOT_DIR}/scripts/gen-op-descriptors.py" --check \
+"${ROOT_DIR}/scripts/gen-op-descriptors.py" --check --emit=descriptors \
   "${ROOT_DIR}/src/ir/op_schema.yml" \
   "${ROOT_DIR}/src/ir/GeneratedOpDescriptors.inc"
+"${ROOT_DIR}/scripts/gen-op-descriptors.py" --check --emit=classes \
+  "${ROOT_DIR}/src/ir/op_schema.yml" \
+  "${ROOT_DIR}/src/ir/GeneratedOpClasses.inc"
+
+if ! grep -q "class ArithAddiODSOp" "${ROOT_DIR}/src/ir/GeneratedOpClasses.inc"; then
+  echo "expected generated ODS wrapper for arith.addi" >&2
+  exit 1
+fi
+if ! grep -q "getLhs" "${ROOT_DIR}/src/ir/GeneratedOpClasses.inc"; then
+  echo "expected generated typed getter for arith.addi.lhs" >&2
+  exit 1
+fi
 
 if "${ROOT_DIR}/scripts/gen-op-descriptors.py" \
     "${ROOT_DIR}/tests/opgen/bad_missing_field.yml" >/dev/null 2>"${OUT_DIR}/bad-missing.log"; then
@@ -44,6 +56,54 @@ for op in arith.addi arith.select scf.for memref.load; do
     exit 1
   fi
 done
+if ! grep -q "operands=\\[lhs,rhs\\]" <<<"${descriptors}"; then
+  echo "expected descriptor dump to include operand names" >&2
+  exit 1
+fi
+
+context="$("${COMPILER}" --dump-ir-context)"
+echo "${context}"
+if ! grep -q "\\[ir-context\\] type i32 uniqued=1" <<<"${context}"; then
+  echo "expected uniqued i32 in IRContext dump" >&2
+  exit 1
+fi
+if ! grep -q "\\[ir-context\\] attr loc(\"unknown\":0:0) uniqued=1" <<<"${context}"; then
+  echo "expected uniqued location attr in IRContext dump" >&2
+  exit 1
+fi
+
+scopes="$("${COMPILER}" --dump-pass-scopes)"
+echo "${scopes}"
+if ! grep -q "\\[pass-scope\\] function mem2reg" <<<"${scopes}"; then
+  echo "expected scoped pass dump to contain function mem2reg" >&2
+  exit 1
+fi
+if ! grep -q "\\[pass-scope\\] loop licm" <<<"${scopes}"; then
+  echo "expected scoped pass dump to contain loop licm" >&2
+  exit 1
+fi
+
+conversion="$("${COMPILER}" --dump-dialect-conversion)"
+echo "${conversion}"
+if ! grep -q "\\[dialect-conversion\\] legal-dialect arith" <<<"${conversion}"; then
+  echo "expected dialect conversion dump to contain arith" >&2
+  exit 1
+fi
+if ! grep -q "illegal-count=0" <<<"${conversion}"; then
+  echo "expected standard scalar target to legalize all generated ops" >&2
+  exit 1
+fi
+
+blockargs="$("${COMPILER}" --dump-block-arguments)"
+echo "${blockargs}"
+if ! grep -q "\\[block-arg\\] count=1" <<<"${blockargs}"; then
+  echo "expected block argument dump" >&2
+  exit 1
+fi
+if ! grep -q "first=iv" <<<"${blockargs}"; then
+  echo "expected named block argument in dump" >&2
+  exit 1
+fi
 
 stats="$(SISY_ENABLE_PATTERN_CANONICALIZE=1 "${COMPILER}" \
   "${ROOT_DIR}/tests/mlir_infra/pattern_fold.sy" -S \

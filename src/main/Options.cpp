@@ -43,6 +43,10 @@ Options::Options() {
   disableSMTSynth = false;
   dumpAnalysisCache = false;
   dumpOpDescriptors = false;
+  dumpIRContext = false;
+  dumpPassScopes = false;
+  dumpDialectConversion = false;
+  dumpBlockArguments = false;
   inlineThreshold = 200;
   lateInlineThreshold = 200;
   inlineThresholdExplicit = false;
@@ -195,6 +199,10 @@ Options sys::parseArgs(int argc, char **argv) {
     PARSEOPT("--dump-pass-timing", dumpPassTiming);
     PARSEOPT("--dump-analysis-cache", dumpAnalysisCache);
     PARSEOPT("--dump-op-descriptors", dumpOpDescriptors);
+    PARSEOPT("--dump-ir-context", dumpIRContext);
+    PARSEOPT("--dump-pass-scopes", dumpPassScopes);
+    PARSEOPT("--dump-dialect-conversion", dumpDialectConversion);
+    PARSEOPT("--dump-block-arguments", dumpBlockArguments);
     PARSEOPT("--enable-experimental", enableExperimental);
     PARSEOPT("--disable-o2-experimental", disableO2Experimental);
     PARSEOPT("--enable-hir-pipeline", enableHIRPipeline);
@@ -359,14 +367,18 @@ Options sys::parseArgs(int argc, char **argv) {
   }
 
   if (opts.inputFile.empty() && !opts.bv && !opts.sat &&
-      opts.thinLinkOut.empty() && !opts.dumpOpDescriptors) {
+      opts.thinLinkOut.empty() && !opts.dumpOpDescriptors &&
+      !opts.dumpIRContext && !opts.dumpPassScopes &&
+      !opts.dumpDialectConversion && !opts.dumpBlockArguments) {
     std::cerr
       << "usage: compiler <input.sy> -S -o <output.s> [-O0|-O1|-O2] [--target=riscv|arm]\n"
       << "       [--inline-threshold=N] [--late-inline-threshold=N]\n"
       << "       [--disable-o2-experimental]\n"
       << "       [--thin-summary-out=<path>] [--thin-summary-in=<path>] [--thin-link-out=<path>]\n"
       << "       [--profile-generate=<path>] [--profile-use=<path>] [--fdo-use=<path>]\n"
-      << "       [--pass-pipeline=<comma-separated-passes>] [--dump-analysis-cache] [--dump-op-descriptors]\n"
+      << "       [--pass-pipeline=<comma-separated-passes>] [--dump-analysis-cache]\n"
+      << "       [--dump-op-descriptors] [--dump-ir-context] [--dump-pass-scopes]\n"
+      << "       [--dump-dialect-conversion] [--dump-block-arguments]\n"
       << "       [--enable-rvv] [--disable-smt-synth]\n"
       << "       [--enable-hir-pipeline|--disable-hir-pipeline|--use-legacy-codegen|--force-dialect-codegen]\n"
       << "       [--dialect-fallback-report=stderr|<path>]\n"

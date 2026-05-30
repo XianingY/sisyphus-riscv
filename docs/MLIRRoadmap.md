@@ -8,16 +8,32 @@ It is intentionally shadow/opt-in for the default RISC-V O1 path.
 - `src/ir/op_schema.yml` defines a restricted YAML op schema for the first
   `arith`, `scf`, and `memref` descriptors.
 - `scripts/gen-op-descriptors.py` generates the committed
-  `src/ir/GeneratedOpDescriptors.inc` file without PyYAML or other external
-  dependencies.
+  `src/ir/GeneratedOpDescriptors.inc` and `src/ir/GeneratedOpClasses.inc`
+  files without PyYAML or other external dependencies. The class file is an
+  ODS-style adapter layer with typed operand getters and verify stubs.
 - `sys::ir::OpDescriptorTable` verifies and dumps generated op metadata through
   `--dump-op-descriptors`.
+- `sys::ir::IRContext` interns lightweight Type and Attribute handles, including
+  parameterized memref/vector types and location attributes. This is a shadow
+  bridge toward MLIR-style hash-consed type/attribute storage while legacy
+  `Value::Type` remains the default execution path.
+- Legacy `LocationAttr` is available so production ops can gradually adopt
+  mandatory location tracking without forcing an all-at-once IR migration.
+- `BasicBlock` now carries a block-argument side table. Phi ops remain the
+  production SSA representation for now, but the new API lets CFG utilities,
+  tests, and future conversions model MLIR-style block arguments incrementally.
 - `PatternRewriter`, `PatternBenefit`, and `RewriteDriver` provide a greedy
   local rewrite framework. `PatternCanonicalize` is opt-in via
   `--pass-pipeline=pattern-canonicalize` or `SISY_ENABLE_PATTERN_CANONICALIZE=1`.
 - `AnalysisManager` now tracks typed cache keys for DataLayout, AffineNest
   summary, and MemRefAlias in addition to dominators, loops, MemorySSA, alias,
   and block frequency.
+- `ScopedPassRegistry` records MLIR-like pass scope, required analyses,
+  preserved analyses, and parallelizability for the first module/function/loop
+  and block passes. It is introspectable through `--dump-pass-scopes`.
+- `DialectConversionDriver` provides a small ConversionTarget/TypeConverter
+  scaffold. The current standard scalar target legalizes `arith`, `scf`, and
+  `memref` descriptors and can be inspected with `--dump-dialect-conversion`.
 - `MemRefType` and `MemRefAliasAnalysis` provide a base+offset+layout alias
   side table. It is currently a queryable analysis layer, not a default
   behavior change.
@@ -41,10 +57,12 @@ source-name triggers.
 ## Next Migration Steps
 
 1. Move more `RegularFold` rules into declarative canonicalization patterns.
-2. Replace per-pass affine shape matching with cached `AffineNestAnalysis`
+2. Start replacing Phi users with block arguments at region boundaries where
+   the predecessor set is structurally simple.
+3. Replace per-pass affine shape matching with cached `AffineNestAnalysis`
    summaries.
-3. Feed `MemRefAliasAnalysis` into LICM, DSE, DLE, and scalar replacement behind
+4. Feed `MemRefAliasAnalysis` into LICM, DSE, DLE, and scalar replacement behind
    dedicated compare gates.
-4. Add a vector dialect layer for explicit RVV/NEON opt-in lowering.
-5. Gradually table-drive backend peepholes before attempting full instruction
+5. Add a vector dialect layer for explicit RVV/NEON opt-in lowering.
+6. Gradually table-drive backend peepholes before attempting full instruction
    selection generation.

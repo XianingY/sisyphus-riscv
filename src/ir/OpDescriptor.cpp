@@ -56,6 +56,19 @@ bool OpDescriptorTable::verify(std::string *error) {
                  " has invalid arity";
       return false;
     }
+    if (op.operandCount >= 0 && op.operandNameCount != (std::size_t) op.operandCount) {
+      if (error)
+        *error = std::string(op.dialect) + "." + op.name +
+                 " has mismatched operand names";
+      return false;
+    }
+    if (op.resultNameCount != (std::size_t) op.resultCount ||
+        op.attrNameCount != (std::size_t) op.attrCount) {
+      if (error)
+        *error = std::string(op.dialect) + "." + op.name +
+                 " has mismatched result/attr names";
+      return false;
+    }
     std::string key = std::string(op.dialect) + "." + op.name;
     if (!previous.empty() && key < previous) {
       if (error)
@@ -93,6 +106,25 @@ void OpDescriptorTable::dump(std::ostream &os) {
         os << ",";
       os << op.traits[i];
     }
+    os << " operands=[";
+    for (std::size_t i = 0; i < op.operandNameCount; ++i) {
+      if (i)
+        os << ",";
+      os << op.operandNames[i];
+    }
+    os << "] results=[";
+    for (std::size_t i = 0; i < op.resultNameCount; ++i) {
+      if (i)
+        os << ",";
+      os << op.resultNames[i];
+    }
+    os << "] attrs=[";
+    for (std::size_t i = 0; i < op.attrNameCount; ++i) {
+      if (i)
+        os << ",";
+      os << op.attrNames[i];
+    }
+    os << "]";
     os << "\n";
   }
 }

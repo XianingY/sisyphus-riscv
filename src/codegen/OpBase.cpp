@@ -31,6 +31,12 @@ void BasicBlock::remove(iterator at) {
   ops.erase(at);
 }
 
+BlockArgument &BasicBlock::addArgument(Value::Type type, const std::string &name) {
+  int index = (int) arguments.size();
+  arguments.emplace_back(this, index, type, name);
+  return arguments.back();
+}
+
 BasicBlock *BasicBlock::nextBlock() const {
   auto it = place;
   return *++it;

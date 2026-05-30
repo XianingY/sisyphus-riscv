@@ -2,10 +2,36 @@
 
 namespace {
 
+static const char *const kOperands_arith_addi[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_arith_addi[] = {
+  "result",
+};
+
+static const char *const kAttrs_arith_addi[] = {
+  nullptr,
+};
+
 static const char *const kTraits_arith_addi[] = {
   "Commutative",
   "Pure",
   "SameOperandsAndResultType",
+};
+
+static const char *const kOperands_arith_andi[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_arith_andi[] = {
+  "result",
+};
+
+static const char *const kAttrs_arith_andi[] = {
+  nullptr,
 };
 
 static const char *const kTraits_arith_andi[] = {
@@ -14,8 +40,33 @@ static const char *const kTraits_arith_andi[] = {
   "SameOperandsAndResultType",
 };
 
+static const char *const kOperands_arith_constant[] = {
+  nullptr,
+};
+
+static const char *const kResults_arith_constant[] = {
+  "result",
+};
+
+static const char *const kAttrs_arith_constant[] = {
+  "value",
+};
+
 static const char *const kTraits_arith_constant[] = {
   "Pure",
+};
+
+static const char *const kOperands_arith_muli[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_arith_muli[] = {
+  "result",
+};
+
+static const char *const kAttrs_arith_muli[] = {
+  nullptr,
 };
 
 static const char *const kTraits_arith_muli[] = {
@@ -24,8 +75,35 @@ static const char *const kTraits_arith_muli[] = {
   "SameOperandsAndResultType",
 };
 
+static const char *const kOperands_arith_select[] = {
+  "cond",
+  "true_value",
+  "false_value",
+};
+
+static const char *const kResults_arith_select[] = {
+  "result",
+};
+
+static const char *const kAttrs_arith_select[] = {
+  nullptr,
+};
+
 static const char *const kTraits_arith_select[] = {
   "Pure",
+};
+
+static const char *const kOperands_arith_subi[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_arith_subi[] = {
+  "result",
+};
+
+static const char *const kAttrs_arith_subi[] = {
+  nullptr,
 };
 
 static const char *const kTraits_arith_subi[] = {
@@ -33,20 +111,84 @@ static const char *const kTraits_arith_subi[] = {
   "SameOperandsAndResultType",
 };
 
+static const char *const kOperands_memref_alloca[] = {
+  nullptr,
+};
+
+static const char *const kResults_memref_alloca[] = {
+  "memref",
+};
+
+static const char *const kAttrs_memref_alloca[] = {
+  "type",
+};
+
 static const char *const kTraits_memref_alloca[] = {
   "MemoryEffect",
+};
+
+static const char *const kOperands_memref_global[] = {
+  nullptr,
+};
+
+static const char *const kResults_memref_global[] = {
+  "memref",
+};
+
+static const char *const kAttrs_memref_global[] = {
+  "type",
+  "symbol",
 };
 
 static const char *const kTraits_memref_global[] = {
   "MemoryEffect",
 };
 
+static const char *const kOperands_memref_load[] = {
+  "base",
+  "index",
+};
+
+static const char *const kResults_memref_load[] = {
+  "value",
+};
+
+static const char *const kAttrs_memref_load[] = {
+  nullptr,
+};
+
 static const char *const kTraits_memref_load[] = {
   "MemoryEffect",
 };
 
+static const char *const kOperands_memref_store[] = {
+  "value",
+  "base",
+  "index",
+};
+
+static const char *const kResults_memref_store[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_memref_store[] = {
+  nullptr,
+};
+
 static const char *const kTraits_memref_store[] = {
   "MemoryEffect",
+};
+
+static const char *const kOperands_scf_br[] = {
+  "cond",
+};
+
+static const char *const kResults_scf_br[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_scf_br[] = {
+  "dest",
 };
 
 static const char *const kTraits_scf_br[] = {
@@ -54,17 +196,67 @@ static const char *const kTraits_scf_br[] = {
   "Terminator",
 };
 
+static const char *const kOperands_scf_for[] = {
+  "lower",
+  "upper",
+  "step",
+};
+
+static const char *const kResults_scf_for[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_scf_for[] = {
+  nullptr,
+};
+
 static const char *const kTraits_scf_for[] = {
   "HasRegion",
   "LoopLike",
+};
+
+static const char *const kOperands_scf_if[] = {
+  "cond",
+};
+
+static const char *const kResults_scf_if[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_scf_if[] = {
+  nullptr,
 };
 
 static const char *const kTraits_scf_if[] = {
   "HasRegion",
 };
 
+static const char *const kOperands_scf_return[] = {
+  "variadic",
+};
+
+static const char *const kResults_scf_return[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_scf_return[] = {
+  nullptr,
+};
+
 static const char *const kTraits_scf_return[] = {
   "Terminator",
+};
+
+static const char *const kOperands_scf_while[] = {
+  "cond",
+};
+
+static const char *const kResults_scf_while[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_scf_while[] = {
+  nullptr,
 };
 
 static const char *const kTraits_scf_while[] = {
@@ -73,21 +265,21 @@ static const char *const kTraits_scf_while[] = {
 };
 
 static const sys::ir::OpDescriptor kGeneratedOpDescriptors[] = {
-  {"arith", "addi", 2, 1, 0, "verifySameIntegerOperands", "foldAddI", kTraits_arith_addi, 3},
-  {"arith", "andi", 2, 1, 0, "verifySameIntegerOperands", "foldAndI", kTraits_arith_andi, 3},
-  {"arith", "constant", 0, 1, 1, "verifyConstantAttr", "foldConstant", kTraits_arith_constant, 1},
-  {"arith", "muli", 2, 1, 0, "verifySameIntegerOperands", "foldMulI", kTraits_arith_muli, 3},
-  {"arith", "select", 3, 1, 0, "verifySelect", "foldSelect", kTraits_arith_select, 1},
-  {"arith", "subi", 2, 1, 0, "verifySameIntegerOperands", "foldSubI", kTraits_arith_subi, 2},
-  {"memref", "alloca", 0, 1, 1, "verifyMemRefTypeAttr", "foldNone", kTraits_memref_alloca, 1},
-  {"memref", "global", 0, 1, 2, "verifyMemRefGlobal", "foldNone", kTraits_memref_global, 1},
-  {"memref", "load", 2, 1, 0, "verifyMemRefLoad", "foldNone", kTraits_memref_load, 1},
-  {"memref", "store", 3, 0, 0, "verifyMemRefStore", "foldNone", kTraits_memref_store, 1},
-  {"scf", "br", 1, 0, 1, "verifyBranch", "foldNone", kTraits_scf_br, 2},
-  {"scf", "for", 3, 0, 0, "verifyForLike", "foldNone", kTraits_scf_for, 2},
-  {"scf", "if", 1, 0, 0, "verifyIfRegions", "foldNone", kTraits_scf_if, 1},
-  {"scf", "return", -1, 0, 0, "verifyReturn", "foldNone", kTraits_scf_return, 1},
-  {"scf", "while", 1, 0, 0, "verifyWhileRegions", "foldNone", kTraits_scf_while, 2},
+  {"arith", "addi", 2, 1, 0, "verifySameIntegerOperands", "foldAddI", kTraits_arith_addi, 3, kOperands_arith_addi, 2, kResults_arith_addi, 1, kAttrs_arith_addi, 0},
+  {"arith", "andi", 2, 1, 0, "verifySameIntegerOperands", "foldAndI", kTraits_arith_andi, 3, kOperands_arith_andi, 2, kResults_arith_andi, 1, kAttrs_arith_andi, 0},
+  {"arith", "constant", 0, 1, 1, "verifyConstantAttr", "foldConstant", kTraits_arith_constant, 1, kOperands_arith_constant, 0, kResults_arith_constant, 1, kAttrs_arith_constant, 1},
+  {"arith", "muli", 2, 1, 0, "verifySameIntegerOperands", "foldMulI", kTraits_arith_muli, 3, kOperands_arith_muli, 2, kResults_arith_muli, 1, kAttrs_arith_muli, 0},
+  {"arith", "select", 3, 1, 0, "verifySelect", "foldSelect", kTraits_arith_select, 1, kOperands_arith_select, 3, kResults_arith_select, 1, kAttrs_arith_select, 0},
+  {"arith", "subi", 2, 1, 0, "verifySameIntegerOperands", "foldSubI", kTraits_arith_subi, 2, kOperands_arith_subi, 2, kResults_arith_subi, 1, kAttrs_arith_subi, 0},
+  {"memref", "alloca", 0, 1, 1, "verifyMemRefTypeAttr", "foldNone", kTraits_memref_alloca, 1, kOperands_memref_alloca, 0, kResults_memref_alloca, 1, kAttrs_memref_alloca, 1},
+  {"memref", "global", 0, 1, 2, "verifyMemRefGlobal", "foldNone", kTraits_memref_global, 1, kOperands_memref_global, 0, kResults_memref_global, 1, kAttrs_memref_global, 2},
+  {"memref", "load", 2, 1, 0, "verifyMemRefLoad", "foldNone", kTraits_memref_load, 1, kOperands_memref_load, 2, kResults_memref_load, 1, kAttrs_memref_load, 0},
+  {"memref", "store", 3, 0, 0, "verifyMemRefStore", "foldNone", kTraits_memref_store, 1, kOperands_memref_store, 3, kResults_memref_store, 0, kAttrs_memref_store, 0},
+  {"scf", "br", 1, 0, 1, "verifyBranch", "foldNone", kTraits_scf_br, 2, kOperands_scf_br, 1, kResults_scf_br, 0, kAttrs_scf_br, 1},
+  {"scf", "for", 3, 0, 0, "verifyForLike", "foldNone", kTraits_scf_for, 2, kOperands_scf_for, 3, kResults_scf_for, 0, kAttrs_scf_for, 0},
+  {"scf", "if", 1, 0, 0, "verifyIfRegions", "foldNone", kTraits_scf_if, 1, kOperands_scf_if, 1, kResults_scf_if, 0, kAttrs_scf_if, 0},
+  {"scf", "return", -1, 0, 0, "verifyReturn", "foldNone", kTraits_scf_return, 1, kOperands_scf_return, 1, kResults_scf_return, 0, kAttrs_scf_return, 0},
+  {"scf", "while", 1, 0, 0, "verifyWhileRegions", "foldNone", kTraits_scf_while, 2, kOperands_scf_while, 1, kResults_scf_while, 0, kAttrs_scf_while, 0},
 };
 
 } // namespace

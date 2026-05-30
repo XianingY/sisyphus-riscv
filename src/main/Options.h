@@ -38,6 +38,10 @@ struct Options {
     option disableSMTSynth : 1;
     option dumpAnalysisCache : 1;
     option dumpOpDescriptors : 1;
+    option dumpIRContext : 1;
+    option dumpPassScopes : 1;
+    option dumpDialectConversion : 1;
+    option dumpBlockArguments : 1;
   };
 
   std::string inputFile;
