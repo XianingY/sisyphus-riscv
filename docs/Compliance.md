@@ -52,7 +52,10 @@ These are the preferred places to improve performance:
   call handling, scalar replacement, and conservative MemorySSA side tables.
 - Loop optimization: loop canonicalization, LICM, SCEV/LSR, generic unrolling,
   fusion, interchange, tiling, unroll-and-jam, reduction privatization, and
-  vectorization when legality follows from affine/dependence analysis.
+  vectorization when legality follows from affine/dependence analysis.  For the
+  official RISC-V O1 profile this means scalar `rv64gc` code by default; RVV,
+  including strided vector loads/stores, remains explicit opt-in while the
+  contest link command is `-march=rv64gc`.
 - Recursion optimization: tail-call elimination and runtime memoization of
   proven pure recursive functions. Runtime memoization is allowed because all
   cache entries are computed at runtime for the actual input.

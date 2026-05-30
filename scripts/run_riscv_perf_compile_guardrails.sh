@@ -38,7 +38,7 @@ for src in "${cases[@]}"; do
   "${COMPILER}" "${src}" -S -o "${asm}" -O1 --target=riscv --verify-ir --stats \
     >"${stats}" 2>&1
 
-  if grep -Eq '\bvsetvli\b|\bvle[0-9]+\.v\b|\bvse[0-9]+\.v\b' "${asm}"; then
+  if grep -Eq '\bvsetvli\b|\bv[ls]e[0-9]+\.v\b|\bv[ls]se[0-9]+\.v\b' "${asm}"; then
     echo "default RISC-V path emitted RVV instructions for ${name}; use --enable-rvv for RVV" >&2
     exit 1
   fi

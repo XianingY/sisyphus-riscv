@@ -13,7 +13,8 @@ if [[ ! -x "${COMPILER}" ]]; then
 fi
 
 asm="${OUT_DIR}/rvv_add_loop.s"
-"${COMPILER}" "${CASE_DIR}/rvv_add_loop.sy" -S -o "${asm}" -O1 --target=riscv --enable-experimental --verify-ir
+SISY_ENABLE_LOOP_ROTATE_STORES=1 \
+  "${COMPILER}" "${CASE_DIR}/rvv_add_loop.sy" -S -o "${asm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vadd.vv" "vse32.v"; do
   if ! grep -q "${needle}" "${asm}"; then
@@ -23,17 +24,15 @@ for needle in "vsetvli" "vle32.v" "vadd.vv" "vse32.v"; do
 done
 
 inplace_fasm="${OUT_DIR}/rvv_loop_inplace_add.s"
-"${COMPILER}" "${CASE_DIR}/loop_inplace_add.sy" -S -o "${inplace_fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/loop_inplace_add.sy" -S -o "${inplace_fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
-for needle in "vsetvli" "vle32.v" "vadd.vv" "vse32.v"; do
-  if ! grep -q "${needle}" "${inplace_fasm}"; then
-    echo "missing expected RVV in-place loop instruction '${needle}' in ${inplace_fasm}"
-    exit 1
-  fi
-done
+if grep -q "vadd.vv" "${inplace_fasm}"; then
+  echo "unexpected RVV vectorization for in-place update without store-loop rotation opt-in in ${inplace_fasm}"
+  exit 1
+fi
 
 same_base_fasm="${OUT_DIR}/rvv_loop_same_base_no_vector.s"
-"${COMPILER}" "${CASE_DIR}/loop_same_base_no_vector.sy" -S -o "${same_base_fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/loop_same_base_no_vector.sy" -S -o "${same_base_fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 if grep -q "vadd.vv" "${same_base_fasm}"; then
   echo "unexpected RVV loop vectorization for loop-carried same-base dependence in ${same_base_fasm}"
@@ -42,7 +41,7 @@ fi
 
 tiny_trip_asm="${OUT_DIR}/rvv_loop_tiny_trip_no_vector.s"
 "${COMPILER}" "${CASE_DIR}/loop_tiny_trip_no_vector.sy" -S -o "${tiny_trip_asm}" -O1 \
-  --target=riscv --enable-experimental --disable-const-unroll --enable-loop-rotate --verify-ir
+  --target=riscv --enable-rvv --disable-const-unroll --enable-loop-rotate --verify-ir
 
 if grep -q "vadd.vv" "${tiny_trip_asm}"; then
   echo "unexpected RVV loop vectorization for tiny fixed trip count in ${tiny_trip_asm}"
@@ -51,7 +50,7 @@ fi
 
 many_live_asm="${OUT_DIR}/rvv_loop_many_live_vectors_no_vector.s"
 "${COMPILER}" "${CASE_DIR}/loop_many_live_vectors_no_vector.sy" -S \
-  -o "${many_live_asm}" -O1 --target=riscv --enable-experimental --enable-loop-rotate --verify-ir
+  -o "${many_live_asm}" -O1 --target=riscv --enable-rvv --enable-loop-rotate --verify-ir
 
 if grep -q "vadd.vv" "${many_live_asm}"; then
   echo "unexpected RVV loop vectorization for excessive live vector pressure in ${many_live_asm}"
@@ -59,7 +58,8 @@ if grep -q "vadd.vv" "${many_live_asm}"; then
 fi
 
 fasm="${OUT_DIR}/rvv_fadd_loop.s"
-"${COMPILER}" "${CASE_DIR}/rvv_fadd_loop.sy" -S -o "${fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+SISY_ENABLE_LOOP_ROTATE_STORES=1 \
+  "${COMPILER}" "${CASE_DIR}/rvv_fadd_loop.sy" -S -o "${fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vfadd.vv" "vse32.v"; do
   if ! grep -q "${needle}" "${fasm}"; then
@@ -69,7 +69,8 @@ for needle in "vsetvli" "vle32.v" "vfadd.vv" "vse32.v"; do
 done
 
 arm_fasm="${OUT_DIR}/arm_fadd_loop.s"
-"${COMPILER}" "${CASE_DIR}/rvv_fadd_loop.sy" -S -o "${arm_fasm}" -O2 --target=arm --enable-experimental --verify-ir
+SISY_ENABLE_LOOP_ROTATE_STORES=1 \
+  "${COMPILER}" "${CASE_DIR}/rvv_fadd_loop.sy" -S -o "${arm_fasm}" -O2 --target=arm --enable-experimental --verify-ir
 
 for needle in "ld1" "fadd v" "st1"; do
   if ! grep -q "${needle}" "${arm_fasm}"; then
@@ -79,7 +80,7 @@ for needle in "ld1" "fadd v" "st1"; do
 done
 
 slp_fasm="${OUT_DIR}/rvv_slp_fadd_straightline.s"
-"${COMPILER}" "${CASE_DIR}/slp_fadd_straightline.sy" -S -o "${slp_fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_fadd_straightline.sy" -S -o "${slp_fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vfadd.vv" "vse32.v"; do
   if ! grep -q "${needle}" "${slp_fasm}"; then
@@ -89,7 +90,7 @@ for needle in "vsetvli" "vle32.v" "vfadd.vv" "vse32.v"; do
 done
 
 slp_iadd_asm="${OUT_DIR}/rvv_slp_iadd_straightline.s"
-"${COMPILER}" "${CASE_DIR}/slp_iadd_straightline.sy" -S -o "${slp_iadd_asm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_iadd_straightline.sy" -S -o "${slp_iadd_asm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vadd.vv" "vse32.v"; do
   if ! grep -q "${needle}" "${slp_iadd_asm}"; then
@@ -99,7 +100,7 @@ for needle in "vsetvli" "vle32.v" "vadd.vv" "vse32.v"; do
 done
 
 slp_copy_asm="${OUT_DIR}/rvv_slp_copy_straightline.s"
-"${COMPILER}" "${CASE_DIR}/slp_copy_straightline.sy" -S -o "${slp_copy_asm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_copy_straightline.sy" -S -o "${slp_copy_asm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vse32.v"; do
   if ! grep -q "${needle}" "${slp_copy_asm}"; then
@@ -109,7 +110,7 @@ for needle in "vsetvli" "vle32.v" "vse32.v"; do
 done
 
 copy_overlap_asm="${OUT_DIR}/rvv_slp_copy_overlap_vector.s"
-"${COMPILER}" "${CASE_DIR}/slp_copy_overlap_vector.sy" -S -o "${copy_overlap_asm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_copy_overlap_vector.sy" -S -o "${copy_overlap_asm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vse32.v"; do
   if ! grep -q "${needle}" "${copy_overlap_asm}"; then
@@ -129,7 +130,7 @@ for needle in "ld1" "fadd v" "st1"; do
 done
 
 slp_sub_fasm="${OUT_DIR}/rvv_slp_fsub_straightline.s"
-"${COMPILER}" "${CASE_DIR}/slp_fsub_straightline.sy" -S -o "${slp_sub_fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_fsub_straightline.sy" -S -o "${slp_sub_fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vfsub.vv" "vse32.v"; do
   if ! grep -q "${needle}" "${slp_sub_fasm}"; then
@@ -149,7 +150,7 @@ for needle in "ld1" "fsub v" "st1"; do
 done
 
 slp_splat_fasm="${OUT_DIR}/rvv_slp_fadd_splat.s"
-"${COMPILER}" "${CASE_DIR}/slp_fadd_splat.sy" -S -o "${slp_splat_fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_fadd_splat.sy" -S -o "${slp_splat_fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 for needle in "vsetvli" "vle32.v" "vfmv.v.f" "vfadd.vv" "vse32.v"; do
   if ! grep -q "${needle}" "${slp_splat_fasm}"; then
@@ -169,7 +170,7 @@ for needle in "ld1" "dup v" "fadd v" "st1"; do
 done
 
 overlap_fasm="${OUT_DIR}/rvv_slp_overlap_no_vector.s"
-"${COMPILER}" "${CASE_DIR}/slp_overlap_no_vector.sy" -S -o "${overlap_fasm}" -O1 --target=riscv --enable-experimental --verify-ir
+"${COMPILER}" "${CASE_DIR}/slp_overlap_no_vector.sy" -S -o "${overlap_fasm}" -O1 --target=riscv --enable-rvv --verify-ir
 
 if grep -q "vfadd.vv" "${overlap_fasm}"; then
   echo "unexpected RVV SLP vectorization for overlapping dependence in ${overlap_fasm}"

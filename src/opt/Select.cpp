@@ -96,10 +96,10 @@ bool onlyLocalUsesOrPhi(Op *op, BasicBlock *bb, Op *phi) {
   return true;
 }
 
-bool convertShortPureBranch(BranchOp *branch) {
+int convertShortPureBranch(BranchOp *branch) {
   if (!branch || branch->getOperandCount() != 1 || !branch->has<TargetAttr>() ||
       !branch->has<ElseAttr>())
-    return false;
+    return 0;
 
   auto trueBlock = TARGET(branch);
   auto falseBlock = ELSE(branch);
@@ -112,21 +112,21 @@ bool convertShortPureBranch(BranchOp *branch) {
     calcBlock = falseBlock;
     emptyBlock = trueBlock;
   } else {
-    return false;
+    return 0;
   }
 
   if (calcBlock->preds.size() != 1 || emptyBlock->preds.size() != 1 ||
       *calcBlock->preds.begin() != branch->getParent() ||
       *emptyBlock->preds.begin() != branch->getParent())
-    return false;
+    return 0;
 
   auto calcTerm = dyn_cast<GotoOp>(calcBlock->getLastOp());
   auto emptyTerm = dyn_cast<GotoOp>(emptyBlock->getLastOp());
   if (!calcTerm || !emptyTerm || TARGET(calcTerm) != TARGET(emptyTerm))
-    return false;
+    return 0;
   auto join = TARGET(calcTerm);
-  if (!join || join->getPhis().size() != 1)
-    return false;
+  if (!join || join->getPhis().empty())
+    return 0;
 
   std::vector<Op*> phis;
   for (auto phi : join->getPhis()) {
@@ -139,21 +139,19 @@ bool convertShortPureBranch(BranchOp *branch) {
     if (fromCalc->getParent() == calcBlock && onlyLocalUsesOrPhi(fromCalc, calcBlock, phi))
       phis.push_back(phi);
   }
-  if (phis.size() != 1)
-    return false;
-
-  auto phi = phis[0];
-  auto trueValue = incomingFrom(phi, trueBlock);
-  auto falseValue = incomingFrom(phi, falseBlock);
-  if (!trueValue || !falseValue)
-    return false;
+  if (phis.empty() || phis.size() != join->getPhis().size())
+    return 0;
+  for (auto phi : phis) {
+    if (!incomingFrom(phi, trueBlock) || !incomingFrom(phi, falseBlock))
+      return 0;
+  }
 
   std::vector<Op*> moving;
   for (auto op : calcBlock->getOps()) {
     if (op == calcBlock->getLastOp())
       continue;
     if (!pureSpeculatable(op))
-      return false;
+      return 0;
     moving.push_back(op);
   }
 
@@ -162,14 +160,20 @@ bool convertShortPureBranch(BranchOp *branch) {
 
   Builder builder;
   builder.setBeforeOp(branch);
-  auto select = builder.create<SelectOp>(
-      std::vector<Value>{ branch->DEF(0), trueValue, falseValue });
-  phi->replaceAllUsesWith(select);
-  phi->erase();
+  int converted = 0;
+  for (auto phi : phis) {
+    auto trueValue = incomingFrom(phi, trueBlock);
+    auto falseValue = incomingFrom(phi, falseBlock);
+    auto select = builder.create<SelectOp>(
+        std::vector<Value>{ branch->DEF(0), trueValue, falseValue });
+    phi->replaceAllUsesWith(select);
+    phi->erase();
+    converted++;
+  }
   builder.replace<GotoOp>(branch, { new TargetAttr(join) });
   calcBlock->forceErase();
   emptyBlock->forceErase();
-  return true;
+  return converted;
 }
 
 }
@@ -187,8 +191,7 @@ void Select::run() {
 
   auto branches = module->findAll<BranchOp>();
   for (auto op : branches) {
-    if (convertShortPureBranch(cast<BranchOp>(op)))
-      raised++;
+    raised += convertShortPureBranch(cast<BranchOp>(op));
   }
 
   for (auto func : collectFuncs())

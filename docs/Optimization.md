@@ -232,6 +232,14 @@ important defaults as of this review:
 - `SISY_ENABLE_UNROLL_INTERNAL_ROTATE=false`; the old unroll-local rotation
   helpers remain available for experiments but are not part of the default
   correctness envelope.
+- `SISY_ENABLE_LOOP_ROTATE_STORES=false`; store-containing loop rotation is
+  available only for explicit experiments such as RVV vectorization tests.  The
+  default scalar RISC-V O1 route keeps those loops unrotated until downstream
+  passes have stronger store-path proofs.
+- `SISY_ENABLE_RVV_STRIDED=false`; RVV strided `vlse32.v`/`vsse32.v`
+  lowering is experimental and requires both RVV enablement and this explicit
+  strided-vector switch.  The default RISC-V O1 profile must remain `rv64gc`
+  scalar code.
 - `SISY_SYNTH_CONST_ARRAY_MAX=4096` caps the default source-constant table
   synthesis budget, including input-independent initialization loops
 - `SISY_ENABLE_FINAL_ITER_COLLAPSE=true` enables the narrow IR-proven

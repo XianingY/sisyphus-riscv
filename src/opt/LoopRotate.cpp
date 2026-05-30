@@ -1,7 +1,18 @@
 #include "LoopPasses.h"
 #include "../utils/Matcher.h"
 
+#include <cstdlib>
+#include <cstring>
+
 using namespace sys;
+
+static bool envEnabled(const char *name, bool fallback) {
+  const char *raw = std::getenv(name);
+  if (!raw || !raw[0])
+    return fallback;
+  return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+         std::strcmp(raw, "FALSE") != 0;
+}
 
 static void postorder(LoopInfo *loop, std::vector<LoopInfo*> &loops) {
   for (auto subloop : loop->subloops)
@@ -72,7 +83,8 @@ void LoopRotate::runImpl(LoopInfo *info) {
   }
   for (auto bb : info->getBlocks()) {
     for (auto op : bb->getOps()) {
-      if (isa<StoreOp>(op)) {
+      if (isa<StoreOp>(op) &&
+          !envEnabled("SISY_ENABLE_LOOP_ROTATE_STORES", false)) {
         rejectShape++;
         return;
       }

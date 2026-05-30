@@ -466,6 +466,8 @@ void Lower::run() {
   runRewriter([&](VScaleLoadOp *op) {
     bool strided = op->has<VectorShapeAttr>() && VSHAPE(op)->strided;
     if (strided) {
+      if (!envEnabled("SISY_ENABLE_RVV_STRIDED", false))
+        return false;
       builder.replace<Vlse32Op>(op, op->getResultType(), op->getOperands());
       return true;
     }
@@ -479,6 +481,8 @@ void Lower::run() {
   runRewriter([&](VScaleStoreOp *op) {
     bool strided = op->has<VectorShapeAttr>() && VSHAPE(op)->strided;
     if (strided) {
+      if (!envEnabled("SISY_ENABLE_RVV_STRIDED", false))
+        return false;
       builder.replace<Vsse32Op>(op, op->getOperands(), op->getAttrs());
       return true;
     }

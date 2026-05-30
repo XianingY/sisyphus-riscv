@@ -1,0 +1,14 @@
+int main() {
+  int x = getint();
+  int a = 1;
+  int b = 2;
+  if (0 < x) {
+    a = x + 3;
+    b = x + 4;
+  }
+  putint(a);
+  putch(10);
+  putint(b);
+  putch(10);
+  return 0;
+}
