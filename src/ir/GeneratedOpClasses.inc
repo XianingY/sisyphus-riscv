@@ -4,17 +4,74 @@
 
 namespace sys::ir::ods {
 
+class AffineApplyODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "affine";
+  static constexpr const char *kName = "apply";
+  explicit AffineApplyODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class AffineForODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "affine";
+  static constexpr const char *kName = "for";
+  explicit AffineForODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getLower() const { return op->getOperand(0); }
+  sys::Value getUpper() const { return op->getOperand(1); }
+  sys::Value getStep() const { return op->getOperand(2); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class AffineLoadODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "affine";
+  static constexpr const char *kName = "load";
+  explicit AffineLoadODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getBase() const { return op->getOperand(0); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class AffineStoreODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "affine";
+  static constexpr const char *kName = "store";
+  explicit AffineStoreODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getValue() const { return op->getOperand(0); }
+  sys::Value getBase() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
 class ArithAddiODSOp {
   sys::ir::Operation *op = nullptr;
 public:
   static constexpr const char *kDialect = "arith";
   static constexpr const char *kName = "addi";
   explicit ArithAddiODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ArithAddiODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getLhs() const { return op->getOperand(0); }
   sys::Value getRhs() const { return op->getOperand(1); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -26,11 +83,10 @@ public:
   static constexpr const char *kDialect = "arith";
   static constexpr const char *kName = "andi";
   explicit ArithAndiODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ArithAndiODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getLhs() const { return op->getOperand(0); }
   sys::Value getRhs() const { return op->getOperand(1); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -42,9 +98,8 @@ public:
   static constexpr const char *kDialect = "arith";
   static constexpr const char *kName = "constant";
   explicit ArithConstantODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ArithConstantODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -56,11 +111,10 @@ public:
   static constexpr const char *kDialect = "arith";
   static constexpr const char *kName = "muli";
   explicit ArithMuliODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ArithMuliODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getLhs() const { return op->getOperand(0); }
   sys::Value getRhs() const { return op->getOperand(1); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -72,12 +126,11 @@ public:
   static constexpr const char *kDialect = "arith";
   static constexpr const char *kName = "select";
   explicit ArithSelectODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ArithSelectODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getCond() const { return op->getOperand(0); }
   sys::Value getTrueValue() const { return op->getOperand(1); }
   sys::Value getFalseValue() const { return op->getOperand(2); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -89,11 +142,106 @@ public:
   static constexpr const char *kDialect = "arith";
   static constexpr const char *kName = "subi";
   explicit ArithSubiODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ArithSubiODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getLhs() const { return op->getOperand(0); }
   sys::Value getRhs() const { return op->getOperand(1); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class ArmAddODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "arm";
+  static constexpr const char *kName = "add";
+  explicit ArmAddODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getLhs() const { return op->getOperand(0); }
+  sys::Value getRhs() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class ArmMachineAddODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "arm_machine";
+  static constexpr const char *kName = "add";
+  explicit ArmMachineAddODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getLhs() const { return op->getOperand(0); }
+  sys::Value getRhs() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class ArmMachineMovODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "arm_machine";
+  static constexpr const char *kName = "mov";
+  explicit ArmMachineMovODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class ArmMachineRetODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "arm_machine";
+  static constexpr const char *kName = "ret";
+  explicit ArmMachineRetODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class BuiltinModuleODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "builtin";
+  static constexpr const char *kName = "module";
+  explicit BuiltinModuleODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class CfBrODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "cf";
+  static constexpr const char *kName = "br";
+  explicit CfBrODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class CfCondBrODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "cf";
+  static constexpr const char *kName = "cond_br";
+  explicit CfCondBrODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getCond() const { return op->getOperand(0); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -105,9 +253,8 @@ public:
   static constexpr const char *kDialect = "memref";
   static constexpr const char *kName = "alloca";
   explicit MemrefAllocaODSOp(sys::ir::Operation *op): op(op) {}
-  explicit MemrefAllocaODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -119,9 +266,8 @@ public:
   static constexpr const char *kDialect = "memref";
   static constexpr const char *kName = "global";
   explicit MemrefGlobalODSOp(sys::ir::Operation *op): op(op) {}
-  explicit MemrefGlobalODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -133,11 +279,10 @@ public:
   static constexpr const char *kDialect = "memref";
   static constexpr const char *kName = "load";
   explicit MemrefLoadODSOp(sys::ir::Operation *op): op(op) {}
-  explicit MemrefLoadODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getBase() const { return op->getOperand(0); }
   sys::Value getIndex() const { return op->getOperand(1); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -149,12 +294,67 @@ public:
   static constexpr const char *kDialect = "memref";
   static constexpr const char *kName = "store";
   explicit MemrefStoreODSOp(sys::ir::Operation *op): op(op) {}
-  explicit MemrefStoreODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getValue() const { return op->getOperand(0); }
   sys::Value getBase() const { return op->getOperand(1); }
   sys::Value getIndex() const { return op->getOperand(2); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class RvAddODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "rv";
+  static constexpr const char *kName = "add";
+  explicit RvAddODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getLhs() const { return op->getOperand(0); }
+  sys::Value getRhs() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class RvMachineAddwODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "rv_machine";
+  static constexpr const char *kName = "addw";
+  explicit RvMachineAddwODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getLhs() const { return op->getOperand(0); }
+  sys::Value getRhs() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class RvMachineLiODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "rv_machine";
+  static constexpr const char *kName = "li";
+  explicit RvMachineLiODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class RvMachineRetODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "rv_machine";
+  static constexpr const char *kName = "ret";
+  explicit RvMachineRetODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -166,10 +366,9 @@ public:
   static constexpr const char *kDialect = "scf";
   static constexpr const char *kName = "br";
   explicit ScfBrODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ScfBrODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getCond() const { return op->getOperand(0); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -181,12 +380,11 @@ public:
   static constexpr const char *kDialect = "scf";
   static constexpr const char *kName = "for";
   explicit ScfForODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ScfForODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getLower() const { return op->getOperand(0); }
   sys::Value getUpper() const { return op->getOperand(1); }
   sys::Value getStep() const { return op->getOperand(2); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -198,10 +396,9 @@ public:
   static constexpr const char *kDialect = "scf";
   static constexpr const char *kName = "if";
   explicit ScfIfODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ScfIfODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getCond() const { return op->getOperand(0); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -213,9 +410,8 @@ public:
   static constexpr const char *kDialect = "scf";
   static constexpr const char *kName = "return";
   explicit ScfReturnODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ScfReturnODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }
@@ -227,10 +423,68 @@ public:
   static constexpr const char *kDialect = "scf";
   static constexpr const char *kName = "while";
   explicit ScfWhileODSOp(sys::ir::Operation *op): op(op) {}
-  explicit ScfWhileODSOp(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {}
   sys::ir::Operation *getOperation() const { return op; }
   sys::Value getCond() const { return op->getOperand(0); }
-  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class SysyFuncODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "sysy";
+  static constexpr const char *kName = "func";
+  explicit SysyFuncODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class VectorAddODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "vector";
+  static constexpr const char *kName = "add";
+  explicit VectorAddODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getLhs() const { return op->getOperand(0); }
+  sys::Value getRhs() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class VectorTransferReadODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "vector";
+  static constexpr const char *kName = "transfer_read";
+  explicit VectorTransferReadODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getBase() const { return op->getOperand(0); }
+  sys::Value getIndex() const { return op->getOperand(1); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
+  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
+    return op ? op->verifyBridge(error) : false;
+  }
+};
+
+class VectorTransferWriteODSOp {
+  sys::ir::Operation *op = nullptr;
+public:
+  static constexpr const char *kDialect = "vector";
+  static constexpr const char *kName = "transfer_write";
+  explicit VectorTransferWriteODSOp(sys::ir::Operation *op): op(op) {}
+  sys::ir::Operation *getOperation() const { return op; }
+  sys::Value getVector() const { return op->getOperand(0); }
+  sys::Value getBase() const { return op->getOperand(1); }
+  sys::Value getIndex() const { return op->getOperand(2); }
+  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }
   static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {
     return op ? op->verifyBridge(error) : false;
   }

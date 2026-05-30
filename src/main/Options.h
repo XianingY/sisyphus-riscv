@@ -44,6 +44,9 @@ struct Options {
     option dumpBlockArguments : 1;
     option dumpOperationIR : 1;
     option verifyOperationBridge : 1;
+    option runSelfMLIRCoreTests : 1;
+    option runSelfMLIRConversionTests : 1;
+    option dumpSelfMLIRSample : 1;
   };
 
   std::string inputFile;

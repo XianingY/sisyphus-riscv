@@ -2,6 +2,96 @@
 
 namespace {
 
+static const char *const kOperands_affine_apply[] = {
+  "variadic",
+};
+
+static const char *const kResults_affine_apply[] = {
+  "index",
+};
+
+static const char *const kAttrs_affine_apply[] = {
+  "map",
+};
+
+static const char *const kInterfaces_affine_apply[] = {
+  "PureOpInterface",
+};
+
+static const char *const kTraits_affine_apply[] = {
+  "Pure",
+  "AffineLike",
+};
+
+static const char *const kOperands_affine_for[] = {
+  "lower",
+  "upper",
+  "step",
+};
+
+static const char *const kResults_affine_for[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_affine_for[] = {
+  "map",
+};
+
+static const char *const kInterfaces_affine_for[] = {
+  "RegionBranchOpInterface",
+};
+
+static const char *const kTraits_affine_for[] = {
+  "HasRegion",
+  "LoopLike",
+  "AffineLike",
+};
+
+static const char *const kOperands_affine_load[] = {
+  "base",
+  "variadic",
+};
+
+static const char *const kResults_affine_load[] = {
+  "value",
+};
+
+static const char *const kAttrs_affine_load[] = {
+  "map",
+};
+
+static const char *const kInterfaces_affine_load[] = {
+  "MemoryEffectOpInterface",
+};
+
+static const char *const kTraits_affine_load[] = {
+  "MemoryEffect",
+  "AffineLike",
+};
+
+static const char *const kOperands_affine_store[] = {
+  "value",
+  "base",
+  "variadic",
+};
+
+static const char *const kResults_affine_store[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_affine_store[] = {
+  "map",
+};
+
+static const char *const kInterfaces_affine_store[] = {
+  "MemoryEffectOpInterface",
+};
+
+static const char *const kTraits_affine_store[] = {
+  "MemoryEffect",
+  "AffineLike",
+};
+
 static const char *const kOperands_arith_addi[] = {
   "lhs",
   "rhs",
@@ -135,6 +225,159 @@ static const char *const kTraits_arith_subi[] = {
   "SameOperandsAndResultType",
 };
 
+static const char *const kOperands_arm_add[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_arm_add[] = {
+  "result",
+};
+
+static const char *const kAttrs_arm_add[] = {
+  nullptr,
+};
+
+static const char *const kInterfaces_arm_add[] = {
+  "PureOpInterface",
+};
+
+static const char *const kTraits_arm_add[] = {
+  "Pure",
+};
+
+static const char *const kOperands_arm_machine_add[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_arm_machine_add[] = {
+  "result",
+};
+
+static const char *const kAttrs_arm_machine_add[] = {
+  "reg_class",
+};
+
+static const char *const kInterfaces_arm_machine_add[] = {
+  nullptr,
+};
+
+static const char *const kTraits_arm_machine_add[] = {
+  "MachineOp",
+  "RegisterOp",
+};
+
+static const char *const kOperands_arm_machine_mov[] = {
+  nullptr,
+};
+
+static const char *const kResults_arm_machine_mov[] = {
+  "result",
+};
+
+static const char *const kAttrs_arm_machine_mov[] = {
+  "value",
+  "reg_class",
+};
+
+static const char *const kInterfaces_arm_machine_mov[] = {
+  nullptr,
+};
+
+static const char *const kTraits_arm_machine_mov[] = {
+  "MachineOp",
+  "RegisterOp",
+};
+
+static const char *const kOperands_arm_machine_ret[] = {
+  "variadic",
+};
+
+static const char *const kResults_arm_machine_ret[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_arm_machine_ret[] = {
+  nullptr,
+};
+
+static const char *const kInterfaces_arm_machine_ret[] = {
+  "TerminatorOpInterface",
+};
+
+static const char *const kTraits_arm_machine_ret[] = {
+  "MachineOp",
+  "Terminator",
+};
+
+static const char *const kOperands_builtin_module[] = {
+  nullptr,
+};
+
+static const char *const kResults_builtin_module[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_builtin_module[] = {
+  nullptr,
+};
+
+static const char *const kInterfaces_builtin_module[] = {
+  "RegionBranchOpInterface",
+};
+
+static const char *const kTraits_builtin_module[] = {
+  "IsolatedFromAbove",
+  "HasRegion",
+};
+
+static const char *const kOperands_cf_br[] = {
+  "variadic",
+};
+
+static const char *const kResults_cf_br[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_cf_br[] = {
+  "dest",
+};
+
+static const char *const kInterfaces_cf_br[] = {
+  "TerminatorOpInterface",
+  "RegionBranchOpInterface",
+};
+
+static const char *const kTraits_cf_br[] = {
+  "BranchLike",
+  "Terminator",
+};
+
+static const char *const kOperands_cf_cond_br[] = {
+  "cond",
+  "variadic",
+};
+
+static const char *const kResults_cf_cond_br[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_cf_cond_br[] = {
+  "true_dest",
+  "false_dest",
+};
+
+static const char *const kInterfaces_cf_cond_br[] = {
+  "TerminatorOpInterface",
+  "RegionBranchOpInterface",
+};
+
+static const char *const kTraits_cf_cond_br[] = {
+  "BranchLike",
+  "Terminator",
+};
+
 static const char *const kOperands_memref_alloca[] = {
   nullptr,
 };
@@ -217,6 +460,92 @@ static const char *const kInterfaces_memref_store[] = {
 
 static const char *const kTraits_memref_store[] = {
   "MemoryEffect",
+};
+
+static const char *const kOperands_rv_add[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_rv_add[] = {
+  "result",
+};
+
+static const char *const kAttrs_rv_add[] = {
+  nullptr,
+};
+
+static const char *const kInterfaces_rv_add[] = {
+  "PureOpInterface",
+};
+
+static const char *const kTraits_rv_add[] = {
+  "Pure",
+};
+
+static const char *const kOperands_rv_machine_addw[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_rv_machine_addw[] = {
+  "result",
+};
+
+static const char *const kAttrs_rv_machine_addw[] = {
+  "reg_class",
+};
+
+static const char *const kInterfaces_rv_machine_addw[] = {
+  nullptr,
+};
+
+static const char *const kTraits_rv_machine_addw[] = {
+  "MachineOp",
+  "RegisterOp",
+};
+
+static const char *const kOperands_rv_machine_li[] = {
+  nullptr,
+};
+
+static const char *const kResults_rv_machine_li[] = {
+  "result",
+};
+
+static const char *const kAttrs_rv_machine_li[] = {
+  "value",
+  "reg_class",
+};
+
+static const char *const kInterfaces_rv_machine_li[] = {
+  nullptr,
+};
+
+static const char *const kTraits_rv_machine_li[] = {
+  "MachineOp",
+  "RegisterOp",
+};
+
+static const char *const kOperands_rv_machine_ret[] = {
+  "variadic",
+};
+
+static const char *const kResults_rv_machine_ret[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_rv_machine_ret[] = {
+  nullptr,
+};
+
+static const char *const kInterfaces_rv_machine_ret[] = {
+  "TerminatorOpInterface",
+};
+
+static const char *const kTraits_rv_machine_ret[] = {
+  "MachineOp",
+  "Terminator",
 };
 
 static const char *const kOperands_scf_br[] = {
@@ -325,22 +654,133 @@ static const char *const kTraits_scf_while[] = {
   "LoopLike",
 };
 
+static const char *const kOperands_sysy_func[] = {
+  nullptr,
+};
+
+static const char *const kResults_sysy_func[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_sysy_func[] = {
+  "sym_name",
+  "type",
+};
+
+static const char *const kInterfaces_sysy_func[] = {
+  "RegionBranchOpInterface",
+};
+
+static const char *const kTraits_sysy_func[] = {
+  "FunctionLike",
+  "IsolatedFromAbove",
+  "HasRegion",
+  "Symbol",
+};
+
+static const char *const kOperands_vector_add[] = {
+  "lhs",
+  "rhs",
+};
+
+static const char *const kResults_vector_add[] = {
+  "result",
+};
+
+static const char *const kAttrs_vector_add[] = {
+  nullptr,
+};
+
+static const char *const kInterfaces_vector_add[] = {
+  "PureOpInterface",
+};
+
+static const char *const kTraits_vector_add[] = {
+  "Pure",
+  "SameOperandsAndResultType",
+  "VectorLike",
+};
+
+static const char *const kOperands_vector_transfer_read[] = {
+  "base",
+  "index",
+};
+
+static const char *const kResults_vector_transfer_read[] = {
+  "vector",
+};
+
+static const char *const kAttrs_vector_transfer_read[] = {
+  "mask",
+};
+
+static const char *const kInterfaces_vector_transfer_read[] = {
+  "MemoryEffectOpInterface",
+};
+
+static const char *const kTraits_vector_transfer_read[] = {
+  "MemoryEffect",
+  "VectorLike",
+};
+
+static const char *const kOperands_vector_transfer_write[] = {
+  "vector",
+  "base",
+  "index",
+};
+
+static const char *const kResults_vector_transfer_write[] = {
+  nullptr,
+};
+
+static const char *const kAttrs_vector_transfer_write[] = {
+  "mask",
+};
+
+static const char *const kInterfaces_vector_transfer_write[] = {
+  "MemoryEffectOpInterface",
+};
+
+static const char *const kTraits_vector_transfer_write[] = {
+  "MemoryEffect",
+  "VectorLike",
+};
+
 static const sys::ir::OpDescriptor kGeneratedOpDescriptors[] = {
+  {"affine", "apply", -1, 1, 1, "verifyAffineApply", "foldAffineApply", kTraits_affine_apply, 2, kOperands_affine_apply, 1, kResults_affine_apply, 1, kAttrs_affine_apply, 1, "AffineApplyODSOp", "legacy", "generic", kInterfaces_affine_apply, 1},
+  {"affine", "for", 3, 0, 1, "verifyAffineFor", "foldNone", kTraits_affine_for, 3, kOperands_affine_for, 3, kResults_affine_for, 0, kAttrs_affine_for, 1, "AffineForODSOp", "legacy", "generic", kInterfaces_affine_for, 1},
+  {"affine", "load", 2, 1, 1, "verifyAffineLoad", "foldNone", kTraits_affine_load, 2, kOperands_affine_load, 2, kResults_affine_load, 1, kAttrs_affine_load, 1, "AffineLoadODSOp", "legacy", "generic", kInterfaces_affine_load, 1},
+  {"affine", "store", 3, 0, 1, "verifyAffineStore", "foldNone", kTraits_affine_store, 2, kOperands_affine_store, 3, kResults_affine_store, 0, kAttrs_affine_store, 1, "AffineStoreODSOp", "legacy", "generic", kInterfaces_affine_store, 1},
   {"arith", "addi", 2, 1, 0, "verifySameIntegerOperands", "foldAddI", kTraits_arith_addi, 3, kOperands_arith_addi, 2, kResults_arith_addi, 1, kAttrs_arith_addi, 0, "ArithAddiODSOp", "sameOperandsAndResult", "generic", kInterfaces_arith_addi, 1},
   {"arith", "andi", 2, 1, 0, "verifySameIntegerOperands", "foldAndI", kTraits_arith_andi, 3, kOperands_arith_andi, 2, kResults_arith_andi, 1, kAttrs_arith_andi, 0, "ArithAndiODSOp", "legacy", "generic", kInterfaces_arith_andi, 1},
   {"arith", "constant", 0, 1, 1, "verifyConstantAttr", "foldConstant", kTraits_arith_constant, 1, kOperands_arith_constant, 0, kResults_arith_constant, 1, kAttrs_arith_constant, 1, "ArithConstantODSOp", "legacy", "generic", kInterfaces_arith_constant, 1},
   {"arith", "muli", 2, 1, 0, "verifySameIntegerOperands", "foldMulI", kTraits_arith_muli, 3, kOperands_arith_muli, 2, kResults_arith_muli, 1, kAttrs_arith_muli, 0, "ArithMuliODSOp", "legacy", "generic", kInterfaces_arith_muli, 1},
   {"arith", "select", 3, 1, 0, "verifySelect", "foldSelect", kTraits_arith_select, 1, kOperands_arith_select, 3, kResults_arith_select, 1, kAttrs_arith_select, 0, "ArithSelectODSOp", "legacy", "generic", kInterfaces_arith_select, 1},
   {"arith", "subi", 2, 1, 0, "verifySameIntegerOperands", "foldSubI", kTraits_arith_subi, 2, kOperands_arith_subi, 2, kResults_arith_subi, 1, kAttrs_arith_subi, 0, "ArithSubiODSOp", "legacy", "generic", kInterfaces_arith_subi, 1},
+  {"arm", "add", 2, 1, 0, "verifyARMAdd", "foldNone", kTraits_arm_add, 1, kOperands_arm_add, 2, kResults_arm_add, 1, kAttrs_arm_add, 0, "ArmAddODSOp", "legacy", "generic", kInterfaces_arm_add, 1},
+  {"arm_machine", "add", 2, 1, 1, "verifyARMMachineAdd", "foldNone", kTraits_arm_machine_add, 2, kOperands_arm_machine_add, 2, kResults_arm_machine_add, 1, kAttrs_arm_machine_add, 1, "ArmMachineAddODSOp", "legacy", "generic", kInterfaces_arm_machine_add, 0},
+  {"arm_machine", "mov", 0, 1, 2, "verifyARMMachineMov", "foldNone", kTraits_arm_machine_mov, 2, kOperands_arm_machine_mov, 0, kResults_arm_machine_mov, 1, kAttrs_arm_machine_mov, 2, "ArmMachineMovODSOp", "legacy", "generic", kInterfaces_arm_machine_mov, 0},
+  {"arm_machine", "ret", -1, 0, 0, "verifyARMMachineRet", "foldNone", kTraits_arm_machine_ret, 2, kOperands_arm_machine_ret, 1, kResults_arm_machine_ret, 0, kAttrs_arm_machine_ret, 0, "ArmMachineRetODSOp", "legacy", "generic", kInterfaces_arm_machine_ret, 1},
+  {"builtin", "module", 0, 0, 0, "verifyModule", "foldNone", kTraits_builtin_module, 2, kOperands_builtin_module, 0, kResults_builtin_module, 0, kAttrs_builtin_module, 0, "BuiltinModuleODSOp", "none", "region", kInterfaces_builtin_module, 1},
+  {"cf", "br", -1, 0, 1, "verifyBranch", "foldNone", kTraits_cf_br, 2, kOperands_cf_br, 1, kResults_cf_br, 0, kAttrs_cf_br, 1, "CfBrODSOp", "legacy", "generic", kInterfaces_cf_br, 2},
+  {"cf", "cond_br", 2, 0, 2, "verifyCondBranch", "foldNone", kTraits_cf_cond_br, 2, kOperands_cf_cond_br, 2, kResults_cf_cond_br, 0, kAttrs_cf_cond_br, 2, "CfCondBrODSOp", "legacy", "generic", kInterfaces_cf_cond_br, 2},
   {"memref", "alloca", 0, 1, 1, "verifyMemRefTypeAttr", "foldNone", kTraits_memref_alloca, 1, kOperands_memref_alloca, 0, kResults_memref_alloca, 1, kAttrs_memref_alloca, 1, "MemrefAllocaODSOp", "legacy", "generic", kInterfaces_memref_alloca, 1},
   {"memref", "global", 0, 1, 2, "verifyMemRefGlobal", "foldNone", kTraits_memref_global, 1, kOperands_memref_global, 0, kResults_memref_global, 1, kAttrs_memref_global, 2, "MemrefGlobalODSOp", "legacy", "generic", kInterfaces_memref_global, 1},
   {"memref", "load", 2, 1, 0, "verifyMemRefLoad", "foldNone", kTraits_memref_load, 1, kOperands_memref_load, 2, kResults_memref_load, 1, kAttrs_memref_load, 0, "MemrefLoadODSOp", "legacy", "generic", kInterfaces_memref_load, 1},
   {"memref", "store", 3, 0, 0, "verifyMemRefStore", "foldNone", kTraits_memref_store, 1, kOperands_memref_store, 3, kResults_memref_store, 0, kAttrs_memref_store, 0, "MemrefStoreODSOp", "legacy", "generic", kInterfaces_memref_store, 1},
+  {"rv", "add", 2, 1, 0, "verifyRVAdd", "foldNone", kTraits_rv_add, 1, kOperands_rv_add, 2, kResults_rv_add, 1, kAttrs_rv_add, 0, "RvAddODSOp", "legacy", "generic", kInterfaces_rv_add, 1},
+  {"rv_machine", "addw", 2, 1, 1, "verifyRVMachineAddw", "foldNone", kTraits_rv_machine_addw, 2, kOperands_rv_machine_addw, 2, kResults_rv_machine_addw, 1, kAttrs_rv_machine_addw, 1, "RvMachineAddwODSOp", "legacy", "generic", kInterfaces_rv_machine_addw, 0},
+  {"rv_machine", "li", 0, 1, 2, "verifyRVMachineLi", "foldNone", kTraits_rv_machine_li, 2, kOperands_rv_machine_li, 0, kResults_rv_machine_li, 1, kAttrs_rv_machine_li, 2, "RvMachineLiODSOp", "legacy", "generic", kInterfaces_rv_machine_li, 0},
+  {"rv_machine", "ret", -1, 0, 0, "verifyRVMachineRet", "foldNone", kTraits_rv_machine_ret, 2, kOperands_rv_machine_ret, 1, kResults_rv_machine_ret, 0, kAttrs_rv_machine_ret, 0, "RvMachineRetODSOp", "legacy", "generic", kInterfaces_rv_machine_ret, 1},
   {"scf", "br", 1, 0, 1, "verifyBranch", "foldNone", kTraits_scf_br, 2, kOperands_scf_br, 1, kResults_scf_br, 0, kAttrs_scf_br, 1, "ScfBrODSOp", "legacy", "generic", kInterfaces_scf_br, 2},
   {"scf", "for", 3, 0, 0, "verifyForLike", "foldNone", kTraits_scf_for, 2, kOperands_scf_for, 3, kResults_scf_for, 0, kAttrs_scf_for, 0, "ScfForODSOp", "legacy", "generic", kInterfaces_scf_for, 1},
   {"scf", "if", 1, 0, 0, "verifyIfRegions", "foldNone", kTraits_scf_if, 1, kOperands_scf_if, 1, kResults_scf_if, 0, kAttrs_scf_if, 0, "ScfIfODSOp", "legacy", "generic", kInterfaces_scf_if, 1},
   {"scf", "return", -1, 0, 0, "verifyReturn", "foldNone", kTraits_scf_return, 1, kOperands_scf_return, 1, kResults_scf_return, 0, kAttrs_scf_return, 0, "ScfReturnODSOp", "legacy", "generic", kInterfaces_scf_return, 1},
   {"scf", "while", 1, 0, 0, "verifyWhileRegions", "foldNone", kTraits_scf_while, 2, kOperands_scf_while, 1, kResults_scf_while, 0, kAttrs_scf_while, 0, "ScfWhileODSOp", "legacy", "generic", kInterfaces_scf_while, 1},
+  {"sysy", "func", 0, 0, 2, "verifyFunction", "foldNone", kTraits_sysy_func, 4, kOperands_sysy_func, 0, kResults_sysy_func, 0, kAttrs_sysy_func, 2, "SysyFuncODSOp", "function", "function", kInterfaces_sysy_func, 1},
+  {"vector", "add", 2, 1, 0, "verifyVectorSameType", "foldNone", kTraits_vector_add, 3, kOperands_vector_add, 2, kResults_vector_add, 1, kAttrs_vector_add, 0, "VectorAddODSOp", "legacy", "generic", kInterfaces_vector_add, 1},
+  {"vector", "transfer_read", 2, 1, 1, "verifyVectorTransferRead", "foldNone", kTraits_vector_transfer_read, 2, kOperands_vector_transfer_read, 2, kResults_vector_transfer_read, 1, kAttrs_vector_transfer_read, 1, "VectorTransferReadODSOp", "legacy", "generic", kInterfaces_vector_transfer_read, 1},
+  {"vector", "transfer_write", 3, 0, 1, "verifyVectorTransferWrite", "foldNone", kTraits_vector_transfer_write, 2, kOperands_vector_transfer_write, 3, kResults_vector_transfer_write, 0, kAttrs_vector_transfer_write, 1, "VectorTransferWriteODSOp", "legacy", "generic", kInterfaces_vector_transfer_write, 1},
 };
 
 } // namespace

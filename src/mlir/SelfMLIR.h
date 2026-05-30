@@ -1,0 +1,303 @@
+#ifndef SISY_SELF_MLIR_H
+#define SISY_SELF_MLIR_H
+
+#include <cstdint>
+#include <functional>
+#include <iosfwd>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace sys::mlir {
+
+enum class TypeKind {
+  None,
+  Integer,
+  Float,
+  Index,
+  MemRef,
+  Vector,
+  Function,
+  Register,
+};
+
+struct TypeStorage;
+struct AttributeStorage;
+struct LocationStorage;
+
+class Type {
+  const TypeStorage *storage = nullptr;
+
+public:
+  explicit Type(const TypeStorage *storage = nullptr): storage(storage) {}
+  explicit operator bool() const { return storage != nullptr; }
+  bool operator==(Type other) const { return storage == other.storage; }
+  bool operator!=(Type other) const { return storage != other.storage; }
+  bool operator<(Type other) const { return storage < other.storage; }
+  TypeKind kind() const;
+  std::string str() const;
+};
+
+class Attribute {
+  const AttributeStorage *storage = nullptr;
+
+public:
+  explicit Attribute(const AttributeStorage *storage = nullptr): storage(storage) {}
+  explicit operator bool() const { return storage != nullptr; }
+  bool operator==(Attribute other) const { return storage == other.storage; }
+  bool operator!=(Attribute other) const { return storage != other.storage; }
+  std::string str() const;
+};
+
+class Location {
+  const LocationStorage *storage = nullptr;
+
+public:
+  explicit Location(const LocationStorage *storage = nullptr): storage(storage) {}
+  explicit operator bool() const { return storage != nullptr; }
+  bool operator==(Location other) const { return storage == other.storage; }
+  bool operator!=(Location other) const { return storage != other.storage; }
+  std::string str() const;
+};
+
+class Context {
+  std::unordered_map<std::string, std::unique_ptr<TypeStorage>> types;
+  std::unordered_map<std::string, std::unique_ptr<AttributeStorage>> attrs;
+  std::unordered_map<std::string, std::unique_ptr<LocationStorage>> locations;
+
+  Type internType(TypeKind kind, std::string key, std::string text);
+  Attribute internAttr(std::string key, std::string text);
+
+public:
+  Type noneType();
+  Type i(unsigned bits);
+  Type f(unsigned bits);
+  Type index();
+  Type memref(const std::vector<int64_t> &shape, Type element,
+              const std::vector<int64_t> &strides = {},
+              const std::string &layout = "identity",
+              bool readonly = false);
+  Type vector(Type element, int64_t lanes, bool scalable = false);
+  Type function(const std::vector<Type> &inputs, const std::vector<Type> &results);
+  Type reg(const std::string &target, const std::string &regClass);
+
+  Attribute integerAttr(int64_t value, Type type);
+  Attribute stringAttr(const std::string &value);
+  Attribute boolAttr(bool value);
+  Location loc(const std::string &file, int line, int column);
+  Location unknownLoc();
+
+  std::size_t typeCount() const { return types.size(); }
+  std::size_t attrCount() const { return attrs.size(); }
+  std::size_t locationCount() const { return locations.size(); }
+};
+
+class Operation;
+class Region;
+class Block;
+class BlockArgument;
+
+class Value {
+  Operation *owner = nullptr;
+  BlockArgument *argument = nullptr;
+  unsigned resultIndex = 0;
+  Type valueType;
+
+public:
+  Value() = default;
+  static Value result(Operation *owner, unsigned resultIndex, Type type);
+  static Value blockArgument(BlockArgument *arg);
+
+  bool valid() const { return owner || argument; }
+  bool isOperationResult() const { return owner != nullptr; }
+  bool isBlockArgument() const { return argument != nullptr; }
+  Operation *getDefiningOp() const { return owner; }
+  BlockArgument *getBlockArgument() const { return argument; }
+  unsigned getResultIndex() const { return resultIndex; }
+  Type type() const { return valueType; }
+  std::string printName() const;
+
+  bool operator==(Value other) const {
+    return owner == other.owner && argument == other.argument &&
+           resultIndex == other.resultIndex;
+  }
+  bool operator!=(Value other) const { return !(*this == other); }
+};
+
+class BlockArgument {
+  Block *owner = nullptr;
+  unsigned index = 0;
+  Type argType;
+  Location argLoc;
+  std::string argName;
+
+public:
+  BlockArgument(Block *owner, unsigned index, Type type, Location loc,
+                std::string name);
+  Block *getOwner() const { return owner; }
+  unsigned getIndex() const { return index; }
+  Type type() const { return argType; }
+  Location loc() const { return argLoc; }
+  const std::string &name() const { return argName; }
+  Value value();
+};
+
+class Operation {
+  std::string opName;
+  std::vector<Value> operands;
+  std::vector<Type> resultTypes;
+  std::map<std::string, Attribute> attributes;
+  std::vector<std::unique_ptr<Region>> regions;
+  Location opLoc;
+  Block *parent = nullptr;
+  bool erased = false;
+
+public:
+  Operation(std::string name, std::vector<Value> operands,
+            std::vector<Type> results, std::map<std::string, Attribute> attrs,
+            Location loc);
+
+  const std::string &name() const { return opName; }
+  std::string dialect() const;
+  void rename(std::string newName) { opName = std::move(newName); }
+  Location loc() const { return opLoc; }
+  Block *getBlock() const { return parent; }
+  void setBlock(Block *block) { parent = block; }
+
+  int operandCount() const { return (int) operands.size(); }
+  Value operand(int index) const { return operands[index]; }
+  void setOperand(int index, Value value) { operands[index] = value; }
+  const std::vector<Value> &getOperands() const { return operands; }
+
+  int resultCount() const { return (int) resultTypes.size(); }
+  Type resultType(int index = 0) const { return resultTypes[index]; }
+  Value result(int index = 0) { return Value::result(this, index, resultTypes[index]); }
+
+  const std::map<std::string, Attribute> &attrs() const { return attributes; }
+  Attribute attr(const std::string &name) const;
+  void setAttr(std::string name, Attribute attr) {
+    attributes[std::move(name)] = attr;
+  }
+
+  Region &addRegion();
+  const std::vector<std::unique_ptr<Region>> &getRegions() const { return regions; }
+  std::vector<std::unique_ptr<Region>> &getRegions() { return regions; }
+
+  bool isTerminator() const;
+  bool isErased() const { return erased; }
+  void markErased() { erased = true; }
+};
+
+class Block {
+  Region *parent = nullptr;
+  std::vector<std::unique_ptr<BlockArgument>> arguments;
+  std::vector<std::unique_ptr<Operation>> operations;
+
+public:
+  explicit Block(Region *parent): parent(parent) {}
+  Region *getRegion() const { return parent; }
+  BlockArgument &addArgument(Type type, Location loc, const std::string &name = "");
+  Operation &addOperation(std::unique_ptr<Operation> op);
+  void eraseMarkedOperations();
+  const std::vector<std::unique_ptr<BlockArgument>> &args() const { return arguments; }
+  const std::vector<std::unique_ptr<Operation>> &ops() const { return operations; }
+  std::vector<std::unique_ptr<Operation>> &ops() { return operations; }
+};
+
+class Region {
+  Operation *parent = nullptr;
+  std::vector<std::unique_ptr<Block>> blocks;
+
+public:
+  explicit Region(Operation *parent): parent(parent) {}
+  Operation *getParent() const { return parent; }
+  Block &addBlock();
+  const std::vector<std::unique_ptr<Block>> &getBlocks() const { return blocks; }
+  std::vector<std::unique_ptr<Block>> &getBlocks() { return blocks; }
+};
+
+class Module {
+  Context &ctx;
+  std::unique_ptr<Operation> moduleOp;
+
+public:
+  explicit Module(Context &ctx);
+  Context &context() const { return ctx; }
+  Operation &op() const { return *moduleOp; }
+  Region &body();
+};
+
+class Builder {
+  Context &ctx;
+  Block *insertionBlock = nullptr;
+
+public:
+  Builder(Context &ctx, Block *block = nullptr): ctx(ctx), insertionBlock(block) {}
+  void setInsertionBlock(Block *block) { insertionBlock = block; }
+  Operation &create(const std::string &name, const std::vector<Value> &operands,
+                    const std::vector<Type> &results,
+                    const std::map<std::string, Attribute> &attrs = {},
+                    Location loc = Location(), int regionCount = 0);
+};
+
+struct VerifyResult {
+  bool ok = true;
+  std::vector<std::string> errors;
+};
+
+VerifyResult verify(Module &module);
+void print(Module &module, std::ostream &os);
+void replaceAllUses(Module &module, Value oldValue, Value newValue);
+std::vector<Operation*> walk(Module &module);
+
+struct RewriteRule {
+  std::string name;
+  std::string root;
+  std::string kind;
+  int benefit = 1;
+};
+
+struct RewriteStats {
+  int rules = 0;
+  int rewrites = 0;
+  int iterations = 0;
+};
+
+std::vector<RewriteRule> parseDRR(const std::string &text, std::vector<std::string> &errors);
+RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> &rules);
+
+class ConversionTarget {
+  std::set<std::string> legalDialects;
+
+public:
+  void addLegalDialect(const std::string &dialect) { legalDialects.insert(dialect); }
+  bool isLegal(Operation &op) const { return legalDialects.count(op.dialect()) != 0; }
+};
+
+struct ConversionPattern {
+  std::string root;
+  std::string replacement;
+};
+
+struct ConversionStats {
+  int visited = 0;
+  int legal = 0;
+  int converted = 0;
+  int failed = 0;
+  int rollbacks = 0;
+};
+
+ConversionStats convertDialects(Module &module, const ConversionTarget &target,
+                                const std::vector<ConversionPattern> &patterns);
+
+int runCoreSelfTest(std::ostream &os);
+int runConversionSelfTest(std::ostream &os);
+void dumpSample(std::ostream &os);
+
+} // namespace sys::mlir
+
+#endif

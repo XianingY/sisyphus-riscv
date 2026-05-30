@@ -1,7 +1,8 @@
 # LLVM/MLIR-Style Refactor Roadmap
 
-This project now has a conservative first layer of MLIR-like infrastructure.
-It is intentionally shadow/opt-in for the default RISC-V O1 path.
+This project now has a self-hosted MLIR core in addition to the historical
+legacy compiler path.  The new core is not an upstream LLVM dependency; it is a
+project-local implementation of the MLIR object model and conversion contracts.
 
 ## Implemented Skeleton
 
@@ -52,6 +53,22 @@ It is intentionally shadow/opt-in for the default RISC-V O1 path.
 - `--pass-pipeline=<passes>` adds a development-only textual pipeline prefix.
   Unknown pass names fail fast.
 
+## Self-MLIR Core
+
+- `src/mlir/SelfMLIR.*` defines the production-candidate MLIR object model:
+  `Context`, hash-consed `Type`/`Attribute`/`Location`, `Operation`, `Region`,
+  `Block`, `BlockArgument`, `Value`, `Builder`, verifier, and printer.
+- The self-MLIR verifier rejects `legacy.*` and Phi-shaped operations.  The
+  sample module uses only region ops and block arguments.
+- `src/mlir/canonicalize.drr` is the first declarative rewrite rule file.
+  `--run-self-mlir-core-tests` parses the DRR seed and runs a greedy rewrite
+  driver over a pure self-MLIR module.
+- `--run-self-mlir-conversion-tests` exercises target legalization and rollback
+  for both `rv_machine` and `arm_machine` without touching legacy IR.
+- `scripts/run_mlir_core_tests.sh` and
+  `scripts/run_dialect_conversion_tests.sh` are the new core gates that must
+  pass before migrating default compilation stages onto the self-MLIR path.
+
 ## Default Policy
 
 The official path remains:
@@ -66,15 +83,13 @@ source-name triggers.
 
 ## Next Migration Steps
 
-1. Move more `RegularFold` rules into declarative canonicalization patterns.
-2. Replace the current non-mutating block-argument bridge with real
-   block-argument operands for simple function-local joins.
-3. Start replacing Phi users with block arguments at region boundaries where
-   the predecessor set is structurally simple.
-4. Replace per-pass affine shape matching with cached `AffineNestAnalysis`
-   summaries.
-5. Feed `MemRefAliasAnalysis` into LICM, DSE, DLE, and scalar replacement behind
-   dedicated compare gates.
-6. Add a vector dialect layer for explicit RVV/NEON opt-in lowering.
-7. Gradually table-drive backend peepholes before attempting full instruction
-   selection generation.
+1. Replace AST/HIR construction with direct `sysy + scf + memref + arith`
+   self-MLIR emission.
+2. Port Mem2Reg, DCE, SCCP, LICM, SCEV, MemorySSA, affine transforms, and
+   vectorization to `OperationPass<OpT>` over self-MLIR operations.
+3. Replace RV/ARM lowering with `DialectConversion` into
+   `rv_machine`/`arm_machine`.
+4. Move register allocation, live-range splitting, scheduling, and asm printing
+   onto machine dialect operations.
+5. Delete legacy bridge files once default RISC-V and ARM gates are green on
+   the self-MLIR pipeline.

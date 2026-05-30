@@ -20,6 +20,13 @@ ALLOWED_TRAITS = {
     "HasRegion",
     "NoSideEffect",
     "Commutative",
+    "IsolatedFromAbove",
+    "Symbol",
+    "FunctionLike",
+    "AffineLike",
+    "VectorLike",
+    "MachineOp",
+    "RegisterOp",
 }
 ALLOWED_INTERFACES = {
     "PureOpInterface",
@@ -227,13 +234,12 @@ def render_classes(records):
         out.append(f"  static constexpr const char *kDialect = \"{rec['dialect']}\";")
         out.append(f"  static constexpr const char *kName = \"{rec['name']}\";")
         out.append(f"  explicit {cls}(sys::ir::Operation *op): op(op) {{}}")
-        out.append(f"  explicit {cls}(sys::Op *op): op(sys::ir::Operation::fromLegacy(op)) {{}}")
         out.append("  sys::ir::Operation *getOperation() const { return op; }")
         for idx, operand in enumerate(rec["operands"]):
             if operand == "variadic":
                 continue
             out.append(f"  sys::Value get{method_suffix(operand)}() const {{ return op->getOperand({idx}); }}")
-        out.append("  static sys::ir::Operation *build(sys::Op *legacy) { return sys::ir::Operation::fromLegacy(legacy); }")
+        out.append("  static sys::ir::Operation *build(sys::ir::Operation *op) { return op; }")
         out.append("  static bool verify(sys::ir::Operation *op, std::string *error = nullptr) {")
         out.append("    return op ? op->verifyBridge(error) : false;")
         out.append("  }")

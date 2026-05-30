@@ -25,6 +25,7 @@
 #include "../ir/IRContext.h"
 #include "../ir/OpDescriptor.h"
 #include "../ir/Operation.h"
+#include "../mlir/SelfMLIR.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
 #include "../opt/ScopedPassManager.h"
@@ -314,6 +315,17 @@ int main(int argc, char **argv) {
 
   if (opts.dumpDialectConversion) {
     sys::ir::DialectConversionDriver::dumpStandardScalarLegality(std::cout);
+    return 0;
+  }
+
+  if (opts.runSelfMLIRCoreTests)
+    return sys::mlir::runCoreSelfTest(std::cout);
+
+  if (opts.runSelfMLIRConversionTests)
+    return sys::mlir::runConversionSelfTest(std::cout);
+
+  if (opts.dumpSelfMLIRSample) {
+    sys::mlir::dumpSample(std::cout);
     return 0;
   }
 

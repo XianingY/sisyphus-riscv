@@ -34,6 +34,13 @@ bool OpDescriptorTable::verify(std::string *error) {
     "HasRegion",
     "NoSideEffect",
     "Commutative",
+    "IsolatedFromAbove",
+    "Symbol",
+    "FunctionLike",
+    "AffineLike",
+    "VectorLike",
+    "MachineOp",
+    "RegisterOp",
   };
   static const std::set<std::string> allowedInterfaces = {
     "PureOpInterface",

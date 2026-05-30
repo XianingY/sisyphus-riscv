@@ -30,6 +30,10 @@ if ! grep -q "sys::ir::Operation \\*op" "${ROOT_DIR}/src/ir/GeneratedOpClasses.i
   echo "expected generated ODS wrappers to use Operation*" >&2
   exit 1
 fi
+if grep -q "Operation::fromLegacy" "${ROOT_DIR}/src/ir/GeneratedOpClasses.inc"; then
+  echo "generated ODS wrappers must not depend on legacy Operation::fromLegacy" >&2
+  exit 1
+fi
 
 if "${ROOT_DIR}/scripts/gen-op-descriptors.py" \
     "${ROOT_DIR}/tests/opgen/bad_missing_field.yml" >/dev/null 2>"${OUT_DIR}/bad-missing.log"; then
@@ -54,7 +58,7 @@ if ! grep -q "unknown trait" "${OUT_DIR}/bad-trait.log"; then
 fi
 
 descriptors="$("${COMPILER}" --dump-op-descriptors)"
-for op in arith.addi arith.select scf.for memref.load; do
+for op in builtin.module sysy.func arith.addi arith.select scf.for memref.load rv_machine.addw arm_machine.add; do
   if ! grep -q "${op}" <<<"${descriptors}"; then
     echo "expected op descriptor dump to contain ${op}" >&2
     exit 1
@@ -101,8 +105,8 @@ if ! grep -q "\\[dialect-conversion\\] legal-dialect arith" <<<"${conversion}"; 
   echo "expected dialect conversion dump to contain arith" >&2
   exit 1
 fi
-if ! grep -q "illegal-count=0" <<<"${conversion}"; then
-  echo "expected standard scalar target to legalize all generated ops" >&2
+if ! grep -q "illegal-op rv_machine.addw" <<<"${conversion}"; then
+  echo "expected standard scalar target to keep machine dialect illegal before target lowering" >&2
   exit 1
 fi
 

@@ -1,0 +1,6 @@
+# Self-MLIR declarative rewrite seed.
+# Format consumed by sys::mlir::parseDRR:
+#   rule <name> <root-op> <kind> <benefit>
+rule fold_addi_zero arith.addi addi-zero 10
+rule fold_muli_one arith.muli muli-one 9
+rule fold_select_same arith.select select-same 8

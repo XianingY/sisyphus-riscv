@@ -1,4 +1,28 @@
 ops:
+  - name: module
+    dialect: builtin
+    operands: []
+    results: []
+    attrs: []
+    traits: [IsolatedFromAbove, HasRegion]
+    interfaces: [RegionBranchOpInterface]
+    cppClass: BuiltinModuleODSOp
+    typeFormat: none
+    assemblyFormat: region
+    verify: verifyModule
+    fold: foldNone
+  - name: func
+    dialect: sysy
+    operands: []
+    results: []
+    attrs: [sym_name, type]
+    traits: [FunctionLike, IsolatedFromAbove, HasRegion, Symbol]
+    interfaces: [RegionBranchOpInterface]
+    cppClass: SysyFuncODSOp
+    typeFormat: function
+    assemblyFormat: function
+    verify: verifyFunction
+    fold: foldNone
   - name: addi
     dialect: arith
     operands: [lhs, rhs]
@@ -122,4 +146,140 @@ ops:
     attrs: []
     traits: [HasRegion, LoopLike]
     verify: verifyWhileRegions
+    fold: foldNone
+  - name: br
+    dialect: cf
+    operands: [variadic]
+    results: []
+    attrs: [dest]
+    traits: [BranchLike, Terminator]
+    verify: verifyBranch
+    fold: foldNone
+  - name: cond_br
+    dialect: cf
+    operands: [cond, variadic]
+    results: []
+    attrs: [true_dest, false_dest]
+    traits: [BranchLike, Terminator]
+    verify: verifyCondBranch
+    fold: foldNone
+  - name: apply
+    dialect: affine
+    operands: [variadic]
+    results: [index]
+    attrs: [map]
+    traits: [Pure, AffineLike]
+    verify: verifyAffineApply
+    fold: foldAffineApply
+  - name: for
+    dialect: affine
+    operands: [lower, upper, step]
+    results: []
+    attrs: [map]
+    traits: [HasRegion, LoopLike, AffineLike]
+    verify: verifyAffineFor
+    fold: foldNone
+  - name: load
+    dialect: affine
+    operands: [base, variadic]
+    results: [value]
+    attrs: [map]
+    traits: [MemoryEffect, AffineLike]
+    verify: verifyAffineLoad
+    fold: foldNone
+  - name: store
+    dialect: affine
+    operands: [value, base, variadic]
+    results: []
+    attrs: [map]
+    traits: [MemoryEffect, AffineLike]
+    verify: verifyAffineStore
+    fold: foldNone
+  - name: transfer_read
+    dialect: vector
+    operands: [base, index]
+    results: [vector]
+    attrs: [mask]
+    traits: [MemoryEffect, VectorLike]
+    verify: verifyVectorTransferRead
+    fold: foldNone
+  - name: transfer_write
+    dialect: vector
+    operands: [vector, base, index]
+    results: []
+    attrs: [mask]
+    traits: [MemoryEffect, VectorLike]
+    verify: verifyVectorTransferWrite
+    fold: foldNone
+  - name: add
+    dialect: vector
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, SameOperandsAndResultType, VectorLike]
+    verify: verifyVectorSameType
+    fold: foldNone
+  - name: add
+    dialect: rv
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifyRVAdd
+    fold: foldNone
+  - name: add
+    dialect: arm
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifyARMAdd
+    fold: foldNone
+  - name: addw
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineAddw
+    fold: foldNone
+  - name: li
+    dialect: rv_machine
+    operands: []
+    results: [result]
+    attrs: [value, reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineLi
+    fold: foldNone
+  - name: ret
+    dialect: rv_machine
+    operands: [variadic]
+    results: []
+    attrs: []
+    traits: [MachineOp, Terminator]
+    verify: verifyRVMachineRet
+    fold: foldNone
+  - name: add
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineAdd
+    fold: foldNone
+  - name: mov
+    dialect: arm_machine
+    operands: []
+    results: [result]
+    attrs: [value, reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineMov
+    fold: foldNone
+  - name: ret
+    dialect: arm_machine
+    operands: [variadic]
+    results: []
+    attrs: []
+    traits: [MachineOp, Terminator]
+    verify: verifyARMMachineRet
     fold: foldNone

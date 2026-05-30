@@ -49,6 +49,9 @@ Options::Options() {
   dumpBlockArguments = false;
   dumpOperationIR = false;
   verifyOperationBridge = false;
+  runSelfMLIRCoreTests = false;
+  runSelfMLIRConversionTests = false;
+  dumpSelfMLIRSample = false;
   inlineThreshold = 200;
   lateInlineThreshold = 200;
   inlineThresholdExplicit = false;
@@ -207,6 +210,9 @@ Options sys::parseArgs(int argc, char **argv) {
     PARSEOPT("--dump-block-arguments", dumpBlockArguments);
     PARSEOPT("--dump-operation-ir", dumpOperationIR);
     PARSEOPT("--verify-operation-bridge", verifyOperationBridge);
+    PARSEOPT("--run-self-mlir-core-tests", runSelfMLIRCoreTests);
+    PARSEOPT("--run-self-mlir-conversion-tests", runSelfMLIRConversionTests);
+    PARSEOPT("--dump-self-mlir-sample", dumpSelfMLIRSample);
     PARSEOPT("--enable-experimental", enableExperimental);
     PARSEOPT("--disable-o2-experimental", disableO2Experimental);
     PARSEOPT("--enable-hir-pipeline", enableHIRPipeline);
@@ -388,6 +394,8 @@ Options sys::parseArgs(int argc, char **argv) {
       !opts.dumpIRContext && !opts.dumpPassScopes &&
       !opts.dumpDialectConversion && !opts.dumpBlockArguments &&
       !opts.dumpOperationIR && !opts.verifyOperationBridge &&
+      !opts.runSelfMLIRCoreTests && !opts.runSelfMLIRConversionTests &&
+      !opts.dumpSelfMLIRSample &&
       opts.runDialectConversion.empty()) {
     std::cerr
       << "usage: compiler <input.sy> -S -o <output.s> [-O0|-O1|-O2] [--target=riscv|arm]\n"
@@ -399,6 +407,7 @@ Options sys::parseArgs(int argc, char **argv) {
       << "       [--dump-op-descriptors] [--dump-ir-context] [--dump-pass-scopes]\n"
       << "       [--dump-dialect-conversion] [--dump-block-arguments]\n"
       << "       [--dump-operation-ir] [--verify-operation-bridge]\n"
+      << "       [--run-self-mlir-core-tests] [--run-self-mlir-conversion-tests] [--dump-self-mlir-sample]\n"
       << "       [--run-dialect-conversion=<legacy|rollback-test>]\n"
       << "       [--enable-rvv] [--disable-smt-synth]\n"
       << "       [--enable-hir-pipeline|--disable-hir-pipeline|--use-legacy-codegen|--force-dialect-codegen]\n"
