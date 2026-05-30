@@ -1,5 +1,6 @@
 #include "PassManager.h"
 #include "Passes.h"
+#include "ScopedPassManager.h"
 #include "../utils/Exec.h"
 
 #include <iostream>
@@ -80,6 +81,12 @@ void PassManager::run() {
       std::make_unique<AnalysisManager>(module, analysisManagerEnabled,
                                         dumpAnalysisCache);
   PassContext passContext(analysisManager.get());
+  std::string scopedPassError;
+  if (!ScopedPassRegistry::verify(&scopedPassError)) {
+    std::cerr << "scoped pass registry verification failed: "
+              << scopedPassError << "\n";
+    std::exit(1);
+  }
 
   for (auto &passPtr : passes) {
     Pass *pass = passPtr.get();
@@ -113,6 +120,17 @@ void PassManager::run() {
     }
 
     auto passStart = std::chrono::steady_clock::now();
+    auto *scopeInfo = ScopedPassRegistry::find(pname);
+    if (opts.dumpPassTiming) {
+      if (scopeInfo) {
+        std::cerr << "[pass-scope-check] " << pname
+                  << " scope=" << passScopeName(scopeInfo->scope)
+                  << " declared=1\n";
+      } else {
+        std::cerr << "[pass-scope-check] " << pname
+                  << " scope=legacy declared=0\n";
+      }
+    }
     PreservedAnalyses preserved =
         analysisManagerEnabled ? pass->run(passContext)
                                : (pass->run(), PreservedAnalyses::none());

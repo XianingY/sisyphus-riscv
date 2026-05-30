@@ -1,6 +1,8 @@
 #include "OpBase.h"
 #include "Attrs.h"
 #include "Ops.h"
+#include "../ir/IRContext.h"
+#include "../ir/Operation.h"
 
 #include <cstdlib>
 #include <deque>
@@ -56,13 +58,24 @@ Op *Op::nextOp() {
   return *it;
 }
 
-Value::Value(Op *from): defining(from) {}
+Value::Value(Op *from): defining(from), blockArg(nullptr) {}
+
+Value::Value(BlockArgument *from): defining(nullptr), blockArg(from) {}
+
+ir::Type Value::getIRType() const {
+  if (blockArg)
+    return ir::legacyTypeToIRType(blockArg->type);
+  if (defining)
+    return defining->getIRResultType();
+  return ir::legacyTypeToIRType(Value::unit);
+}
 
 Op::Op(int id, Value::Type resultTy, const std::vector<Value> &values):
   resultTy(resultTy), opid(id) {
   for (auto x : values) {
     operands.push_back(x);
-    x.defining->uses.insert(this);
+    if (x.defining)
+      x.defining->uses.insert(this);
   }
 }
 
@@ -70,7 +83,8 @@ Op::Op(int id, Value::Type resultTy, const std::vector<Value> &values, const std
   resultTy(resultTy), opid(id) {
   for (auto x : values) {
     operands.push_back(x);
-    x.defining->uses.insert(this);
+    if (x.defining)
+      x.defining->uses.insert(this);
   }
   for (auto attr : attrs) {
     auto cloned = attr->clone();
@@ -93,8 +107,11 @@ Region *Op::appendRegion() {
 }
 
 void Op::pushOperand(Value v) {
-  v.defining->uses.insert(this);
+  if (v.defining)
+    v.defining->uses.insert(this);
   operands.push_back(v);
+  if (operationCore)
+    operationCore->syncFromLegacy();
 }
 
 Op *Op::getParentOp() {
@@ -145,9 +162,12 @@ void Op::moveToStart(BasicBlock *block) {
 void Op::removeAllOperands() {
   for (auto x : operands) {
     auto op = x.defining;
-    op->uses.erase(this);
+    if (op)
+      op->uses.erase(this);
   }
   operands.clear();
+  if (operationCore)
+    operationCore->syncFromLegacy();
 }
 
 void Op::removeAllAttributes() {
@@ -190,14 +210,21 @@ void Op::removeOperandUse(Op *def) {
 void Op::setOperand(int i, Value v) {
   auto def = operands[i].defining;
   operands[i] = v;
-  removeOperandUse(def);
-  v.defining->uses.insert(this);
+  if (def)
+    removeOperandUse(def);
+  if (v.defining)
+    v.defining->uses.insert(this);
+  if (operationCore)
+    operationCore->syncFromLegacy();
 }
 
 void Op::removeOperand(int i) {
   auto def = operands[i].defining;
   operands.erase(operands.begin() + i);
-  removeOperandUse(def);
+  if (def)
+    removeOperandUse(def);
+  if (operationCore)
+    operationCore->syncFromLegacy();
 }
 
 void Op::removeOperand(Op *v) {
@@ -229,6 +256,8 @@ void Op::setAttribute(int i, Attr *attr) {
   if (!--attrs[i]->refcnt)
     delete attrs[i];
   attrs[i] = attr;
+  if (operationCore)
+    operationCore->syncFromLegacy();
 }
 
 void Op::erase() {
@@ -268,6 +297,26 @@ void Op::release() {
 BasicBlock *Op::createFirstBlock() {
   appendRegion();
   return regions[0]->appendBlock();
+}
+
+ir::Operation *Op::getOperation() {
+  return ir::Operation::fromLegacy(this);
+}
+
+ir::Type Op::getIRResultType() const {
+  return ir::legacyTypeToIRType(resultTy);
+}
+
+void Op::setLocation(std::string file, int line, int column) {
+  locationFile = std::move(file);
+  locationLine = line;
+  locationColumn = column;
+  if (operationCore)
+    operationCore->syncFromLegacy();
+}
+
+ir::Attribute Op::getLocationAttr() const {
+  return ir::IRContext::global().getLocationAttr(locationFile, locationLine, locationColumn);
 }
 
 void Op::replaceAllUsesWith(Op *other) {
@@ -311,6 +360,12 @@ static std::map<Op*, int> valueName = {};
 static int id = 0;
 
 std::string getValueNumber(Value value) {
+  if (value.isBlockArgument()) {
+    auto *arg = value.getBlockArgument();
+    if (arg && !arg->name.empty())
+      return "%" + arg->name;
+    return "%arg" + std::to_string(arg ? arg->index : -1);
+  }
   if (!valueName.count(value.defining))
     valueName[value.defining] = id++;
   return "%" + std::to_string(valueName[value.defining]);

@@ -13,6 +13,9 @@ It is intentionally shadow/opt-in for the default RISC-V O1 path.
   ODS-style adapter layer with typed operand getters and verify stubs.
 - `sys::ir::OpDescriptorTable` verifies and dumps generated op metadata through
   `--dump-op-descriptors`.
+- `sys::ir::Operation` is now the bridge core between legacy `Op` and the
+  MLIR-style side tables. Legacy ops can expose an `Operation*`, ODS wrappers
+  wrap `Operation*`, and `--dump-operation-ir` prints a minimal MLIR-like view.
 - `sys::ir::IRContext` interns lightweight Type and Attribute handles, including
   parameterized memref/vector types and location attributes. This is a shadow
   bridge toward MLIR-style hash-consed type/attribute storage while legacy
@@ -22,6 +25,9 @@ It is intentionally shadow/opt-in for the default RISC-V O1 path.
 - `BasicBlock` now carries a block-argument side table. Phi ops remain the
   production SSA representation for now, but the new API lets CFG utilities,
   tests, and future conversions model MLIR-style block arguments incrementally.
+- `PhiToBlockArgumentBridge` can materialize simple Phi nodes into block
+  argument side-table entries and lower them back, giving the project a safe
+  round-trip test path before replacing production Phi users.
 - `PatternRewriter`, `PatternBenefit`, and `RewriteDriver` provide a greedy
   local rewrite framework. `PatternCanonicalize` is opt-in via
   `--pass-pipeline=pattern-canonicalize` or `SISY_ENABLE_PATTERN_CANONICALIZE=1`.
@@ -34,6 +40,10 @@ It is intentionally shadow/opt-in for the default RISC-V O1 path.
 - `DialectConversionDriver` provides a small ConversionTarget/TypeConverter
   scaffold. The current standard scalar target legalizes `arith`, `scf`, and
   `memref` descriptors and can be inspected with `--dump-dialect-conversion`.
+  `--run-dialect-conversion=legacy` performs a non-mutating legacy dry run, and
+  `--run-dialect-conversion=rollback-test` exercises rollback accounting.
+- `ScopedPassRegistry` is verified by the real `PassManager`; with pass timing
+  enabled, pass scope declarations are surfaced alongside normal timing output.
 - `MemRefType` and `MemRefAliasAnalysis` provide a base+offset+layout alias
   side table. It is currently a queryable analysis layer, not a default
   behavior change.
@@ -57,12 +67,14 @@ source-name triggers.
 ## Next Migration Steps
 
 1. Move more `RegularFold` rules into declarative canonicalization patterns.
-2. Start replacing Phi users with block arguments at region boundaries where
+2. Replace the current non-mutating block-argument bridge with real
+   block-argument operands for simple function-local joins.
+3. Start replacing Phi users with block arguments at region boundaries where
    the predecessor set is structurally simple.
-3. Replace per-pass affine shape matching with cached `AffineNestAnalysis`
+4. Replace per-pass affine shape matching with cached `AffineNestAnalysis`
    summaries.
-4. Feed `MemRefAliasAnalysis` into LICM, DSE, DLE, and scalar replacement behind
+5. Feed `MemRefAliasAnalysis` into LICM, DSE, DLE, and scalar replacement behind
    dedicated compare gates.
-5. Add a vector dialect layer for explicit RVV/NEON opt-in lowering.
-6. Gradually table-drive backend peepholes before attempting full instruction
+6. Add a vector dialect layer for explicit RVV/NEON opt-in lowering.
+7. Gradually table-drive backend peepholes before attempting full instruction
    selection generation.

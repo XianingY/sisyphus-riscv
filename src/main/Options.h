@@ -42,11 +42,14 @@ struct Options {
     option dumpPassScopes : 1;
     option dumpDialectConversion : 1;
     option dumpBlockArguments : 1;
+    option dumpOperationIR : 1;
+    option verifyOperationBridge : 1;
   };
 
   std::string inputFile;
   std::string outputFile;
   std::string passPipeline;
+  std::string runDialectConversion;
   std::string printAfter;
   std::string printBefore;
   std::string compareWith;

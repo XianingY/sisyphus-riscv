@@ -47,6 +47,8 @@ Options::Options() {
   dumpPassScopes = false;
   dumpDialectConversion = false;
   dumpBlockArguments = false;
+  dumpOperationIR = false;
+  verifyOperationBridge = false;
   inlineThreshold = 200;
   lateInlineThreshold = 200;
   inlineThresholdExplicit = false;
@@ -203,6 +205,8 @@ Options sys::parseArgs(int argc, char **argv) {
     PARSEOPT("--dump-pass-scopes", dumpPassScopes);
     PARSEOPT("--dump-dialect-conversion", dumpDialectConversion);
     PARSEOPT("--dump-block-arguments", dumpBlockArguments);
+    PARSEOPT("--dump-operation-ir", dumpOperationIR);
+    PARSEOPT("--verify-operation-bridge", verifyOperationBridge);
     PARSEOPT("--enable-experimental", enableExperimental);
     PARSEOPT("--disable-o2-experimental", disableO2Experimental);
     PARSEOPT("--enable-hir-pipeline", enableHIRPipeline);
@@ -293,6 +297,19 @@ Options sys::parseArgs(int argc, char **argv) {
       }
       continue;
     }
+    if (strcmp(argv[i], "--run-dialect-conversion") == 0) {
+      opts.runDialectConversion = requireValue(i, "--run-dialect-conversion");
+      i++;
+      continue;
+    }
+    if (strncmp(argv[i], "--run-dialect-conversion=", 25) == 0) {
+      opts.runDialectConversion = argv[i] + 25;
+      if (opts.runDialectConversion.empty()) {
+        std::cerr << "error: --run-dialect-conversion requires value\n";
+        exit(1);
+      }
+      continue;
+    }
     PARSEOPT("--dump-hir", dumpHIR);
     PARSEOPT("--dump-cfg", dumpCFG);
     PARSEOPT("--verify-hir", verifyHIR);
@@ -369,7 +386,9 @@ Options sys::parseArgs(int argc, char **argv) {
   if (opts.inputFile.empty() && !opts.bv && !opts.sat &&
       opts.thinLinkOut.empty() && !opts.dumpOpDescriptors &&
       !opts.dumpIRContext && !opts.dumpPassScopes &&
-      !opts.dumpDialectConversion && !opts.dumpBlockArguments) {
+      !opts.dumpDialectConversion && !opts.dumpBlockArguments &&
+      !opts.dumpOperationIR && !opts.verifyOperationBridge &&
+      opts.runDialectConversion.empty()) {
     std::cerr
       << "usage: compiler <input.sy> -S -o <output.s> [-O0|-O1|-O2] [--target=riscv|arm]\n"
       << "       [--inline-threshold=N] [--late-inline-threshold=N]\n"
@@ -379,6 +398,8 @@ Options sys::parseArgs(int argc, char **argv) {
       << "       [--pass-pipeline=<comma-separated-passes>] [--dump-analysis-cache]\n"
       << "       [--dump-op-descriptors] [--dump-ir-context] [--dump-pass-scopes]\n"
       << "       [--dump-dialect-conversion] [--dump-block-arguments]\n"
+      << "       [--dump-operation-ir] [--verify-operation-bridge]\n"
+      << "       [--run-dialect-conversion=<legacy|rollback-test>]\n"
       << "       [--enable-rvv] [--disable-smt-synth]\n"
       << "       [--enable-hir-pipeline|--disable-hir-pipeline|--use-legacy-codegen|--force-dialect-codegen]\n"
       << "       [--dialect-fallback-report=stderr|<path>]\n"

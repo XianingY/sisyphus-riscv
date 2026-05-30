@@ -4,6 +4,7 @@
 #include <string>
 
 #include "../codegen/OpBase.h"
+#include "Operation.h"
 
 #include "GeneratedOpClasses.inc"
 

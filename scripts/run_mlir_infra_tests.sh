@@ -26,6 +26,10 @@ if ! grep -q "getLhs" "${ROOT_DIR}/src/ir/GeneratedOpClasses.inc"; then
   echo "expected generated typed getter for arith.addi.lhs" >&2
   exit 1
 fi
+if ! grep -q "sys::ir::Operation \\*op" "${ROOT_DIR}/src/ir/GeneratedOpClasses.inc"; then
+  echo "expected generated ODS wrappers to use Operation*" >&2
+  exit 1
+fi
 
 if "${ROOT_DIR}/scripts/gen-op-descriptors.py" \
     "${ROOT_DIR}/tests/opgen/bad_missing_field.yml" >/dev/null 2>"${OUT_DIR}/bad-missing.log"; then
@@ -58,6 +62,14 @@ for op in arith.addi arith.select scf.for memref.load; do
 done
 if ! grep -q "operands=\\[lhs,rhs\\]" <<<"${descriptors}"; then
   echo "expected descriptor dump to include operand names" >&2
+  exit 1
+fi
+if ! grep -q "interfaces=\\[PureOpInterface\\]" <<<"${descriptors}"; then
+  echo "expected descriptor dump to include generated interfaces" >&2
+  exit 1
+fi
+if ! grep -q "cppClass=ArithAddiODSOp" <<<"${descriptors}"; then
+  echo "expected descriptor dump to include ODS class metadata" >&2
   exit 1
 fi
 
@@ -105,6 +117,39 @@ if ! grep -q "first=iv" <<<"${blockargs}"; then
   exit 1
 fi
 
+operation_ir="$("${COMPILER}" --dump-operation-ir)"
+echo "${operation_ir}"
+if ! grep -q "\\[operation-ir\\].*arith.addi" <<<"${operation_ir}"; then
+  echo "expected operation IR dump to bridge legacy AddIOp to arith.addi" >&2
+  exit 1
+fi
+if ! grep -q "loc(loc(\"unknown\":0:0))" <<<"${operation_ir}"; then
+  echo "expected operation IR dump to include default location" >&2
+  exit 1
+fi
+
+bridge="$("${COMPILER}" --verify-operation-bridge)"
+echo "${bridge}"
+if ! grep -q "\\[operation-bridge\\] checked=" <<<"${bridge}"; then
+  echo "expected operation bridge verification stats" >&2
+  exit 1
+fi
+if ! grep -q "failures=0" <<<"${bridge}"; then
+  echo "expected operation bridge verification to succeed" >&2
+  exit 1
+fi
+if ! grep -q "\\[block-arg-bridge\\]" <<<"${bridge}"; then
+  echo "expected block argument bridge round-trip stats" >&2
+  exit 1
+fi
+
+rollback="$("${COMPILER}" --run-dialect-conversion=rollback-test)"
+echo "${rollback}"
+if ! grep -q "rollbacks=1" <<<"${rollback}"; then
+  echo "expected dialect conversion rollback self-test" >&2
+  exit 1
+fi
+
 stats="$(SISY_ENABLE_PATTERN_CANONICALIZE=1 "${COMPILER}" \
   "${ROOT_DIR}/tests/mlir_infra/pattern_fold.sy" -S \
   -o "${OUT_DIR}/pattern_fold.s" \
@@ -119,6 +164,21 @@ if ! grep -q "pattern-canonicalize:" <<<"${stats}"; then
 fi
 if ! grep -Eq "rewrites : [1-9]" <<<"${stats}"; then
   echo "expected pattern-canonicalize to rewrite at least one op" >&2
+  exit 1
+fi
+
+bridge_stats="$("${COMPILER}" "${ROOT_DIR}/tests/mlir_infra/pattern_fold.sy" -S \
+  -o "${OUT_DIR}/operation_bridge.s" \
+  -O1 --target=riscv --use-legacy-codegen --verify-ir \
+  --verify-operation-bridge --run-dialect-conversion=legacy \
+  --compare "${ROOT_DIR}/tests/mlir_infra/pattern_fold.out" 2>&1)"
+echo "${bridge_stats}"
+if ! grep -q "\\[operation-bridge\\] checked=" <<<"${bridge_stats}"; then
+  echo "expected input operation bridge verification stats" >&2
+  exit 1
+fi
+if ! grep -q "\\[dialect-conversion\\] target=legacy" <<<"${bridge_stats}"; then
+  echo "expected legacy dialect conversion dry-run stats" >&2
   exit 1
 fi
 

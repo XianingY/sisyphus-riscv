@@ -20,9 +20,11 @@
 #include "../hir/HIRCanonicalize.h"
 #include "../hir/HIRPolyhedral.h"
 #include "../pass/PassRegistry.h"
+#include "../ir/BlockArgumentBridge.h"
 #include "../ir/DialectConversion.h"
 #include "../ir/IRContext.h"
 #include "../ir/OpDescriptor.h"
+#include "../ir/Operation.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
 #include "../opt/ScopedPassManager.h"
@@ -94,6 +96,46 @@ static const char *legacyTypeName(sys::Value::Type type) {
   case sys::Value::vscale_f32: return "vscale_f32";
   }
   return "unknown";
+}
+
+static sys::ModuleOp *createOperationSampleModule() {
+  auto *module = new sys::ModuleOp();
+  auto *bb = module->createFirstBlock();
+  auto *one = new sys::IntOp({new sys::IntAttr(1)});
+  auto *two = new sys::IntOp({new sys::IntAttr(2)});
+  auto *add = new sys::AddIOp({one->getResult(), two->getResult()});
+  bb->insert(bb->end(), one);
+  bb->insert(bb->end(), two);
+  bb->insert(bb->end(), add);
+  return module;
+}
+
+static int runOperationDevActions(sys::ModuleOp *module, const sys::Options &opts) {
+  if (opts.verifyOperationBridge) {
+    if (!sys::ir::Operation::verifyModuleBridge(module, std::cout))
+      return 1;
+    if (!sys::ir::PhiToBlockArgumentBridge::roundTrip(module, std::cout))
+      return 1;
+  }
+  if (opts.dumpOperationIR)
+    sys::ir::Operation::dumpModule(module, std::cout);
+  if (!opts.runDialectConversion.empty()) {
+    if (opts.runDialectConversion == "legacy" ||
+        opts.runDialectConversion == "standard-scalar") {
+      auto stats = sys::ir::DialectConversionDriver::runLegacyDryRun(module, std::cout);
+      if (stats.failed)
+        return 1;
+    } else if (opts.runDialectConversion == "rollback-test") {
+      auto stats = sys::ir::DialectConversionDriver::runRollbackSelfTest(std::cout);
+      if (stats.rollbacks != 1)
+        return 1;
+    } else {
+      std::cerr << "error: unknown dialect conversion target '"
+                << opts.runDialectConversion << "'\n";
+      return 1;
+    }
+  }
+  return 0;
 }
 
 void removeDuplicates(std::vector<Atomic>& clause) {
@@ -284,6 +326,13 @@ int main(int argc, char **argv) {
               << " index=" << arg.index
               << " type=" << legacyTypeName(arg.type) << "\n";
     return 0;
+  }
+
+  if (opts.inputFile.empty() &&
+      (opts.dumpOperationIR || opts.verifyOperationBridge ||
+       !opts.runDialectConversion.empty())) {
+    auto *sample = createOperationSampleModule();
+    return runOperationDevActions(sample, opts);
   }
 
   // Test for submodules: bitvector SMT solver, and CDCL SAT solver.
@@ -775,6 +824,13 @@ int main(int argc, char **argv) {
     if (opts.emitIR)
       std::cerr << "===== Initial IR =====\n";
     std::cerr << module;
+  }
+
+  if (opts.dumpOperationIR || opts.verifyOperationBridge ||
+      !opts.runDialectConversion.empty()) {
+    int devStatus = runOperationDevActions(module, opts);
+    if (devStatus)
+      return devStatus;
   }
 
   sys::PassManager pm(module, opts);

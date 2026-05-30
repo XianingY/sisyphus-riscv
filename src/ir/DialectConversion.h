@@ -2,10 +2,13 @@
 #define SISY_IR_DIALECT_CONVERSION_H
 
 #include "OpDescriptor.h"
+#include "Operation.h"
 
+#include <functional>
 #include <iosfwd>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sys::ir {
@@ -43,11 +46,40 @@ struct ConversionLegalitySummary {
   std::vector<std::string> illegalOps;
 };
 
+struct ConversionStats {
+  int visited = 0;
+  int legal = 0;
+  int converted = 0;
+  int failed = 0;
+  int rollbacks = 0;
+};
+
+class ConversionPatternRewriter {
+  bool transactionFailed = false;
+public:
+  void replaceOp(Operation *, Operation *) {}
+  void eraseOp(Operation *) {}
+  void signalFailure() { transactionFailed = true; }
+  bool failed() const { return transactionFailed; }
+};
+
+class ConversionPattern {
+  std::string rootName;
+public:
+  explicit ConversionPattern(std::string rootName): rootName(std::move(rootName)) {}
+  virtual ~ConversionPattern() = default;
+  const std::string &getRootName() const { return rootName; }
+  virtual bool matchAndRewrite(Operation *op,
+                               ConversionPatternRewriter &rewriter) const = 0;
+};
+
 class DialectConversionDriver {
 public:
   static ConversionLegalitySummary analyzeDescriptors(const ConversionTarget &target);
   static ConversionTarget standardScalarTarget();
   static void dumpStandardScalarLegality(std::ostream &os);
+  static ConversionStats runLegacyDryRun(ModuleOp *module, std::ostream &os);
+  static ConversionStats runRollbackSelfTest(std::ostream &os);
 };
 
 } // namespace sys::ir

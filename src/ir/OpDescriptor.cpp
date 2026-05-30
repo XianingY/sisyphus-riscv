@@ -35,6 +35,12 @@ bool OpDescriptorTable::verify(std::string *error) {
     "NoSideEffect",
     "Commutative",
   };
+  static const std::set<std::string> allowedInterfaces = {
+    "PureOpInterface",
+    "MemoryEffectOpInterface",
+    "RegionBranchOpInterface",
+    "TerminatorOpInterface",
+  };
 
   std::set<std::string> seen;
   std::string previous;
@@ -69,6 +75,14 @@ bool OpDescriptorTable::verify(std::string *error) {
                  " has mismatched result/attr names";
       return false;
     }
+    if (!op.cppClass || !op.cppClass[0] || !op.typeFormat ||
+        !op.typeFormat[0] || !op.assemblyFormat ||
+        !op.assemblyFormat[0]) {
+      if (error)
+        *error = std::string(op.dialect) + "." + op.name +
+                 " has empty generated class/type/assembly metadata";
+      return false;
+    }
     std::string key = std::string(op.dialect) + "." + op.name;
     if (!previous.empty() && key < previous) {
       if (error)
@@ -88,6 +102,14 @@ bool OpDescriptorTable::verify(std::string *error) {
         return false;
       }
     }
+    for (std::size_t i = 0; i < op.interfaceCount; ++i) {
+      if (!op.interfaces || !op.interfaces[i] ||
+          !allowedInterfaces.count(op.interfaces[i])) {
+        if (error)
+          *error = "unknown interface on " + key;
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -100,6 +122,9 @@ void OpDescriptorTable::dump(std::ostream &os) {
        << " attrs=" << op.attrCount
        << " verify=" << op.verifyHook
        << " fold=" << op.foldHook
+       << " cppClass=" << op.cppClass
+       << " typeFormat=" << op.typeFormat
+       << " assemblyFormat=" << op.assemblyFormat
        << " traits=";
     for (std::size_t i = 0; i < op.traitCount; ++i) {
       if (i)
@@ -123,6 +148,13 @@ void OpDescriptorTable::dump(std::ostream &os) {
       if (i)
         os << ",";
       os << op.attrNames[i];
+    }
+    os << "]";
+    os << " interfaces=[";
+    for (std::size_t i = 0; i < op.interfaceCount; ++i) {
+      if (i)
+        os << ",";
+      os << op.interfaces[i];
     }
     os << "]";
     os << "\n";

@@ -24,6 +24,11 @@ struct OpDescriptor {
   std::size_t resultNameCount;
   const char *const *attrNames;
   std::size_t attrNameCount;
+  const char *cppClass;
+  const char *typeFormat;
+  const char *assemblyFormat;
+  const char *const *interfaces;
+  std::size_t interfaceCount;
 };
 
 class OpDescriptorTable {

@@ -17,25 +17,40 @@ namespace sys {
 
 class Op;
 class BasicBlock;
+struct BlockArgument;
+
+namespace ir {
+class Operation;
+class Type;
+class Attribute;
+}
 
 class Value {
 public:
-  Op *defining;
+  Op *defining = nullptr;
+  BlockArgument *blockArg = nullptr;
   // Value itself shouldn't record type.
   // The type is changeable and should be carried by the (unique) op.
   enum Type {
     unit, i32, i64, f32, i128, f128, vscale_i32, vscale_f32
   };
 
-  Value() {} // uninitialized, for std::map
+  Value() = default; // uninitialized/null, for std::map
   Value(Op *from);
+  explicit Value(BlockArgument *from);
 
-  bool operator==(Value x) const { return defining == x.defining; }
-  bool operator!=(Value x) const { return defining != x.defining; }
-  bool operator<(Value x) const { return defining < x.defining; }
-  bool operator>(Value x) const { return defining > x.defining; }
-  bool operator<=(Value x) const { return defining <= x.defining; }
-  bool operator>=(Value x) const { return defining >= x.defining; }
+  bool isBlockArgument() const { return blockArg != nullptr; }
+  BlockArgument *getBlockArgument() const { return blockArg; }
+  ir::Type getIRType() const;
+
+  bool operator==(Value x) const { return defining == x.defining && blockArg == x.blockArg; }
+  bool operator!=(Value x) const { return !(*this == x); }
+  bool operator<(Value x) const {
+    return defining == x.defining ? blockArg < x.blockArg : defining < x.defining;
+  }
+  bool operator>(Value x) const { return x < *this; }
+  bool operator<=(Value x) const { return !(x < *this); }
+  bool operator>=(Value x) const { return !(*this < x); }
 };
 
 struct BlockArgument {
@@ -211,9 +226,14 @@ protected:
   BasicBlock *parent;
   BasicBlock::iterator place;
   Value::Type resultTy;
+  ir::Operation *operationCore = nullptr;
+  std::string locationFile = "unknown";
+  int locationLine = 0;
+  int locationColumn = 0;
 
   friend class Builder;
   friend class BasicBlock;
+  friend class ir::Operation;
 
   std::string opname;
   // This is for ease of writing macro.
@@ -240,6 +260,7 @@ public:
 
   Region *getRegion(int i = 0) { return regions[i]; }
   Value getOperand(int i = 0) { return operands[i]; }
+  ir::Operation *getOperation();
 
   void pushOperand(Value v);
   void removeAllOperands();
@@ -258,6 +279,9 @@ public:
   Value getResult() { return Value(this); }
   Value::Type getResultType() const { return resultTy; }
   void setResultType(Value::Type ty) { resultTy = ty; }
+  ir::Type getIRResultType() const;
+  void setLocation(std::string file, int line = 0, int column = 0);
+  ir::Attribute getLocationAttr() const;
 
   Op(int id, Value::Type resultTy, const std::vector<Value> &values);
   Op(int id, Value::Type resultTy, const std::vector<Value> &values, const std::vector<Attr*> &attrs);

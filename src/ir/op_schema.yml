@@ -5,6 +5,10 @@ ops:
     results: [result]
     attrs: []
     traits: [Commutative, Pure, SameOperandsAndResultType]
+    interfaces: [PureOpInterface]
+    cppClass: ArithAddiODSOp
+    typeFormat: sameOperandsAndResult
+    assemblyFormat: generic
     verify: verifySameIntegerOperands
     fold: foldAddI
   - name: andi
