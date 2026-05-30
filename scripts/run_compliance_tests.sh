@@ -146,6 +146,20 @@ echo "${final_iter_accum}"
 require_stat "${final_iter_accum}" "repeat-invariant-reduction" "final-iteration-collapsed : 0" \
   "memory accumulation loops must not be collapsed to the final iteration"
 
+crc_prefix_stats="$("${COMPILER}" "${ROOT_DIR}/test2026/performance_riscv/crc1.sy" \
+  -S -o "${OUT_DIR}/crc1.rv.s" \
+  -O1 --target=riscv --verify-ir --stats \
+  --compare "${ROOT_DIR}/test2026/performance_riscv/crc1.out" \
+  -i "${ROOT_DIR}/test2026/performance_riscv/crc1.in" \
+  2>&1 >/dev/null)"
+echo "${crc_prefix_stats}"
+require_stat "${crc_prefix_stats}" "prefix-call-reduction" "collapsed : [1-9]" \
+  "expected prefix/final-value countdown loop reduction on CRC-style repeated prefix calls"
+require_stat "${crc_prefix_stats}" "proven-bitwise-helper" "replaced-calls : [1-9]" \
+  "expected proven bitwise helper lowering to guard CRC arithmetic helper calls"
+require_absent "${crc_prefix_stats}" "^structural-bitwise:" \
+  "CRC fast path must not rely on the opt-in structural-bitwise pass"
+
 o2_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o2.rv.s" \
   -O2 --target=riscv --verify-hir --verify-ir --stats 2>&1 >/dev/null)"
 

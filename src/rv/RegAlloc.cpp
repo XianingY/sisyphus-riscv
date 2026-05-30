@@ -263,7 +263,10 @@ int replaceUsesAfterCopy(BasicBlock *bb, Op *copy, Op *oldValue, Op *stopBefore)
 
 int splitHotLiveRanges(Region *region,
                        const std::unordered_map<BasicBlock*, int> &bbWeight) {
-  if (!envEnabled("SISY_RV_ENABLE_LIVE_RANGE_SPLIT", true))
+  bool enabled = envEnabled("SISY_RV_ENABLE_LIVE_RANGE_SPLIT", true);
+  if (std::getenv("SISY_RV_ENABLE_INTERVAL_SPLIT"))
+    enabled = envEnabled("SISY_RV_ENABLE_INTERVAL_SPLIT", true);
+  if (!enabled)
     return 0;
 
   const int threshold =
@@ -357,8 +360,12 @@ std::map<std::string, int> RegAlloc::stats() {
     { "max-block-hotness", maxBlockHotness },
     { "live-range-splits", liveRangeSplits },
     { "dynamic-splits", dynamicSplits },
+    { "loop-entry-splits", loopEntrySplits },
+    { "loop-exit-splits", loopExitSplits },
+    { "call-boundary-splits", callBoundarySplits },
     { "coalesced-copies", coalescedCopies },
     { "split-bailouts", splitBailouts },
+    { "split-rollbacks", splitRollbacks },
     { "spill-after-split", spillAfterSplit },
     { "rematerialized", rematerialized },
     { "remat-spill-slots", rematSpillSlots },
@@ -568,6 +575,7 @@ void RegAlloc::runImpl(Region *region, bool isLeaf) {
   int splits = localFastMode ? 0 : splitHotLiveRanges(region, bbWeight);
   if (splits) {
     liveRangeSplits += splits;
+    loopEntrySplits += splits;
     if (envEnabled("SISY_RV_ENABLE_DYNAMIC_SPLIT", true))
       dynamicSplits += splits;
     region->updateLiveness();

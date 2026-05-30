@@ -327,6 +327,29 @@ public:
   void run() override;
 };
 
+// Reduces repeated prefix/final-value calls inside countdown loops when the loop
+// only exposes the last iteration's value.  This is a correctness-first subset
+// of prefix-call recurrence recovery: the zero-trip guard is preserved, and the
+// loop body is evaluated once with the final positive counter value.
+class PrefixCallReduction : public Pass {
+  int candidates = 0;
+  int collapsed = 0;
+  int rejectedShape = 0;
+  int rejectedSideEffect = 0;
+  int rejectedPhi = 0;
+  int rejectedCounter = 0;
+
+  bool runImpl(LoopInfo *info, const std::map<std::string, FuncOp*> &fnMap);
+
+public:
+  PrefixCallReduction(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "prefix-call-reduction"; }
+  std::map<std::string, int> stats() override;
+  PreservedAnalyses run(PassContext &context) override;
+  void run() override;
+};
+
 // Collapses bounded affine modular update loops such as:
 //   while (i < n) {
 //     *p = (*p + c) % m;

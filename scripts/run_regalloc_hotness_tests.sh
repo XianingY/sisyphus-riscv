@@ -29,7 +29,8 @@ stats="$("${COMPILER}" "${CASE_DIR}/nested_loop_hotness.sy" -S \
 
 echo "${stats}"
 
-if ! grep -A4 '^rv-regalloc:$' <<<"${stats}" | grep -Eq 'max-block-hotness : ([6-9][4-9]|[1-9][0-9]{2,})'; then
+rv_hotness="$(extract_pass_stat "${stats}" "rv-regalloc" "max-block-hotness")"
+if [[ -z "${rv_hotness}" || "${rv_hotness}" -lt 64 ]]; then
   echo "expected RV regalloc to expose nested-loop hotness >= 64" >&2
   exit 1
 fi
@@ -40,12 +41,13 @@ split_stats="$("${COMPILER}" "${CASE_DIR}/hot_loop_no_call_split.sy" -S \
 
 echo "${split_stats}"
 
-if ! grep -A5 '^rv-regalloc:$' <<<"${split_stats}" | grep -Eq 'live-range-splits : [1-9]'; then
+rv_splits="$(extract_pass_stat "${split_stats}" "rv-regalloc" "live-range-splits")"
+if [[ -z "${rv_splits}" || "${rv_splits}" -lt 1 ]]; then
   echo "expected RV regalloc to split live-in values for hot loops without calls" >&2
   exit 1
 fi
 
-if ! grep -A5 '^rv-regalloc:$' <<<"${split_stats}" | grep -Eq 'live-range-splits : ([3-9]|[1-9][0-9]+)'; then
+if [[ "${rv_splits}" -lt 3 ]]; then
   echo "expected RV regalloc to split all hot live-in scalar values, not only one per block" >&2
   exit 1
 fi
@@ -71,11 +73,13 @@ nosplit_spill_stats="$(SISY_RV_ENABLE_LIVE_RANGE_SPLIT=0 "${COMPILER}" "${CASE_D
 echo "${split_spill_stats}"
 echo "${nosplit_spill_stats}"
 
-if ! grep -A5 '^rv-regalloc:$' <<<"${split_spill_stats}" | grep -Eq 'live-range-splits : [1-9]'; then
+rv_spill_splits="$(extract_pass_stat "${split_spill_stats}" "rv-regalloc" "live-range-splits")"
+rv_nosplit_splits="$(extract_pass_stat "${nosplit_spill_stats}" "rv-regalloc" "live-range-splits")"
+if [[ -z "${rv_spill_splits}" || "${rv_spill_splits}" -lt 1 ]]; then
   echo "expected RV live-range splitting to run on hot live-in values" >&2
   exit 1
 fi
-if ! grep -A5 '^rv-regalloc:$' <<<"${nosplit_spill_stats}" | grep -Eq 'live-range-splits : 0'; then
+if [[ -z "${rv_nosplit_splits}" || "${rv_nosplit_splits}" -ne 0 ]]; then
   echo "expected RV live-range splitting kill switch to disable splits" >&2
   exit 1
 fi

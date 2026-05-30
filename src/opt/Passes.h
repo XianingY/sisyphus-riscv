@@ -330,6 +330,24 @@ public:
   void run() override;
 };
 
+// Default-allowed, proof-driven lowering for source-level helpers that compute
+// bitwise and/or/xor with 32-step arithmetic loops.  Unlike the opt-in
+// StructuralBitwise pass, unknown signed inputs keep a guarded fallback to the
+// original helper, so the fast path is only taken when runtime/proven facts make
+// the replacement equivalent.
+class ProvenBitwiseHelper : public Pass {
+  int classified = 0;
+  int replaced = 0;
+  int guarded = 0;
+
+public:
+  ProvenBitwiseHelper(ModuleOp *module): Pass(module) {}
+
+  std::string name() override { return "proven-bitwise-helper"; }
+  std::map<std::string, int> stats() override;
+  void run() override;
+};
+
 // Convert short parity-controlled accumulator branches into SelectOp. This is
 // deliberately narrower than the generic Select pass because it may hoist
 // loads out of the taken block.

@@ -529,7 +529,6 @@ void ensureHelper(ModuleOp *module, const BitCandidate &candidate) {
     new ArgCountAttr(2),
     new ArgTypesAttr({ Value::i32, Value::i32 })
   });
-  func->add<ImpureAttr>();
   auto region = func->appendRegion();
   auto entry = region->appendBlock();
   auto slow = region->appendBlock();
@@ -555,6 +554,57 @@ void ensureHelper(ModuleOp *module, const BitCandidate &candidate) {
   builder.create<ReturnOp>(std::vector<Value>{ result });
 }
 
+bool runBitwiseLowering(ModuleOp *module, int &classified, int &guarded,
+                        int &replaced) {
+  CallGraph(module).run();
+
+  std::map<std::string, BitCandidate> candidates;
+  for (auto op : module->findAll<FuncOp>()) {
+    auto func = cast<FuncOp>(op);
+    if (isExtern(NAME(func)))
+      continue;
+    auto candidate = classify(func);
+    if (!candidate)
+      continue;
+    candidates[NAME(func)] = *candidate;
+    classified++;
+  }
+  if (candidates.empty())
+    return false;
+
+  bool changed = false;
+  Builder builder;
+  auto calls = module->findAll<CallOp>();
+  for (auto call : calls) {
+    auto it = candidates.find(NAME(call));
+    if (it == candidates.end() || call->getResultType() != Value::i32 ||
+        call->getOperandCount() != 2)
+      continue;
+
+    auto parent = call->getParentOp<FuncOp>();
+    if (parent == it->second.func ||
+        NAME(parent) == helperName(NAME(it->second.func), it->second.kind))
+      continue;
+
+    builder.setBeforeOp(call);
+    if (provenNonNegative(call->DEF(0)) && provenNonNegative(call->DEF(1))) {
+      auto replacement = buildBitOp(builder, it->second.kind, call->DEF(0), call->DEF(1));
+      call->replaceAllUsesWith(replacement);
+      call->erase();
+      replaced++;
+      changed = true;
+      continue;
+    }
+
+    ensureHelper(module, it->second);
+    NAME(call) = helperName(NAME(it->second.func), it->second.kind);
+    guarded++;
+    replaced++;
+    changed = true;
+  }
+  return changed;
+}
+
 } // namespace
 
 std::map<std::string, int> StructuralBitwise::stats() {
@@ -569,45 +619,19 @@ void StructuralBitwise::run() {
   if (!envEnabled("SISY_ENABLE_STRUCTURAL_BITWISE", false))
     return;
 
-  CallGraph(module).run();
+  runBitwiseLowering(module, classified, guarded, replaced);
+}
 
-  std::map<std::string, BitCandidate> candidates;
-  for (auto func : collectFuncs()) {
-    if (isExtern(NAME(func)))
-      continue;
-    auto candidate = classify(func);
-    if (!candidate)
-      continue;
-    candidates[NAME(func)] = *candidate;
-    classified++;
-  }
-  if (candidates.empty())
+std::map<std::string, int> ProvenBitwiseHelper::stats() {
+  return {
+    { "classified", classified },
+    { "guarded-calls", guarded },
+    { "replaced-calls", replaced },
+  };
+}
+
+void ProvenBitwiseHelper::run() {
+  if (!envEnabled("SISY_ENABLE_PROVEN_BITWISE_HELPER", true))
     return;
-
-  Builder builder;
-  runRewriter([&](CallOp *call) {
-    auto it = candidates.find(NAME(call));
-    if (it == candidates.end() || call->getResultType() != Value::i32 ||
-        call->getOperandCount() != 2)
-      return false;
-
-    auto parent = call->getParentOp<FuncOp>();
-    if (parent == it->second.func || NAME(parent) == helperName(NAME(it->second.func), it->second.kind))
-      return false;
-
-    builder.setBeforeOp(call);
-    if (provenNonNegative(call->DEF(0)) && provenNonNegative(call->DEF(1))) {
-      auto replacement = buildBitOp(builder, it->second.kind, call->DEF(0), call->DEF(1));
-      call->replaceAllUsesWith(replacement);
-      call->erase();
-      replaced++;
-      return true;
-    }
-
-    ensureHelper(module, it->second);
-    NAME(call) = helperName(NAME(it->second.func), it->second.kind);
-    guarded++;
-    replaced++;
-    return false;
-  });
+  runBitwiseLowering(module, classified, guarded, replaced);
 }

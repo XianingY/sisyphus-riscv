@@ -189,6 +189,11 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::StructuralBitwise>();
       pm.addPass<sys::DCE>();
     }
+    if (opts.rv && !aggressive &&
+        getenvEnabled("SISY_ENABLE_PROVEN_BITWISE_HELPER", true)) {
+      pm.addPass<sys::ProvenBitwiseHelper>();
+      pm.addPass<sys::DCE>();
+    }
     if (opts.rv && !aggressive && getenvEnabled("SISY_ENABLE_CONST_ARG_SPECIALIZE", true)) {
       pm.addPass<sys::ConstArgSpecialize>();
       pm.addPass<sys::GVN>();
@@ -276,6 +281,9 @@ void appendCoreO1(sys::PassManager &pm, const sys::Options &opts, const Pipeline
       pm.addPass<sys::RotlRepeatLoopFold>();
       pm.addPass<sys::SimplifyCFG>();
     }
+    if (opts.rv && !aggressive &&
+        getenvEnabled("SISY_ENABLE_PREFIX_CALL_REDUCTION", true))
+      pm.addPass<sys::PrefixCallReduction>();
     if (enableRvSemanticPasses && getenvEnabled("SISY_ENABLE_REPEAT_REDUCTION", true))
       pm.addPass<sys::RepeatInvariantReduction>();
     if ((opts.rv || opts.arm) && getenvEnabled("SISY_ENABLE_ADVANCED_CONV2D", false))

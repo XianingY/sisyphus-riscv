@@ -103,6 +103,23 @@ Its legality boundary is intentionally narrow:
 
 The default kill switch is `SISY_ENABLE_SYNTH_CONST_ARRAY=0`.
 
+## Proven Prefix And Helper Reductions
+
+The default RISC-V O1 profile may also use two narrow proof-driven reductions:
+
+- `PrefixCallReduction` may collapse a countdown loop to its final positive
+  iteration only when the loop's observable value is overwritten each iteration,
+  the zero-trip guard remains intact, and no external side effect or
+  counter-dependent store is present.  This covers repeated prefix-call shapes
+  without inspecting public inputs or expected outputs.
+- `ProvenBitwiseHelper` may lower a fully classified source helper that computes
+  bitwise `and`/`or`/`xor` through arithmetic loops.  If both operands are not
+  statically non-negative, it emits a runtime guard and keeps the original helper
+  as fallback; the opt-in `StructuralBitwise` whole recognizer remains disabled.
+
+The kill switches are `SISY_ENABLE_PREFIX_CALL_REDUCTION=0` and
+`SISY_ENABLE_PROVEN_BITWISE_HELPER=0`.
+
 ## Strict-Mode Or Experimental Only
 
 The following passes may exist in the tree for experiments and A/B comparison,
@@ -123,7 +140,7 @@ The following constant-table variants remain prohibited by default:
 
 - cached or recursive compile-time precomputation;
 - function-equivalence or sample-based whole-function replacement;
-- structural bitwise or modular-multiplication recognizers;
+- unguarded structural bitwise or modular-multiplication recognizers;
 - row-scratch matrix helper replacement;
 - fixed `printf` assembly output paths or checksum/output replacement.
 
@@ -143,6 +160,8 @@ The active RISC-V path should prefer:
 - branch-to-select conversion when CFG and SSA conditions are proven;
 - source-constant table synthesis when every array element and every load index
   is proven under the boundary above;
+- prefix/final-value reduction and guarded bitwise-helper lowering under the
+  proof boundaries above;
 - MemorySSA-backed LICM, DLE, and DSE.
 
 For CRC, Huffman, FFT, convolution, matrix multiplication, transpose, and

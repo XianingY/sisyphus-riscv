@@ -97,6 +97,9 @@ ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
 
   ReductionTilePlan plan;
   plan.needsScratch = needsScratch;
+  if (!hirEnvEnabled("SISY_ENABLE_AFFINE_MATMUL_REG_TILE",
+                     hirEnvEnabled("SISY_HIR_ENABLE_REDUCTION_MICROTILE", true)))
+    return plan;
   if (mainType != TypeKind::Int)
     return plan;
 
@@ -108,7 +111,8 @@ ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
                      metrics.scalarIntDefs;
   int usableRegs = kUsableGPRs;
 
-  int requestedNr = hirEnvInt("SISY_HIR_MICRO_NR", 0);
+  int requestedNr = hirEnvInt("SISY_MATMUL_NR",
+                              hirEnvInt("SISY_HIR_MICRO_NR", 0));
   if (requestedNr >= 2 && requestedNr <= 8) {
     plan.nr = requestedNr;
   } else {
@@ -129,7 +133,8 @@ ReductionTilePlan computeReductionTilePlan(const Op *innerBody,
   const int panelBudget = kL1DataCacheSize / 4;
   int cacheKc = panelBudget / std::max(elementBytes * streamCount * plan.nr, 1);
   cacheKc = clampPow2(cacheKc, 8, 32);
-  plan.kc = hirEnvInt("SISY_HIR_MICRO_KC", cacheKc);
+  plan.kc = hirEnvInt("SISY_MATMUL_KC",
+                      hirEnvInt("SISY_HIR_MICRO_KC", cacheKc));
   if (plan.kc < 2) {
     plan.nr = 0;
     plan.kc = 0;

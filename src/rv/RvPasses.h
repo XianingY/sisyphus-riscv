@@ -90,6 +90,10 @@ class RegAlloc : public Pass {
   int coalescedCopies = 0;
   int splitBailouts = 0;
   int spillAfterSplit = 0;
+  int loopEntrySplits = 0;
+  int loopExitSplits = 0;
+  int callBoundarySplits = 0;
+  int splitRollbacks = 0;
   bool fastMode;
 
   std::map<FuncOp*, std::set<Reg>> usedRegisters;
