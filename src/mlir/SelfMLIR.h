@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+namespace sys::hir {
+struct Module;
+}
+
 namespace sys::mlir {
 
 enum class TypeKind {
@@ -293,6 +297,27 @@ struct ConversionStats {
 
 ConversionStats convertDialects(Module &module, const ConversionTarget &target,
                                 const std::vector<ConversionPattern> &patterns);
+
+struct ProductionStats {
+  int hirOps = 0;
+  int mlirOpsBefore = 0;
+  int mlirOpsAfter = 0;
+  int rewrites = 0;
+  int conversionVisited = 0;
+  int conversionLegal = 0;
+  int conversionConverted = 0;
+  int conversionFailed = 0;
+  int conversionRollbacks = 0;
+  bool verifyBefore = false;
+  bool verifyAfter = false;
+  std::string error;
+};
+
+std::unique_ptr<Module> lowerFromHIR(Context &ctx, const sys::hir::Module &hirModule,
+                                     const std::string &target,
+                                     ProductionStats *stats = nullptr);
+bool runProductionGate(const sys::hir::Module &hirModule, const std::string &target,
+                       ProductionStats &stats, std::ostream *dump = nullptr);
 
 int runCoreSelfTest(std::ostream &os);
 int runConversionSelfTest(std::ostream &os);

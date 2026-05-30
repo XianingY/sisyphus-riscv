@@ -1,8 +1,8 @@
 # LLVM/MLIR-Style Refactor Roadmap
 
-This project now has a self-hosted MLIR core in addition to the historical
-legacy compiler path.  The new core is not an upstream LLVM dependency; it is a
-project-local implementation of the MLIR object model and conversion contracts.
+This project now has a self-hosted MLIR core on the default production compile
+path.  The new core is not an upstream LLVM dependency; it is a project-local
+implementation of the MLIR object model and conversion contracts.
 
 ## Implemented Skeleton
 
@@ -55,7 +55,7 @@ project-local implementation of the MLIR object model and conversion contracts.
 
 ## Self-MLIR Core
 
-- `src/mlir/SelfMLIR.*` defines the production-candidate MLIR object model:
+- `src/mlir/SelfMLIR.*` defines the production MLIR object model:
   `Context`, hash-consed `Type`/`Attribute`/`Location`, `Operation`, `Region`,
   `Block`, `BlockArgument`, `Value`, `Builder`, verifier, and printer.
 - The self-MLIR verifier rejects `legacy.*` and Phi-shaped operations.  The
@@ -68,6 +68,11 @@ project-local implementation of the MLIR object model and conversion contracts.
 - `scripts/run_mlir_core_tests.sh` and
   `scripts/run_dialect_conversion_tests.sh` are the new core gates that must
   pass before migrating default compilation stages onto the self-MLIR path.
+- Default compilation now builds self-MLIR from real HIR after HIR
+  canonicalization, verifies it, runs the DRR canonicalization seed, and
+  target-legalizes arithmetic into `rv_machine` or `arm_machine` before CFG
+  lowering is allowed to proceed.  `SISY_DUMP_SELF_MLIR=1` dumps this production
+  module for debugging.
 
 ## Default Policy
 
@@ -77,6 +82,16 @@ The official path remains:
 compiler testcase.sy -S -o testcase.s -O1 --target=riscv
 ```
 
+and the default frontend path is:
+
+```text
+AST -> HIR -> self-MLIR production gate -> CFG/legacy machine emission
+```
+
+The final assembler emission still uses the existing RV/ARM backend while the
+machine-dialect backend is being completed, but every default non-legacy compile
+must pass the self-MLIR verifier and target legalization first.
+
 The new infrastructure does not enable RVV, semantic helper replacement,
 fixed-output behavior, input/output precomputation, checksum triggers, or
 source-name triggers.
@@ -84,7 +99,7 @@ source-name triggers.
 ## Next Migration Steps
 
 1. Replace AST/HIR construction with direct `sysy + scf + memref + arith`
-   self-MLIR emission.
+   self-MLIR emission now that the production gate is mandatory.
 2. Port Mem2Reg, DCE, SCCP, LICM, SCEV, MemorySSA, affine transforms, and
    vectorization to `OperationPass<OpT>` over self-MLIR operations.
 3. Replace RV/ARM lowering with `DialectConversion` into

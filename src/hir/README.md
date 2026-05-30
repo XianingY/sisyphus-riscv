@@ -10,7 +10,9 @@ This directory hosts a lightweight high-level IR layer inspired by MLIR/ClangIR 
 
 Current rollout strategy:
 
-1. Default compilation path uses dialect frontend:
-   `AST -> HIR -> CFG -> legacy ModuleOp adapter`.
+1. Default compilation path uses dialect frontend with a mandatory self-MLIR
+   production gate:
+   `AST -> HIR -> self-MLIR verify/canonicalize/legalize -> CFG -> legacy ModuleOp adapter`.
 2. `--use-legacy-codegen` switches back to legacy `AST -> CodeGen` path.
-3. Backend and existing O1/O2 pipelines remain unchanged.
+3. Backend and existing O1/O2 machine emission remain unchanged while the
+   machine-dialect backend is being completed.

@@ -1,5 +1,10 @@
 #include "SelfMLIR.h"
 
+#include "../hir/HIROps.h"
+#include "../parse/ASTNode.h"
+#include "../parse/Type.h"
+#include "../utils/DynamicCast.h"
+
 #include <algorithm>
 #include <cctype>
 #include <iostream>
@@ -230,6 +235,8 @@ Region &Operation::addRegion() {
 
 bool Operation::isTerminator() const {
   return opName == "scf.yield" || opName == "scf.return" ||
+         opName == "sysy.return" || opName == "sysy.break" ||
+         opName == "sysy.continue" ||
          opName == "cf.br" || opName == "cf.cond_br" ||
          opName == "rv_machine.ret" || opName == "arm_machine.ret" ||
          opName == "rv_machine.j" || opName == "arm_machine.b";
@@ -573,6 +580,424 @@ ConversionStats convertDialects(Module &module, const ConversionTarget &target,
   return stats;
 }
 
+namespace {
+
+Type mapHIRType(Context &ctx, sys::hir::TypeKind type) {
+  switch (type) {
+  case sys::hir::TypeKind::Int:
+    return ctx.i(32);
+  case sys::hir::TypeKind::Float:
+    return ctx.f(32);
+  case sys::hir::TypeKind::Void:
+    return ctx.noneType();
+  case sys::hir::TypeKind::Pointer:
+  case sys::hir::TypeKind::Array:
+    return ctx.memref({-1}, ctx.i(32));
+  case sys::hir::TypeKind::Function:
+    return ctx.function({}, {});
+  case sys::hir::TypeKind::Unknown:
+    return ctx.i(32);
+  }
+  return ctx.i(32);
+}
+
+std::string arithOpName(const sys::hir::Op *op) {
+  const bool isFloat = op && op->type == sys::hir::TypeKind::Float;
+  const std::string sym = op ? op->symbol : "";
+  if (sym == "+") return isFloat ? "arith.addf" : "arith.addi";
+  if (sym == "-") {
+    if (op && op->children.size() == 1)
+      return isFloat ? "arith.negf" : "arith.negi";
+    return isFloat ? "arith.subf" : "arith.subi";
+  }
+  if (sym == "*") return isFloat ? "arith.mulf" : "arith.muli";
+  if (sym == "/") return isFloat ? "arith.divf" : "arith.divi";
+  if (sym == "%") return "arith.remi";
+  if (sym == "&&") return "arith.andi";
+  if (sym == "||") return "arith.ori";
+  if (sym == "!") return "arith.noti";
+  if (sym == "i2f") return "arith.sitofp";
+  if (sym == "f2i") return "arith.fptosi";
+  return isFloat ? "arith.unknownf" : "arith.unknowni";
+}
+
+std::string cmpPredicate(const std::string &sym) {
+  if (sym == "==") return "eq";
+  if (sym == "!=") return "ne";
+  if (sym == "<=") return "sle";
+  if (sym == "<") return "slt";
+  return sym.empty() ? "unknown" : sym;
+}
+
+Location locFor(Context &ctx, const sys::hir::Op *op) {
+  // The current HIR does not retain source spans, so every production import
+  // still receives an explicit location object instead of a missing loc.
+  if (!op || !op->origin)
+    return ctx.unknownLoc();
+  return ctx.loc("sysy", 0, 0);
+}
+
+int countHIR(const sys::hir::Op *op) {
+  if (!op)
+    return 0;
+  int total = 1;
+  for (const auto &child : op->children)
+    total += countHIR(child.get());
+  return total;
+}
+
+class HIRImporter {
+  Context &ctx;
+
+  static bool blockEndsWithTerminator(const Block &block) {
+    return !block.ops().empty() && block.ops().back()->isTerminator();
+  }
+
+  Value materializeUnknown(Builder &builder, const sys::hir::Op *op) {
+    auto type = mapHIRType(ctx, op ? op->type : sys::hir::TypeKind::Int);
+    auto &unknown = builder.create("sysy.unknown_value", {}, {type}, {},
+                                   locFor(ctx, op));
+    return unknown.result();
+  }
+
+  Value emitExpr(const sys::hir::Op *op, Builder &builder) {
+    if (!op)
+      return materializeUnknown(builder, op);
+
+    switch (op->kind) {
+    case sys::hir::OpKind::ConstInt: {
+      auto &constant = builder.create(
+          "arith.constant", {}, {ctx.i(32)},
+          {{"value", ctx.integerAttr(op->hasIntValue ? op->intValue : 0, ctx.i(32))}},
+          locFor(ctx, op));
+      return constant.result();
+    }
+    case sys::hir::OpKind::ConstFloat: {
+      auto &constant = builder.create(
+          "arith.constant", {}, {ctx.f(32)},
+          {{"value", ctx.stringAttr(op->hasFloatValue ? std::to_string(op->floatValue) : "0.0")}},
+          locFor(ctx, op));
+      return constant.result();
+    }
+    case sys::hir::OpKind::Load: {
+      std::vector<Value> indices;
+      for (const auto &child : op->children)
+        indices.push_back(emitExpr(child.get(), builder));
+      auto attrs = std::map<std::string, Attribute>{{"symbol", ctx.stringAttr(op->symbol)}};
+      auto &load = builder.create("memref.load", indices, {mapHIRType(ctx, op->type)},
+                                  attrs, locFor(ctx, op));
+      return load.result();
+    }
+    case sys::hir::OpKind::Arith: {
+      std::vector<Value> operands;
+      for (const auto &child : op->children)
+        operands.push_back(emitExpr(child.get(), builder));
+      auto &arith = builder.create(arithOpName(op), operands,
+                                   {mapHIRType(ctx, op->type)}, {},
+                                   locFor(ctx, op));
+      return arith.result();
+    }
+    case sys::hir::OpKind::Cmp: {
+      std::vector<Value> operands;
+      for (const auto &child : op->children)
+        operands.push_back(emitExpr(child.get(), builder));
+      auto &cmp = builder.create(
+          "arith.cmpi", operands, {ctx.i(32)},
+          {{"predicate", ctx.stringAttr(cmpPredicate(op->symbol))}},
+          locFor(ctx, op));
+      return cmp.result();
+    }
+    case sys::hir::OpKind::Call: {
+      std::vector<Value> operands;
+      for (const auto &child : op->children)
+        operands.push_back(emitExpr(child.get(), builder));
+      std::vector<Type> results;
+      if (op->type != sys::hir::TypeKind::Void)
+        results.push_back(mapHIRType(ctx, op->type));
+      auto &call = builder.create("sysy.call", operands, results,
+                                  {{"callee", ctx.stringAttr(op->symbol)}},
+                                  locFor(ctx, op));
+      return call.resultCount() ? call.result() : materializeUnknown(builder, op);
+    }
+    default:
+      emitStmt(op, builder);
+      return materializeUnknown(builder, op);
+    }
+  }
+
+  void emitRegionFromBlock(const sys::hir::Op *op, Region &region) {
+    auto &block = region.addBlock();
+    Builder nested(ctx, &block);
+    if (op && op->kind == sys::hir::OpKind::Block) {
+      for (const auto &child : op->children)
+        emitStmt(child.get(), nested);
+    } else if (op) {
+      emitStmt(op, nested);
+    }
+    if (!blockEndsWithTerminator(block))
+      nested.create("scf.yield", {}, {}, {}, locFor(ctx, op));
+  }
+
+  void emitFunc(const sys::hir::Op *op, Builder &builder) {
+    auto fnType = ctx.function({}, op && op->type != sys::hir::TypeKind::Void
+                                     ? std::vector<Type>{mapHIRType(ctx, op->type)}
+                                     : std::vector<Type>{});
+    auto &func = builder.create(
+        "sysy.func", {}, {},
+        {{"sym_name", ctx.stringAttr(op ? op->symbol : "")},
+         {"type", ctx.stringAttr(fnType.str())}},
+        locFor(ctx, op), 1);
+    auto &entry = func.getRegions()[0]->addBlock();
+    if (op && op->origin) {
+      if (auto *fn = dyn_cast<FnDeclNode>(op->origin)) {
+        for (const auto &argName : fn->args)
+          entry.addArgument(ctx.i(32), locFor(ctx, op), argName);
+      }
+    }
+    Builder bodyBuilder(ctx, &entry);
+    if (op && !op->children.empty())
+      emitStmt(op->children[0].get(), bodyBuilder);
+    if (!blockEndsWithTerminator(entry))
+      bodyBuilder.create("scf.yield", {}, {}, {}, locFor(ctx, op));
+  }
+
+public:
+  explicit HIRImporter(Context &ctx): ctx(ctx) {}
+
+  void emitStmt(const sys::hir::Op *op, Builder &builder) {
+    if (!op)
+      return;
+
+    switch (op->kind) {
+    case sys::hir::OpKind::Module:
+      for (const auto &child : op->children)
+        emitStmt(child.get(), builder);
+      return;
+    case sys::hir::OpKind::Func:
+      emitFunc(op, builder);
+      return;
+    case sys::hir::OpKind::Block:
+      for (const auto &child : op->children)
+        emitStmt(child.get(), builder);
+      return;
+    case sys::hir::OpKind::VarDecl: {
+      std::vector<Value> operands;
+      if (!op->children.empty() && op->children[0])
+        operands.push_back(emitExpr(op->children[0].get(), builder));
+      std::map<std::string, Attribute> attrs{{"symbol", ctx.stringAttr(op->symbol)}};
+      if (!op->arrayDims.empty()) {
+        std::string dims;
+        for (size_t i = 0; i < op->arrayDims.size(); i++) {
+          if (i)
+            dims += "x";
+          dims += std::to_string(op->arrayDims[i]);
+        }
+        attrs["shape"] = ctx.stringAttr(dims);
+      }
+      builder.create("memref.alloca", operands,
+                     {mapHIRType(ctx, op->type)}, attrs, locFor(ctx, op));
+      return;
+    }
+    case sys::hir::OpKind::Store: {
+      std::vector<Value> operands;
+      for (const auto &child : op->children)
+        operands.push_back(emitExpr(child.get(), builder));
+      builder.create("memref.store", operands, {},
+                     {{"symbol", ctx.stringAttr(op->symbol)}}, locFor(ctx, op));
+      return;
+    }
+    case sys::hir::OpKind::If: {
+      Value cond = op->children.empty() ? materializeUnknown(builder, op)
+                                        : emitExpr(op->children[0].get(), builder);
+      auto &ifOp = builder.create("scf.if", {cond}, {}, {}, locFor(ctx, op),
+                                  op->children.size() >= 3 ? 2 : 1);
+      if (op->children.size() >= 2)
+        emitRegionFromBlock(op->children[1].get(), *ifOp.getRegions()[0]);
+      if (op->children.size() >= 3)
+        emitRegionFromBlock(op->children[2].get(), *ifOp.getRegions()[1]);
+      return;
+    }
+    case sys::hir::OpKind::While: {
+      Value cond = op->children.empty() ? materializeUnknown(builder, op)
+                                        : emitExpr(op->children[0].get(), builder);
+      auto &whileOp = builder.create("scf.while", {cond}, {}, {}, locFor(ctx, op), 1);
+      if (op->children.size() >= 2)
+        emitRegionFromBlock(op->children[1].get(), *whileOp.getRegions()[0]);
+      return;
+    }
+    case sys::hir::OpKind::For: {
+      std::vector<Value> operands;
+      for (size_t i = 0; i < op->children.size() && i < 3; i++)
+        operands.push_back(emitExpr(op->children[i].get(), builder));
+      auto &forOp = builder.create("scf.for", operands, {}, {}, locFor(ctx, op), 1);
+      if (op->children.size() >= 4)
+        emitRegionFromBlock(op->children[3].get(), *forOp.getRegions()[0]);
+      return;
+    }
+    case sys::hir::OpKind::Return: {
+      std::vector<Value> operands;
+      for (const auto &child : op->children)
+        if (child)
+          operands.push_back(emitExpr(child.get(), builder));
+      builder.create("sysy.return", operands, {}, {}, locFor(ctx, op));
+      return;
+    }
+    case sys::hir::OpKind::Break:
+      builder.create("sysy.break", {}, {}, {}, locFor(ctx, op));
+      return;
+    case sys::hir::OpKind::Continue:
+      builder.create("sysy.continue", {}, {}, {}, locFor(ctx, op));
+      return;
+    case sys::hir::OpKind::ConstInt:
+    case sys::hir::OpKind::ConstFloat:
+    case sys::hir::OpKind::Load:
+    case sys::hir::OpKind::Arith:
+    case sys::hir::OpKind::Cmp:
+    case sys::hir::OpKind::Call:
+      (void) emitExpr(op, builder);
+      return;
+    case sys::hir::OpKind::Unknown:
+      builder.create("sysy.unknown", {}, {}, {}, locFor(ctx, op));
+      return;
+    }
+  }
+};
+
+std::vector<ConversionPattern> targetPatterns(const std::string &target) {
+  const std::string prefix = target == "arm" ? "arm_machine." : "rv_machine.";
+  if (target == "arm") {
+    return {
+      {"arith.constant", prefix + "mov"},
+      {"arith.addi", prefix + "add"},
+      {"arith.subi", prefix + "sub"},
+      {"arith.muli", prefix + "mul"},
+      {"arith.divi", prefix + "sdiv"},
+      {"arith.remi", prefix + "srem"},
+      {"arith.andi", prefix + "and"},
+      {"arith.ori", prefix + "orr"},
+      {"arith.noti", prefix + "not"},
+      {"arith.cmpi", prefix + "cmp"},
+      {"arith.addf", prefix + "fadd"},
+      {"arith.subf", prefix + "fsub"},
+      {"arith.mulf", prefix + "fmul"},
+      {"arith.divf", prefix + "fdiv"},
+      {"arith.negf", prefix + "fneg"},
+      {"arith.negi", prefix + "neg"},
+      {"arith.sitofp", prefix + "scvtf"},
+      {"arith.fptosi", prefix + "fcvtzs"},
+      {"arith.select", prefix + "select"},
+    };
+  }
+  return {
+    {"arith.constant", prefix + "li"},
+    {"arith.addi", prefix + "addw"},
+    {"arith.subi", prefix + "subw"},
+    {"arith.muli", prefix + "mulw"},
+    {"arith.divi", prefix + "divw"},
+    {"arith.remi", prefix + "remw"},
+    {"arith.andi", prefix + "and"},
+    {"arith.ori", prefix + "or"},
+    {"arith.noti", prefix + "seqz"},
+    {"arith.cmpi", prefix + "cmp"},
+    {"arith.addf", prefix + "fadd"},
+    {"arith.subf", prefix + "fsub"},
+    {"arith.mulf", prefix + "fmul"},
+    {"arith.divf", prefix + "fdiv"},
+    {"arith.negf", prefix + "fneg"},
+    {"arith.negi", prefix + "neg"},
+    {"arith.sitofp", prefix + "fcvt_s_w"},
+    {"arith.fptosi", prefix + "fcvt_w_s"},
+    {"arith.select", prefix + "select"},
+  };
+}
+
+ConversionTarget productionTarget(const std::string &target) {
+  ConversionTarget convTarget;
+  convTarget.addLegalDialect("builtin");
+  convTarget.addLegalDialect("sysy");
+  convTarget.addLegalDialect("scf");
+  convTarget.addLegalDialect("cf");
+  convTarget.addLegalDialect("memref");
+  convTarget.addLegalDialect("affine");
+  convTarget.addLegalDialect("vector");
+  convTarget.addLegalDialect(target == "arm" ? "arm_machine" : "rv_machine");
+  return convTarget;
+}
+
+} // namespace
+
+static const char *kCoreRules =
+  "rule fold_addi_zero arith.addi addi-zero 10\n"
+  "rule fold_muli_one arith.muli muli-one 9\n"
+  "rule fold_select_same arith.select select-same 8\n";
+
+std::unique_ptr<Module> lowerFromHIR(Context &ctx, const sys::hir::Module &hirModule,
+                                     const std::string &target,
+                                     ProductionStats *stats) {
+  if (stats)
+    stats->hirOps = countHIR(hirModule.root.get());
+  auto module = std::make_unique<Module>(ctx);
+  auto &top = module->body().getBlocks()[0];
+  Builder builder(ctx, top.get());
+  (void) target;
+  HIRImporter importer(ctx);
+  if (hirModule.root)
+    importer.emitStmt(hirModule.root.get(), builder);
+  if (stats)
+    stats->mlirOpsBefore = (int) walk(*module).size();
+  return module;
+}
+
+bool runProductionGate(const sys::hir::Module &hirModule, const std::string &target,
+                       ProductionStats &stats, std::ostream *dump) {
+  stats = ProductionStats();
+  Context ctx;
+  auto module = lowerFromHIR(ctx, hirModule, target, &stats);
+  auto before = verify(*module);
+  stats.verifyBefore = before.ok;
+  if (!before.ok) {
+    stats.error = before.errors.empty() ? "self-MLIR verification failed before canonicalization"
+                                        : before.errors.front();
+    if (dump)
+      print(*module, *dump);
+    return false;
+  }
+
+  std::vector<std::string> parseErrors;
+  auto rules = parseDRR(kCoreRules, parseErrors);
+  if (!parseErrors.empty()) {
+    stats.error = parseErrors.front();
+    return false;
+  }
+  auto rewriteStats = applyGreedyPatterns(*module, rules);
+  stats.rewrites = rewriteStats.rewrites;
+
+  auto after = verify(*module);
+  stats.verifyAfter = after.ok;
+  if (!after.ok) {
+    stats.error = after.errors.empty() ? "self-MLIR verification failed after canonicalization"
+                                       : after.errors.front();
+    if (dump)
+      print(*module, *dump);
+    return false;
+  }
+
+  auto convStats = convertDialects(*module, productionTarget(target), targetPatterns(target));
+  stats.conversionVisited = convStats.visited;
+  stats.conversionLegal = convStats.legal;
+  stats.conversionConverted = convStats.converted;
+  stats.conversionFailed = convStats.failed;
+  stats.conversionRollbacks = convStats.rollbacks;
+  stats.mlirOpsAfter = (int) walk(*module).size();
+  if (dump)
+    print(*module, *dump);
+  if (convStats.failed) {
+    stats.error = "self-MLIR dialect conversion failed for target " + target;
+    return false;
+  }
+  return true;
+}
+
 static Module buildSample(Context &ctx) {
   Module module(ctx);
   auto &top = module.body().getBlocks()[0];
@@ -591,11 +1016,6 @@ static Module buildSample(Context &ctx) {
   b.create("scf.return", {add.result()}, {}, {}, ctx.loc("sample.sy", 3, 1));
   return module;
 }
-
-static const char *kCoreRules =
-  "rule fold_addi_zero arith.addi addi-zero 10\n"
-  "rule fold_muli_one arith.muli muli-one 9\n"
-  "rule fold_select_same arith.select select-same 8\n";
 
 int runCoreSelfTest(std::ostream &os) {
   Context ctx;

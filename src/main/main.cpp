@@ -483,7 +483,7 @@ int main(int argc, char **argv) {
     return !reasons.empty();
   };
 
-  std::string frontendPath = "dialect";
+  std::string frontendPath = "self-mlir";
   std::vector<std::string> fallbackReasons;
   if (opts.useLegacyCodegen) {
     frontendPath = "legacy-forced";
@@ -679,9 +679,44 @@ int main(int argc, char **argv) {
       });
     }
 
+    sys::mlir::ProductionStats selfMLIRStats;
+    runStage("self-mlir.production", [&]() {
+      bool dumpSelfMLIR = false;
+      if (const char *env = std::getenv("SISY_DUMP_SELF_MLIR"))
+        dumpSelfMLIR = env[0] && std::strcmp(env, "0") != 0;
+
+      std::ostringstream dumpBuffer;
+      const std::string target = opts.arm ? "arm" : "riscv";
+      if (!sys::mlir::runProductionGate(*hirModule, target, selfMLIRStats,
+                                         dumpSelfMLIR ? &dumpBuffer : nullptr)) {
+        std::vector<std::string> errors;
+        errors.push_back(selfMLIRStats.error.empty()
+                         ? "self-MLIR production gate failed"
+                         : selfMLIRStats.error);
+        failStage("self-mlir-production", errors, dumpBuffer.str());
+      }
+      if (dumpSelfMLIR) {
+        std::cerr << "===== self-MLIR production =====\n";
+        std::cerr << dumpBuffer.str();
+      }
+    });
+    if (opts.verbose || opts.stats) {
+      std::cerr << "[self-mlir] target=" << (opts.arm ? "arm" : "riscv")
+                << " hir-ops=" << selfMLIRStats.hirOps
+                << " mlir-ops-before=" << selfMLIRStats.mlirOpsBefore
+                << " mlir-ops-after=" << selfMLIRStats.mlirOpsAfter
+                << " rewrites=" << selfMLIRStats.rewrites
+                << " converted=" << selfMLIRStats.conversionConverted
+                << " failed=" << selfMLIRStats.conversionFailed
+                << " rollbacks=" << selfMLIRStats.conversionRollbacks
+                << " verify-before=" << (selfMLIRStats.verifyBefore ? 1 : 0)
+                << " verify-after=" << (selfMLIRStats.verifyAfter ? 1 : 0)
+                << "\n";
+    }
+
     if (requiresLegacyFallback(*hirModule, fallbackReasons)) {
       if (opts.forceDialectCodegen) {
-        frontendPath = "dialect";
+        frontendPath = "self-mlir";
         emitDialectReport(frontendPath, fallbackReasons);
         failStage("dialect-forced-fallback", fallbackReasons, "");
       }
@@ -694,7 +729,7 @@ int main(int argc, char **argv) {
       emitDialectReport(frontendPath, fallbackReasons);
       cg = std::make_unique<sys::CodeGen>(node);
     } else {
-      frontendPath = "dialect";
+      frontendPath = "self-mlir";
       emitDialectReport(frontendPath, fallbackReasons);
     }
 
