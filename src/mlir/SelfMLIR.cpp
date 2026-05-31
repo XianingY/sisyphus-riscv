@@ -1833,6 +1833,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else if (opname == "rv_machine.or") inst = "or";
         else if (opname == "rv_machine.xor") inst = "xor";
         os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
+        if (inst == "and" || inst == "or" || inst == "xor")
+          os << "    addiw " << dst << ", " << dst << ", 0\n";
       }
       if (shouldSpillDefinedValue(op.result()))
         spillHome(op.result(), dst);

@@ -98,6 +98,11 @@ SYSY
 : >"${OUT_DIR}/direct_and.in"
 printf '5\n' >"${OUT_DIR}/direct_and.out"
 run_case direct_and bitwise-rewritten-calls 1
+if ! grep -Eq '^[[:space:]]+and[[:space:]]' "${OUT_DIR}/direct_and.s" ||
+   ! grep -Eq '^[[:space:]]+addiw[[:space:]]' "${OUT_DIR}/direct_and.s"; then
+  echo "expected RISC-V bitwise lowering to sign-extend i32 and result" >&2
+  exit 1
+fi
 
 guarded_sy="${OUT_DIR}/guarded_xor.sy"
 write_xor_helper "${guarded_sy}"
@@ -113,6 +118,11 @@ SYSY
 printf '5 3\n' >"${OUT_DIR}/guarded_xor.in"
 printf '6\n' >"${OUT_DIR}/guarded_xor.out"
 run_case guarded_xor bitwise-guarded-calls 1
+if ! grep -Eq '^[[:space:]]+xor[[:space:]]' "${OUT_DIR}/guarded_xor.s" ||
+   ! grep -Eq '^[[:space:]]+addiw[[:space:]]' "${OUT_DIR}/guarded_xor.s"; then
+  echo "expected RISC-V bitwise lowering to sign-extend i32 xor result" >&2
+  exit 1
+fi
 
 negative_sy="${OUT_DIR}/negative_shape.sy"
 cat >"${negative_sy}" <<'SYSY'
