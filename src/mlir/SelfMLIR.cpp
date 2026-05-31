@@ -278,9 +278,10 @@ Operation::Operation(std::string name, std::vector<Value> operands,
 }
 
 Operation::~Operation() {
-  for (int i = 0; i < (int) operands.size(); i++) {
-    unregisterUse(operands[i], Use{this, i});
-  }
+  // Whole-module teardown destroys operations in container order, which is not
+  // necessarily use-def order.  Do not chase operand defining ops here: they may
+  // already be gone.  Explicit IR erasure goes through markErased(), which drops
+  // operands while all referenced operations are still alive.
 }
 
 void Operation::setOperand(int index, Value value) {
@@ -294,6 +295,32 @@ void Operation::setOperand(int index, Value value) {
 void Operation::addOperand(Value value) {
   operands.push_back(value);
   registerUse(value, Use{this, (int) operands.size() - 1});
+}
+
+void Operation::dropAllOperands() {
+  for (int i = 0; i < (int) operands.size(); i++) {
+    unregisterUse(operands[i], Use{this, i});
+  }
+  operands.clear();
+}
+
+static void dropNestedOperandUses(Operation &op) {
+  for (auto &region : op.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &child : block->ops()) {
+        child->dropAllOperands();
+        dropNestedOperandUses(*child);
+      }
+    }
+  }
+}
+
+void Operation::markErased() {
+  if (erased)
+    return;
+  dropAllOperands();
+  dropNestedOperandUses(*this);
+  erased = true;
 }
 
 std::string Operation::dialect() const {
@@ -1061,11 +1088,21 @@ static bool applyRule(Module &module, Operation &op, const RewriteRule &rule) {
   return false;
 }
 
+static void eraseMarkedInRegion(Region &region) {
+  for (auto &block : region.getBlocks()) {
+    for (auto &owned : block->ops()) {
+      if (!owned || owned->isErased())
+        continue;
+      for (auto &nested : owned->getRegions())
+        eraseMarkedInRegion(*nested);
+    }
+    block->eraseMarkedOperations();
+  }
+}
+
 void eraseMarked(Module &module) {
-  for (auto *op : walk(module))
-    for (auto &region : op->getRegions())
-      for (auto &block : region->getBlocks())
-        block->eraseMarkedOperations();
+  for (auto &region : module.op().getRegions())
+    eraseMarkedInRegion(*region);
 }
 
 RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> &rules) {
@@ -2189,7 +2226,8 @@ void runGlobalOpt(Module &module) {
     }
 
     if (accesses.empty()) {
-      global->markErased();
+      if (global->resultCount() == 0 || usesOf(module, global->result()).empty())
+        global->markErased();
       continue;
     }
 
@@ -2211,7 +2249,8 @@ void runGlobalOpt(Module &module) {
             op->addOperand(slot.result());
           }
         }
-        global->markErased();
+        if (global->resultCount() == 0 || usesOf(module, global->result()).empty())
+          global->markErased();
       }
     }
   }

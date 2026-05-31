@@ -208,7 +208,8 @@ public:
   bool isLoop() const;
   bool isTerminator() const;
   bool isErased() const { return erased; }
-  void markErased() { erased = true; }
+  void dropAllOperands();
+  void markErased();
 };
 
 class Block {
@@ -258,6 +259,7 @@ class Builder {
 
 public:
   Builder(Context &ctx, Block *block = nullptr): ctx(ctx), insertionBlock(block) {}
+  Block *getInsertionBlock() const { return insertionBlock; }
   void setInsertionBlock(Block *block) { insertionBlock = block; }
   Operation &create(const std::string &name, const std::vector<Value> &operands,
                     const std::vector<Type> &results,

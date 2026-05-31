@@ -276,19 +276,30 @@ class ASTToMLIR {
     popScope();
   }
 
+  bool insertionBlockTerminated(Builder &builder) const {
+    auto *block = builder.getInsertionBlock();
+    return block && !block->ops().empty() && block->ops().back()->isTerminator();
+  }
+
   void emitStmt(sys::ASTNode *node, Builder &builder) {
     if (!node)
       return;
     if (auto *block = dyn_cast<sys::BlockNode>(node)) {
       pushScope();
-      for (auto *child : block->nodes)
+      for (auto *child : block->nodes) {
+        if (insertionBlockTerminated(builder))
+          break;
         emitStmt(child, builder);
+      }
       popScope();
       return;
     }
     if (auto *transparent = dyn_cast<sys::TransparentBlockNode>(node)) {
-      for (auto *decl : transparent->nodes)
+      for (auto *decl : transparent->nodes) {
+        if (insertionBlockTerminated(builder))
+          break;
         emitStmt(decl, builder);
+      }
       return;
     }
     if (auto *func = dyn_cast<sys::FnDeclNode>(node)) {

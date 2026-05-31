@@ -15,8 +15,18 @@ static Operation* findAllocaForLoad(Operation *loadOp) {
   return nullptr;
 }
 
+static void dropRegionOperandUses(Region &region) {
+  for (auto &block : region.getBlocks()) {
+    for (auto &owned : block->ops()) {
+      owned->dropAllOperands();
+      for (auto &nested : owned->getRegions())
+        dropRegionOperandUses(*nested);
+    }
+  }
+}
+
 void runRaiseToAffine(Module &module) {
-  std::vector<Operation*> toErase;
+restart:
   for (auto *op : walk(module)) {
     if (!op || op->isErased()) continue;
     if (op->name() == "scf.while") {
@@ -116,6 +126,7 @@ void runRaiseToAffine(Module &module) {
       else op->addOperand(stepVal);
 
       // Erase the condBlock (we only need the body)
+      dropRegionOperandUses(*op->getRegions()[0]);
       op->getRegions().erase(op->getRegions().begin());
 
       // Add block argument for IV
@@ -137,6 +148,8 @@ void runRaiseToAffine(Module &module) {
       if (!body->ops().empty() && body->ops().back()->name() == "scf.yield") {
         body->ops().back()->rename("affine.yield");
       }
+      eraseMarked(module);
+      goto restart;
     }
   }
   eraseMarked(module);
