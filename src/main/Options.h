@@ -46,6 +46,7 @@ struct Options {
     option verifyOperationBridge : 1;
     option runSelfMLIRCoreTests : 1;
     option runSelfMLIRConversionTests : 1;
+    option runSelfMLIRNativeBackendTests : 1;
     option dumpSelfMLIRSample : 1;
   };
 

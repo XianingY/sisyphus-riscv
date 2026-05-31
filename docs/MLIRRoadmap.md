@@ -65,6 +65,10 @@ implementation of the MLIR object model and conversion contracts.
   driver over a pure self-MLIR module.
 - `--run-self-mlir-conversion-tests` exercises target legalization and rollback
   for both `rv_machine` and `arm_machine` without touching legacy IR.
+- `--run-self-mlir-native-backend-tests` exercises the first fully native
+  self-MLIR vertical backend slice: `arith` is legalized to machine dialect and
+  emitted as RISC-V/ARM assembly without legacy `ModuleOp`, `PhiOp`, or
+  `Value::Type`.
 - `scripts/run_mlir_core_tests.sh` and
   `scripts/run_dialect_conversion_tests.sh` are the new core gates that must
   pass before migrating default compilation stages onto the self-MLIR path.
@@ -88,9 +92,11 @@ and the default frontend path is:
 AST -> HIR -> self-MLIR production gate -> CFG/legacy machine emission
 ```
 
-The final assembler emission still uses the existing RV/ARM backend while the
-machine-dialect backend is being completed, but every default non-legacy compile
-must pass the self-MLIR verifier and target legalization first.
+The final full-program assembler emission still uses the existing RV/ARM backend
+while the machine-dialect backend is being completed, but every default
+non-legacy compile must pass the self-MLIR verifier and target legalization
+first.  The native machine-dialect printer is now present and covered for the
+initial straight-line integer slice.
 
 The new infrastructure does not enable RVV, semantic helper replacement,
 fixed-output behavior, input/output precomputation, checksum triggers, or

@@ -37,6 +37,37 @@ if grep -Eq 'legacy\.|PhiOp|phi' <<<"${out}"; then
   exit 1
 fi
 
+native="$("${COMPILER}" --run-self-mlir-native-backend-tests)"
+echo "${native}"
+grep -q '\[self-mlir-native-backend\]' <<<"${native}" || {
+  echo "missing self-MLIR native backend stats" >&2
+  exit 1
+}
+grep -q 'rv-emitted=1' <<<"${native}" || {
+  echo "expected native RISC-V machine dialect asm emission" >&2
+  exit 1
+}
+grep -q 'arm-emitted=1' <<<"${native}" || {
+  echo "expected native ARM machine dialect asm emission" >&2
+  exit 1
+}
+grep -q 'legacy-free=1' <<<"${native}" || {
+  echo "native self-MLIR backend smoke must be legacy/Phi free" >&2
+  exit 1
+}
+grep -q 'addw' <<<"${native}" || {
+  echo "expected RISC-V native asm to contain addw" >&2
+  exit 1
+}
+grep -q 'add w' <<<"${native}" || {
+  echo "expected ARM native asm to contain add" >&2
+  exit 1
+}
+if grep -Eq 'legacy\.|PhiOp|\"phi\"' <<<"${native}"; then
+  echo "native self-MLIR backend output must not contain legacy or Phi operations" >&2
+  exit 1
+fi
+
 OUT_DIR="${ROOT_DIR}/tests/.out/self_mlir_core"
 mkdir -p "${OUT_DIR}"
 

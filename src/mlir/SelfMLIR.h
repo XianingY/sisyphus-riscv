@@ -147,7 +147,7 @@ public:
   Type type() const { return argType; }
   Location loc() const { return argLoc; }
   const std::string &name() const { return argName; }
-  Value value();
+  Value value() const;
 };
 
 class Operation {
@@ -298,6 +298,21 @@ struct ConversionStats {
 ConversionStats convertDialects(Module &module, const ConversionTarget &target,
                                 const std::vector<ConversionPattern> &patterns);
 
+struct NativeAsmStats {
+  int functions = 0;
+  int machineOps = 0;
+  int returns = 0;
+  int unsupportedOps = 0;
+  int legacyOps = 0;
+  int phiLikeOps = 0;
+  bool emitted = false;
+  std::string error;
+};
+
+bool verifyLegacyFree(Module &module, NativeAsmStats *stats = nullptr);
+bool emitNativeAssembly(Module &module, const std::string &target, std::ostream &os,
+                        NativeAsmStats &stats);
+
 struct ProductionStats {
   int hirOps = 0;
   int mlirOpsBefore = 0;
@@ -321,6 +336,7 @@ bool runProductionGate(const sys::hir::Module &hirModule, const std::string &tar
 
 int runCoreSelfTest(std::ostream &os);
 int runConversionSelfTest(std::ostream &os);
+int runNativeBackendSelfTest(std::ostream &os);
 void dumpSample(std::ostream &os);
 
 } // namespace sys::mlir

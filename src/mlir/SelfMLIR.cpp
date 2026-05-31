@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 
@@ -205,8 +206,8 @@ BlockArgument::BlockArgument(Block *owner, unsigned index, Type type,
     argName = "arg" + std::to_string(index);
 }
 
-Value BlockArgument::value() {
-  return Value::blockArgument(this);
+Value BlockArgument::value() const {
+  return Value::blockArgument(const_cast<BlockArgument*>(this));
 }
 
 Operation::Operation(std::string name, std::vector<Value> operands,
@@ -578,6 +579,200 @@ ConversionStats convertDialects(Module &module, const ConversionTarget &target,
     stats.converted++;
   }
   return stats;
+}
+
+bool verifyLegacyFree(Module &module, NativeAsmStats *stats) {
+  bool ok = true;
+  for (auto *op : walk(module)) {
+    if (!op)
+      continue;
+    if (op->dialect() == "legacy") {
+      ok = false;
+      if (stats)
+        stats->legacyOps++;
+    }
+    if (op->name().find("Phi") != std::string::npos ||
+        op->name().find(".phi") != std::string::npos) {
+      ok = false;
+      if (stats)
+        stats->phiLikeOps++;
+    }
+  }
+  return ok;
+}
+
+namespace {
+
+int64_t parseIntegerAttr(Attribute attr) {
+  if (!attr)
+    return 0;
+  std::string text = attr.str();
+  size_t pos = 0;
+  while (pos < text.size() && text[pos] == '"')
+    pos++;
+  size_t end = pos;
+  if (end < text.size() && (text[end] == '-' || text[end] == '+'))
+    end++;
+  while (end < text.size() && std::isdigit((unsigned char) text[end]))
+    end++;
+  if (end == pos)
+    return 0;
+  return std::stoll(text.substr(pos, end - pos));
+}
+
+std::string symbolAttr(Attribute attr, const std::string &fallback = "") {
+  if (!attr)
+    return fallback;
+  std::string text = attr.str();
+  if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+    return text.substr(1, text.size() - 2);
+  return text.empty() ? fallback : text;
+}
+
+std::string rvResultReg(int index) {
+  static const char *regs[] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
+  return regs[index % 7];
+}
+
+std::string armResultReg(int index) {
+  static const char *regs[] = {"w9", "w10", "w11", "w12", "w13", "w14", "w15"};
+  return regs[index % 7];
+}
+
+std::string valueKey(Value value) {
+  return value.printName();
+}
+
+std::string lookupReg(Value value, const std::map<std::string, std::string> &regs) {
+  auto it = regs.find(valueKey(value));
+  return it == regs.end() ? "" : it->second;
+}
+
+bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
+                          NativeAsmStats &stats) {
+  if (func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1) {
+    stats.unsupportedOps++;
+    stats.error = "native asm currently requires one-region/one-block functions";
+    return false;
+  }
+
+  std::string name = symbolAttr(func.attr("sym_name"), "main");
+  auto &block = *func.getRegions()[0]->getBlocks()[0];
+  std::map<std::string, std::string> regs;
+  bool isArm = target == "arm";
+
+  os << (isArm ? "    .text\n    .global " : "    .text\n    .globl ") << name << "\n";
+  os << name << ":\n";
+
+  for (size_t i = 0; i < block.args().size(); i++) {
+    const auto &arg = *block.args()[i];
+    if (isArm)
+      regs[valueKey(arg.value())] = "w" + std::to_string((int) i);
+    else
+      regs[valueKey(arg.value())] = "a" + std::to_string((int) i);
+  }
+
+  int nextReg = 0;
+  for (auto &owned : block.ops()) {
+    auto &op = *owned;
+    const std::string opname = op.name();
+    if (opname == "rv_machine.li" || opname == "arm_machine.mov") {
+      std::string dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
+      regs[valueKey(op.result())] = dst;
+      int64_t imm = parseIntegerAttr(op.attr("value"));
+      if (isArm)
+        os << "    mov " << dst << ", #" << imm << "\n";
+      else
+        os << "    li " << dst << ", " << imm << "\n";
+      stats.machineOps++;
+      continue;
+    }
+    if (opname == "rv_machine.addw" || opname == "arm_machine.add") {
+      if (op.operandCount() != 2 || op.resultCount() != 1) {
+        stats.unsupportedOps++;
+        stats.error = "bad machine add shape";
+        return false;
+      }
+      std::string lhs = lookupReg(op.operand(0), regs);
+      std::string rhs = lookupReg(op.operand(1), regs);
+      if (lhs.empty() || rhs.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "machine add operand has no assigned register";
+        return false;
+      }
+      std::string dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
+      regs[valueKey(op.result())] = dst;
+      if (isArm)
+        os << "    add " << dst << ", " << lhs << ", " << rhs << "\n";
+      else
+        os << "    addw " << dst << ", " << lhs << ", " << rhs << "\n";
+      stats.machineOps++;
+      continue;
+    }
+    if (opname == "sysy.return" || opname == "scf.return" ||
+        opname == "rv_machine.ret" || opname == "arm_machine.ret") {
+      if (op.operandCount() > 0) {
+        std::string src = lookupReg(op.operand(0), regs);
+        if (src.empty()) {
+          stats.unsupportedOps++;
+          stats.error = "return operand has no assigned register";
+          return false;
+        }
+        if (isArm) {
+          if (src != "w0")
+            os << "    mov w0, " << src << "\n";
+        } else {
+          if (src != "a0")
+            os << "    mv a0, " << src << "\n";
+        }
+      }
+      os << "    ret\n";
+      stats.returns++;
+      continue;
+    }
+    if (opname == "scf.yield")
+      continue;
+
+    stats.unsupportedOps++;
+    stats.error = "unsupported native asm op: " + opname;
+    return false;
+  }
+
+  return stats.returns > 0;
+}
+
+} // namespace
+
+bool emitNativeAssembly(Module &module, const std::string &target, std::ostream &os,
+                        NativeAsmStats &stats) {
+  stats = NativeAsmStats();
+  if (target != "riscv" && target != "arm") {
+    stats.error = "native asm target must be riscv|arm";
+    return false;
+  }
+  if (!verifyLegacyFree(module, &stats)) {
+    stats.error = "self-MLIR native asm refuses legacy/Phi operations";
+    return false;
+  }
+  auto verified = verify(module);
+  if (!verified.ok) {
+    stats.error = verified.errors.empty() ? "self-MLIR verify failed" : verified.errors.front();
+    return false;
+  }
+
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.func") {
+      stats.functions++;
+      if (!emitFunctionAssembly(*op, target, os, stats))
+        return false;
+    }
+  }
+  stats.emitted = stats.functions > 0 && stats.unsupportedOps == 0;
+  if (!stats.emitted && stats.error.empty())
+    stats.error = "no self-MLIR functions emitted";
+  return stats.emitted;
 }
 
 namespace {
@@ -1017,6 +1212,27 @@ static Module buildSample(Context &ctx) {
   return module;
 }
 
+static Module buildNativeAsmSample(Context &ctx) {
+  Module module(ctx);
+  auto &top = module.body().getBlocks()[0];
+  Builder topBuilder(ctx, top.get());
+  auto &func = topBuilder.create(
+      "sysy.func", {}, {}, {{"sym_name", ctx.stringAttr("main")}},
+      ctx.loc("native.sy", 1, 1), 1);
+  auto &entry = func.getRegions()[0]->addBlock();
+  Builder b(ctx, &entry);
+  auto &seven = b.create("arith.constant", {}, {ctx.i(32)},
+                         {{"value", ctx.integerAttr(7, ctx.i(32))}},
+                         ctx.loc("native.sy", 2, 3));
+  auto &one = b.create("arith.constant", {}, {ctx.i(32)},
+                       {{"value", ctx.integerAttr(1, ctx.i(32))}},
+                       ctx.loc("native.sy", 2, 7));
+  auto &sum = b.create("arith.addi", {seven.result(), one.result()}, {ctx.i(32)},
+                       {}, ctx.loc("native.sy", 2, 11));
+  b.create("sysy.return", {sum.result()}, {}, {}, ctx.loc("native.sy", 3, 1));
+  return module;
+}
+
 int runCoreSelfTest(std::ostream &os) {
   Context ctx;
   auto i32a = ctx.i(32);
@@ -1091,6 +1307,58 @@ int runConversionSelfTest(std::ostream &os) {
          armStats.converted == 2 && armStats.failed == 0 && armVerify.ok &&
          rollbackStats.failed == 1 && rollbackStats.rollbacks == 1 &&
          rollbackVerify.ok ? 0 : 1;
+}
+
+int runNativeBackendSelfTest(std::ostream &os) {
+  Context ctx;
+  Module rvModule = buildNativeAsmSample(ctx);
+  ConversionTarget rvTarget;
+  rvTarget.addLegalDialect("builtin");
+  rvTarget.addLegalDialect("sysy");
+  rvTarget.addLegalDialect("rv_machine");
+  auto rvConv = convertDialects(rvModule, rvTarget, {
+      {"arith.constant", "rv_machine.li"},
+      {"arith.addi", "rv_machine.addw"},
+  });
+  NativeAsmStats rvStats;
+  std::ostringstream rvAsm;
+  bool rvOk = emitNativeAssembly(rvModule, "riscv", rvAsm, rvStats);
+
+  Module armModule = buildNativeAsmSample(ctx);
+  ConversionTarget armTarget;
+  armTarget.addLegalDialect("builtin");
+  armTarget.addLegalDialect("sysy");
+  armTarget.addLegalDialect("arm_machine");
+  auto armConv = convertDialects(armModule, armTarget, {
+      {"arith.constant", "arm_machine.mov"},
+      {"arith.addi", "arm_machine.add"},
+  });
+  NativeAsmStats armStats;
+  std::ostringstream armAsm;
+  bool armOk = emitNativeAssembly(armModule, "arm", armAsm, armStats);
+
+  os << "[self-mlir-native-backend]"
+     << " rv-converted=" << rvConv.converted
+     << " rv-failed=" << rvConv.failed
+     << " rv-emitted=" << (rvOk ? 1 : 0)
+     << " rv-machine-ops=" << rvStats.machineOps
+     << " rv-unsupported=" << rvStats.unsupportedOps
+     << " arm-converted=" << armConv.converted
+     << " arm-failed=" << armConv.failed
+     << " arm-emitted=" << (armOk ? 1 : 0)
+     << " arm-machine-ops=" << armStats.machineOps
+     << " arm-unsupported=" << armStats.unsupportedOps
+     << " legacy-free=" << ((rvStats.legacyOps == 0 && rvStats.phiLikeOps == 0 &&
+                              armStats.legacyOps == 0 && armStats.phiLikeOps == 0) ? 1 : 0)
+     << "\n";
+  os << "[self-mlir-native-backend-rv-asm]\n" << rvAsm.str();
+  os << "[self-mlir-native-backend-arm-asm]\n" << armAsm.str();
+
+  return rvOk && armOk && rvConv.failed == 0 && armConv.failed == 0 &&
+         rvStats.legacyOps == 0 && rvStats.phiLikeOps == 0 &&
+         armStats.legacyOps == 0 && armStats.phiLikeOps == 0 &&
+         rvAsm.str().find("addw") != std::string::npos &&
+         armAsm.str().find("add ") != std::string::npos ? 0 : 1;
 }
 
 void dumpSample(std::ostream &os) {

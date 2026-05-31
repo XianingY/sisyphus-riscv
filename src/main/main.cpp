@@ -324,6 +324,9 @@ int main(int argc, char **argv) {
   if (opts.runSelfMLIRConversionTests)
     return sys::mlir::runConversionSelfTest(std::cout);
 
+  if (opts.runSelfMLIRNativeBackendTests)
+    return sys::mlir::runNativeBackendSelfTest(std::cout);
+
   if (opts.dumpSelfMLIRSample) {
     sys::mlir::dumpSample(std::cout);
     return 0;
