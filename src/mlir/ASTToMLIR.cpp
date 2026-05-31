@@ -1,10 +1,13 @@
 #include "ASTToMLIR.h"
+#include "Polyhedral.h"
+#include "IPO.h"
 
 #include "../parse/ASTNode.h"
 #include "../parse/Type.h"
 #include "../utils/DynamicCast.h"
 
 #include <map>
+#include <cstdlib>
 #include <sstream>
 #include <vector>
 
@@ -192,6 +195,8 @@ class ASTToMLIR {
       if (direct.valid())
         return direct;
       Value slot = lookupStorage(ref->name);
+      if (slot.valid() && (isa<sys::ArrayType>(node->type) || isa<sys::PointerType>(node->type)))
+        return slot;
       if (slot.valid()) {
         auto &load = builder.create("sysy.load", {slot}, {scalarType(ctx, node->type)},
                                     {{"symbol", ctx.stringAttr(ref->name)}}, loc());
@@ -293,6 +298,7 @@ class ASTToMLIR {
                                  {"type", ctx.stringAttr(typeText(ctx, func->type))}},
                                 loc(), 1);
       auto &entry = op.getRegions()[0]->addBlock();
+      Builder body(ctx, &entry);
       pushScope();
       for (size_t i = 0; i < func->args.size(); i++) {
         sys::Type *argTy = fnTy && i < fnTy->params.size() ? fnTy->params[i] : nullptr;
@@ -300,12 +306,16 @@ class ASTToMLIR {
                                           ? storageType(ctx, argTy)
                                           : scalarType(ctx, argTy),
                                       loc(), func->args[i]);
-        if (isa<sys::ArrayType>(argTy) || isa<sys::PointerType>(argTy))
+        if (isa<sys::ArrayType>(argTy) || isa<sys::PointerType>(argTy)) {
           bindStorage(func->args[i], arg.value());
-        else
-          bindValue(func->args[i], arg.value());
+        } else {
+          auto &slot = body.create("sysy.alloca", {}, {storageType(ctx, argTy)},
+                                   {{"symbol", ctx.stringAttr(func->args[i])}}, loc());
+          body.create("sysy.store", {arg.value(), slot.result()}, {},
+                      {{"symbol", ctx.stringAttr(func->args[i])}}, loc());
+          bindStorage(func->args[i], slot.result());
+        }
       }
-      Builder body(ctx, &entry);
       emitStmt(func->body, body);
       if (entry.ops().empty() || !entry.ops().back()->isTerminator())
         body.create("scf.yield", {}, {}, {}, loc());
@@ -350,9 +360,12 @@ class ASTToMLIR {
       return;
     }
     if (auto *loop = dyn_cast<sys::WhileNode>(node)) {
-      Value cond = emitExpr(loop->cond, builder);
-      auto &op = builder.create("scf.while", {cond}, {}, {}, loc(), 1);
-      emitRegion(loop->body, *op.getRegions()[0]);
+      auto &op = builder.create("scf.while", {}, {}, {}, loc(), 2);
+      auto &beforeBlock = op.getRegions()[0]->addBlock();
+      Builder beforeBuilder(ctx, &beforeBlock);
+      Value cond = emitExpr(loop->cond, beforeBuilder);
+      beforeBuilder.create("scf.condition", {cond}, {}, {}, loc());
+      emitRegion(loop->body, *op.getRegions()[1]);
       return;
     }
     if (auto *assign = dyn_cast<sys::AssignNode>(node)) {
@@ -435,6 +448,9 @@ std::vector<ConversionPattern> targetPatterns(const std::string &target) {
       {"arith.divf", prefix + "fdiv"}, {"arith.negf", prefix + "fneg"},
       {"arith.negi", prefix + "neg"}, {"arith.sitofp", prefix + "scvtf"},
       {"arith.fptosi", prefix + "fcvtzs"}, {"arith.select", prefix + "select"},
+      {"vector.transfer_read", "arm_machine.ld1"},
+      {"vector.transfer_write", "arm_machine.st1"},
+      {"vector.splat", "arm_machine.dup"},
     };
   }
   return {
@@ -448,6 +464,9 @@ std::vector<ConversionPattern> targetPatterns(const std::string &target) {
     {"arith.divf", prefix + "fdiv"}, {"arith.negf", prefix + "fneg"},
     {"arith.negi", prefix + "neg"}, {"arith.sitofp", prefix + "fcvt_s_w"},
     {"arith.fptosi", prefix + "fcvt_w_s"}, {"arith.select", prefix + "select"},
+    {"vector.transfer_read", "rv_machine.vle32"},
+    {"vector.transfer_write", "rv_machine.vse32"},
+    {"vector.splat", "rv_machine.vfmv"},
   };
 }
 
@@ -467,7 +486,12 @@ ConversionTarget productionTarget(const std::string &target) {
 static const char *kASTCoreRules =
   "rule fold_addi_zero arith.addi addi-zero 10\n"
   "rule fold_muli_one arith.muli muli-one 9\n"
-  "rule fold_select_same arith.select select-same 8\n";
+  "rule fold_select_same arith.select select-same 8\n"
+  "rule fold_subi_same arith.subi subi-same 12\n"
+  "rule fold_muli_zero arith.muli muli-zero 11\n"
+  "rule fold_andi_same arith.andi andi-same 7\n"
+  "rule fold_ori_same arith.ori ori-same 6\n"
+  "rule fold_double_noti arith.noti double-noti 15\n";
 
 } // namespace
 
@@ -478,11 +502,29 @@ std::unique_ptr<Module> lowerFromAST(Context &ctx, const sys::ASTNode &ast,
   return ASTToMLIR(ctx).run(ast, stats);
 }
 
-bool runProductionGateFromAST(const sys::ASTNode &ast, const std::string &target,
-                              ProductionStats &stats, std::ostream *dump) {
+std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNode &ast, const std::string &target,
+                                                 ProductionStats &stats, std::ostream *dump) {
   stats = ProductionStats();
-  Context ctx;
   auto module = lowerFromAST(ctx, ast, target, &stats);
+
+  // 1. AST lowering
+  runGlobalOpt(*module);
+
+  // 2. High-level structure recovery and polyhedral preparation
+  runRaiseToAffine(*module);
+  runAffineLoopFusion(*module);
+  runAffineLoopInterchange(*module);
+
+  // 3. Inter-Procedural Optimizations (IPO)
+  runPureFunctionDeduction(*module);
+  runInlining(*module);
+  runIPCP(*module);
+
+  // 4. Global straight-line optimizations
+  runGlobalOpt(*module);
+  runMemoryOpt(*module);
+  if (std::getenv("SISY_ENABLE_RVV"))
+    runLoopVectorization(*module);
   auto before = verify(*module);
   stats.verifyBefore = before.ok;
   if (!before.ok) {
@@ -490,14 +532,14 @@ bool runProductionGateFromAST(const sys::ASTNode &ast, const std::string &target
                                         : before.errors.front();
     if (dump)
       print(*module, *dump);
-    return false;
+    return nullptr;
   }
 
   std::vector<std::string> parseErrors;
   auto rules = parseDRR(kASTCoreRules, parseErrors);
   if (!parseErrors.empty()) {
     stats.error = parseErrors.front();
-    return false;
+    return nullptr;
   }
   auto rewriteStats = applyGreedyPatterns(*module, rules);
   stats.rewrites = rewriteStats.rewrites;
@@ -509,7 +551,7 @@ bool runProductionGateFromAST(const sys::ASTNode &ast, const std::string &target
                                        : after.errors.front();
     if (dump)
       print(*module, *dump);
-    return false;
+    return nullptr;
   }
 
   auto convStats = convertDialects(*module, productionTarget(target), targetPatterns(target));
@@ -519,13 +561,15 @@ bool runProductionGateFromAST(const sys::ASTNode &ast, const std::string &target
   stats.conversionFailed = convStats.failed;
   stats.conversionRollbacks = convStats.rollbacks;
   stats.mlirOpsAfter = (int) walk(*module).size();
-  if (dump)
+  if (dump) {
+    *dump << "===== self-MLIR production =====\n";
     print(*module, *dump);
+  }
   if (convStats.failed) {
     stats.error = "self-MLIR AST dialect conversion failed for target " + target;
-    return false;
+    return nullptr;
   }
-  return true;
+  return module;
 }
 
 } // namespace sys::mlir

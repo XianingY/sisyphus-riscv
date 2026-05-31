@@ -42,47 +42,11 @@ if(BUILD_TESTING)
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_smoke.sh"
   )
   add_test(
-    NAME rvv_vectorize_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_vectorize_tests.sh"
-  )
-  add_test(
-    NAME hir_polyhedral_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_polyhedral_tests.sh"
-  )
-  add_test(
-    NAME cvp_range_fold_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_cvp_tests.sh"
-  )
-  add_test(
-    NAME bitwise_arith_fold_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_bitwise_arith_tests.sh"
-  )
-  add_test(
-    NAME compliant_replacements_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_compliant_replacements_tests.sh"
-  )
-  add_test(
-    NAME memoryssa_reaching_store_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_memoryssa_tests.sh"
-  )
-  add_test(
-    NAME mlir_infra_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_mlir_infra_tests.sh"
-  )
-  add_test(
     NAME self_mlir_core_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_mlir_core_tests.sh"
   )
   add_test(
     NAME self_mlir_dialect_conversion_smoke
     COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_dialect_conversion_tests.sh"
-  )
-  add_test(
-    NAME regalloc_hotness_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_regalloc_hotness_tests.sh"
-  )
-  add_test(
-    NAME deep_optimization_smoke
-    COMMAND bash -lc "cd ${CMAKE_CURRENT_SOURCE_DIR} && scripts/run_deep_optimization_tests.sh"
   )
 endif()

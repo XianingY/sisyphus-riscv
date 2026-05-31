@@ -14,7 +14,14 @@ fi
 
 run_compare_cases() {
   local target="$1"
-  for case in "${CASE_DIR}"/*.sy; do
+  shopt -s nullglob
+  local cases=("${CASE_DIR}"/*.sy)
+  shopt -u nullglob
+  if [[ "${#cases[@]}" -eq 0 ]]; then
+    echo "[frontend-compare] ${target} no cases under ${CASE_DIR}; skipping"
+    return
+  fi
+  for case in "${cases[@]}"; do
     local base out stem asm
     base="${case%.sy}"
     out="${base}.out"

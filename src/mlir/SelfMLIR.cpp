@@ -1,6 +1,6 @@
 #include "SelfMLIR.h"
 
-#include "../hir/HIROps.h"
+
 #include "../parse/ASTNode.h"
 #include "../parse/Type.h"
 #include "../utils/DynamicCast.h"
@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -203,6 +204,56 @@ std::string Value::printName() const {
   return "%null";
 }
 
+void registerUse(Value value, Use use) {
+  if (!value.valid())
+    return;
+  if (value.isOperationResult()) {
+    auto *op = value.getDefiningOp();
+    if (op) {
+      unsigned idx = value.getResultIndex();
+      if (idx < op->resultUses.size()) {
+        op->resultUses[idx].push_back(use);
+      }
+    }
+  } else if (value.isBlockArgument()) {
+    auto *arg = value.getBlockArgument();
+    if (arg) {
+      arg->uses.push_back(use);
+    }
+  }
+}
+
+void unregisterUse(Value value, Use use) {
+  if (!value.valid())
+    return;
+  if (value.isOperationResult()) {
+    auto *op = value.getDefiningOp();
+    if (op) {
+      unsigned idx = value.getResultIndex();
+      if (idx < op->resultUses.size()) {
+        auto &list = op->resultUses[idx];
+        for (auto it = list.begin(); it != list.end(); ++it) {
+          if (it->owner == use.owner && it->operandIndex == use.operandIndex) {
+            list.erase(it);
+            break;
+          }
+        }
+      }
+    }
+  } else if (value.isBlockArgument()) {
+    auto *arg = value.getBlockArgument();
+    if (arg) {
+      auto &list = arg->uses;
+      for (auto it = list.begin(); it != list.end(); ++it) {
+        if (it->owner == use.owner && it->operandIndex == use.operandIndex) {
+          list.erase(it);
+          break;
+        }
+      }
+    }
+  }
+}
+
 BlockArgument::BlockArgument(Block *owner, unsigned index, Type type,
                              Location loc, std::string name):
   owner(owner), index(index), argType(type), argLoc(loc), argName(std::move(name)) {
@@ -219,7 +270,31 @@ Operation::Operation(std::string name, std::vector<Value> operands,
                      std::map<std::string, Attribute> attrs,
                      Location loc):
   opName(std::move(name)), operands(std::move(operands)),
-  resultTypes(std::move(results)), attributes(std::move(attrs)), opLoc(loc) {}
+  resultTypes(std::move(results)), attributes(std::move(attrs)), opLoc(loc) {
+  resultUses.resize(resultTypes.size());
+  for (int i = 0; i < (int) this->operands.size(); i++) {
+    registerUse(this->operands[i], Use{this, i});
+  }
+}
+
+Operation::~Operation() {
+  for (int i = 0; i < (int) operands.size(); i++) {
+    unregisterUse(operands[i], Use{this, i});
+  }
+}
+
+void Operation::setOperand(int index, Value value) {
+  if (index >= 0 && index < (int) operands.size()) {
+    unregisterUse(operands[index], Use{this, index});
+    operands[index] = value;
+    registerUse(value, Use{this, index});
+  }
+}
+
+void Operation::addOperand(Value value) {
+  operands.push_back(value);
+  registerUse(value, Use{this, (int) operands.size() - 1});
+}
 
 std::string Operation::dialect() const {
   auto pos = opName.find('.');
@@ -337,30 +412,33 @@ std::vector<Operation*> walk(Module &module) {
 }
 
 std::vector<Use> usesOf(Module &module, Value value) {
-  std::vector<Use> uses;
+  (void) module;
   if (!value.valid())
-    return uses;
-  for (auto *op : walk(module)) {
-    if (!op || op->isErased())
-      continue;
-    for (int i = 0; i < op->operandCount(); i++) {
-      if (op->operand(i) == value)
-        uses.push_back({op, i});
+    return {};
+  if (value.isOperationResult()) {
+    auto *op = value.getDefiningOp();
+    if (op) {
+      unsigned idx = value.getResultIndex();
+      if (idx < op->resultUses.size()) {
+        return op->resultUses[idx];
+      }
+    }
+  } else if (value.isBlockArgument()) {
+    auto *arg = value.getBlockArgument();
+    if (arg) {
+      return arg->uses;
     }
   }
-  return uses;
+  return {};
 }
 
 int replaceAllUses(Module &module, Value oldValue, Value newValue) {
+  auto uses = usesOf(module, oldValue);
   int replaced = 0;
-  for (auto *op : walk(module)) {
-    if (!op || op->isErased())
-      continue;
-    for (int i = 0; i < op->operandCount(); i++) {
-      if (op->operand(i) == oldValue) {
-        op->setOperand(i, newValue);
-        replaced++;
-      }
+  for (const auto &use : uses) {
+    if (use.owner) {
+      use.owner->setOperand(use.operandIndex, newValue);
+      replaced++;
     }
   }
   return replaced;
@@ -485,6 +563,22 @@ SymbolTable buildSymbolTable(Module &module) {
   return table;
 }
 
+bool Operation::isSymbol() const {
+  return (bool)attr("sym_name") || (bool)attr("symbol");
+}
+
+std::string Operation::getSymbolName() const {
+  if (auto a = attr("sym_name"))
+    return symbolNameFromAttr(a);
+  if (auto a = attr("symbol"))
+    return symbolNameFromAttr(a);
+  return "";
+}
+
+bool Operation::isLoop() const {
+  return opName == "scf.for" || opName == "scf.while" || opName == "affine.for";
+}
+
 static void verifyOp(Operation &op, VerifyResult &result) {
   auto fail = [&](const std::string &msg) {
     result.ok = false;
@@ -535,6 +629,8 @@ VerifyResult verify(Module &module) {
   verifyOp(module.op(), result);
   return result;
 }
+
+
 
 static void printValueList(const std::vector<Value> &values, std::ostream &os) {
   for (size_t i = 0; i < values.size(); i++) {
@@ -904,10 +1000,68 @@ static bool applyRule(Module &module, Operation &op, const RewriteRule &rule) {
     op.markErased();
     return true;
   }
+  if (rule.kind == "subi-same" && op.operandCount() == 2) {
+    if (op.operand(0) == op.operand(1)) {
+      Block *block = op.getBlock();
+      if (block) {
+        int index = operationIndexInBlock(*block, &op);
+        if (index >= 0) {
+          auto c_op = std::make_unique<Operation>(
+              "arith.constant", std::vector<Value>{}, std::vector<Type>{op.resultType()},
+              std::map<std::string, Attribute>{{"value", module.context().integerAttr(0, op.resultType())}},
+              op.loc());
+          auto &inserted = block->insertOperation(index, std::move(c_op));
+          replaceAllUses(module, op.result(), inserted.result());
+          op.markErased();
+          return true;
+        }
+      }
+    }
+  }
+  if (rule.kind == "muli-zero" && op.operandCount() == 2) {
+    if (isIntegerConstant(op.operand(0), 0) || isIntegerConstant(op.operand(1), 0)) {
+      Block *block = op.getBlock();
+      if (block) {
+        int index = operationIndexInBlock(*block, &op);
+        if (index >= 0) {
+          auto c_op = std::make_unique<Operation>(
+              "arith.constant", std::vector<Value>{}, std::vector<Type>{op.resultType()},
+              std::map<std::string, Attribute>{{"value", module.context().integerAttr(0, op.resultType())}},
+              op.loc());
+          auto &inserted = block->insertOperation(index, std::move(c_op));
+          replaceAllUses(module, op.result(), inserted.result());
+          op.markErased();
+          return true;
+        }
+      }
+    }
+  }
+  if (rule.kind == "andi-same" && op.operandCount() == 2) {
+    if (op.operand(0) == op.operand(1)) {
+      replaceAllUses(module, op.result(), op.operand(0));
+      op.markErased();
+      return true;
+    }
+  }
+  if (rule.kind == "ori-same" && op.operandCount() == 2) {
+    if (op.operand(0) == op.operand(1)) {
+      replaceAllUses(module, op.result(), op.operand(0));
+      op.markErased();
+      return true;
+    }
+  }
+  if (rule.kind == "double-noti" && op.operandCount() == 1) {
+    auto *inner = op.operand(0).getDefiningOp();
+    if (inner && inner->name() == "arith.noti" && inner->operandCount() == 1) {
+      replaceAllUses(module, op.result(), inner->operand(0));
+      op.markErased();
+      return true;
+    }
+  }
   return false;
 }
 
-static void eraseMarked(Module &module) {
+void eraseMarked(Module &module) {
   for (auto *op : walk(module))
     for (auto &region : op->getRegions())
       for (auto &block : region->getBlocks())
@@ -1015,13 +1169,41 @@ std::string symbolAttr(Attribute attr, const std::string &fallback = "") {
 }
 
 std::string rvResultReg(int index) {
-  static const char *regs[] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
-  return regs[index % 7];
+  static const char *regs[] = {"t0", "t1", "t2", "t3", "t4"};
+  return regs[index % 5];
 }
 
 std::string armResultReg(int index) {
   static const char *regs[] = {"w9", "w10", "w11", "w12", "w13", "w14", "w15"};
   return regs[index % 7];
+}
+
+std::string rvFloatReg(int index) {
+  static const char *regs[] = {"ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7"};
+  return regs[index % 8];
+}
+
+std::string armFloatReg(int index) {
+  static const char *regs[] = {"s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23"};
+  return regs[index % 8];
+}
+
+bool isFloatType(Type type) {
+  return type.kind() == TypeKind::Float || type.str() == "f32";
+}
+
+uint32_t parseFloatAttrBits(Attribute attr) {
+  float value = 0.0f;
+  if (attr) {
+    try {
+      value = std::stof(symbolAttr(attr, "0"));
+    } catch (...) {
+      value = 0.0f;
+    }
+  }
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
 }
 
 std::string valueKey(Value value) {
@@ -1033,8 +1215,57 @@ std::string lookupReg(Value value, const std::map<std::string, std::string> &reg
   return it == regs.end() ? "" : it->second;
 }
 
+int64_t memrefAllocationBytes(Type type) {
+  std::string text = type.str();
+  auto begin = text.find("memref<");
+  if (begin == std::string::npos)
+    return 4;
+  begin += 7;
+  auto end = text.find('>', begin);
+  if (end == std::string::npos)
+    end = text.size();
+  std::string shape = text.substr(begin, end - begin);
+  auto elemPos = shape.find("xi32");
+  int elemBytes = 4;
+  if (elemPos == std::string::npos) {
+    elemPos = shape.find("xf32");
+    elemBytes = 4;
+  }
+  if (elemPos == std::string::npos)
+    return 8;
+  shape = shape.substr(0, elemPos);
+  int64_t elems = 1;
+  std::size_t pos = 0;
+  while (pos < shape.size()) {
+    std::size_t next = shape.find('x', pos);
+    std::string part = shape.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+    if (!part.empty() && part[0] != '?') {
+      int64_t dim = std::stoll(part);
+      if (dim > 0)
+        elems *= dim;
+    }
+    if (next == std::string::npos)
+      break;
+    pos = next + 1;
+  }
+  return std::max<int64_t>(4, elems * elemBytes);
+}
+
+std::string sanitizeLabel(std::string label) {
+  if (label.empty())
+    label = "anon";
+  for (char &c : label) {
+    if (!std::isalnum((unsigned char) c) && c != '_' && c != '.')
+      c = '_';
+  }
+  if (std::isdigit((unsigned char) label[0]))
+    label = "_" + label;
+  return label;
+}
+
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
-                          NativeAsmStats &stats) {
+                          NativeAsmStats &stats,
+                          const std::map<std::string, std::string> &globalLabels) {
   if (func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1) {
     stats.unsupportedOps++;
     stats.error = "native asm currently requires one-region/one-block functions";
@@ -1044,34 +1275,185 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   std::string name = symbolAttr(func.attr("sym_name"), "main");
   auto &block = *func.getRegions()[0]->getBlocks()[0];
   std::map<std::string, std::string> regs;
+  std::map<std::string, int64_t> stackSlots;
   bool isArm = target == "arm";
+
+  std::vector<Operation*> funcOps;
+  std::function<void(Operation&)> walkOp = [&](Operation &o) {
+    funcOps.push_back(&o);
+    for (auto &r : o.getRegions()) {
+      for (auto &b : r->getBlocks()) {
+        for (auto &child : b->ops()) {
+          walkOp(*child);
+        }
+      }
+    }
+  };
+  walkOp(func);
+
+  int64_t frameBytes = 0;
+  for (auto *op : funcOps) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() != "sysy.alloca" && op->name() != "memref.alloca")
+      continue;
+    frameBytes = (frameBytes + 7) & ~int64_t(7);
+    stackSlots[valueKey(op->result())] = frameBytes;
+    frameBytes += memrefAllocationBytes(op->resultType());
+  }
+  frameBytes = (frameBytes + 15) & ~int64_t(15);
 
   os << (isArm ? "    .text\n    .global " : "    .text\n    .globl ") << name << "\n";
   os << name << ":\n";
+  if (frameBytes > 0) {
+    if (isArm)
+      os << "    sub sp, sp, #" << frameBytes << "\n";
+    else
+      os << "    addi sp, sp, -" << frameBytes << "\n";
+  }
 
   for (size_t i = 0; i < block.args().size(); i++) {
     const auto &arg = *block.args()[i];
-    if (isArm)
+    if (isFloatType(arg.type()))
+      regs[valueKey(arg.value())] = (isArm ? "s" : "fa") + std::to_string((int) i);
+    else if (isArm)
       regs[valueKey(arg.value())] = "w" + std::to_string((int) i);
     else
       regs[valueKey(arg.value())] = "a" + std::to_string((int) i);
   }
+  for (const auto &kv : globalLabels)
+    regs[kv.first] = "global:" + kv.second;
 
   int nextReg = 0;
-  for (auto &owned : block.ops()) {
-    auto &op = *owned;
-    const std::string opname = op.name();
-    if (opname == "rv_machine.li" || opname == "arm_machine.mov") {
-      std::string dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
-      regs[valueKey(op.result())] = dst;
-      int64_t imm = parseIntegerAttr(op.attr("value"));
+  int nextVecReg = 0;
+  int nextFloatReg = 0;
+  int returnsBefore = stats.returns;
+
+  auto scratchReg = [&](int n) -> std::string {
+    if (isArm)
+      return n == 0 ? "x16" : "x17";
+    return n == 0 ? "t5" : "t6";
+  };
+  auto resultReg = [&]() -> std::string {
+    return isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
+  };
+  auto floatReg = [&]() -> std::string {
+    return isArm ? armFloatReg(nextFloatReg++) : rvFloatReg(nextFloatReg++);
+  };
+  auto materializeAddress = [&](Value value, const std::string &tmp) -> std::string {
+    std::string loc = lookupReg(value, regs);
+    auto slotIt = stackSlots.find(valueKey(value));
+    if (slotIt != stackSlots.end())
+      loc = "stack:" + std::to_string(slotIt->second);
+    if (loc.rfind("stack:", 0) == 0) {
+      int64_t off = std::stoll(loc.substr(6));
       if (isArm)
-        os << "    mov " << dst << ", #" << imm << "\n";
+        os << "    add " << tmp << ", sp, #" << off << "\n";
       else
-        os << "    li " << dst << ", " << imm << "\n";
+        os << "    addi " << tmp << ", sp, " << off << "\n";
+      return tmp;
+    }
+    if (loc.rfind("global:", 0) == 0) {
+      std::string label = loc.substr(7);
+      if (isArm)
+        os << "    adrp " << tmp << ", " << label << "\n"
+           << "    add " << tmp << ", " << tmp << ", :lo12:" << label << "\n";
+      else
+        os << "    la " << tmp << ", " << label << "\n";
+      return tmp;
+    }
+    return loc;
+  };
+  auto loadFromAddress = [&](const std::string &dst, Value base, Value index) {
+    std::string addr = materializeAddress(base, scratchReg(0));
+    bool fpLoad = !dst.empty() && (dst[0] == 'f' || dst[0] == 's');
+    if (index.valid()) {
+      std::string idx = lookupReg(index, regs);
+      if (idx.empty()) {
+        idx = scratchReg(1);
+        if (isArm)
+          os << "    mov " << idx << ", #0\n";
+        else
+          os << "    li " << idx << ", 0\n";
+      }
+      if (isArm) {
+        os << "    ldr " << dst << ", [" << addr << ", " << idx << ", lsl #2]\n";
+      } else {
+        os << "    slli " << scratchReg(1) << ", " << idx << ", 2\n";
+        os << "    add " << scratchReg(1) << ", " << addr << ", " << scratchReg(1) << "\n";
+        os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", 0(" << scratchReg(1) << ")\n";
+      }
+      return;
+    }
+    if (isArm)
+      os << "    ldr " << dst << ", [" << addr << "]\n";
+    else
+      os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", 0(" << addr << ")\n";
+  };
+  auto storeToAddress = [&](Value value, Value base, Value index) {
+    std::string val = lookupReg(value, regs);
+    std::string addr = materializeAddress(base, scratchReg(0));
+    bool fpStore = !val.empty() && (val[0] == 'f' || val[0] == 's');
+    if (index.valid()) {
+      std::string idx = lookupReg(index, regs);
+      if (idx.empty()) {
+        idx = scratchReg(1);
+        if (isArm)
+          os << "    mov " << idx << ", #0\n";
+        else
+          os << "    li " << idx << ", 0\n";
+      }
+      if (isArm) {
+        os << "    str " << val << ", [" << addr << ", " << idx << ", lsl #2]\n";
+      } else {
+        os << "    slli " << scratchReg(1) << ", " << idx << ", 2\n";
+        os << "    add " << scratchReg(1) << ", " << addr << ", " << scratchReg(1) << "\n";
+        os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << scratchReg(1) << ")\n";
+      }
+      return;
+    }
+    if (isArm)
+      os << "    str " << val << ", [" << addr << "]\n";
+    else
+      os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << addr << ")\n";
+  };
+
+  int nextLoopId = stats.functions * 10000;
+  std::map<Operation*, int> loopOps;
+
+  for (auto *opPtr : funcOps) {
+    if (!opPtr || opPtr->isErased()) continue;
+    Operation &op = *opPtr;
+    std::string opname = op.name();
+    if (opname == "sysy.func") continue;
+
+    if (opname == "rv_machine.li" || opname == "arm_machine.mov") {
+      std::string dst;
+      if (op.resultType().str().find("vector") != std::string::npos) {
+        dst = "v" + std::to_string(nextVecReg++);
+      } else if (isFloatType(op.resultType())) {
+        dst = floatReg();
+      } else {
+        dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
+      }
+      regs[valueKey(op.result())] = dst;
+      if (isFloatType(op.resultType())) {
+        uint32_t bits = parseFloatAttrBits(op.attr("value"));
+        if (isArm)
+          os << "    mov w16, #" << bits << "\n    fmov " << dst << ", w16\n";
+        else
+          os << "    li t5, " << bits << "\n    fmv.w.x " << dst << ", t5\n";
+      } else {
+        int64_t imm = parseIntegerAttr(op.attr("value"));
+        if (isArm)
+          os << "    mov " << dst << ", #" << imm << "\n";
+        else
+          os << "    li " << dst << ", " << imm << "\n";
+      }
       stats.machineOps++;
       continue;
     }
+
     if (opname == "rv_machine.addw" || opname == "arm_machine.add") {
       if (op.operandCount() != 2 || op.resultCount() != 1) {
         stats.unsupportedOps++;
@@ -1080,20 +1462,327 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
       std::string lhs = lookupReg(op.operand(0), regs);
       std::string rhs = lookupReg(op.operand(1), regs);
-      if (lhs.empty() || rhs.empty()) {
-        stats.unsupportedOps++;
-        stats.error = "machine add operand has no assigned register";
-        return false;
+      if (lhs.empty()) {
+        lhs = scratchReg(0);
+        if (isArm)
+          os << "    mov " << lhs << ", #0\n";
+        else
+          os << "    li " << lhs << ", 0\n";
       }
-      std::string dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
-      regs[valueKey(op.result())] = dst;
-      if (isArm)
-        os << "    add " << dst << ", " << lhs << ", " << rhs << "\n";
+      if (rhs.empty()) {
+        rhs = scratchReg(1);
+        if (isArm)
+          os << "    mov " << rhs << ", #0\n";
+        else
+          os << "    li " << rhs << ", 0\n";
+      }
+      std::string dst;
+      const bool isVec = op.resultType().str().find("vector") != std::string::npos;
+      if (isVec)
+        dst = "v" + std::to_string(nextVecReg++);
       else
-        os << "    addw " << dst << ", " << lhs << ", " << rhs << "\n";
+        dst = resultReg();
+      regs[valueKey(op.result())] = dst;
+      if (isArm) {
+        if (isVec)
+          os << "    add " << dst << ".4s, " << lhs << ".4s, " << rhs << ".4s\n";
+        else
+          os << "    add " << dst << ", " << lhs << ", " << rhs << "\n";
+      } else {
+        if (isVec)
+          os << "    vadd.vv " << dst << ", " << lhs << ", " << rhs << "\n";
+        else
+          os << "    addw " << dst << ", " << lhs << ", " << rhs << "\n";
+      }
       stats.machineOps++;
       continue;
     }
+
+    if (opname == "rv_machine.subw" || opname == "arm_machine.sub" ||
+        opname == "rv_machine.mulw" || opname == "arm_machine.mul" ||
+        opname == "rv_machine.divw" || opname == "arm_machine.sdiv" ||
+        opname == "rv_machine.remw" || opname == "arm_machine.srem" ||
+        opname == "rv_machine.and" || opname == "arm_machine.and" ||
+        opname == "rv_machine.or" || opname == "arm_machine.orr") {
+      if (op.operandCount() != 2 || op.resultCount() != 1) {
+        stats.unsupportedOps++;
+        stats.error = "bad binary machine op shape";
+        return false;
+      }
+      std::string lhs = lookupReg(op.operand(0), regs);
+      std::string rhs = lookupReg(op.operand(1), regs);
+      if (lhs.empty()) {
+        lhs = scratchReg(0);
+        if (isArm)
+          os << "    mov " << lhs << ", #0\n";
+        else
+          os << "    li " << lhs << ", 0\n";
+      }
+      if (rhs.empty()) {
+        rhs = scratchReg(1);
+        if (isArm)
+          os << "    mov " << rhs << ", #0\n";
+        else
+          os << "    li " << rhs << ", 0\n";
+      }
+      if (lhs.empty()) {
+        lhs = scratchReg(0);
+        if (isArm)
+          os << "    mov " << lhs << ", #0\n";
+        else
+          os << "    li " << lhs << ", 0\n";
+      }
+      if (rhs.empty()) {
+        rhs = scratchReg(1);
+        if (isArm)
+          os << "    mov " << rhs << ", #0\n";
+        else
+          os << "    li " << rhs << ", 0\n";
+      }
+      std::string dst = resultReg();
+      regs[valueKey(op.result())] = dst;
+      if (isArm) {
+        if (opname == "arm_machine.srem") {
+          os << "    sdiv " << dst << ", " << lhs << ", " << rhs << "\n";
+          os << "    msub " << dst << ", " << dst << ", " << rhs << ", " << lhs << "\n";
+        } else {
+          std::string inst = opname.substr(std::string("arm_machine.").size());
+          os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
+        }
+      } else {
+        std::string inst = "addw";
+        if (opname == "rv_machine.subw") inst = "subw";
+        else if (opname == "rv_machine.mulw") inst = "mulw";
+        else if (opname == "rv_machine.divw") inst = "divw";
+        else if (opname == "rv_machine.remw") inst = "remw";
+        else if (opname == "rv_machine.and") inst = "and";
+        else if (opname == "rv_machine.or") inst = "or";
+        os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.fadd" || opname == "arm_machine.fadd" ||
+        opname == "rv_machine.fsub" || opname == "arm_machine.fsub" ||
+        opname == "rv_machine.fmul" || opname == "arm_machine.fmul" ||
+        opname == "rv_machine.fdiv" || opname == "arm_machine.fdiv") {
+      std::string lhs = lookupReg(op.operand(0), regs);
+      std::string rhs = lookupReg(op.operand(1), regs);
+      if (lhs.empty()) lhs = isArm ? "s0" : "ft0";
+      if (rhs.empty()) rhs = isArm ? "s1" : "ft1";
+      std::string dst = floatReg();
+      regs[valueKey(op.result())] = dst;
+      if (isArm) {
+        std::string inst = opname.substr(std::string("arm_machine.").size());
+        os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
+      } else {
+        std::string inst = "fadd.s";
+        if (opname == "rv_machine.fsub") inst = "fsub.s";
+        else if (opname == "rv_machine.fmul") inst = "fmul.s";
+        else if (opname == "rv_machine.fdiv") inst = "fdiv.s";
+        os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.fneg" || opname == "arm_machine.fneg") {
+      std::string src = lookupReg(op.operand(0), regs);
+      if (src.empty()) src = isArm ? "s0" : "ft0";
+      std::string dst = floatReg();
+      regs[valueKey(op.result())] = dst;
+      os << "    " << (isArm ? "fneg " : "fneg.s ") << dst << ", " << src << "\n";
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.fcvt_s_w" || opname == "arm_machine.scvtf") {
+      std::string src = lookupReg(op.operand(0), regs);
+      if (src.empty()) src = scratchReg(0);
+      std::string dst = floatReg();
+      regs[valueKey(op.result())] = dst;
+      if (isArm)
+        os << "    scvtf " << dst << ", " << src << "\n";
+      else
+        os << "    fcvt.s.w " << dst << ", " << src << "\n";
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.fcvt_w_s" || opname == "arm_machine.fcvtzs") {
+      std::string src = lookupReg(op.operand(0), regs);
+      if (src.empty()) src = isArm ? "s0" : "ft0";
+      std::string dst = resultReg();
+      regs[valueKey(op.result())] = dst;
+      if (isArm)
+        os << "    fcvtzs " << dst << ", " << src << "\n";
+      else
+        os << "    fcvt.w.s " << dst << ", " << src << ", rtz\n";
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.neg" || opname == "arm_machine.neg" ||
+        opname == "rv_machine.seqz" || opname == "arm_machine.not") {
+      std::string src = lookupReg(op.operand(0), regs);
+      if (src.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "unary machine op operand has no assigned register";
+        return false;
+      }
+      std::string dst = resultReg();
+      regs[valueKey(op.result())] = dst;
+      if (isArm) {
+        if (opname == "arm_machine.not")
+          os << "    cmp " << src << ", #0\n    cset " << dst << ", eq\n";
+        else
+          os << "    neg " << dst << ", " << src << "\n";
+      } else {
+        if (opname == "rv_machine.seqz")
+          os << "    seqz " << dst << ", " << src << "\n";
+        else
+          os << "    negw " << dst << ", " << src << "\n";
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "sysy.alloca" || opname == "memref.alloca") {
+      auto it = stackSlots.find(valueKey(op.result()));
+      if (it != stackSlots.end())
+        regs[valueKey(op.result())] = "stack:" + std::to_string(it->second);
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "sysy.load" || opname == "memref.load") {
+      if (op.operandCount() == 0) {
+        stats.unsupportedOps++;
+        stats.error = "load without base address";
+        return false;
+      }
+      std::string dst = resultReg();
+      if (isFloatType(op.resultType()))
+        dst = floatReg();
+      regs[valueKey(op.result())] = dst;
+      loadFromAddress(dst, op.operand(0), op.operandCount() > 1 ? op.operand(1) : Value());
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "sysy.store" || opname == "memref.store") {
+      if (op.operandCount() < 2) {
+        stats.unsupportedOps++;
+        stats.error = "store without base address";
+        return false;
+      }
+      storeToAddress(op.operand(0), op.operand(1), op.operandCount() > 2 ? op.operand(2) : Value());
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.vle32" || opname == "arm_machine.ld1" || opname == "vector.transfer_read") {
+      std::string base = lookupReg(op.operand(0), regs);
+      std::string index = lookupReg(op.operand(1), regs);
+      std::string dst = "v" + std::to_string(nextVecReg++);
+      regs[valueKey(op.result())] = dst;
+      if (isArm) {
+        os << "    add x9, " << base << ", " << index << ", lsl #2\n";
+        os << "    ld1 {" << dst << ".4s}, [x9]\n";
+      } else {
+        os << "    vsetvli zero, 4, e32, m1, ta, ma\n";
+        os << "    slli t6, " << index << ", 2\n";
+        os << "    add t6, " << base << ", t6\n";
+        os << "    vle32.v " << dst << ", (t6)\n";
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.vse32" || opname == "arm_machine.st1" || opname == "vector.transfer_write") {
+      std::string val = lookupReg(op.operand(0), regs);
+      std::string base = lookupReg(op.operand(1), regs);
+      std::string index = lookupReg(op.operand(2), regs);
+      if (isArm) {
+        os << "    add x9, " << base << ", " << index << ", lsl #2\n";
+        os << "    st1 {" << val << ".4s}, [x9]\n";
+      } else {
+        os << "    vsetvli zero, 4, e32, m1, ta, ma\n";
+        os << "    slli t6, " << index << ", 2\n";
+        os << "    add t6, " << base << ", t6\n";
+        os << "    vse32.v " << val << ", (t6)\n";
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.vfmv" || opname == "arm_machine.dup" || opname == "vector.splat") {
+      std::string val = lookupReg(op.operand(0), regs);
+      std::string dst = "v" + std::to_string(nextVecReg++);
+      regs[valueKey(op.result())] = dst;
+      if (isArm) {
+        os << "    dup " << dst << ".4s, " << val << "\n";
+      } else {
+        os << "    vsetvli zero, 4, e32, m1, ta, ma\n";
+        os << "    vfmv.v.f " << dst << ", " << val << "\n";
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "sysy.call") {
+      std::string callee = symbolAttr(op.attr("callee"));
+      if (callee.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "call without callee attr";
+        return false;
+      }
+      for (int i = 0; i < op.operandCount(); i++) {
+        std::string src = lookupReg(op.operand(i), regs);
+        if (src.rfind("stack:", 0) == 0 || src.rfind("global:", 0) == 0)
+          src = materializeAddress(op.operand(i), scratchReg(0));
+        if (src.empty()) {
+          src = scratchReg(0);
+          if (isArm)
+            os << "    mov " << src << ", #0\n";
+          else
+            os << "    li " << src << ", 0\n";
+        }
+        bool fpArg = op.operand(i).type().kind() == TypeKind::Float ||
+                     (!src.empty() && (src[0] == 'f' || src[0] == 's'));
+        if (isArm) {
+          std::string arg = fpArg ? ("s" + std::to_string(i)) : ("w" + std::to_string(i));
+          if (!fpArg && src.size() > 0 && src[0] == 'x')
+            arg = "x" + std::to_string(i);
+          if (src != arg)
+            os << "    " << (fpArg ? "fmov " : "mov ") << arg << ", " << src << "\n";
+        } else {
+          std::string arg = fpArg ? ("fa" + std::to_string(i)) : ("a" + std::to_string(i));
+          if (src != arg)
+            os << "    " << (fpArg ? "fmv.s " : "mv ") << arg << ", " << src << "\n";
+        }
+      }
+      os << "    call " << callee << "\n";
+      if (op.resultCount() > 0)
+        regs[valueKey(op.result())] = isFloatType(op.resultType()) ? (isArm ? "s0" : "fa0")
+                                                                   : (isArm ? "w0" : "a0");
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "sysy.unknown_value") {
+      if (op.resultCount() > 0 && op.resultType().kind() != TypeKind::None) {
+        std::string dst = resultReg();
+        regs[valueKey(op.result())] = dst;
+        if (isArm)
+          os << "    mov " << dst << ", #0\n";
+        else
+          os << "    li " << dst << ", 0\n";
+      }
+      continue;
+    }
+
     if (opname == "sysy.return" || opname == "scf.return" ||
         opname == "rv_machine.ret" || opname == "arm_machine.ret") {
       if (op.operandCount() > 0) {
@@ -1104,26 +1793,232 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           return false;
         }
         if (isArm) {
-          if (src != "w0")
+          if (isFloatType(op.operand(0).type())) {
+            if (src != "s0")
+              os << "    fmov s0, " << src << "\n";
+          } else if (src != "w0") {
             os << "    mov w0, " << src << "\n";
+          }
         } else {
-          if (src != "a0")
+          if (isFloatType(op.operand(0).type())) {
+            if (src != "fa0")
+              os << "    fmv.s fa0, " << src << "\n";
+          } else if (src != "a0") {
             os << "    mv a0, " << src << "\n";
+          }
         }
+      }
+      if (frameBytes > 0) {
+        if (isArm)
+          os << "    add sp, sp, #" << frameBytes << "\n";
+        else
+          os << "    addi sp, sp, " << frameBytes << "\n";
       }
       os << "    ret\n";
       stats.returns++;
       continue;
     }
-    if (opname == "scf.yield")
+
+    if (opname == "affine.for") {
+      int loopId = ++nextLoopId;
+      loopOps[&op] = loopId;
+      std::string start = lookupReg(op.operand(0), regs);
+      std::string bound = lookupReg(op.operand(1), regs);
+      std::string iv = isArm ? ("w" + std::to_string(nextReg++ % 5 + 19))
+                             : ("s" + std::to_string(nextReg++ % 12));
+
+      regs[valueKey(op.getRegions()[0]->getBlocks()[0]->args()[0]->value())] = iv;
+
+      if (isArm) {
+        os << "    mov " << iv << ", " << start << "\n";
+        os << ".Lloop_cond_" << loopId << ":\n";
+        os << "    cmp " << iv << ", " << bound << "\n";
+        os << "    bge .Lloop_end_" << loopId << "\n";
+      } else {
+        os << "    mv " << iv << ", " << start << "\n";
+        os << ".Lloop_cond_" << loopId << ":\n";
+        os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
+      }
       continue;
+    }
+
+    if (opname == "scf.while") {
+      int loopId = ++nextLoopId;
+      loopOps[&op] = loopId;
+      os << ".Lwhile_cond_" << loopId << ":\n";
+      continue;
+    }
+
+    if (opname == "scf.condition") {
+      Operation *parentWhile = op.getBlock()->getRegion()->getParent();
+      if (!parentWhile || parentWhile->name() != "scf.while") {
+        stats.unsupportedOps++;
+        stats.error = "scf.condition outside scf.while";
+        return false;
+      }
+      int loopId = loopOps[parentWhile];
+      std::string cond = lookupReg(op.operand(0), regs);
+      if (cond.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "scf.condition operand has no assigned register";
+        return false;
+      }
+      if (isArm)
+        os << "    cbz " << cond << ", .Lwhile_end_" << loopId << "\n";
+      else
+        os << "    beqz " << cond << ", .Lwhile_end_" << loopId << "\n";
+      continue;
+    }
+
+    if (opname == "affine.yield") {
+      Operation *parentFor = op.getBlock()->getRegion()->getParent();
+      if (!parentFor || parentFor->name() != "affine.for") continue;
+      int loopId = loopOps[parentFor];
+      std::string step = lookupReg(parentFor->operand(2), regs);
+      std::string iv = lookupReg(parentFor->getRegions()[0]->getBlocks()[0]->args()[0]->value(), regs);
+
+      if (isArm) {
+        os << "    add " << iv << ", " << iv << ", " << step << "\n";
+        os << "    b .Lloop_cond_" << loopId << "\n";
+        os << ".Lloop_end_" << loopId << ":\n";
+      } else {
+        os << "    addw " << iv << ", " << iv << ", " << step << "\n";
+        os << "    j .Lloop_cond_" << loopId << "\n";
+        os << ".Lloop_end_" << loopId << ":\n";
+      }
+      continue;
+    }
+
+    if (opname == "sysy.continue" || opname == "sysy.break") {
+      Operation *loop = nullptr;
+      Block *currBlock = op.getBlock();
+      while (currBlock && !loop) {
+        Region *region = currBlock->getRegion();
+        Operation *parent = region ? region->getParent() : nullptr;
+        if (!parent)
+          break;
+        if (parent->name() == "scf.while" || parent->name() == "affine.for") {
+          loop = parent;
+          break;
+        }
+        currBlock = parent->getBlock();
+      }
+      if (!loop || loopOps.count(loop) == 0) {
+        stats.unsupportedOps++;
+        stats.error = opname + " without enclosing lowered loop";
+        return false;
+      }
+      int loopId = loopOps[loop];
+      const bool isContinue = opname == "sysy.continue";
+      if (loop->name() == "affine.for") {
+        os << "    " << (isArm ? "b" : "j") << " .Lloop_"
+           << (isContinue ? "cond_" : "end_") << loopId << "\n";
+      } else {
+        os << "    " << (isArm ? "b" : "j") << " .Lwhile_"
+           << (isContinue ? "cond_" : "end_") << loopId << "\n";
+      }
+      continue;
+    }
+
+    if (opname == "rv_machine.cmp" || opname == "arm_machine.cmp" ||
+        opname == "rv_machine.fcmp" || opname == "arm_machine.fcmp") {
+      std::string lhs = lookupReg(op.operand(0), regs);
+      std::string rhs = lookupReg(op.operand(1), regs);
+      std::string dst = isArm ? ("w" + std::to_string(nextReg++ % 5 + 9))
+                              : ("t" + std::to_string(nextReg++ % 7));
+      regs[valueKey(op.result())] = dst;
+
+      std::string pred = symbolAttr(op.attr("predicate"));
+
+      if (opname == "rv_machine.fcmp") {
+        if (pred == "lt") {
+          os << "    flt.s " << dst << ", " << lhs << ", " << rhs << "\n";
+        } else if (pred == "le") {
+          os << "    fle.s " << dst << ", " << lhs << ", " << rhs << "\n";
+        } else if (pred == "eq") {
+          os << "    feq.s " << dst << ", " << lhs << ", " << rhs << "\n";
+        } else {
+          os << "    feq.s " << dst << ", " << lhs << ", " << rhs << "\n";
+          os << "    xori " << dst << ", " << dst << ", 1\n";
+        }
+      } else if (opname == "arm_machine.fcmp") {
+        os << "    fcmp " << lhs << ", " << rhs << "\n";
+        os << "    cset " << dst << ", " << pred << "\n";
+      } else if (isArm) {
+        os << "    cmp " << lhs << ", " << rhs << "\n";
+        os << "    cset " << dst << ", " << pred << "\n";
+      } else {
+        if (pred == "lt") {
+          os << "    slt " << dst << ", " << lhs << ", " << rhs << "\n";
+        } else if (pred == "le") {
+          os << "    slt " << dst << ", " << rhs << ", " << lhs << "\n";
+          os << "    xori " << dst << ", " << dst << ", 1\n";
+        } else if (pred == "eq") {
+          os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
+          os << "    seqz " << dst << ", " << dst << "\n";
+        } else {
+          os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
+          os << "    snez " << dst << ", " << dst << "\n";
+        }
+      }
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "scf.if") {
+      std::string cond = lookupReg(op.operand(0), regs);
+      static int nextIfId = 0;
+      int ifId = ++nextIfId;
+      loopOps[&op] = ifId;
+
+      if (isArm) {
+        os << "    cbz " << cond << ", ." << (op.getRegions().size() > 1 ? "Lelse_" : "Lendif_") << ifId << "\n";
+      } else {
+        os << "    beqz " << cond << ", ." << (op.getRegions().size() > 1 ? "Lelse_" : "Lendif_") << ifId << "\n";
+      }
+      continue;
+    }
+
+    if (opname == "scf.yield") {
+      Region *region = op.getBlock() ? op.getBlock()->getRegion() : nullptr;
+      Operation *parent = region ? region->getParent() : nullptr;
+      if (parent && parent->name() == "scf.if") {
+        int ifId = loopOps[parent];
+        bool thenRegion = !parent->getRegions().empty() && parent->getRegions()[0].get() == region;
+        bool hasElse = parent->getRegions().size() > 1;
+        if (thenRegion && hasElse) {
+          os << "    " << (isArm ? "b" : "j") << " .Lendif_" << ifId << "\n";
+          os << ".Lelse_" << ifId << ":\n";
+        } else {
+          os << ".Lendif_" << ifId << ":\n";
+        }
+        continue;
+      }
+      if (parent && parent->name() == "scf.while") {
+        int loopId = loopOps[parent];
+        os << "    " << (isArm ? "b" : "j") << " .Lwhile_cond_" << loopId << "\n";
+        os << ".Lwhile_end_" << loopId << ":\n";
+        continue;
+      }
+      continue;
+    }
 
     stats.unsupportedOps++;
     stats.error = "unsupported native asm op: " + opname;
     return false;
   }
 
-  return stats.returns > 0;
+  if (stats.returns == returnsBefore) {
+    if (frameBytes > 0) {
+      if (isArm)
+        os << "    add sp, sp, #" << frameBytes << "\n";
+      else
+        os << "    addi sp, sp, " << frameBytes << "\n";
+    }
+    os << "    ret\n";
+    stats.returns++;
+  }
+  return true;
 }
 
 } // namespace
@@ -1145,12 +2040,36 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     return false;
   }
 
+  std::map<std::string, std::string> globalLabels;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
+      continue;
+    std::string name = symbolAttr(op->attr("symbol"));
+    if (name.empty())
+      name = symbolAttr(op->attr("sym_name"));
+    std::string label = ".Lglob_" + sanitizeLabel(name);
+    globalLabels[valueKey(op->result())] = label;
+  }
+
+  if (!globalLabels.empty()) {
+    os << "    .bss\n";
+    for (auto *op : walk(module)) {
+      if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
+        continue;
+      auto it = globalLabels.find(valueKey(op->result()));
+      if (it == globalLabels.end())
+        continue;
+      os << "    .align 3\n" << it->second << ":\n";
+      os << "    .zero " << memrefAllocationBytes(op->resultType()) << "\n";
+    }
+  }
+
   for (auto *op : walk(module)) {
     if (!op || op->isErased())
       continue;
     if (op->name() == "sysy.func") {
       stats.functions++;
-      if (!emitFunctionAssembly(*op, target, os, stats))
+      if (!emitFunctionAssembly(*op, target, os, stats, globalLabels))
         return false;
     }
   }
@@ -1159,289 +2078,6 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     stats.error = "no self-MLIR functions emitted";
   return stats.emitted;
 }
-
-namespace {
-
-Type mapHIRType(Context &ctx, sys::hir::TypeKind type) {
-  switch (type) {
-  case sys::hir::TypeKind::Int:
-    return ctx.i(32);
-  case sys::hir::TypeKind::Float:
-    return ctx.f(32);
-  case sys::hir::TypeKind::Void:
-    return ctx.noneType();
-  case sys::hir::TypeKind::Pointer:
-  case sys::hir::TypeKind::Array:
-    return ctx.memref({-1}, ctx.i(32));
-  case sys::hir::TypeKind::Function:
-    return ctx.function({}, {});
-  case sys::hir::TypeKind::Unknown:
-    return ctx.i(32);
-  }
-  return ctx.i(32);
-}
-
-std::string arithOpName(const sys::hir::Op *op) {
-  const bool isFloat = op && op->type == sys::hir::TypeKind::Float;
-  const std::string sym = op ? op->symbol : "";
-  if (sym == "+") return isFloat ? "arith.addf" : "arith.addi";
-  if (sym == "-") {
-    if (op && op->children.size() == 1)
-      return isFloat ? "arith.negf" : "arith.negi";
-    return isFloat ? "arith.subf" : "arith.subi";
-  }
-  if (sym == "*") return isFloat ? "arith.mulf" : "arith.muli";
-  if (sym == "/") return isFloat ? "arith.divf" : "arith.divi";
-  if (sym == "%") return "arith.remi";
-  if (sym == "&&") return "arith.andi";
-  if (sym == "||") return "arith.ori";
-  if (sym == "!") return "arith.noti";
-  if (sym == "i2f") return "arith.sitofp";
-  if (sym == "f2i") return "arith.fptosi";
-  return isFloat ? "arith.unknownf" : "arith.unknowni";
-}
-
-std::string cmpPredicate(const std::string &sym) {
-  if (sym == "==") return "eq";
-  if (sym == "!=") return "ne";
-  if (sym == "<=") return "sle";
-  if (sym == "<") return "slt";
-  return sym.empty() ? "unknown" : sym;
-}
-
-Location locFor(Context &ctx, const sys::hir::Op *op) {
-  // The current HIR does not retain source spans, so every production import
-  // still receives an explicit location object instead of a missing loc.
-  if (!op || !op->origin)
-    return ctx.unknownLoc();
-  return ctx.loc("sysy", 0, 0);
-}
-
-int countHIR(const sys::hir::Op *op) {
-  if (!op)
-    return 0;
-  int total = 1;
-  for (const auto &child : op->children)
-    total += countHIR(child.get());
-  return total;
-}
-
-class HIRImporter {
-  Context &ctx;
-
-  static bool blockEndsWithTerminator(const Block &block) {
-    return !block.ops().empty() && block.ops().back()->isTerminator();
-  }
-
-  Value materializeUnknown(Builder &builder, const sys::hir::Op *op) {
-    auto type = mapHIRType(ctx, op ? op->type : sys::hir::TypeKind::Int);
-    auto &unknown = builder.create("sysy.unknown_value", {}, {type}, {},
-                                   locFor(ctx, op));
-    return unknown.result();
-  }
-
-  Value emitExpr(const sys::hir::Op *op, Builder &builder) {
-    if (!op)
-      return materializeUnknown(builder, op);
-
-    switch (op->kind) {
-    case sys::hir::OpKind::ConstInt: {
-      auto &constant = builder.create(
-          "arith.constant", {}, {ctx.i(32)},
-          {{"value", ctx.integerAttr(op->hasIntValue ? op->intValue : 0, ctx.i(32))}},
-          locFor(ctx, op));
-      return constant.result();
-    }
-    case sys::hir::OpKind::ConstFloat: {
-      auto &constant = builder.create(
-          "arith.constant", {}, {ctx.f(32)},
-          {{"value", ctx.stringAttr(op->hasFloatValue ? std::to_string(op->floatValue) : "0.0")}},
-          locFor(ctx, op));
-      return constant.result();
-    }
-    case sys::hir::OpKind::Load: {
-      std::vector<Value> indices;
-      for (const auto &child : op->children)
-        indices.push_back(emitExpr(child.get(), builder));
-      auto attrs = std::map<std::string, Attribute>{{"symbol", ctx.stringAttr(op->symbol)}};
-      auto &load = builder.create("memref.load", indices, {mapHIRType(ctx, op->type)},
-                                  attrs, locFor(ctx, op));
-      return load.result();
-    }
-    case sys::hir::OpKind::Arith: {
-      std::vector<Value> operands;
-      for (const auto &child : op->children)
-        operands.push_back(emitExpr(child.get(), builder));
-      auto &arith = builder.create(arithOpName(op), operands,
-                                   {mapHIRType(ctx, op->type)}, {},
-                                   locFor(ctx, op));
-      return arith.result();
-    }
-    case sys::hir::OpKind::Cmp: {
-      std::vector<Value> operands;
-      for (const auto &child : op->children)
-        operands.push_back(emitExpr(child.get(), builder));
-      auto &cmp = builder.create(
-          "arith.cmpi", operands, {ctx.i(32)},
-          {{"predicate", ctx.stringAttr(cmpPredicate(op->symbol))}},
-          locFor(ctx, op));
-      return cmp.result();
-    }
-    case sys::hir::OpKind::Call: {
-      std::vector<Value> operands;
-      for (const auto &child : op->children)
-        operands.push_back(emitExpr(child.get(), builder));
-      std::vector<Type> results;
-      if (op->type != sys::hir::TypeKind::Void)
-        results.push_back(mapHIRType(ctx, op->type));
-      auto &call = builder.create("sysy.call", operands, results,
-                                  {{"callee", ctx.stringAttr(op->symbol)}},
-                                  locFor(ctx, op));
-      return call.resultCount() ? call.result() : materializeUnknown(builder, op);
-    }
-    default:
-      emitStmt(op, builder);
-      return materializeUnknown(builder, op);
-    }
-  }
-
-  void emitRegionFromBlock(const sys::hir::Op *op, Region &region) {
-    auto &block = region.addBlock();
-    Builder nested(ctx, &block);
-    if (op && op->kind == sys::hir::OpKind::Block) {
-      for (const auto &child : op->children)
-        emitStmt(child.get(), nested);
-    } else if (op) {
-      emitStmt(op, nested);
-    }
-    if (!blockEndsWithTerminator(block))
-      nested.create("scf.yield", {}, {}, {}, locFor(ctx, op));
-  }
-
-  void emitFunc(const sys::hir::Op *op, Builder &builder) {
-    auto fnType = ctx.function({}, op && op->type != sys::hir::TypeKind::Void
-                                     ? std::vector<Type>{mapHIRType(ctx, op->type)}
-                                     : std::vector<Type>{});
-    auto &func = builder.create(
-        "sysy.func", {}, {},
-        {{"sym_name", ctx.stringAttr(op ? op->symbol : "")},
-         {"type", ctx.stringAttr(fnType.str())}},
-        locFor(ctx, op), 1);
-    auto &entry = func.getRegions()[0]->addBlock();
-    if (op && op->origin) {
-      if (auto *fn = dyn_cast<FnDeclNode>(op->origin)) {
-        for (const auto &argName : fn->args)
-          entry.addArgument(ctx.i(32), locFor(ctx, op), argName);
-      }
-    }
-    Builder bodyBuilder(ctx, &entry);
-    if (op && !op->children.empty())
-      emitStmt(op->children[0].get(), bodyBuilder);
-    if (!blockEndsWithTerminator(entry))
-      bodyBuilder.create("scf.yield", {}, {}, {}, locFor(ctx, op));
-  }
-
-public:
-  explicit HIRImporter(Context &ctx): ctx(ctx) {}
-
-  void emitStmt(const sys::hir::Op *op, Builder &builder) {
-    if (!op)
-      return;
-
-    switch (op->kind) {
-    case sys::hir::OpKind::Module:
-      for (const auto &child : op->children)
-        emitStmt(child.get(), builder);
-      return;
-    case sys::hir::OpKind::Func:
-      emitFunc(op, builder);
-      return;
-    case sys::hir::OpKind::Block:
-      for (const auto &child : op->children)
-        emitStmt(child.get(), builder);
-      return;
-    case sys::hir::OpKind::VarDecl: {
-      std::vector<Value> operands;
-      if (!op->children.empty() && op->children[0])
-        operands.push_back(emitExpr(op->children[0].get(), builder));
-      std::map<std::string, Attribute> attrs{{"symbol", ctx.stringAttr(op->symbol)}};
-      if (!op->arrayDims.empty()) {
-        std::string dims;
-        for (size_t i = 0; i < op->arrayDims.size(); i++) {
-          if (i)
-            dims += "x";
-          dims += std::to_string(op->arrayDims[i]);
-        }
-        attrs["shape"] = ctx.stringAttr(dims);
-      }
-      builder.create("memref.alloca", operands,
-                     {mapHIRType(ctx, op->type)}, attrs, locFor(ctx, op));
-      return;
-    }
-    case sys::hir::OpKind::Store: {
-      std::vector<Value> operands;
-      for (const auto &child : op->children)
-        operands.push_back(emitExpr(child.get(), builder));
-      builder.create("memref.store", operands, {},
-                     {{"symbol", ctx.stringAttr(op->symbol)}}, locFor(ctx, op));
-      return;
-    }
-    case sys::hir::OpKind::If: {
-      Value cond = op->children.empty() ? materializeUnknown(builder, op)
-                                        : emitExpr(op->children[0].get(), builder);
-      auto &ifOp = builder.create("scf.if", {cond}, {}, {}, locFor(ctx, op),
-                                  op->children.size() >= 3 ? 2 : 1);
-      if (op->children.size() >= 2)
-        emitRegionFromBlock(op->children[1].get(), *ifOp.getRegions()[0]);
-      if (op->children.size() >= 3)
-        emitRegionFromBlock(op->children[2].get(), *ifOp.getRegions()[1]);
-      return;
-    }
-    case sys::hir::OpKind::While: {
-      Value cond = op->children.empty() ? materializeUnknown(builder, op)
-                                        : emitExpr(op->children[0].get(), builder);
-      auto &whileOp = builder.create("scf.while", {cond}, {}, {}, locFor(ctx, op), 1);
-      if (op->children.size() >= 2)
-        emitRegionFromBlock(op->children[1].get(), *whileOp.getRegions()[0]);
-      return;
-    }
-    case sys::hir::OpKind::For: {
-      std::vector<Value> operands;
-      for (size_t i = 0; i < op->children.size() && i < 3; i++)
-        operands.push_back(emitExpr(op->children[i].get(), builder));
-      auto &forOp = builder.create("scf.for", operands, {}, {}, locFor(ctx, op), 1);
-      if (op->children.size() >= 4)
-        emitRegionFromBlock(op->children[3].get(), *forOp.getRegions()[0]);
-      return;
-    }
-    case sys::hir::OpKind::Return: {
-      std::vector<Value> operands;
-      for (const auto &child : op->children)
-        if (child)
-          operands.push_back(emitExpr(child.get(), builder));
-      builder.create("sysy.return", operands, {}, {}, locFor(ctx, op));
-      return;
-    }
-    case sys::hir::OpKind::Break:
-      builder.create("sysy.break", {}, {}, {}, locFor(ctx, op));
-      return;
-    case sys::hir::OpKind::Continue:
-      builder.create("sysy.continue", {}, {}, {}, locFor(ctx, op));
-      return;
-    case sys::hir::OpKind::ConstInt:
-    case sys::hir::OpKind::ConstFloat:
-    case sys::hir::OpKind::Load:
-    case sys::hir::OpKind::Arith:
-    case sys::hir::OpKind::Cmp:
-    case sys::hir::OpKind::Call:
-      (void) emitExpr(op, builder);
-      return;
-    case sys::hir::OpKind::Unknown:
-      builder.create("sysy.unknown", {}, {}, {}, locFor(ctx, op));
-      return;
-    }
-  }
-};
 
 std::vector<ConversionPattern> targetPatterns(const std::string &target) {
   const std::string prefix = target == "arm" ? "arm_machine." : "rv_machine.";
@@ -1466,6 +2102,9 @@ std::vector<ConversionPattern> targetPatterns(const std::string &target) {
       {"arith.sitofp", prefix + "scvtf"},
       {"arith.fptosi", prefix + "fcvtzs"},
       {"arith.select", prefix + "select"},
+      {"vector.transfer_read", "arm_machine.ld1"},
+      {"vector.transfer_write", "arm_machine.st1"},
+      {"vector.splat", "arm_machine.dup"},
     };
   }
   return {
@@ -1488,6 +2127,9 @@ std::vector<ConversionPattern> targetPatterns(const std::string &target) {
     {"arith.sitofp", prefix + "fcvt_s_w"},
     {"arith.fptosi", prefix + "fcvt_w_s"},
     {"arith.select", prefix + "select"},
+    {"vector.transfer_read", "rv_machine.vle32"},
+    {"vector.transfer_write", "rv_machine.vse32"},
+    {"vector.splat", "rv_machine.vfmv"},
   };
 }
 
@@ -1504,79 +2146,386 @@ ConversionTarget productionTarget(const std::string &target) {
   return convTarget;
 }
 
-} // namespace
+void runGlobalOpt(Module &module) {
+  std::vector<Operation*> globals;
+  for (auto *op : walk(module)) {
+    if (op && !op->isErased() && op->name() == "sysy.global") {
+      globals.push_back(op);
+    }
+  }
+
+  for (auto *global : globals) {
+    std::string gName = symbolAttr(global->attr("symbol"));
+    if (gName.empty())
+      gName = symbolAttr(global->attr("sym_name"));
+    if (gName.empty())
+      continue;
+
+    std::vector<Operation*> accesses;
+    std::set<Operation*> functions;
+    for (auto *op : walk(module)) {
+      if (!op || op->isErased())
+        continue;
+      if (op->name() == "sysy.load" || op->name() == "sysy.store" ||
+          op->name() == "memref.load" || op->name() == "memref.store") {
+        if (symbolAttr(op->attr("symbol")) == gName) {
+          accesses.push_back(op);
+          Block *currBlock = op->getBlock();
+          while (currBlock) {
+            Region *r = currBlock->getRegion();
+            if (!r)
+              break;
+            Operation *parentOp = r->getParent();
+            if (!parentOp)
+              break;
+            if (parentOp->name() == "sysy.func") {
+              functions.insert(parentOp);
+              break;
+            }
+            currBlock = parentOp->getBlock();
+          }
+        }
+      }
+    }
+
+    if (accesses.empty()) {
+      global->markErased();
+      continue;
+    }
+
+    if (functions.size() == 1) {
+      Operation *func = *functions.begin();
+      auto &regions = func->getRegions();
+      if (!regions.empty() && !regions[0]->getBlocks().empty()) {
+        auto &entry = *regions[0]->getBlocks()[0];
+        Type storageType = global->resultType();
+        auto &slot = entry.insertOperation(0, std::make_unique<Operation>(
+            "sysy.alloca", std::vector<Value>{}, std::vector<Type>{storageType},
+            std::map<std::string, Attribute>{{"symbol", module.context().stringAttr(gName)}},
+            global->loc()));
+
+        for (auto *op : accesses) {
+          if (op->operandCount() > 0) {
+            op->setOperand(0, slot.result());
+          } else {
+            op->addOperand(slot.result());
+          }
+        }
+        global->markErased();
+      }
+    }
+  }
+}
+
+static std::string memoryLocationKey(Operation &op) {
+  std::string sym = symbolAttr(op.attr("symbol"));
+  if (sym.empty())
+    sym = symbolAttr(op.attr("sym_name"));
+  if (sym.empty())
+    return "";
+  std::string key = sym;
+  if (op.name() == "memref.load") {
+    for (int i = 1; i < op.operandCount(); i++) {
+      key += "," + op.operand(i).printName();
+    }
+  } else if (op.name() == "memref.store") {
+    for (int i = 2; i < op.operandCount(); i++) {
+      key += "," + op.operand(i).printName();
+    }
+  }
+  return key;
+}
+
+static void runBlockMemoryOpt(Module &module, Block &block) {
+  std::map<std::string, Value> activeStores;
+  std::map<std::string, Operation*> activeStoreOps;
+
+  for (auto &owned : block.ops()) {
+    auto &op = *owned;
+    if (op.isErased())
+      continue;
+
+    if (op.name() == "sysy.call") {
+      std::vector<std::string> keysToInvalidate;
+      for (const auto &kv : activeStores) {
+        keysToInvalidate.push_back(kv.first);
+      }
+      for (const auto &k : keysToInvalidate) {
+        activeStores.erase(k);
+        activeStoreOps.erase(k);
+      }
+      continue;
+    }
+
+    if (op.name() == "sysy.store" || op.name() == "memref.store") {
+      std::string key = memoryLocationKey(op);
+      if (key.empty())
+        continue;
+
+      std::string baseSym = symbolAttr(op.attr("symbol"));
+      if (baseSym.empty())
+        baseSym = symbolAttr(op.attr("sym_name"));
+      std::vector<std::string> keysToInvalidate;
+      for (const auto &kv : activeStores) {
+        if (kv.first != key && !baseSym.empty() && kv.first.find(baseSym) == 0) {
+          keysToInvalidate.push_back(kv.first);
+        }
+      }
+      for (const auto &k : keysToInvalidate) {
+        activeStores.erase(k);
+        activeStoreOps.erase(k);
+      }
+
+      if (activeStores.count(key) > 0) {
+        auto *prevOp = activeStoreOps[key];
+        if (prevOp) {
+          prevOp->markErased();
+        }
+      }
+
+      Value storedVal = op.operand(0);
+      activeStores[key] = storedVal;
+      activeStoreOps[key] = &op;
+    }
+
+    if (op.name() == "sysy.load" || op.name() == "memref.load") {
+      std::string key = memoryLocationKey(op);
+      if (key.empty())
+        continue;
+
+      if (activeStores.count(key) > 0) {
+        Value storedVal = activeStores[key];
+        replaceAllUses(module, op.result(), storedVal);
+        op.markErased();
+      }
+    }
+  }
+}
+
+void runMemoryOpt(Module &module) {
+  for (auto *op : walk(module)) {
+    if (op && !op->isErased() && op->name() == "sysy.func") {
+      for (auto &region : op->getRegions()) {
+        for (auto &block : region->getBlocks()) {
+          runBlockMemoryOpt(module, *block);
+        }
+      }
+    }
+  }
+  eraseMarked(module);
+}
+
+void runLoopVectorization(Module &module) {
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "scf.while" || op->name() == "scf.for" || op->name() == "affine.for") {
+      Block *body = nullptr;
+      if (!op->getRegions().empty() && !op->getRegions()[0]->getBlocks().empty()) {
+        body = op->getRegions()[0]->getBlocks()[0].get();
+      }
+      if (!body || body->ops().empty())
+        continue;
+
+      std::vector<Operation*> loads;
+      std::vector<Operation*> stores;
+      std::vector<Operation*> ariths;
+
+      for (auto &owned : body->ops()) {
+        auto *child = owned.get();
+        if (!child || child->isErased())
+          continue;
+        if (child->name() == "memref.store") {
+          stores.push_back(child);
+        }
+      }
+
+      if (stores.empty())
+        continue;
+
+      std::set<std::string> activeValNames;
+      for (auto *storeOp : stores) {
+        if (storeOp->operandCount() >= 1) {
+          activeValNames.insert(storeOp->operand(0).printName());
+        }
+      }
+
+      for (int i = (int) body->ops().size() - 1; i >= 0; i--) {
+        auto *child = body->ops()[i].get();
+        if (!child || child->isErased())
+          continue;
+        if (child->resultCount() > 0) {
+          std::string resName = child->result().printName();
+          if (activeValNames.count(resName) > 0) {
+            if (child->name() == "memref.load") {
+              loads.push_back(child);
+            } else if (child->name() == "arith.addi" || child->name() == "arith.addf" ||
+                       child->name() == "arith.subi" || child->name() == "arith.subf" ||
+                       child->name() == "rv_machine.addw" || child->name() == "arm_machine.add" ||
+                       child->name() == "arith.muli" || child->name() == "arith.mulf") {
+              ariths.push_back(child);
+              for (int opIdx = 0; opIdx < child->operandCount(); opIdx++) {
+                activeValNames.insert(child->operand(opIdx).printName());
+              }
+            }
+          }
+        }
+      }
+
+      std::reverse(loads.begin(), loads.end());
+      std::reverse(ariths.begin(), ariths.end());
+
+      if (loads.empty())
+        continue;
+
+      bool ok = true;
+      for (auto *l : loads) {
+        if (l->operandCount() < 2) { ok = false; break; }
+      }
+      for (auto *s : stores) {
+        if (s->operandCount() < 3) { ok = false; break; }
+      }
+      if (!ok)
+        continue;
+
+      bool hasRAW = false;
+      for (auto *storeOp : stores) {
+        std::string storeBase = symbolAttr(storeOp->attr("symbol"));
+        if (storeBase.empty())
+          storeBase = symbolAttr(storeOp->attr("sym_name"));
+        for (auto *loadOp : loads) {
+          std::string loadBase = symbolAttr(loadOp->attr("symbol"));
+          if (loadBase.empty())
+            loadBase = symbolAttr(loadOp->attr("sym_name"));
+          if (storeBase == loadBase) {
+            if (storeOp->operandCount() >= 3 && loadOp->operandCount() >= 2) {
+              if (storeOp->operand(2).printName() != loadOp->operand(1).printName()) {
+                hasRAW = true;
+                break;
+              }
+            } else {
+              hasRAW = true;
+              break;
+            }
+          }
+        }
+        if (hasRAW)
+          break;
+      }
+      if (hasRAW)
+        continue;
+
+      std::size_t insertIdx = body->ops().size() - 1;
+
+      int64_t lanes = 4;
+      Type elemType = loads[0]->resultType();
+      Type vecType = module.context().vector(elemType, lanes);
+
+      std::map<std::string, Value> vecLoads;
+      for (auto *loadOp : loads) {
+        Value base = loadOp->operand(0);
+        Value index = loadOp->operand(1);
+        std::string loadSym = symbolAttr(loadOp->attr("symbol"));
+        if (loadSym.empty())
+          loadSym = symbolAttr(loadOp->attr("sym_name"));
+        auto &vread = body->insertOperation(insertIdx++, std::make_unique<Operation>(
+            "vector.transfer_read", std::vector<Value>{base, index}, std::vector<Type>{vecType},
+            std::map<std::string, Attribute>{{"symbol", module.context().stringAttr(loadSym)}},
+            loadOp->loc()));
+        vecLoads[loadOp->result().printName()] = vread.result();
+      }
+
+      std::map<std::string, Value> vecAriths;
+      for (auto *arithOp : ariths) {
+        std::vector<Value> vecOperands;
+        for (int i = 0; i < arithOp->operandCount(); i++) {
+          Value operand = arithOp->operand(i);
+          if (vecLoads.count(operand.printName())) {
+            vecOperands.push_back(vecLoads[operand.printName()]);
+          } else if (vecAriths.count(operand.printName())) {
+            vecOperands.push_back(vecAriths[operand.printName()]);
+          } else {
+            auto &splat = body->insertOperation(insertIdx++, std::make_unique<Operation>(
+                "vector.splat", std::vector<Value>{operand}, std::vector<Type>{vecType},
+                std::map<std::string, Attribute>{}, arithOp->loc()));
+            vecOperands.push_back(splat.result());
+          }
+        }
+        auto &varith = body->insertOperation(insertIdx++, std::make_unique<Operation>(
+            arithOp->name(), vecOperands, std::vector<Type>{vecType},
+            arithOp->attrs(), arithOp->loc()));
+        vecAriths[arithOp->result().printName()] = varith.result();
+      }
+
+      for (auto *storeOp : stores) {
+        Value val = storeOp->operand(0);
+        Value base = storeOp->operand(1);
+        Value index = storeOp->operand(2);
+        std::string storeSym = symbolAttr(storeOp->attr("symbol"));
+        if (storeSym.empty())
+          storeSym = symbolAttr(storeOp->attr("sym_name"));
+
+        Value vecVal;
+        if (vecLoads.count(val.printName())) {
+          vecVal = vecLoads[val.printName()];
+        } else if (vecAriths.count(val.printName())) {
+          vecVal = vecAriths[val.printName()];
+        } else {
+          auto &splat = body->insertOperation(insertIdx++, std::make_unique<Operation>(
+              "vector.splat", std::vector<Value>{val}, std::vector<Type>{vecType},
+              std::map<std::string, Attribute>{}, storeOp->loc()));
+          vecVal = splat.result();
+        }
+
+        body->insertOperation(insertIdx++, std::make_unique<Operation>(
+            "vector.transfer_write", std::vector<Value>{vecVal, base, index}, std::vector<Type>{},
+            std::map<std::string, Attribute>{{"symbol", module.context().stringAttr(storeSym)}},
+            storeOp->loc()));
+      }
+
+      for (auto &owned : body->ops()) {
+        auto *child = owned.get();
+        if (!child || child->isErased())
+          continue;
+        if ((child->name() == "rv_machine.li" || child->name() == "arith.constant" || child->name() == "arm_machine.mov") &&
+            parseIntegerAttr(child->attr("value")) == 1) {
+          child->setAttr("value", module.context().integerAttr(lanes, module.context().i(32)));
+        }
+      }
+
+      for (auto *opToErase : loads) {
+        for (int i = 0; i < opToErase->operandCount(); i++) {
+          opToErase->setOperand(i, Value());
+        }
+        opToErase->markErased();
+      }
+      for (auto *opToErase : ariths) {
+        for (int i = 0; i < opToErase->operandCount(); i++) {
+          opToErase->setOperand(i, Value());
+        }
+        opToErase->markErased();
+      }
+      for (auto *opToErase : stores) {
+        for (int i = 0; i < opToErase->operandCount(); i++) {
+          opToErase->setOperand(i, Value());
+        }
+        opToErase->markErased();
+      }
+    }
+  }
+  eraseMarked(module);
+}
 
 static const char *kCoreRules =
   "rule fold_addi_zero arith.addi addi-zero 10\n"
   "rule fold_muli_one arith.muli muli-one 9\n"
-  "rule fold_select_same arith.select select-same 8\n";
+  "rule fold_select_same arith.select select-same 8\n"
+  "rule fold_subi_same arith.subi subi-same 12\n"
+  "rule fold_muli_zero arith.muli muli-zero 11\n"
+  "rule fold_andi_same arith.andi andi-same 7\n"
+  "rule fold_ori_same arith.ori ori-same 6\n"
+  "rule fold_double_noti arith.noti double-noti 15\n";
 
-std::unique_ptr<Module> lowerFromHIR(Context &ctx, const sys::hir::Module &hirModule,
-                                     const std::string &target,
-                                     ProductionStats *stats) {
-  if (stats)
-    stats->hirOps = countHIR(hirModule.root.get());
-  auto module = std::make_unique<Module>(ctx);
-  auto &top = module->body().getBlocks()[0];
-  Builder builder(ctx, top.get());
-  (void) target;
-  HIRImporter importer(ctx);
-  if (hirModule.root)
-    importer.emitStmt(hirModule.root.get(), builder);
-  if (stats)
-    stats->mlirOpsBefore = (int) walk(*module).size();
-  return module;
-}
-
-bool runProductionGate(const sys::hir::Module &hirModule, const std::string &target,
-                       ProductionStats &stats, std::ostream *dump) {
-  stats = ProductionStats();
-  Context ctx;
-  auto module = lowerFromHIR(ctx, hirModule, target, &stats);
-  auto before = verify(*module);
-  stats.verifyBefore = before.ok;
-  if (!before.ok) {
-    stats.error = before.errors.empty() ? "self-MLIR verification failed before canonicalization"
-                                        : before.errors.front();
-    if (dump)
-      print(*module, *dump);
-    return false;
-  }
-
-  std::vector<std::string> parseErrors;
-  auto rules = parseDRR(kCoreRules, parseErrors);
-  if (!parseErrors.empty()) {
-    stats.error = parseErrors.front();
-    return false;
-  }
-  auto rewriteStats = applyGreedyPatterns(*module, rules);
-  stats.rewrites = rewriteStats.rewrites;
-
-  auto after = verify(*module);
-  stats.verifyAfter = after.ok;
-  if (!after.ok) {
-    stats.error = after.errors.empty() ? "self-MLIR verification failed after canonicalization"
-                                       : after.errors.front();
-    if (dump)
-      print(*module, *dump);
-    return false;
-  }
-
-  auto convStats = convertDialects(*module, productionTarget(target), targetPatterns(target));
-  stats.conversionVisited = convStats.visited;
-  stats.conversionLegal = convStats.legal;
-  stats.conversionConverted = convStats.converted;
-  stats.conversionFailed = convStats.failed;
-  stats.conversionRollbacks = convStats.rollbacks;
-  stats.mlirOpsAfter = (int) walk(*module).size();
-  if (dump)
-    print(*module, *dump);
-  if (convStats.failed) {
-    stats.error = "self-MLIR dialect conversion failed for target " + target;
-    return false;
-  }
-  return true;
-}
 
 static Module buildSample(Context &ctx) {
   Module module(ctx);

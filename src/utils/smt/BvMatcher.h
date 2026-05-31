@@ -3,13 +3,32 @@
 
 #include "BvExpr.h"
 #include <vector>
-#include "../Matcher.h"
+#include <map>
+#include <string>
 
 namespace smt {
 
-using sys::Expr;
-using sys::Atom;
-using sys::List;
+struct Expr {
+  int id;
+  Expr(int id): id(id) {}
+  virtual ~Expr() {}
+};
+
+struct Atom : Expr {
+  template<class T>
+  static bool classof(T *t) { return t->id == 1; }
+
+  std::string_view value;
+  Atom(std::string_view value): Expr(1), value(value) {}
+};
+
+struct List : Expr {
+  template<class T>
+  static bool classof(T *t) { return t->id == 2; }
+
+  std::vector<Expr*> elements;
+  List(): Expr(2) {}
+};
 
 class BvRule {
   std::map<std::string_view, BvExpr*> binding;

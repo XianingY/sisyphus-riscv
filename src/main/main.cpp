@@ -1,5 +1,5 @@
 #include "Options.h"
-#include "PipelineProfiles.h"
+
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -10,26 +10,9 @@
 #include <vector>
 
 #include "../frontend/FrontendFacade.h"
-#include "../cfg/CFGOps.h"
-#include "../cfg/HIRToCFG.h"
-#include "../cfg/CFGVerifier.h"
-#include "../cfg/CFGLegality.h"
-#include "../cfg/CFGToLegacy.h"
-#include "../hir/HIRBuilder.h"
-#include "../hir/HIRVerifier.h"
-#include "../hir/HIRCanonicalize.h"
-#include "../hir/HIRPolyhedral.h"
-#include "../pass/PassRegistry.h"
-#include "../ir/BlockArgumentBridge.h"
-#include "../ir/DialectConversion.h"
-#include "../ir/IRContext.h"
-#include "../ir/OpDescriptor.h"
-#include "../ir/Operation.h"
+
 #include "../mlir/ASTToMLIR.h"
 #include "../mlir/SelfMLIR.h"
-#include "../codegen/Ops.h"
-#include "../codegen/Attrs.h"
-#include "../opt/ScopedPassManager.h"
 #include "../utils/smt/SMT.h"
 #include "../parse/CompileError.h"
 
@@ -86,59 +69,7 @@ static int thinLinkOnly(const sys::Options &opts) {
   return 0;
 }
 
-static const char *legacyTypeName(sys::Value::Type type) {
-  switch (type) {
-  case sys::Value::unit: return "unit";
-  case sys::Value::i32: return "i32";
-  case sys::Value::i64: return "i64";
-  case sys::Value::f32: return "f32";
-  case sys::Value::i128: return "i128";
-  case sys::Value::f128: return "f128";
-  case sys::Value::vscale_i32: return "vscale_i32";
-  case sys::Value::vscale_f32: return "vscale_f32";
-  }
-  return "unknown";
-}
 
-static sys::ModuleOp *createOperationSampleModule() {
-  auto *module = new sys::ModuleOp();
-  auto *bb = module->createFirstBlock();
-  auto *one = new sys::IntOp({new sys::IntAttr(1)});
-  auto *two = new sys::IntOp({new sys::IntAttr(2)});
-  auto *add = new sys::AddIOp({one->getResult(), two->getResult()});
-  bb->insert(bb->end(), one);
-  bb->insert(bb->end(), two);
-  bb->insert(bb->end(), add);
-  return module;
-}
-
-static int runOperationDevActions(sys::ModuleOp *module, const sys::Options &opts) {
-  if (opts.verifyOperationBridge) {
-    if (!sys::ir::Operation::verifyModuleBridge(module, std::cout))
-      return 1;
-    if (!sys::ir::PhiToBlockArgumentBridge::roundTrip(module, std::cout))
-      return 1;
-  }
-  if (opts.dumpOperationIR)
-    sys::ir::Operation::dumpModule(module, std::cout);
-  if (!opts.runDialectConversion.empty()) {
-    if (opts.runDialectConversion == "legacy" ||
-        opts.runDialectConversion == "standard-scalar") {
-      auto stats = sys::ir::DialectConversionDriver::runLegacyDryRun(module, std::cout);
-      if (stats.failed)
-        return 1;
-    } else if (opts.runDialectConversion == "rollback-test") {
-      auto stats = sys::ir::DialectConversionDriver::runRollbackSelfTest(std::cout);
-      if (stats.rollbacks != 1)
-        return 1;
-    } else {
-      std::cerr << "error: unknown dialect conversion target '"
-                << opts.runDialectConversion << "'\n";
-      return 1;
-    }
-  }
-  return 0;
-}
 
 void removeDuplicates(std::vector<Atomic>& clause) {
   std::sort(clause.begin(), clause.end());
@@ -201,7 +132,7 @@ void bv(const sys::Options &opts) {
   assert(ctx.create(BvExpr::Var, "x") == ctx.create(BvExpr::Var, "x"));
 
   // Test: x = (x == 1) ? 2x : x + 1
-  // > unsat 
+  // > unsat
   if (true) {
     BvSolver solver(opts);
     BvExprContext ctx;
@@ -237,7 +168,7 @@ void bv(const sys::Options &opts) {
 
     infer(solver, _9);
   }
-  
+
   // Test: 7 / x = -2
   // > sat, x = -3
   // Note: very expensive, ~0.2s
@@ -289,35 +220,6 @@ int main(int argc, char **argv) {
   if (opts.dumpAnalysisCache)
     setenv("SISY_DUMP_ANALYSIS_CACHE", "1", 1);
 
-  if (opts.dumpOpDescriptors) {
-    std::string error;
-    if (!sys::ir::OpDescriptorTable::verify(&error)) {
-      std::cerr << "op descriptor verification failed: " << error << "\n";
-      return 1;
-    }
-    sys::ir::OpDescriptorTable::dump(std::cout);
-    return 0;
-  }
-
-  if (opts.dumpIRContext) {
-    sys::ir::IRContext::global().dump(std::cout);
-    return 0;
-  }
-
-  if (opts.dumpPassScopes) {
-    std::string error;
-    if (!sys::ScopedPassRegistry::verify(&error)) {
-      std::cerr << "scoped pass registry verification failed: " << error << "\n";
-      return 1;
-    }
-    sys::ScopedPassRegistry::dump(std::cout);
-    return 0;
-  }
-
-  if (opts.dumpDialectConversion) {
-    sys::ir::DialectConversionDriver::dumpStandardScalarLegality(std::cout);
-    return 0;
-  }
 
   if (opts.runSelfMLIRCoreTests)
     return sys::mlir::runCoreSelfTest(std::cout);
@@ -333,23 +235,7 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (opts.dumpBlockArguments) {
-    sys::ModuleOp module;
-    auto *bb = module.createFirstBlock();
-    auto &arg = bb->addArgument(sys::Value::i32, "iv");
-    std::cout << "[block-arg] count=" << bb->getArguments().size()
-              << " first=" << arg.name
-              << " index=" << arg.index
-              << " type=" << legacyTypeName(arg.type) << "\n";
-    return 0;
-  }
 
-  if (opts.inputFile.empty() &&
-      (opts.dumpOperationIR || opts.verifyOperationBridge ||
-       !opts.runDialectConversion.empty())) {
-    auto *sample = createOperationSampleModule();
-    return runOperationDevActions(sample, opts);
-  }
 
   // Test for submodules: bitvector SMT solver, and CDCL SAT solver.
   if (opts.bv) {
@@ -372,8 +258,6 @@ int main(int argc, char **argv) {
   }
 
   std::stringstream ss;
-  // Add a newline at the end.
-  // Single-line comments cannot terminate with EOF.
   ss << ifs.rdbuf() << "\n";
 
   sys::TypeContext ctx;
@@ -394,518 +278,58 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::unique_ptr<sys::CodeGen> cg;
-  std::unique_ptr<sys::ModuleOp> loweredModule;
-  std::unique_ptr<sys::hir::Module> hirModule;
-  std::unique_ptr<sys::cfg::Module> cfgModule;
+  sys::mlir::ProductionStats selfMLIRStats;
+  std::ostringstream dumpBuffer;
+  const std::string target = opts.arm ? "arm" : "riscv";
 
-  // Captured from the HIR polyhedral stage and forwarded into
-  // PipelineMetrics so selectPlan / appendCoreO1 can react to the
-  // outcome (e.g. skip a redundant SCEV+GVN cleanup when nothing fired).
-  sys::hir::PolyhedralStats hirPolyStats;
-  bool hirPolyRan = false;
+  sys::mlir::Context mlirCtx;
+  auto module = sys::mlir::runProductionGateFromAST(mlirCtx, *node, target, selfMLIRStats, &dumpBuffer);
 
-  auto runStage = [&](const char *stageName, auto &&fn) {
-    auto start = std::chrono::steady_clock::now();
-    fn();
-    if (opts.dumpPassTiming) {
-      auto end = std::chrono::steady_clock::now();
-      double ms = std::chrono::duration<double, std::milli>(end - start).count();
-      std::cerr << "[stage-timing] " << stageName << " : " << ms << " ms\n";
-    }
-  };
-  auto stageDumpPath = [&](const std::string &stage, const std::string &payload) {
-    auto path = "/tmp/sisyphus-" + stage + ".dump";
-    std::ofstream ofs(path);
-    ofs << payload;
-    return path;
-  };
-  auto failStage = [&](const std::string &stage, const std::vector<std::string> &errors, const std::string &payload) {
-    auto dumpPath = stageDumpPath(stage, payload);
-    std::cerr << "[stage-fail] file=" << opts.inputFile
-              << " stage=" << stage
-              << " dump=" << dumpPath << "\n";
-    for (const auto &e : errors)
-      std::cerr << "  - " << e << "\n";
-    std::exit(1);
-  };
+  if (!module) {
+    std::cerr << "[stage-fail] file=" << opts.inputFile << " stage=self-mlir-production\n";
+    std::cerr << "  - " << (selfMLIRStats.error.empty() ? "self-MLIR production gate failed" : selfMLIRStats.error) << "\n";
+    std::cerr << "dump:\n" << dumpBuffer.str() << "\n";
+    delete node;
+    return 1;
+  }
 
-  bool dumpHIR = opts.dumpHIR;
-  if (const char *env = std::getenv("SISY_DUMP_HIR"))
-    dumpHIR = dumpHIR || (env[0] && std::strcmp(env, "0") != 0);
-  bool dumpCFG = opts.dumpCFG;
-  if (const char *env = std::getenv("SISY_DUMP_CFG"))
-    dumpCFG = dumpCFG || (env[0] && std::strcmp(env, "0") != 0);
-  auto emitDialectReport = [&](const std::string &frontendPath, const std::vector<std::string> &reasons) {
-    if (opts.dialectFallbackReport.empty())
-      return;
+  if (opts.stats) {
+    std::cerr << "[self-mlir] target=" << target << " source=ast frontend_path=self-mlir failed=0\n";
+  }
 
-    std::ostringstream body;
-    body << "frontend_path=" << frontendPath << "\n";
-    body << "fallback_reason_codes=";
-    if (reasons.empty())
-      body << "none";
-    else {
-      for (size_t i = 0; i < reasons.size(); i++) {
-        if (i)
-          body << ",";
-        body << reasons[i];
-      }
-    }
-    body << "\n";
-    body << "force_dialect_codegen=" << (opts.forceDialectCodegen ? 1 : 0) << "\n";
-    body << "input_file=" << opts.inputFile << "\n";
+  if (getenv("SISY_DUMP_SELF_MLIR")) {
+    std::cerr << dumpBuffer.str();
+  }
 
-    if (opts.dialectFallbackReport == "stderr") {
-      std::istringstream iss(body.str());
-      std::string line;
-      while (std::getline(iss, line))
-        std::cerr << "[dialect-report] " << line << "\n";
-      return;
-    }
+  if (opts.emitIR) {
+    sys::mlir::print(*module, std::cerr);
+  }
 
-    std::ofstream ofs(opts.dialectFallbackReport);
-    ofs << body.str();
-  };
-  auto requiresLegacyFallback = [&](const sys::hir::Module &mod, std::vector<std::string> &reasons) {
-    reasons.clear();
-    std::unordered_set<std::string> seen;
-    std::vector<const sys::hir::Op*> stack;
-    if (mod.root)
-      stack.push_back(mod.root.get());
+  // (removed opts.noLink early exit)
 
-    while (!stack.empty()) {
-      auto *op = stack.back();
-      stack.pop_back();
-      if (!op)
-        continue;
+  sys::mlir::NativeAsmStats asmStats;
+  std::ostringstream asmBuffer;
+  bool asmOk = sys::mlir::emitNativeAssembly(*module, opts.arm ? "arm" : "riscv", asmBuffer, asmStats);
 
-      for (const auto &child : op->children)
-        if (child)
-          stack.push_back(child.get());
-    }
-    return !reasons.empty();
-  };
+  if (!asmOk) {
+    std::cerr << "[stage-fail] file=" << opts.inputFile << " stage=native-assembly\n";
+    std::cerr << "  - " << (asmStats.error.empty() ? "emitNativeAssembly failed" : asmStats.error) << "\n";
+    delete node;
+    return 1;
+  }
 
-  std::string frontendPath = "self-mlir";
-  std::vector<std::string> fallbackReasons;
-  if (opts.useLegacyCodegen) {
-    frontendPath = "legacy-forced";
-    emitDialectReport(frontendPath, fallbackReasons);
-    cg = std::make_unique<sys::CodeGen>(node);
+  if (opts.outputFile.empty()) {
+    std::cout << asmBuffer.str();
   } else {
-    runStage("hir.build", [&]() {
-      sys::hir::Builder builder;
-      hirModule = std::make_unique<sys::hir::Module>(builder.build(node));
-    });
-    if (dumpHIR) {
-      std::cerr << "===== HIR =====\n";
-      sys::hir::dump(*hirModule, std::cerr);
+    std::ofstream ofs(opts.outputFile);
+    if (!ofs) {
+      std::cerr << "cannot open output file: " << opts.outputFile << "\n";
+      delete node;
+      return 1;
     }
-
-    if (opts.verifyHIR) {
-      runStage("hir.verify.pre", [&]() {
-        std::vector<std::string> errors;
-        if (!sys::hir::verify(*hirModule, errors)) {
-          std::ostringstream os;
-          sys::hir::dump(*hirModule, os);
-          failStage("hir-verify-pre", errors, os.str());
-        }
-      });
-    }
-
-    runStage("hir.canonicalize", [&]() {
-      sys::hir::Canonicalizer canonicalizer;
-      auto stats = canonicalizer.run(*hirModule);
-      if (opts.verbose || opts.stats) {
-            std::cerr << "[hir] const_folded=" << stats.constFolded
-                  << " dead_branches=" << stats.deadBranchesEliminated
-                  << " simple-affine-calls-inlined=" << stats.simpleAffineCallsInlined
-                  << "\n";
-      }
-    });
-
-    if (!cg && opts.rv) {
-      bool enableHIRPolyhedral = true;
-      if (const char *env = std::getenv("SISY_DISABLE_HIR_POLYHEDRAL"))
-        enableHIRPolyhedral = !(env[0] && std::strcmp(env, "0") != 0 &&
-                                std::strcmp(env, "false") != 0 &&
-                                std::strcmp(env, "FALSE") != 0);
-      if (enableHIRPolyhedral) {
-        runStage("hir.polyhedral", [&]() {
-          sys::hir::PolyhedralOptimizer polyhedral;
-          auto stats = polyhedral.run(*hirModule);
-          hirPolyStats = stats;
-          hirPolyRan = true;
-          if (const char *dumpAfterPoly = std::getenv("SISY_DUMP_HIR_AFTER_POLY")) {
-            if (dumpAfterPoly[0] && std::strcmp(dumpAfterPoly, "0") != 0) {
-              std::cerr << "===== HIR after polyhedral =====\n";
-              sys::hir::dump(*hirModule, std::cerr);
-            }
-          }
-          if (opts.verbose || opts.stats) {
-            std::cerr << "[hir-poly] reduction-jammed=" << stats.reductionJammed
-                      << " reduction-privatized=" << stats.reductionPrivatized
-                      << " reduction-rowjam-conditional=" << stats.reductionRowJamConditional
-                      << " reduction-microtiled=" << stats.reductionMicroTiled
-                      << " reduction-microtile-inplace=" << stats.reductionMicroTileInPlace
-                      << " reduction-microtile-conditional=" << stats.reductionMicroTileConditional
-                      << " reduction-microtile-3d=" << stats.reductionMicroTile3D
-                      << " reduction-microtile-reject-dep=" << stats.reductionMicroTileRejectDependence
-                      << " reduction-microtile-reject-pressure=" << stats.reductionMicroTileRejectPressure
-                      << " microtile-mr-sum=" << stats.microTileMrSum
-                      << " microtile-nr-sum=" << stats.microTileNrSum
-                      << " microtile-kc-sum=" << stats.microTileKcSum
-                      << " microtile-nc-sum=" << stats.microTileNcSum
-                      << " reduction-interchanged=" << stats.reductionInterchanged
-                      << " conditional-reduction-interchanged=" << stats.conditionalReductionInterchanged
-                      << " repeat-reduced=" << stats.repeatReduced
-                      << " repeat-rejected=" << stats.repeatRejected
-                      << " repeat-reject-shape=" << stats.repeatRejectShape
-                      << " repeat-reject-init=" << stats.repeatRejectInit
-                      << " repeat-reject-bound=" << stats.repeatRejectBound
-                      << " repeat-reject-legal=" << stats.repeatRejectLegal
-                      << " repeat-reject-clone=" << stats.repeatRejectClone
-                      << " overwrite-repeat-reduced=" << stats.overwriteRepeatReduced
-                      << " overwrite-repeat-rejected=" << stats.overwriteRepeatRejected
-                      << " rejected=" << stats.rejected
-                      << " tiling-applied=" << stats.tilingApplied
-                      << " tiling-rejected=" << stats.tilingRejected
-                      << " tiling-reject-shape=" << stats.tilingRejectShape
-                      << " tiling-reject-control=" << stats.tilingRejectControl
-                      << " tiling-reject-bound-write=" << stats.tilingRejectBoundWrite
-                      << " tiling-reject-affine-access=" << stats.tilingRejectAffineAccess
-                      << " tiling-reject-no-inner=" << stats.tilingRejectNoInner
-                      << " tiling-reject-idempotent=" << stats.tilingRejectIdempotent
-                      << " interchange-applied=" << stats.interchangeApplied
-                      << " interchange-rejected=" << stats.interchangeRejected
-                      << " interchange-reject-shape=" << stats.interchangeRejectShape
-                      << " interchange-reject-init=" << stats.interchangeRejectInit
-                      << " interchange-reject-bounds=" << stats.interchangeRejectBounds
-                      << " interchange-reject-control=" << stats.interchangeRejectControl
-                      << " interchange-reject-access=" << stats.interchangeRejectAccess
-                      << " interchange-reject-memory=" << stats.interchangeRejectMemory
-                      << " interchange-3d-applied=" << stats.interchange3DApplied
-                      << " interchange-3d-rejected=" << stats.interchange3DRejected
-                      << " interchange-3d-reject-shape=" << stats.interchange3DRejectShape
-                      << " interchange-3d-reject-init=" << stats.interchange3DRejectInit
-                      << " interchange-3d-reject-bounds=" << stats.interchange3DRejectBounds
-                      << " interchange-3d-reject-control=" << stats.interchange3DRejectControl
-                      << " interchange-3d-reject-access=" << stats.interchange3DRejectAccess
-                      << " interchange-3d-reject-memory=" << stats.interchange3DRejectMemory
-                      << " unroll-jammed=" << stats.unrollJammed
-                      << " unroll-jam-rejected=" << stats.unrollJamRejected
-                      << " unroll-jam-reject-shape=" << stats.unrollJamRejectShape
-                      << " unroll-jam-reject-init=" << stats.unrollJamRejectInit
-                      << " unroll-jam-reject-bounds=" << stats.unrollJamRejectBounds
-                      << " unroll-jam-reject-control=" << stats.unrollJamRejectControl
-                      << " unroll-jam-reject-access=" << stats.unrollJamRejectAccess
-                      << " unroll-jam-reject-memory=" << stats.unrollJamRejectMemory
-                      << " partial-unrolled=" << stats.partialUnrolled
-                      << " partial-unroll-rejected=" << stats.partialUnrollRejected
-                      << " partial-unroll-reject-shape=" << stats.partialUnrollRejectShape
-                      << " partial-unroll-reject-control=" << stats.partialUnrollRejectControl
-                      << " partial-unroll-reject-access=" << stats.partialUnrollRejectAccess
-                      << " fusion-applied=" << stats.fusionApplied
-                      << " fusion-rejected=" << stats.fusionRejected
-                      << " fusion-reject-shape=" << stats.fusionRejectShape
-                      << " fusion-reject-init=" << stats.fusionRejectInit
-                      << " fusion-reject-bounds=" << stats.fusionRejectBounds
-                      << " fusion-reject-control=" << stats.fusionRejectControl
-                      << " fusion-reject-scalar=" << stats.fusionRejectScalar
-                      << " fusion-reject-memory=" << stats.fusionRejectMemory
-                      << " forwarded-array-store-load=" << stats.forwardedArrayStoreLoads
-                      << " transpose-forwarded-loads=" << stats.transposeForwardedLoads
-                      << " presburger-fusion-queries=" << stats.presburgerFusionQueries
-                      << " presburger-fusion-no-deps=" << stats.presburgerFusionNoDeps
-                      << " presburger-fusion-may-deps=" << stats.presburgerFusionMayDeps
-                      << " presburger-fusion-unknown=" << stats.presburgerFusionUnknown
-                      << " presburger-interchange-queries=" << stats.presburgerInterchangeQueries
-                      << " presburger-interchange-no-deps=" << stats.presburgerInterchangeNoDeps
-                      << " presburger-interchange-may-deps=" << stats.presburgerInterchangeMayDeps
-                      << " presburger-interchange-unknown=" << stats.presburgerInterchangeUnknown
-                      << " presburger-projected-dims=" << stats.presburgerProjectedDims
-                      << " presburger-unknown-budget=" << stats.presburgerUnknownBudget
-                      << " affine-nest-candidates=" << stats.affineNestCandidates
-                      << " affine-nest-reject-shape=" << stats.affineNestRejectedShape
-                      << " affine-nest-reject-control=" << stats.affineNestRejectedControl
-                      << " affine-nest-reject-access=" << stats.affineNestRejectedAccess
-                      << " affine-nest-perfect-2d=" << stats.affineNestPerfect2D
-                      << " affine-nest-perfect-3d=" << stats.affineNestPerfect3D
-                      << " matmul-like-candidates=" << stats.matmulLikeCandidates
-                      << " guarded-scop-candidates=" << stats.guardedScopCandidates
-                      << " guarded-scop-applied=" << stats.guardedScopApplied
-                      << " guarded-scop-rejected=" << stats.guardedScopRejected
-                      << " guarded-scop-reject-pressure=" << stats.guardedScopRejectPressure
-                      << " guarded-scop-symbolic=" << stats.guardedScopSymbolic
-                      << " symbolic-affine-accesses=" << stats.symbolicAffineAccesses
-                      << " symbolic-affine-reject-invariant=" << stats.symbolicAffineRejectInvariant
-                      << " symbolic-affine-cancelled=" << stats.symbolicAffineCancelled
-                      << " symbolic-presburger-fallback=" << stats.symbolicPresburgerFallback
-                      << " stencil-interior-dispatched=" << stats.stencilInteriorDispatched
-                      << " stencil-interior-rejected=" << stats.stencilInteriorRejected
-                      << " stencil-interior-reject-shape=" << stats.stencilInteriorRejectShape
-                      << " stencil-interior-reject-bounds=" << stats.stencilInteriorRejectBounds
-                      << " row-stencil-interior-dispatched=" << stats.rowStencilInteriorDispatched
-                      << " row-stencil-interior-rejected=" << stats.rowStencilInteriorRejected
-                      << " row-stencil-reject-shape=" << stats.rowStencilRejectShape
-                      << " row-stencil-reject-bounds=" << stats.rowStencilRejectBounds
-                      << " row-stencil-reject-pressure=" << stats.rowStencilRejectPressure
-                      << " invariant-guard-hoisted=" << stats.invariantGuardHoisted
-                      << " invariant-guard-rejected=" << stats.invariantGuardRejected
-                      << " monotone-guard-tightened=" << stats.monotoneGuardTightened
-                      << " monotone-guard-rejected=" << stats.monotoneGuardRejected
-                      << " monotone-guard-reject-shape=" << stats.monotoneGuardRejectShape
-                      << " monotone-guard-reject-use=" << stats.monotoneGuardRejectUse
-                      << " loop-distribution-applied=" << stats.loopDistributionApplied
-                      << " loop-distribution-rejected=" << stats.loopDistributionRejected
-                      << " loop-distribution-reject-shape=" << stats.loopDistributionRejectShape
-                      << " loop-distribution-reject-control=" << stats.loopDistributionRejectControl
-                      << " loop-distribution-reject-no-split=" << stats.loopDistributionRejectNoSplit
-                      << " matmul-tail-collapsed=" << stats.matmulTailCollapsed
-                      << " matmul-tail-rejected=" << stats.matmulTailRejected
-                      << " matmul-tail-reject-shape=" << stats.matmulTailRejectShape
-                      << " matmul-tail-reject-use=" << stats.matmulTailRejectUse
-                      << "\n";
-          }
-        });
-      }
-    }
-
-    if (opts.verifyHIR) {
-      runStage("hir.verify.post", [&]() {
-        std::vector<std::string> errors;
-        if (!sys::hir::verify(*hirModule, errors)) {
-          std::ostringstream os;
-          sys::hir::dump(*hirModule, os);
-          failStage("hir-verify-post", errors, os.str());
-        }
-      });
-    }
-
-    sys::mlir::ProductionStats selfMLIRStats;
-    runStage("self-mlir.production", [&]() {
-      bool dumpSelfMLIR = false;
-      if (const char *env = std::getenv("SISY_DUMP_SELF_MLIR"))
-        dumpSelfMLIR = env[0] && std::strcmp(env, "0") != 0;
-
-      std::ostringstream dumpBuffer;
-      const std::string target = opts.arm ? "arm" : "riscv";
-      if (!sys::mlir::runProductionGateFromAST(*node, target, selfMLIRStats,
-                                               dumpSelfMLIR ? &dumpBuffer : nullptr)) {
-        std::vector<std::string> errors;
-        errors.push_back(selfMLIRStats.error.empty()
-                         ? "self-MLIR production gate failed"
-                         : selfMLIRStats.error);
-        failStage("self-mlir-production", errors, dumpBuffer.str());
-      }
-      if (dumpSelfMLIR) {
-        std::cerr << "===== self-MLIR production =====\n";
-        std::cerr << dumpBuffer.str();
-      }
-    });
-    if (opts.verbose || opts.stats) {
-      std::cerr << "[self-mlir] target=" << (opts.arm ? "arm" : "riscv")
-                << " source=ast"
-                << " hir-ops=" << selfMLIRStats.hirOps
-                << " mlir-ops-before=" << selfMLIRStats.mlirOpsBefore
-                << " mlir-ops-after=" << selfMLIRStats.mlirOpsAfter
-                << " rewrites=" << selfMLIRStats.rewrites
-                << " converted=" << selfMLIRStats.conversionConverted
-                << " failed=" << selfMLIRStats.conversionFailed
-                << " rollbacks=" << selfMLIRStats.conversionRollbacks
-                << " verify-before=" << (selfMLIRStats.verifyBefore ? 1 : 0)
-                << " verify-after=" << (selfMLIRStats.verifyAfter ? 1 : 0)
-                << "\n";
-    }
-
-    if (requiresLegacyFallback(*hirModule, fallbackReasons)) {
-      if (opts.forceDialectCodegen) {
-        frontendPath = "self-mlir";
-        emitDialectReport(frontendPath, fallbackReasons);
-        failStage("dialect-forced-fallback", fallbackReasons, "");
-      }
-      if (opts.verbose || opts.stats) {
-        std::cerr << "[dialect-fallback] switch to legacy codegen due to:\n";
-        for (const auto &r : fallbackReasons)
-          std::cerr << "  - " << r << "\n";
-      }
-      frontendPath = "legacy-fallback";
-      emitDialectReport(frontendPath, fallbackReasons);
-      cg = std::make_unique<sys::CodeGen>(node);
-    } else {
-      frontendPath = "self-mlir";
-      emitDialectReport(frontendPath, fallbackReasons);
-    }
-
-    if (!cg) {
-      runStage("hir.to-cfg", [&]() {
-        std::vector<std::string> errors;
-        cfgModule = std::make_unique<sys::cfg::Module>(sys::cfg::lowerFromHIR(*hirModule, errors));
-        if (!errors.empty()) {
-          std::ostringstream os;
-          if (cfgModule)
-            sys::cfg::dump(*cfgModule, os);
-          failStage("hir-to-cfg", errors, os.str());
-        }
-      });
-      if (dumpCFG) {
-        std::cerr << "===== CFG =====\n";
-        sys::cfg::dump(*cfgModule, std::cerr);
-      }
-
-      if (opts.verifyCFG) {
-        runStage("cfg.legality", [&]() {
-          std::vector<std::string> errors;
-          if (!sys::cfg::verifyHIRToCFGConversion(*hirModule, *cfgModule, errors)) {
-            std::ostringstream os;
-            sys::cfg::dump(*cfgModule, os);
-            failStage("cfg-legality", errors, os.str());
-          }
-        });
-        runStage("cfg.verify", [&]() {
-          std::vector<std::string> errors;
-          if (!sys::cfg::verify(*cfgModule, errors)) {
-            std::ostringstream os;
-            sys::cfg::dump(*cfgModule, os);
-            failStage("cfg-verify", errors, os.str());
-          }
-        });
-      }
-
-      runStage("cfg.to-legacy", [&]() {
-        std::vector<std::string> errors;
-        loweredModule = sys::cfg::lowerToLegacyIR(*cfgModule, errors);
-        if (!loweredModule || !errors.empty()) {
-          std::ostringstream os;
-          if (cfgModule)
-            sys::cfg::dump(*cfgModule, os);
-          failStage("cfg-to-legacy", errors, os.str());
-        }
-      });
-    }
+    ofs << asmBuffer.str();
   }
+
   delete node;
-
-  sys::ModuleOp *module = cg ? cg->getModule() : loweredModule.get();
-  sys::pipeline::PipelineMetrics metrics;
-  if (module) {
-    std::function<void(sys::Region*, int)> walkRegion;
-    std::function<void(sys::Op*, int)> walkOp;
-
-    walkOp = [&](sys::Op *op, int loopDepth) {
-      if (!op)
-        return;
-      metrics.moduleOpCount++;
-      int nestedDepth = loopDepth +
-                        ((sys::isa<sys::ForOp>(op) || sys::isa<sys::WhileOp>(op)) ? 1 : 0);
-      if (nestedDepth > metrics.maxLoopDepth)
-        metrics.maxLoopDepth = nestedDepth;
-      for (auto *region : op->getRegions())
-        walkRegion(region, nestedDepth);
-    };
-
-    walkRegion = [&](sys::Region *region, int loopDepth) {
-      if (!region)
-        return;
-      for (auto *bb : region->getBlocks()) {
-        if (!bb)
-          continue;
-        metrics.blockCount++;
-        for (auto *op : bb->getOps()) {
-          if (sys::isa<sys::PhiOp>(op))
-            metrics.phiCount++;
-          if (sys::isa<sys::GetArgOp>(op)) {
-            metrics.getArgCount++;
-            auto *idx = op->find<sys::IntAttr>();
-            if (idx)
-              metrics.maxGetArgArity = std::max(metrics.maxGetArgArity, idx->value + 1);
-          }
-          if (sys::isa<sys::CallOp>(op) || sys::isa<sys::CloneOp>(op) ||
-              sys::isa<sys::JoinOp>(op))
-            metrics.callLikeCount++;
-          if (bb->getOpCount() > 0 && op == bb->getLastOp()) {
-            if (sys::isa<sys::BranchOp>(op))
-              metrics.cfgEdgeCount += 2;
-            else if (sys::isa<sys::GotoOp>(op))
-              metrics.cfgEdgeCount += 1;
-          }
-          walkOp(op, loopDepth);
-        }
-      }
-    };
-
-    for (auto *func : module->findAll<sys::FuncOp>()) {
-      if (func->has<sys::ArgCountAttr>())
-        metrics.maxGetArgArity =
-            std::max(metrics.maxGetArgArity, func->get<sys::ArgCountAttr>()->count);
-      walkRegion(func->getRegion(), 0);
-    }
-  }
-
-  // Forward HIR polyhedral outcome into pipeline metrics so the planner
-  // and the SSA pipeline can adjust cleanup intensity. Only meaningful
-  // when the polyhedral stage actually ran (RV path with the env knob on).
-  if (hirPolyRan) {
-    int applied =
-      hirPolyStats.reductionJammed +
-      hirPolyStats.reductionInterchanged +
-      hirPolyStats.conditionalReductionInterchanged +
-      hirPolyStats.repeatReduced +
-      hirPolyStats.overwriteRepeatReduced +
-      hirPolyStats.tilingApplied +
-      hirPolyStats.interchangeApplied +
-      hirPolyStats.interchange3DApplied +
-      hirPolyStats.unrollJammed +
-      hirPolyStats.fusionApplied +
-      hirPolyStats.loopDistributionApplied +
-      hirPolyStats.stencilInteriorDispatched +
-      hirPolyStats.invariantGuardHoisted +
-      hirPolyStats.monotoneGuardTightened +
-      hirPolyStats.forwardedArrayStoreLoads;
-    int rejected =
-      hirPolyStats.affineNestRejectedShape +
-      hirPolyStats.affineNestRejectedControl +
-      hirPolyStats.affineNestRejectedAccess;
-    metrics.hirPolyApplied = applied;
-    metrics.hirPolyTilingApplied = hirPolyStats.tilingApplied;
-    metrics.hirPolyAffineRejected = rejected;
-  }
-
-  if (opts.dumpMidIR) {
-    if (opts.emitIR)
-      std::cerr << "===== Initial IR =====\n";
-    std::cerr << module;
-  }
-
-  if (opts.dumpOperationIR || opts.verifyOperationBridge ||
-      !opts.runDialectConversion.empty()) {
-    int devStatus = runOperationDevActions(module, opts);
-    if (devStatus)
-      return devStatus;
-  }
-
-  sys::PassManager pm(module, opts);
-  auto plan = sys::pipeline::configurePipeline(pm, opts, metrics);
-  if (const char *env = std::getenv("SISY_DUMP_PIPELINE_PROFILE")) {
-    if (env[0] && std::strcmp(env, "0") != 0) {
-      std::cerr << "[pipeline] " << sys::pipeline::formatPlan(plan) << "\n";
-      pm.dumpPipelineProfile(std::cerr);
-    }
-  }
-  if (opts.dumpPassTiming) {
-    std::cerr << "[pass-timing] budget: large_module_mode=" << (plan.largeModuleMode ? 1 : 0)
-              << ", huge_module_mode=" << (plan.hugeModuleMode ? 1 : 0)
-              << ", backend_fast_mode=" << (plan.backendFastMode ? 1 : 0)
-              << ", arm_timeout_safe=" << (plan.armTimeoutSafeMode ? 1 : 0)
-              << ", arm_instcombine_rounds=" << plan.armInstCombineRounds
-              << ", arm_peephole_rounds=" << plan.armPeepholeRounds
-              << ", arm_ra_call_penalty=" << plan.armRegAllocCallPenalty
-              << ", arm_ra_loop_boost=" << plan.armRegAllocLoopBoost
-              << ", arm_ra_prefer_budget=" << plan.armRegAllocPreferBudget
-              << "\n";
-  }
-  
-  pm.run();
   return 0;
 }

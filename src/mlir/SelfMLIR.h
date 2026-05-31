@@ -12,9 +12,6 @@
 #include <utility>
 #include <vector>
 
-namespace sys::hir {
-struct Module;
-}
 
 namespace sys::mlir {
 
@@ -104,6 +101,12 @@ public:
 };
 
 class Operation;
+
+struct Use {
+  Operation *owner = nullptr;
+  int operandIndex = -1;
+};
+
 class Region;
 class Block;
 class BlockArgument;
@@ -143,6 +146,8 @@ class BlockArgument {
   std::string argName;
 
 public:
+  std::vector<Use> uses;
+
   BlockArgument(Block *owner, unsigned index, Type type, Location loc,
                 std::string name);
   Block *getOwner() const { return owner; }
@@ -164,9 +169,12 @@ class Operation {
   bool erased = false;
 
 public:
+  std::vector<std::vector<Use>> resultUses;
+
   Operation(std::string name, std::vector<Value> operands,
             std::vector<Type> results, std::map<std::string, Attribute> attrs,
             Location loc);
+  ~Operation();
 
   const std::string &name() const { return opName; }
   std::string dialect() const;
@@ -177,7 +185,8 @@ public:
 
   int operandCount() const { return (int) operands.size(); }
   Value operand(int index) const { return operands[index]; }
-  void setOperand(int index, Value value) { operands[index] = value; }
+  void setOperand(int index, Value value);
+  void addOperand(Value value);
   const std::vector<Value> &getOperands() const { return operands; }
 
   int resultCount() const { return (int) resultTypes.size(); }
@@ -194,6 +203,9 @@ public:
   const std::vector<std::unique_ptr<Region>> &getRegions() const { return regions; }
   std::vector<std::unique_ptr<Region>> &getRegions() { return regions; }
 
+  bool isSymbol() const;
+  std::string getSymbolName() const;
+  bool isLoop() const;
   bool isTerminator() const;
   bool isErased() const { return erased; }
   void markErased() { erased = true; }
@@ -259,15 +271,14 @@ struct VerifyResult {
 };
 
 VerifyResult verify(Module &module);
+void eraseMarked(Module &module);
+void runGlobalOpt(Module &module);
+void runMemoryOpt(Module &module);
+void runLoopVectorization(Module &module);
 void print(Module &module, std::ostream &os);
 std::vector<Operation*> walk(Module &module);
 std::unique_ptr<Module> parse(Context &ctx, const std::string &text,
                               std::vector<std::string> &errors);
-
-struct Use {
-  Operation *owner = nullptr;
-  int operandIndex = -1;
-};
 
 std::vector<Use> usesOf(Module &module, Value value);
 int replaceAllUses(Module &module, Value oldValue, Value newValue);
@@ -359,11 +370,6 @@ struct ProductionStats {
   std::string error;
 };
 
-std::unique_ptr<Module> lowerFromHIR(Context &ctx, const sys::hir::Module &hirModule,
-                                     const std::string &target,
-                                     ProductionStats *stats = nullptr);
-bool runProductionGate(const sys::hir::Module &hirModule, const std::string &target,
-                       ProductionStats &stats, std::ostream *dump = nullptr);
 
 int runCoreSelfTest(std::ostream &os);
 int runConversionSelfTest(std::ostream &os);
