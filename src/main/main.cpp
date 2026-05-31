@@ -25,6 +25,7 @@
 #include "../ir/IRContext.h"
 #include "../ir/OpDescriptor.h"
 #include "../ir/Operation.h"
+#include "../mlir/ASTToMLIR.h"
 #include "../mlir/SelfMLIR.h"
 #include "../codegen/Ops.h"
 #include "../codegen/Attrs.h"
@@ -690,8 +691,8 @@ int main(int argc, char **argv) {
 
       std::ostringstream dumpBuffer;
       const std::string target = opts.arm ? "arm" : "riscv";
-      if (!sys::mlir::runProductionGate(*hirModule, target, selfMLIRStats,
-                                         dumpSelfMLIR ? &dumpBuffer : nullptr)) {
+      if (!sys::mlir::runProductionGateFromAST(*node, target, selfMLIRStats,
+                                               dumpSelfMLIR ? &dumpBuffer : nullptr)) {
         std::vector<std::string> errors;
         errors.push_back(selfMLIRStats.error.empty()
                          ? "self-MLIR production gate failed"
@@ -705,6 +706,7 @@ int main(int argc, char **argv) {
     });
     if (opts.verbose || opts.stats) {
       std::cerr << "[self-mlir] target=" << (opts.arm ? "arm" : "riscv")
+                << " source=ast"
                 << " hir-ops=" << selfMLIRStats.hirOps
                 << " mlir-ops-before=" << selfMLIRStats.mlirOpsBefore
                 << " mlir-ops-after=" << selfMLIRStats.mlirOpsAfter

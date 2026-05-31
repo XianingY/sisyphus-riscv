@@ -23,6 +23,78 @@ ops:
     assemblyFormat: function
     verify: verifyFunction
     fold: foldNone
+  - name: global
+    dialect: sysy
+    operands: []
+    results: [memref]
+    attrs: [symbol, type]
+    traits: [MemoryEffect, Symbol]
+    verify: verifySysYGlobal
+    fold: foldNone
+  - name: alloca
+    dialect: sysy
+    operands: []
+    results: [memref]
+    attrs: [symbol]
+    traits: [MemoryEffect]
+    verify: verifySysYAlloca
+    fold: foldNone
+  - name: load
+    dialect: sysy
+    operands: [variadic]
+    results: [value]
+    attrs: [symbol]
+    traits: [MemoryEffect]
+    verify: verifySysYLoad
+    fold: foldNone
+  - name: store
+    dialect: sysy
+    operands: [variadic]
+    results: []
+    attrs: [symbol]
+    traits: [MemoryEffect]
+    verify: verifySysYStore
+    fold: foldNone
+  - name: call
+    dialect: sysy
+    operands: [variadic]
+    results: [result]
+    attrs: [callee]
+    traits: [MemoryEffect]
+    verify: verifySysYCall
+    fold: foldNone
+  - name: return
+    dialect: sysy
+    operands: [variadic]
+    results: []
+    attrs: []
+    traits: [Terminator]
+    verify: verifyReturn
+    fold: foldNone
+  - name: break
+    dialect: sysy
+    operands: []
+    results: []
+    attrs: []
+    traits: [Terminator]
+    verify: verifyBreak
+    fold: foldNone
+  - name: continue
+    dialect: sysy
+    operands: []
+    results: []
+    attrs: []
+    traits: [Terminator]
+    verify: verifyContinue
+    fold: foldNone
+  - name: unknown_value
+    dialect: sysy
+    operands: []
+    results: [value]
+    attrs: []
+    traits: []
+    verify: verifyUnknownValue
+    fold: foldNone
   - name: addi
     dialect: arith
     operands: [lhs, rhs]
@@ -43,6 +115,38 @@ ops:
     traits: [Commutative, Pure, SameOperandsAndResultType]
     verify: verifySameIntegerOperands
     fold: foldAndI
+  - name: ori
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Commutative, Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldOrI
+  - name: noti
+    dialect: arith
+    operands: [value]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifyIntegerOperand
+    fold: foldNotI
+  - name: cmpi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [predicate]
+    traits: [Pure]
+    verify: verifyIntegerCompare
+    fold: foldCmpI
+  - name: cmpf
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [predicate]
+    traits: [Pure]
+    verify: verifyFloatCompare
+    fold: foldCmpF
   - name: constant
     dialect: arith
     operands: []
@@ -59,6 +163,86 @@ ops:
     traits: [Commutative, Pure, SameOperandsAndResultType]
     verify: verifySameIntegerOperands
     fold: foldMulI
+  - name: divi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldDivI
+  - name: remi
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, SameOperandsAndResultType]
+    verify: verifySameIntegerOperands
+    fold: foldRemI
+  - name: addf
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Commutative, Pure, SameOperandsAndResultType]
+    verify: verifySameFloatOperands
+    fold: foldAddF
+  - name: subf
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, SameOperandsAndResultType]
+    verify: verifySameFloatOperands
+    fold: foldSubF
+  - name: mulf
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Commutative, Pure, SameOperandsAndResultType]
+    verify: verifySameFloatOperands
+    fold: foldMulF
+  - name: divf
+    dialect: arith
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: []
+    traits: [Pure, SameOperandsAndResultType]
+    verify: verifySameFloatOperands
+    fold: foldDivF
+  - name: negi
+    dialect: arith
+    operands: [value]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifyIntegerOperand
+    fold: foldNegI
+  - name: negf
+    dialect: arith
+    operands: [value]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifyFloatOperand
+    fold: foldNegF
+  - name: sitofp
+    dialect: arith
+    operands: [value]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifySIToFP
+    fold: foldSIToFP
+  - name: fptosi
+    dialect: arith
+    operands: [value]
+    results: [result]
+    attrs: []
+    traits: [Pure]
+    verify: verifyFPToSI
+    fold: foldFPToSI
   - name: select
     dialect: arith
     operands: [cond, true_value, false_value]
@@ -243,6 +427,86 @@ ops:
     traits: [MachineOp, RegisterOp]
     verify: verifyRVMachineAddw
     fold: foldNone
+  - name: subw
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineSubw
+    fold: foldNone
+  - name: mulw
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineMulw
+    fold: foldNone
+  - name: divw
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineDivw
+    fold: foldNone
+  - name: remw
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineRemw
+    fold: foldNone
+  - name: and
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineAnd
+    fold: foldNone
+  - name: or
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineOr
+    fold: foldNone
+  - name: seqz
+    dialect: rv_machine
+    operands: [value]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineSeqz
+    fold: foldNone
+  - name: cmp
+    dialect: rv_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [predicate, reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineCmp
+    fold: foldNone
+  - name: lw
+    dialect: rv_machine
+    operands: [base, offset]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyRVMachineLw
+    fold: foldNone
+  - name: sw
+    dialect: rv_machine
+    operands: [value, base, offset]
+    results: []
+    attrs: []
+    traits: [MachineOp, MemoryEffect]
+    verify: verifyRVMachineSw
+    fold: foldNone
   - name: li
     dialect: rv_machine
     operands: []
@@ -266,6 +530,70 @@ ops:
     attrs: [reg_class]
     traits: [MachineOp, RegisterOp]
     verify: verifyARMMachineAdd
+    fold: foldNone
+  - name: sub
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineSub
+    fold: foldNone
+  - name: mul
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineMul
+    fold: foldNone
+  - name: sdiv
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineSDiv
+    fold: foldNone
+  - name: and
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineAnd
+    fold: foldNone
+  - name: orr
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineOrr
+    fold: foldNone
+  - name: cmp
+    dialect: arm_machine
+    operands: [lhs, rhs]
+    results: [result]
+    attrs: [predicate, reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineCmp
+    fold: foldNone
+  - name: ldr
+    dialect: arm_machine
+    operands: [base, offset]
+    results: [result]
+    attrs: [reg_class]
+    traits: [MachineOp, RegisterOp]
+    verify: verifyARMMachineLdr
+    fold: foldNone
+  - name: str
+    dialect: arm_machine
+    operands: [value, base, offset]
+    results: []
+    attrs: []
+    traits: [MachineOp, MemoryEffect]
+    verify: verifyARMMachineStr
     fold: foldNone
   - name: mov
     dialect: arm_machine

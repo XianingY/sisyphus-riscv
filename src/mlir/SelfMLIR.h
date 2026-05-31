@@ -77,6 +77,9 @@ class Context {
   Attribute internAttr(std::string key, std::string text);
 
 public:
+  Context();
+  ~Context();
+
   Type noneType();
   Type i(unsigned bits);
   Type f(unsigned bits);

@@ -31,6 +31,9 @@ struct LocationStorage {
   std::string text;
 };
 
+Context::Context() = default;
+Context::~Context() = default;
+
 static std::string joinTypes(const std::vector<Type> &types) {
   std::string out;
   for (size_t i = 0; i < types.size(); i++) {

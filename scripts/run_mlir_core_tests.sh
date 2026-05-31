@@ -101,6 +101,10 @@ grep -q '\[self-mlir\]' <<<"${prod}" || {
   echo "default compile did not run the self-MLIR production gate" >&2
   exit 1
 }
+grep -q 'source=ast' <<<"${prod}" || {
+  echo "default self-MLIR production gate must lower directly from AST" >&2
+  exit 1
+}
 grep -q 'frontend_path=self-mlir' <<<"${prod}" || {
   echo "default dialect report must identify self-MLIR as the frontend path" >&2
   exit 1
@@ -121,10 +125,43 @@ if grep -Eq 'legacy\.|PhiOp|\"phi\"' <<<"${dump}"; then
   exit 1
 fi
 
+cat >"${OUT_DIR}/ast_direct.sy" <<'SYSY'
+int main() {
+  int x = 1;
+  x = x + 2;
+  if (x < 4) {
+    x = x + 1;
+  }
+  return x;
+}
+SYSY
+ast_dump="$(SISY_DUMP_SELF_MLIR=1 "${COMPILER}" "${OUT_DIR}/ast_direct.sy" -S -o "${OUT_DIR}/ast_direct.rv.s" -O0 --target=riscv --stats --dialect-fallback-report=stderr 2>&1 >/dev/null)"
+echo "${ast_dump}"
+grep -q 'source=ast' <<<"${ast_dump}" || {
+  echo "AST direct smoke did not use AST self-MLIR lowering" >&2
+  exit 1
+}
+grep -q '"sysy.alloca"' <<<"${ast_dump}" || {
+  echo "AST direct smoke should emit sysy.alloca for local variables" >&2
+  exit 1
+}
+grep -q '"sysy.store"' <<<"${ast_dump}" || {
+  echo "AST direct smoke should emit sysy.store for assignments" >&2
+  exit 1
+}
+grep -q '"scf.if"' <<<"${ast_dump}" || {
+  echo "AST direct smoke should preserve structured scf.if" >&2
+  exit 1
+}
+
 arm_prod="$("${COMPILER}" "${ROOT_DIR}/tests/smoke/basic.sy" -S -o "${OUT_DIR}/basic.arm.s" -O0 --target=arm --stats --dialect-fallback-report=stderr 2>&1 >/dev/null)"
 echo "${arm_prod}"
 grep -q '\[self-mlir\] target=arm' <<<"${arm_prod}" || {
   echo "ARM compile did not run the self-MLIR production gate" >&2
+  exit 1
+}
+grep -q 'source=ast' <<<"${arm_prod}" || {
+  echo "ARM self-MLIR production gate must lower directly from AST" >&2
   exit 1
 }
 grep -q 'frontend_path=self-mlir' <<<"${arm_prod}" || {
