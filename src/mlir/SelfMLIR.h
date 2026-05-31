@@ -206,6 +206,8 @@ public:
   Region *getRegion() const { return parent; }
   BlockArgument &addArgument(Type type, Location loc, const std::string &name = "");
   Operation &addOperation(std::unique_ptr<Operation> op);
+  Operation &insertOperation(std::size_t index, std::unique_ptr<Operation> op);
+  std::unique_ptr<Operation> takeOperation(Operation *op);
   void eraseMarkedOperations();
   const std::vector<std::unique_ptr<BlockArgument>> &args() const { return arguments; }
   const std::vector<std::unique_ptr<Operation>> &ops() const { return operations; }
@@ -255,8 +257,34 @@ struct VerifyResult {
 
 VerifyResult verify(Module &module);
 void print(Module &module, std::ostream &os);
-void replaceAllUses(Module &module, Value oldValue, Value newValue);
 std::vector<Operation*> walk(Module &module);
+std::unique_ptr<Module> parse(Context &ctx, const std::string &text,
+                              std::vector<std::string> &errors);
+
+struct Use {
+  Operation *owner = nullptr;
+  int operandIndex = -1;
+};
+
+std::vector<Use> usesOf(Module &module, Value value);
+int replaceAllUses(Module &module, Value oldValue, Value newValue);
+Operation *replaceOperation(Module &module, Operation &oldOp,
+                            std::unique_ptr<Operation> replacement);
+bool eraseOperation(Module &module, Operation &op, std::string *error = nullptr);
+bool moveOperationBefore(Operation &op, Operation &before, std::string *error = nullptr);
+
+class SymbolTable {
+  std::map<std::string, Operation*> symbols;
+  std::vector<std::string> duplicateSymbols;
+
+public:
+  bool insert(const std::string &name, Operation *op);
+  Operation *lookup(const std::string &name) const;
+  const std::map<std::string, Operation*> &all() const { return symbols; }
+  const std::vector<std::string> &duplicates() const { return duplicateSymbols; }
+};
+
+SymbolTable buildSymbolTable(Module &module);
 
 struct RewriteRule {
   std::string name;

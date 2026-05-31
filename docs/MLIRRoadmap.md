@@ -58,6 +58,9 @@ implementation of the MLIR object model and conversion contracts.
 - `src/mlir/SelfMLIR.*` defines the production MLIR object model:
   `Context`, hash-consed `Type`/`Attribute`/`Location`, `Operation`, `Region`,
   `Block`, `BlockArgument`, `Value`, `Builder`, verifier, and printer.
+- The core now exposes production-style mutation and query primitives:
+  computed use-def lists, `replaceAllUses`, op replace/erase/move APIs, a
+  symbol table for `sym_name`/`symbol`, and a printer/parser round-trip subset.
 - The self-MLIR verifier rejects `legacy.*` and Phi-shaped operations.  The
   sample module uses only region ops and block arguments.
 - `src/mlir/canonicalize.drr` is the first declarative rewrite rule file.

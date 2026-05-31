@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -255,6 +256,27 @@ Operation &Block::addOperation(std::unique_ptr<Operation> op) {
   return *operations.back();
 }
 
+Operation &Block::insertOperation(std::size_t index, std::unique_ptr<Operation> op) {
+  op->setBlock(this);
+  if (index > operations.size())
+    index = operations.size();
+  auto it = operations.insert(operations.begin() + (std::ptrdiff_t) index,
+                              std::move(op));
+  return **it;
+}
+
+std::unique_ptr<Operation> Block::takeOperation(Operation *op) {
+  for (auto it = operations.begin(); it != operations.end(); ++it) {
+    if (it->get() != op)
+      continue;
+    auto owned = std::move(*it);
+    operations.erase(it);
+    owned->setBlock(nullptr);
+    return owned;
+  }
+  return nullptr;
+}
+
 void Block::eraseMarkedOperations() {
   operations.erase(std::remove_if(operations.begin(), operations.end(),
                                   [](const std::unique_ptr<Operation> &op) {
@@ -309,6 +331,155 @@ std::vector<Operation*> walk(Module &module) {
   std::vector<Operation*> out;
   walkOp(module.op(), out);
   return out;
+}
+
+std::vector<Use> usesOf(Module &module, Value value) {
+  std::vector<Use> uses;
+  if (!value.valid())
+    return uses;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    for (int i = 0; i < op->operandCount(); i++) {
+      if (op->operand(i) == value)
+        uses.push_back({op, i});
+    }
+  }
+  return uses;
+}
+
+int replaceAllUses(Module &module, Value oldValue, Value newValue) {
+  int replaced = 0;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    for (int i = 0; i < op->operandCount(); i++) {
+      if (op->operand(i) == oldValue) {
+        op->setOperand(i, newValue);
+        replaced++;
+      }
+    }
+  }
+  return replaced;
+}
+
+static int operationIndexInBlock(Block &block, Operation *needle) {
+  for (size_t i = 0; i < block.ops().size(); i++)
+    if (block.ops()[i].get() == needle)
+      return (int) i;
+  return -1;
+}
+
+Operation *replaceOperation(Module &module, Operation &oldOp,
+                            std::unique_ptr<Operation> replacement) {
+  Block *block = oldOp.getBlock();
+  if (!block || !replacement)
+    return nullptr;
+  int index = operationIndexInBlock(*block, &oldOp);
+  if (index < 0)
+    return nullptr;
+
+  Operation &newOp = block->insertOperation((std::size_t) index, std::move(replacement));
+  int commonResults = std::min(oldOp.resultCount(), newOp.resultCount());
+  for (int i = 0; i < commonResults; i++) {
+    if (oldOp.resultType(i) == newOp.resultType(i))
+      replaceAllUses(module, oldOp.result(i), newOp.result(i));
+  }
+  oldOp.markErased();
+  block->eraseMarkedOperations();
+  return &newOp;
+}
+
+bool eraseOperation(Module &module, Operation &op, std::string *error) {
+  for (int i = 0; i < op.resultCount(); i++) {
+    auto uses = usesOf(module, op.result(i));
+    if (!uses.empty()) {
+      if (error)
+        *error = "cannot erase operation with live result uses";
+      return false;
+    }
+  }
+  Block *block = op.getBlock();
+  if (!block) {
+    if (error)
+      *error = "operation has no parent block";
+    return false;
+  }
+  op.markErased();
+  block->eraseMarkedOperations();
+  return true;
+}
+
+bool moveOperationBefore(Operation &op, Operation &before, std::string *error) {
+  Block *from = op.getBlock();
+  Block *to = before.getBlock();
+  if (!from || !to) {
+    if (error)
+      *error = "operation has no parent block";
+    return false;
+  }
+  if (&op == &before) {
+    if (error)
+      *error = "cannot move operation before itself";
+    return false;
+  }
+  int beforeIndex = operationIndexInBlock(*to, &before);
+  if (beforeIndex < 0) {
+    if (error)
+      *error = "destination operation is not in its parent block";
+    return false;
+  }
+  auto owned = from->takeOperation(&op);
+  if (!owned) {
+    if (error)
+      *error = "source operation is not in its parent block";
+    return false;
+  }
+  if (from == to)
+    beforeIndex = operationIndexInBlock(*to, &before);
+  to->insertOperation((std::size_t) std::max(0, beforeIndex), std::move(owned));
+  return true;
+}
+
+static std::string stripQuotes(const std::string &text) {
+  if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+    return text.substr(1, text.size() - 2);
+  return text;
+}
+
+static std::string symbolNameFromAttr(Attribute attr) {
+  if (!attr)
+    return "";
+  return stripQuotes(attr.str());
+}
+
+bool SymbolTable::insert(const std::string &name, Operation *op) {
+  if (name.empty())
+    return true;
+  auto [it, inserted] = symbols.emplace(name, op);
+  if (!inserted) {
+    duplicateSymbols.push_back(name);
+    return false;
+  }
+  return true;
+}
+
+Operation *SymbolTable::lookup(const std::string &name) const {
+  auto it = symbols.find(name);
+  return it == symbols.end() ? nullptr : it->second;
+}
+
+SymbolTable buildSymbolTable(Module &module) {
+  SymbolTable table;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    std::string name = symbolNameFromAttr(op->attr("sym_name"));
+    if (name.empty())
+      name = symbolNameFromAttr(op->attr("symbol"));
+    table.insert(name, op);
+  }
+  return table;
 }
 
 static void verifyOp(Operation &op, VerifyResult &result) {
@@ -429,14 +600,6 @@ void print(Module &module, std::ostream &os) {
   printOp(module.op(), os, 0);
 }
 
-void replaceAllUses(Module &module, Value oldValue, Value newValue) {
-  for (auto *op : walk(module)) {
-    for (int i = 0; i < op->operandCount(); i++)
-      if (op->operand(i) == oldValue)
-        op->setOperand(i, newValue);
-  }
-}
-
 static std::string trim(const std::string &s) {
   size_t begin = 0;
   while (begin < s.size() && std::isspace((unsigned char) s[begin]))
@@ -445,6 +608,225 @@ static std::string trim(const std::string &s) {
   while (end > begin && std::isspace((unsigned char) s[end - 1]))
     end--;
   return s.substr(begin, end - begin);
+}
+
+static std::vector<std::string> splitTopLevel(const std::string &text, char sep) {
+  std::vector<std::string> out;
+  std::string cur;
+  bool inString = false;
+  int parens = 0;
+  int angles = 0;
+  for (char c : text) {
+    if (c == '"')
+      inString = !inString;
+    else if (!inString) {
+      if (c == '(')
+        parens++;
+      else if (c == ')' && parens > 0)
+        parens--;
+      else if (c == '<')
+        angles++;
+      else if (c == '>' && angles > 0)
+        angles--;
+      else if (c == sep && parens == 0 && angles == 0) {
+        out.push_back(trim(cur));
+        cur.clear();
+        continue;
+      }
+    }
+    cur.push_back(c);
+  }
+  if (!trim(cur).empty())
+    out.push_back(trim(cur));
+  return out;
+}
+
+static Type parseType(Context &ctx, const std::string &text) {
+  std::string ty = trim(text);
+  if (ty == "none")
+    return ctx.noneType();
+  if (ty == "index")
+    return ctx.index();
+  if (ty.size() > 1 && ty[0] == 'i' &&
+      std::all_of(ty.begin() + 1, ty.end(), [](char c) { return std::isdigit((unsigned char) c); }))
+    return ctx.i((unsigned) std::stoul(ty.substr(1)));
+  if (ty.size() > 1 && ty[0] == 'f' &&
+      std::all_of(ty.begin() + 1, ty.end(), [](char c) { return std::isdigit((unsigned char) c); }))
+    return ctx.f((unsigned) std::stoul(ty.substr(1)));
+  if (ty.rfind("!riscv.reg<", 0) == 0)
+    return ctx.reg("riscv", ty.substr(11, ty.size() > 12 ? ty.size() - 12 : 0));
+  if (ty.rfind("!arm.reg<", 0) == 0)
+    return ctx.reg("arm", ty.substr(9, ty.size() > 10 ? ty.size() - 10 : 0));
+  return ctx.noneType();
+}
+
+static Attribute parseAttribute(Context &ctx, const std::string &text) {
+  std::string value = trim(text);
+  if (value == "true" || value == "false")
+    return ctx.boolAttr(value == "true");
+  if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+    return ctx.stringAttr(stripQuotes(value));
+  size_t colon = value.find(':');
+  std::string number = trim(colon == std::string::npos ? value : value.substr(0, colon));
+  if (!number.empty()) {
+    size_t pos = (number[0] == '-' || number[0] == '+') ? 1 : 0;
+    bool allDigits = pos < number.size();
+    for (; pos < number.size(); pos++)
+      allDigits = allDigits && std::isdigit((unsigned char) number[pos]);
+    if (allDigits) {
+      Type type = colon == std::string::npos ? ctx.i(32) : parseType(ctx, value.substr(colon + 1));
+      return ctx.integerAttr(std::stoll(number), type);
+    }
+  }
+  return ctx.stringAttr(value);
+}
+
+static Location parseLocation(Context &ctx, const std::string &line) {
+  size_t loc = line.find("loc(\"");
+  if (loc == std::string::npos)
+    return ctx.unknownLoc();
+  size_t fileBegin = loc + 5;
+  size_t fileEnd = line.find("\":", fileBegin);
+  if (fileEnd == std::string::npos)
+    return ctx.unknownLoc();
+  size_t lineBegin = fileEnd + 2;
+  size_t lineEnd = line.find(':', lineBegin);
+  size_t colEnd = line.find(')', lineEnd == std::string::npos ? lineBegin : lineEnd + 1);
+  if (lineEnd == std::string::npos || colEnd == std::string::npos)
+    return ctx.unknownLoc();
+  int parsedLine = std::atoi(line.substr(lineBegin, lineEnd - lineBegin).c_str());
+  int parsedCol = std::atoi(line.substr(lineEnd + 1, colEnd - lineEnd - 1).c_str());
+  return ctx.loc(line.substr(fileBegin, fileEnd - fileBegin), parsedLine, parsedCol);
+}
+
+static std::map<std::string, Attribute> parseAttrs(Context &ctx, const std::string &line) {
+  std::map<std::string, Attribute> attrs;
+  size_t open = line.find('{');
+  size_t arrow = line.find("->");
+  size_t loc = line.find(" loc(");
+  if (open == std::string::npos || (arrow != std::string::npos && arrow < open) ||
+      (loc != std::string::npos && loc < open))
+    return attrs;
+  size_t close = line.find('}', open);
+  if (close == std::string::npos)
+    return attrs;
+  std::string body = line.substr(open + 1, close - open - 1);
+  for (const auto &entry : splitTopLevel(body, ',')) {
+    size_t eq = entry.find('=');
+    if (eq == std::string::npos)
+      continue;
+    attrs[trim(entry.substr(0, eq))] = parseAttribute(ctx, entry.substr(eq + 1));
+  }
+  return attrs;
+}
+
+static std::vector<Type> parseResultTypes(Context &ctx, const std::string &line) {
+  std::vector<Type> types;
+  size_t arrow = line.find("->");
+  if (arrow == std::string::npos)
+    return types;
+  size_t open = line.find('(', arrow);
+  size_t close = line.find(')', open == std::string::npos ? arrow : open + 1);
+  if (open == std::string::npos || close == std::string::npos)
+    return types;
+  for (const auto &part : splitTopLevel(line.substr(open + 1, close - open - 1), ','))
+    types.push_back(parseType(ctx, part));
+  return types;
+}
+
+std::unique_ptr<Module> parse(Context &ctx, const std::string &text,
+                              std::vector<std::string> &errors) {
+  auto module = std::make_unique<Module>(ctx);
+  std::vector<Region*> regionStack{&module->body()};
+  Block *currentBlock = module->body().getBlocks()[0].get();
+  std::map<std::string, Value> values;
+
+  std::istringstream input(text);
+  std::string raw;
+  int lineNo = 0;
+  while (std::getline(input, raw)) {
+    lineNo++;
+    std::string line = trim(raw);
+    if (line.empty())
+      continue;
+    if (line == "}") {
+      if (regionStack.size() > 1) {
+        regionStack.pop_back();
+        auto &blocks = regionStack.back()->getBlocks();
+        currentBlock = blocks.empty() ? nullptr : blocks.back().get();
+      }
+      continue;
+    }
+    if (line.rfind("\"builtin.module\"", 0) == 0)
+      continue;
+    if (line.rfind("^bb", 0) == 0) {
+      Region *region = regionStack.back();
+      bool useExisting = region == &module->body() && region->getBlocks().size() == 1 &&
+                         region->getBlocks()[0]->ops().empty() &&
+                         region->getBlocks()[0]->args().empty();
+      currentBlock = useExisting ? region->getBlocks()[0].get() : &region->addBlock();
+      size_t open = line.find('(');
+      size_t close = line.find(')', open == std::string::npos ? 0 : open + 1);
+      if (open != std::string::npos && close != std::string::npos) {
+        for (const auto &argText : splitTopLevel(line.substr(open + 1, close - open - 1), ',')) {
+          size_t colon = argText.rfind(':');
+          if (colon == std::string::npos)
+            continue;
+          std::string name = trim(argText.substr(0, colon));
+          if (!name.empty() && name.front() == '%')
+            name.erase(name.begin());
+          auto &arg = currentBlock->addArgument(parseType(ctx, argText.substr(colon + 1)),
+                                                ctx.unknownLoc(), name);
+          values["%" + arg.name()] = arg.value();
+        }
+      }
+      continue;
+    }
+
+    if (!currentBlock) {
+      errors.push_back("line " + std::to_string(lineNo) + ": operation outside block");
+      continue;
+    }
+    std::string resultName;
+    size_t quote = line.find('"');
+    size_t equals = line.find('=');
+    if (equals != std::string::npos && equals < quote) {
+      resultName = trim(line.substr(0, equals));
+      quote = line.find('"', equals);
+    }
+    size_t quoteEnd = line.find('"', quote + 1);
+    if (quote == std::string::npos || quoteEnd == std::string::npos) {
+      errors.push_back("line " + std::to_string(lineNo) + ": expected quoted operation name");
+      continue;
+    }
+    std::string opName = line.substr(quote + 1, quoteEnd - quote - 1);
+    size_t operandsOpen = line.find('(', quoteEnd);
+    size_t operandsClose = line.find(')', operandsOpen == std::string::npos ? quoteEnd : operandsOpen + 1);
+    std::vector<Value> operands;
+    if (operandsOpen != std::string::npos && operandsClose != std::string::npos) {
+      for (const auto &operandText : splitTopLevel(line.substr(operandsOpen + 1,
+                                                               operandsClose - operandsOpen - 1), ',')) {
+        size_t colon = operandText.rfind(':');
+        std::string name = trim(colon == std::string::npos ? operandText
+                                                           : operandText.substr(0, colon));
+        auto it = values.find(name);
+        if (it != values.end())
+          operands.push_back(it->second);
+        else if (!name.empty())
+          errors.push_back("line " + std::to_string(lineNo) + ": unknown SSA value " + name);
+      }
+    }
+    auto &op = Builder(ctx, currentBlock).create(opName, operands, parseResultTypes(ctx, line),
+                                                 parseAttrs(ctx, line), parseLocation(ctx, line));
+    if (!resultName.empty() && op.resultCount() == 1)
+      values[resultName] = op.result();
+    if (!line.empty() && line.back() == '{') {
+      Region &region = op.addRegion();
+      regionStack.push_back(&region);
+      currentBlock = nullptr;
+    }
+  }
+  return module;
 }
 
 std::vector<RewriteRule> parseDRR(const std::string &text,
@@ -1241,23 +1623,92 @@ int runCoreSelfTest(std::ostream &os) {
   auto locB = ctx.loc("sample.sy", 1, 1);
   bool uniqued = i32a == i32b && locA == locB;
   Module module = buildSample(ctx);
+  auto symtab = buildSymbolTable(module);
+  Operation *mainFunc = symtab.lookup("main");
+  Operation *addi = nullptr;
+  Operation *zero = nullptr;
+  for (auto *op : walk(module)) {
+    if (!op)
+      continue;
+    if (op->name() == "arith.addi")
+      addi = op;
+    if (op->name() == "arith.constant")
+      zero = op;
+  }
+  int addUsesBefore = addi ? (int) usesOf(module, addi->result()).size() : -1;
+  int zeroUsesBefore = zero ? (int) usesOf(module, zero->result()).size() : -1;
   auto before = verify(module);
   std::vector<std::string> parseErrors;
   auto rules = parseDRR(kCoreRules, parseErrors);
   auto stats = applyGreedyPatterns(module, rules);
   auto after = verify(module);
+
+  std::string eraseError;
+  bool erasedDeadConstant = false;
+  if (zero && usesOf(module, zero->result()).empty())
+    erasedDeadConstant = eraseOperation(module, *zero, &eraseError);
+
+  std::ostringstream printed;
+  print(module, printed);
+  std::vector<std::string> roundTripErrors;
+  auto roundTrip = parse(ctx, printed.str(), roundTripErrors);
+  auto roundTripVerify = roundTrip ? verify(*roundTrip) : VerifyResult{false, {"parse failed"}};
+  auto roundTripSymbols = roundTrip ? buildSymbolTable(*roundTrip) : SymbolTable();
+
+  Module mutation = buildNativeAsmSample(ctx);
+  Operation *firstConst = nullptr;
+  Operation *secondConst = nullptr;
+  Operation *mutationAdd = nullptr;
+  for (auto *op : walk(mutation)) {
+    if (!op)
+      continue;
+    if (op->name() == "arith.constant") {
+      if (!firstConst)
+        firstConst = op;
+      else if (!secondConst)
+        secondConst = op;
+    } else if (op->name() == "arith.addi") {
+      mutationAdd = op;
+    }
+  }
+  bool moved = firstConst && secondConst && moveOperationBefore(*secondConst, *firstConst);
+  Operation *replacement = nullptr;
+  if (mutationAdd) {
+    auto repl = std::make_unique<Operation>(
+        "arith.subi", mutationAdd->getOperands(), std::vector<Type>{mutationAdd->resultType()},
+        std::map<std::string, Attribute>{}, mutationAdd->loc());
+    replacement = replaceOperation(mutation, *mutationAdd, std::move(repl));
+  }
+  auto mutationVerify = verify(mutation);
+
   os << "[self-mlir-core] uniqued=" << (uniqued ? 1 : 0)
      << " types=" << ctx.typeCount()
      << " attrs=" << ctx.attrCount()
      << " locs=" << ctx.locationCount()
      << " block-args=1"
+     << " symbols=" << symtab.all().size()
+     << " main-symbol=" << (mainFunc ? 1 : 0)
+     << " add-uses-before=" << addUsesBefore
+     << " zero-uses-before=" << zeroUsesBefore
+     << " erased-dead-const=" << (erasedDeadConstant ? 1 : 0)
+     << " moved-op=" << (moved ? 1 : 0)
+     << " replaced-op=" << (replacement ? 1 : 0)
+     << " mutation-verify=" << (mutationVerify.ok ? 1 : 0)
+     << " roundtrip-verify=" << (roundTripVerify.ok ? 1 : 0)
+     << " roundtrip-errors=" << roundTripErrors.size()
+     << " roundtrip-symbols=" << roundTripSymbols.all().size()
      << " rules=" << stats.rules
      << " rewrites=" << stats.rewrites
      << " verify-before=" << (before.ok ? 1 : 0)
      << " verify-after=" << (after.ok ? 1 : 0)
      << " parse-errors=" << parseErrors.size() << "\n";
   print(module, os);
-  return uniqued && before.ok && after.ok && parseErrors.empty() && stats.rewrites == 1 ? 0 : 1;
+  return uniqued && before.ok && after.ok && parseErrors.empty() &&
+         stats.rewrites == 1 && mainFunc && symtab.duplicates().empty() &&
+         addUsesBefore == 1 && zeroUsesBefore == 1 && erasedDeadConstant &&
+         moved && replacement && mutationVerify.ok && roundTrip &&
+         roundTripVerify.ok && roundTripErrors.empty() &&
+         roundTripSymbols.lookup("main") ? 0 : 1;
 }
 
 int runConversionSelfTest(std::ostream &os) {

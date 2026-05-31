@@ -24,6 +24,30 @@ grep -q 'block-args=1' <<<"${out}" || {
   echo "expected block argument SSA in self-MLIR sample" >&2
   exit 1
 }
+grep -q 'main-symbol=1' <<<"${out}" || {
+  echo "expected self-MLIR symbol table to resolve main" >&2
+  exit 1
+}
+grep -q 'add-uses-before=1' <<<"${out}" || {
+  echo "expected self-MLIR use-def query to see the return use" >&2
+  exit 1
+}
+grep -q 'erased-dead-const=1' <<<"${out}" || {
+  echo "expected self-MLIR erase API to remove a dead op" >&2
+  exit 1
+}
+grep -q 'moved-op=1' <<<"${out}" || {
+  echo "expected self-MLIR move API to move an operation" >&2
+  exit 1
+}
+grep -q 'replaced-op=1' <<<"${out}" || {
+  echo "expected self-MLIR replace API to rewrite an operation" >&2
+  exit 1
+}
+grep -q 'roundtrip-verify=1' <<<"${out}" || {
+  echo "expected self-MLIR parser/printer round-trip to verify" >&2
+  exit 1
+}
 grep -q 'rewrites=1' <<<"${out}" || {
   echo "expected DRR/greedy rewrite to fold addi-zero" >&2
   exit 1
