@@ -112,13 +112,15 @@ The default RISC-V O1 profile may also use two narrow proof-driven reductions:
   the zero-trip guard remains intact, and no external side effect or
   counter-dependent store is present.  This covers repeated prefix-call shapes
   without inspecting public inputs or expected outputs.
-- `ProvenBitwiseHelper` may lower a fully classified source helper that computes
-  bitwise `and`/`or`/`xor` through arithmetic loops.  If both operands are not
-  statically non-negative, it emits a runtime guard and keeps the original helper
-  as fallback; the opt-in `StructuralBitwise` whole recognizer remains disabled.
+- `ProvenBitwiseHelper` may lower a fully classified self-MLIR helper that
+  computes bitwise `and`/`xor` through a complete 32-iteration arithmetic loop.
+  The pass fires from IR shape only, never from helper name.  If both operands
+  are not statically non-negative, it emits a runtime guard and keeps the
+  original helper as fallback; the opt-in `StructuralBitwise` whole recognizer
+  remains disabled.
 
 The kill switches are `SISY_ENABLE_PREFIX_CALL_REDUCTION=0` and
-`SISY_ENABLE_PROVEN_BITWISE_HELPER=0`.
+`SISY_ENABLE_SELF_PROVEN_BITWISE=0`.
 
 ## Strict-Mode Or Experimental Only
 

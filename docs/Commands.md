@@ -132,6 +132,8 @@ generic passes keep bisection kill switches. Examples:
 ```bash
 SISY_ENABLE_SELF_AFFINE_OPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_SELF_MEMOPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_PROVEN_BITWISE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_MACHINE_LIVENESS=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_SELF_MACHINE_SCHED=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
@@ -145,6 +147,15 @@ SISY_ENABLE_SYNTH_CONST_ARRAY=0 ./build/compiler testcase.sy -S -o tests/.out/ca
 SISY_HIR_MICRO_NR=2 SISY_HIR_MICRO_KC=32 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_STENCIL_INTERIOR=1 SISY_HIR_STENCIL_SPLIT_COLUMNS=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
+
+Performance reporting helpers:
+
+```bash
+scripts/eval-self-mlir-perf-baseline.sh
+```
+
+The generated CSV and Markdown summary classify public `performance_riscv`
+cases for reporting only. Case names and paths are not compiler triggers.
 
 Strict-mode comparison switches:
 

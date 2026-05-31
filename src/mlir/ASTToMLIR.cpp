@@ -488,6 +488,7 @@ std::vector<ConversionPattern> targetPatterns(const std::string &target) {
       {"arith.subi", prefix + "sub"}, {"arith.muli", prefix + "mul"},
       {"arith.divi", prefix + "sdiv"}, {"arith.remi", prefix + "srem"},
       {"arith.andi", prefix + "and"}, {"arith.ori", prefix + "orr"},
+      {"arith.xori", prefix + "eor"},
       {"arith.noti", prefix + "not"}, {"arith.cmpi", prefix + "cmp"},
       {"arith.cmpf", prefix + "fcmp"}, {"arith.addf", prefix + "fadd"},
       {"arith.subf", prefix + "fsub"}, {"arith.mulf", prefix + "fmul"},
@@ -504,6 +505,7 @@ std::vector<ConversionPattern> targetPatterns(const std::string &target) {
     {"arith.subi", prefix + "subw"}, {"arith.muli", prefix + "mulw"},
     {"arith.divi", prefix + "divw"}, {"arith.remi", prefix + "remw"},
     {"arith.andi", prefix + "and"}, {"arith.ori", prefix + "or"},
+    {"arith.xori", prefix + "xor"},
     {"arith.noti", prefix + "seqz"}, {"arith.cmpi", prefix + "cmp"},
     {"arith.cmpf", prefix + "fcmp"}, {"arith.addf", prefix + "fadd"},
     {"arith.subf", prefix + "fsub"}, {"arith.mulf", prefix + "fmul"},
@@ -576,6 +578,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   // 4. Global straight-line optimizations
   runGlobalOpt(*module, &stats.opt);
   runMemoryOpt(*module, &stats.opt);
+  runProvenBitwiseHelper(*module, &stats.opt);
+  collectAffineNestSummary(*module, &stats.opt);
   if (std::getenv("SISY_ENABLE_RVV"))
     runLoopVectorization(*module);
   auto before = verify(*module);

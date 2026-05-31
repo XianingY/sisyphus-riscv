@@ -280,10 +280,23 @@ struct SelfOptStats {
   int memoryBlocks = 0;
   int memoryForwardedLoads = 0;
   int memoryRemovedStores = 0;
+  int bitwiseCandidates = 0;
+  int bitwiseRewrittenCalls = 0;
+  int bitwiseGuardedCalls = 0;
+  int bitwiseRejectImpure = 0;
+  int bitwiseRejectSignedUnsafe = 0;
+  int affineSummaryLoops = 0;
+  int affineSummaryMemoryOps = 0;
+  int affineSummarySideEffects = 0;
+  int machineLiveSpills = 0;
+  int machineDeadSpillsAvoided = 0;
+  int machineCallBoundarySpills = 0;
 };
 
 void runGlobalOpt(Module &module, SelfOptStats *stats = nullptr);
 void runMemoryOpt(Module &module, SelfOptStats *stats = nullptr);
+void runProvenBitwiseHelper(Module &module, SelfOptStats *stats = nullptr);
+void collectAffineNestSummary(Module &module, SelfOptStats *stats = nullptr);
 void runLoopVectorization(Module &module);
 void print(Module &module, std::ostream &os);
 std::vector<Operation*> walk(Module &module);
@@ -357,6 +370,9 @@ struct NativeAsmStats {
   int unsupportedOps = 0;
   int legacyOps = 0;
   int phiLikeOps = 0;
+  int liveSpills = 0;
+  int deadSpillsAvoided = 0;
+  int callBoundarySpills = 0;
   bool emitted = false;
   std::string error;
 };

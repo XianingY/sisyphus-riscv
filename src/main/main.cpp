@@ -312,6 +312,14 @@ int main(int argc, char **argv) {
               << " mem-blocks=" << selfMLIRStats.opt.memoryBlocks
               << " mem-forwarded-loads=" << selfMLIRStats.opt.memoryForwardedLoads
               << " mem-removed-stores=" << selfMLIRStats.opt.memoryRemovedStores
+              << " bitwise-candidates=" << selfMLIRStats.opt.bitwiseCandidates
+              << " bitwise-rewritten-calls=" << selfMLIRStats.opt.bitwiseRewrittenCalls
+              << " bitwise-guarded-calls=" << selfMLIRStats.opt.bitwiseGuardedCalls
+              << " bitwise-reject-impure=" << selfMLIRStats.opt.bitwiseRejectImpure
+              << " bitwise-reject-signed-unsafe=" << selfMLIRStats.opt.bitwiseRejectSignedUnsafe
+              << " affine-summary-loops=" << selfMLIRStats.opt.affineSummaryLoops
+              << " affine-summary-memory-ops=" << selfMLIRStats.opt.affineSummaryMemoryOps
+              << " affine-summary-side-effects=" << selfMLIRStats.opt.affineSummarySideEffects
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed
               << "\n";
@@ -347,6 +355,9 @@ int main(int argc, char **argv) {
               << " unsupported=" << asmStats.unsupportedOps
               << " legacy-ops=" << asmStats.legacyOps
               << " phi-like-ops=" << asmStats.phiLikeOps
+              << " live-spills=" << asmStats.liveSpills
+              << " dead-spills-avoided=" << asmStats.deadSpillsAvoided
+              << " call-boundary-spills=" << asmStats.callBoundarySpills
               << "\n";
   }
 

@@ -239,9 +239,17 @@ important defaults as of this review:
   disables self-MLIR affine recovery/fusion/interchange for bisection
 - `SISY_ENABLE_SELF_MEMOPT=true`; `SISY_ENABLE_SELF_MEMOPT=0` disables
   self-MLIR recursive memref store/load forwarding and local DSE
+- `SISY_ENABLE_SELF_PROVEN_BITWISE=true`; `SISY_ENABLE_SELF_PROVEN_BITWISE=0`
+  disables guarded lowering of source-defined 32-bit bitwise helpers. The pass
+  is self-MLIR shape driven and emits fallback code when signedness is not
+  statically safe.
+- `SISY_ENABLE_SELF_MACHINE_LIVENESS=true`; `SISY_ENABLE_SELF_MACHINE_LIVENESS=0`
+  returns the native emitter to conservative home-spill behavior. The default
+  local liveness mode still spills before caller-saved clobbers or register
+  reuse when a value remains live.
 - `SISY_ENABLE_SELF_MACHINE_SCHED=true` is reserved for machine-dialect
-  scheduling bisection as the scheduler grows; current native emission remains
-  conservative and scalar by default
+  scheduling bisection as the scheduler grows; current default scheduling stays
+  conservative and scalar.
 - `SISY_ENABLE_FUNCTION_EQUIVALENCE=false`
 - `SISY_ENABLE_STRUCTURAL_BITWISE=false`
 - `SISY_ENABLE_STRUCTURAL_MODMUL=false`

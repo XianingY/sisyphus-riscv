@@ -24,6 +24,8 @@ final_performance
 functional
 h_functional
 performance
+!docs/performance/
+!docs/performance/*.md
 node_modules
 rank
 arm_performance

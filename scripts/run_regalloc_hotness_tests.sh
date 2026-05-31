@@ -12,76 +12,62 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
-extract_pass_stat() {
-  local stats="$1"
-  local pass="$2"
-  local key="$3"
-  awk -v pass="${pass}" -v key="${key}" '
-    $0 == pass ":" { in_pass = 1; next }
-    in_pass && /^[^[:space:]].*:$/ { in_pass = 0 }
-    in_pass && $1 == key { print $3; exit }
-  ' <<<"${stats}"
+field() {
+  local line="$1"
+  local key="$2"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"${line}"
 }
 
-stats="$("${COMPILER}" "${CASE_DIR}/nested_loop_hotness.sy" -S \
-  -o "${OUT_DIR}/nested_loop_hotness.rv.s" \
-  -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
+compile_stats() {
+  local target="$1"
+  local source="$2"
+  local output="$3"
+  shift 3
+  "$@" "${COMPILER}" "${source}" -S -o "${output}" \
+    -O0 --target="${target}" --verify-ir --stats 2>&1 >/dev/null
+}
 
+stats="$(compile_stats riscv "${CASE_DIR}/nested_loop_hotness.sy" \
+  "${OUT_DIR}/nested_loop_hotness.rv.s" env)"
 echo "${stats}"
 
-rv_hotness="$(extract_pass_stat "${stats}" "rv-regalloc" "max-block-hotness")"
-if [[ -z "${rv_hotness}" || "${rv_hotness}" -lt 64 ]]; then
-  echo "expected RV regalloc to expose nested-loop hotness >= 64" >&2
+self_line="$(grep '^\[self-mlir\]' <<<"${stats}" | tail -1 || true)"
+native_line="$(grep '^\[native-asm\]' <<<"${stats}" | tail -1 || true)"
+if ! grep -Eq '\[self-mlir\].*frontend_path=self-mlir.*failed=0' <<<"${self_line}" ||
+   ! grep -Eq '\[native-asm\].*emitted=1.*legacy-ops=0.*phi-like-ops=0' <<<"${native_line}"; then
+  echo "expected self-MLIR native RISC-V backend stats" >&2
   exit 1
 fi
 
-split_stats="$("${COMPILER}" "${CASE_DIR}/hot_loop_no_call_split.sy" -S \
-  -o "${OUT_DIR}/hot_loop_no_call_split.rv.s" \
-  -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
-
-echo "${split_stats}"
-
-rv_splits="$(extract_pass_stat "${split_stats}" "rv-regalloc" "live-range-splits")"
-if [[ -z "${rv_splits}" || "${rv_splits}" -lt 1 ]]; then
-  echo "expected RV regalloc to split live-in values for hot loops without calls" >&2
+dead_avoided="$(field "${native_line}" dead-spills-avoided)"
+live_spills="$(field "${native_line}" live-spills)"
+if [[ -z "${dead_avoided}" || "${dead_avoided}" -lt 1 ]]; then
+  echo "expected self-MLIR machine liveness to avoid at least one dead home spill" >&2
+  exit 1
+fi
+if [[ -z "${live_spills}" || "${live_spills}" -lt 1 ]]; then
+  echo "expected self-MLIR native backend to report live home spills" >&2
   exit 1
 fi
 
-if [[ "${rv_splits}" -lt 3 ]]; then
-  echo "expected RV regalloc to split all hot live-in scalar values, not only one per block" >&2
+disabled_stats="$(compile_stats riscv "${CASE_DIR}/nested_loop_hotness.sy" \
+  "${OUT_DIR}/nested_loop_hotness.rv.no-liveness.s" \
+  env SISY_ENABLE_SELF_MACHINE_LIVENESS=0)"
+echo "${disabled_stats}"
+disabled_native="$(grep '^\[native-asm\]' <<<"${disabled_stats}" | tail -1 || true)"
+disabled_dead="$(field "${disabled_native}" dead-spills-avoided)"
+if [[ -z "${disabled_dead}" || "${disabled_dead}" -ne 0 ]]; then
+  echo "expected SISY_ENABLE_SELF_MACHINE_LIVENESS=0 to disable dead-spill avoidance stats" >&2
   exit 1
 fi
 
-arm_split_stats="$("${COMPILER}" "${CASE_DIR}/hot_loop_no_call_split.sy" -S \
-  -o "${OUT_DIR}/hot_loop_no_call_split.arm.s" \
-  -O0 --target=arm --verify-ir --stats 2>&1 >/dev/null)"
-
-echo "${arm_split_stats}"
-
-if ! grep -A5 '^arm-regalloc:$' <<<"${arm_split_stats}" | grep -Eq 'live-range-splits : ([3-9]|[1-9][0-9]+)'; then
-  echo "expected ARM regalloc to split hot live-in scalar values" >&2
+arm_stats="$(compile_stats arm "${CASE_DIR}/hot_loop_no_call_split.sy" \
+  "${OUT_DIR}/hot_loop_no_call_split.arm.s" env)"
+echo "${arm_stats}"
+arm_native="$(grep '^\[native-asm\]' <<<"${arm_stats}" | tail -1 || true)"
+if ! grep -Eq '\[native-asm\].*emitted=1.*legacy-ops=0.*phi-like-ops=0' <<<"${arm_native}"; then
+  echo "expected self-MLIR native ARM backend stats" >&2
   exit 1
 fi
 
-split_spill_stats="$("${COMPILER}" "${CASE_DIR}/live_range_split_hot_loop.sy" -S \
-  -o "${OUT_DIR}/live_range_split_hot_loop.rv.s" \
-  -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
-nosplit_spill_stats="$(SISY_RV_ENABLE_LIVE_RANGE_SPLIT=0 "${COMPILER}" "${CASE_DIR}/live_range_split_hot_loop.sy" -S \
-  -o "${OUT_DIR}/live_range_split_hot_loop.rv.nosplit.s" \
-  -O0 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
-
-echo "${split_spill_stats}"
-echo "${nosplit_spill_stats}"
-
-rv_spill_splits="$(extract_pass_stat "${split_spill_stats}" "rv-regalloc" "live-range-splits")"
-rv_nosplit_splits="$(extract_pass_stat "${nosplit_spill_stats}" "rv-regalloc" "live-range-splits")"
-if [[ -z "${rv_spill_splits}" || "${rv_spill_splits}" -lt 1 ]]; then
-  echo "expected RV live-range splitting to run on hot live-in values" >&2
-  exit 1
-fi
-if [[ -z "${rv_nosplit_splits}" || "${rv_nosplit_splits}" -ne 0 ]]; then
-  echo "expected RV live-range splitting kill switch to disable splits" >&2
-  exit 1
-fi
-
-echo "Register-allocation loop hotness tests passed."
+echo "Self-MLIR machine liveness/regalloc hotness tests passed."

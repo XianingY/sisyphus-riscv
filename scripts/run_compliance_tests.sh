@@ -12,7 +12,7 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
-if rg -n 'inputFile\.find|emitKnown.*Fixup|fixup_output|SISY_ENABLE_.*FIXUPS' \
+if rg -n 'inputFile\.find|path\.find|basename\(|caseName|case_name|sourcePath|emitKnown.*Fixup|fixup_output|SISY_ENABLE_.*FIXUPS' \
     "${ROOT_DIR}/src" >/tmp/sisy-compliance-source.txt; then
   cat /tmp/sisy-compliance-source.txt >&2
   echo "source-name or fixed-output optimization trigger found under src/" >&2
@@ -71,5 +71,7 @@ for name in "${perf_cases[@]}"; do
   require_absent_file "${asm}" '\bvsetvli\b|\bv[ls]e[0-9]+\.v\b|\bv[ls]se[0-9]+\.v\b' \
     "default RISC-V path emitted RVV for ${name}"
 done
+
+"${ROOT_DIR}/scripts/run_proven_bitwise_tests.sh"
 
 echo "Self-MLIR reference-compliance tests passed."
