@@ -274,8 +274,16 @@ struct VerifyResult {
 
 VerifyResult verify(Module &module);
 void eraseMarked(Module &module);
-void runGlobalOpt(Module &module);
-void runMemoryOpt(Module &module);
+struct SelfOptStats {
+  int globalsPromoted = 0;
+  int globalsErased = 0;
+  int memoryBlocks = 0;
+  int memoryForwardedLoads = 0;
+  int memoryRemovedStores = 0;
+};
+
+void runGlobalOpt(Module &module, SelfOptStats *stats = nullptr);
+void runMemoryOpt(Module &module, SelfOptStats *stats = nullptr);
 void runLoopVectorization(Module &module);
 void print(Module &module, std::ostream &os);
 std::vector<Operation*> walk(Module &module);
@@ -362,11 +370,19 @@ struct ProductionStats {
   int mlirOpsBefore = 0;
   int mlirOpsAfter = 0;
   int rewrites = 0;
+  int affineLoops = 0;
+  int scfLoops = 0;
+  int memrefOps = 0;
+  int loadOps = 0;
+  int storeOps = 0;
+  int callOps = 0;
+  int machineDialectOps = 0;
   int conversionVisited = 0;
   int conversionLegal = 0;
   int conversionConverted = 0;
   int conversionFailed = 0;
   int conversionRollbacks = 0;
+  SelfOptStats opt;
   bool verifyBefore = false;
   bool verifyAfter = false;
   std::string error;

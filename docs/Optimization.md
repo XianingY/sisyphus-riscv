@@ -4,7 +4,20 @@ This document records how Sisyphus optimizations are designed, enabled, and
 validated. It complements `docs/Compliance.md`; if there is any conflict, the
 compliance policy wins.
 
-Last reviewed: 2026-05-30.
+Last reviewed: 2026-05-31.
+
+Current production path:
+
+```text
+AST -> self-MLIR(sysy/scf/memref/arith/affine)
+    -> dialect conversion
+    -> rv_machine/arm_machine
+    -> asm
+```
+
+Older HIR/CFG pass names remain useful when reading historical commits, but
+new default RISC-V O1 work should land on self-MLIR, DRR, memref/affine
+analyses, or machine-dialect scheduling.
 
 ## 1. Default Profile Philosophy
 
@@ -17,9 +30,10 @@ Default-preferred work:
 - improve canonical IR shape so existing passes can reason about it;
 - prove memory safety with alias analysis, readonly/pure facts, and
   MemorySSA-style reaching definitions;
-- prove loop legality with affine access analysis and dependence directions;
+- prove loop legality with self-MLIR affine access analysis and dependence
+  directions;
 - reduce arithmetic with normal algebraic and range-based identities;
-- improve backend register allocation, scheduling, and peepholes.
+- improve machine-dialect register allocation, scheduling, and peepholes.
 
 Do not optimize by recognizing public case names, expected checksums, hidden
 input behavior, or algorithm-specific helper substitutions.
@@ -30,23 +44,23 @@ input behavior, or algorithm-specific helper substitutions.
 
 These are appropriate for default use when verifier and regression checks pass:
 
-- `Mem2Reg`, `RegularFold`, `SCCP`, `Range`, `RangeAwareFold`, `EqClass`,
-  `GVN`, `DCE`, `AggressiveDCE`, `SimplifyCFG`, and `Select`.
-- Alias-aware `DSE`/`DLE`, load forwarding, readonly call handling, and LICM.
-- `SCEV` and ordinary loop strength reduction.
-- Hardened `LoopRotate` for default scalar RISC-V O1.  It rewrites canonical
-  positive-step while loops into a guarded do-while form only after
-  LoopSimplify/LCSSA-style canonicalization, keeps a single-edge loop preheader,
-  repairs exit phis for zero-trip semantics, and leaves calls/stores in place.
-  Store-containing loops remain opt-in until the MemorySSA/guaranteed-execute
-  contract can prove all downstream consumers preserve conditional store
-  semantics; the default route favors PE/AC stability over extra rotation.
-- HIR affine transforms: fusion, interchange, reduction privatization,
-  invariant guard hoisting, partial unroll, and unroll-and-jam when dependence
-  analysis proves legality.
+- self-MLIR DRR canonicalization for local pure folds such as `x + 0`,
+  `x - 0`, `x * 1`, `x * 0`, `x / 1`, `x % 1`, `x & 0`, `x | 0`, and
+  identical-arm select cleanup.
+- self-MLIR global/memref cleanup: single-function global promotion, recursive
+  block-local store/load forwarding, DSE of overwritten stores, readonly call
+  invalidation, and conservative nested-region traversal.
+- self-MLIR affine transforms: structure recovery, fusion, interchange,
+  reduction privatization, invariant guard hoisting, partial unroll, and
+  unroll-and-jam when dependence analysis proves legality.
+- `SCEV`-style induction facts and ordinary loop strength reduction.
+- Hardened loop rotation is allowed only after guaranteed-execution and
+  zero-trip semantics are preserved. Store-containing rotation remains opt-in
+  because `conv2d` and Nussinov-style conditional stores previously exposed
+  correctness risk.
 - Runtime memoization for proven pure recursive functions. It adds runtime
   cache tables and does not precompute answers at compile time.
-- RISC-V and ARM backend lowering, scheduling, hotness-aware register
+- `rv_machine`/`arm_machine` lowering, scheduling, hotness-aware register
   allocation, rematerialization-friendly heuristics, and target peepholes.
 
 ### Default-Off Or Strict-Mode Experiments
@@ -59,7 +73,8 @@ compliance path:
 - `StructuralModMul.cpp`
 - `RowScratchMatmul.cpp`
 - `Cached.cpp`
-- `SynthConstArray.cpp`
+- `SynthConstArray.cpp` variants that do not satisfy the source-constant proof
+  in `docs/Compliance.md`
 - `AdvancedConv2DTransform.cpp`
 - HIR stencil/interior dispatcher when used as a conv-specific shortcut
 
@@ -112,10 +127,11 @@ a general, local, legality-proven transform.
 
 Best legal path:
 
-- stronger HIR affine nest extraction;
+- stronger self-MLIR affine nest extraction;
 - 2D/3D dependence direction solving;
 - cache-aware tiling and register-pressure-aware unroll-and-jam;
-- vectorization handoff for contiguous inner loops;
+- scalar `rv64gc` tiling/interchange by default, with vectorization handoff
+  only under explicit RVV/NEON opt-in;
 - backend address-mode folding and hot spill avoidance.
 
 Avoid replacing matrix loops with hand-written helpers. The transform must keep
@@ -126,7 +142,7 @@ or schedule it under proven dependence constraints.
 
 Best legal path:
 
-- guarded/imperfect affine extraction;
+- guarded/imperfect self-MLIR affine extraction;
 - border peeling so interior regions can be optimized without per-pixel guards;
 - small constant kernel-loop unrolling based on loop trip count and body cost;
 - generic tiling and vectorization of stride-1 inner loops.
@@ -219,6 +235,13 @@ experiments.
 Common bisection and experiment flags are listed in `docs/Commands.md`. The
 important defaults as of this review:
 
+- `SISY_ENABLE_SELF_AFFINE_OPT=true`; `SISY_ENABLE_SELF_AFFINE_OPT=0`
+  disables self-MLIR affine recovery/fusion/interchange for bisection
+- `SISY_ENABLE_SELF_MEMOPT=true`; `SISY_ENABLE_SELF_MEMOPT=0` disables
+  self-MLIR recursive memref store/load forwarding and local DSE
+- `SISY_ENABLE_SELF_MACHINE_SCHED=true` is reserved for machine-dialect
+  scheduling bisection as the scheduler grows; current native emission remains
+  conservative and scalar by default
 - `SISY_ENABLE_FUNCTION_EQUIVALENCE=false`
 - `SISY_ENABLE_STRUCTURAL_BITWISE=false`
 - `SISY_ENABLE_STRUCTURAL_MODMUL=false`
@@ -249,14 +272,9 @@ important defaults as of this review:
   countdown-loop final-iteration collapse used for overwrite-style repeats;
   loops whose stores depend on loop-local loads or call results are rejected
 - `SISY_ENABLE_ADVANCED_CONV2D=false`
-- `SISY_HIR_ENABLE_TILING=true`
-- `SISY_HIR_ENABLE_STENCIL_INTERIOR=false`
-- `SISY_HIR_ENABLE_FUSION=true`
-- `SISY_HIR_ENABLE_INTERCHANGE=true`
-- `SISY_HIR_ENABLE_UNROLL_JAM=true`
-- `SISY_HIR_ENABLE_REDUCTION_PRIVATIZE=true`
-- `SISY_HIR_ENABLE_REDUCTION_MICROTILE=true`
-- `SISY_HIR_ENABLE_INVARIANT_GUARD_HOIST=true`
+- historical `SISY_HIR_*` switches apply only to retired/compatibility
+  experiments; new default RISC-V O1 tuning should use self-MLIR switches and
+  stats
 - `SISY_RV_ENABLE_SUPERBLOCK=true`
 - `SISY_RV_SUPERBLOCK_PRESSURE_BUDGET=20`
 - `SISY_RV_ENABLE_SCHEDULE=true`
@@ -264,9 +282,26 @@ important defaults as of this review:
 - `SISY_RV_ENABLE_REMATERIALIZATION=true`
 - `SISY_RV_ENABLE_LIVE_RANGE_SPLIT=true`
 
-Always verify current defaults in `src/main/PipelineProfiles.cpp`,
-`src/hir/HIRPolyhedral.cpp`, and the pass implementation before relying on a
+Always verify current defaults in `src/mlir/ASTToMLIR.cpp`,
+`src/mlir/SelfMLIR.cpp`, and the pass implementation before relying on a
 documented switch.
+
+## 5a. performance_riscv Classification
+
+The public performance sources may guide engineering priority and test
+coverage, but case names are never compiler triggers. The default reporting
+script classifies cases only in CSV output:
+
+- matrix: `01_mm*`, `matmul*`, `many_mat_cal*`
+- transpose/shuffle: `transpose*`, `shuffle*`
+- stencil: `conv2d-*`, `sl*`
+- lookup/bitwise: `crc*`, `huffman-*`, `crypto-*`, `h-*`
+- branch/dp: `03_sort*`, `knapsack_naive*`
+- math/scheduling: `fft*`, `optimization_scheduling*`, `prime_search*`
+
+Use `scripts/eval-self-mlir-perf-baseline.sh` to collect compile status, asm
+size, self-MLIR op counts, machine op counts, and optimization stats without
+changing the compiler pipeline.
 
 ## 6. Retired Or Rejected Ideas
 

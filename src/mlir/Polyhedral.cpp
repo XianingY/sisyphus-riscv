@@ -25,6 +25,42 @@ static void dropRegionOperandUses(Region &region) {
   }
 }
 
+static bool blockInRegionTree(Block *block, Region *region) {
+  if (!block || !region)
+    return false;
+  for (auto &childBlock : region->getBlocks()) {
+    if (childBlock.get() == block)
+      return true;
+    for (auto &op : childBlock->ops()) {
+      for (auto &nested : op->getRegions()) {
+        if (blockInRegionTree(block, nested.get()))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool valueDefinedInRegionTree(Value value, Region *region) {
+  if (!value.valid())
+    return false;
+  if (value.isOperationResult())
+    return blockInRegionTree(value.getDefiningOp()->getBlock(), region);
+  if (auto *arg = value.getBlockArgument())
+    return blockInRegionTree(arg->getOwner(), region);
+  return false;
+}
+
+static bool opOperandsDependOnRegion(Operation *op, Region *region) {
+  if (!op)
+    return false;
+  for (auto value : op->getOperands()) {
+    if (valueDefinedInRegionTree(value, region))
+      return true;
+  }
+  return false;
+}
+
 void runRaiseToAffine(Module &module) {
 restart:
   for (auto *op : walk(module)) {
@@ -101,6 +137,22 @@ restart:
         if (parentBlock->ops()[i].get() == op) { insertIdx = i; break; }
       }
 
+      Region *condRegion = op->getRegions()[0].get();
+      Region *bodyRegion = op->getRegions()[1].get();
+      if ((blockInRegionTree(boundOp->getBlock(), condRegion) &&
+           opOperandsDependOnRegion(boundOp, condRegion)) ||
+          (blockInRegionTree(boundOp->getBlock(), bodyRegion) &&
+           opOperandsDependOnRegion(boundOp, bodyRegion)))
+        continue;
+
+      Operation *stepValOp = stepVal.getDefiningOp();
+      if (stepValOp &&
+          ((blockInRegionTree(stepValOp->getBlock(), condRegion) &&
+            opOperandsDependOnRegion(stepValOp, condRegion)) ||
+           (blockInRegionTree(stepValOp->getBlock(), bodyRegion) &&
+            opOperandsDependOnRegion(stepValOp, bodyRegion))))
+        continue;
+
       if (boundOp->getBlock() == condBlock || boundOp->getBlock() == body) {
         auto hoisted = boundOp->getBlock()->takeOperation(boundOp);
         hoisted->setBlock(parentBlock);
@@ -108,7 +160,6 @@ restart:
         insertIdx++;
       }
 
-      Operation *stepValOp = stepVal.getDefiningOp();
       if (stepValOp && (stepValOp->getBlock() == condBlock || stepValOp->getBlock() == body)) {
         auto hoisted = stepValOp->getBlock()->takeOperation(stepValOp);
         hoisted->setBlock(parentBlock);
@@ -156,6 +207,7 @@ restart:
 }
 
 void runAffineLoopTiling(Module &module) {
+  (void) module;
   // Tile perfect loop nests
 }
 

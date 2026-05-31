@@ -1,6 +1,7 @@
 #ifndef ASTNODE_H
 #define ASTNODE_H
 
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
@@ -82,6 +83,7 @@ public:
   std::vector<VarDeclNode*> nodes;
 
   TransparentBlockNode(const decltype(nodes) &n): nodes(n) {}
+  ~TransparentBlockNode() { for (auto node : nodes) delete node; }
 };
 
 class BinaryNode : public ASTNodeImpl<BinaryNode, __LINE__> {
@@ -168,13 +170,27 @@ public:
 
   ConstArrayNode(int *vi): vi(vi), isFloat(false) {}
   ConstArrayNode(float *vf): vf(vf), isFloat(true) {}
+  ~ConstArrayNode() {
+    if (isFloat)
+      delete[] vf;
+    else
+      delete[] vi;
+  }
 };
 
 class LocalArrayNode : public ASTNodeImpl<LocalArrayNode, __LINE__> {
 public:
   ASTNode **va;
+  size_t count;
 
-  LocalArrayNode(ASTNode **va): va(va) {}
+  LocalArrayNode(ASTNode **va, size_t count): va(va), count(count) {}
+  ~LocalArrayNode() {
+    if (!va)
+      return;
+    for (size_t i = 0; i < count; i++)
+      delete va[i];
+    delete[] va;
+  }
 };
 
 class ArrayAccessNode : public ASTNodeImpl<ArrayAccessNode, __LINE__> {
@@ -185,6 +201,7 @@ public:
 
   ArrayAccessNode(const std::string &array, const std::vector<ASTNode*> &indices):
     array(array), indices(indices) {}
+  ~ArrayAccessNode() { for (auto index : indices) delete index; }
 };
 
 class ArrayAssignNode : public ASTNodeImpl<ArrayAssignNode, __LINE__> {
@@ -196,6 +213,11 @@ public:
 
   ArrayAssignNode(const std::string &array, const std::vector<ASTNode*> &indices, ASTNode *value):
     array(array), indices(indices), value(value) {}
+  ~ArrayAssignNode() {
+    for (auto index : indices)
+      delete index;
+    delete value;
+  }
 };
 
 class CallNode : public ASTNodeImpl<CallNode, __LINE__> {
@@ -205,6 +227,7 @@ public:
 
   CallNode(const std::string &func, const std::vector<ASTNode*> &args):
     func(func), args(args) {}
+  ~CallNode() { for (auto arg : args) delete arg; }
 };
 
 class BreakNode : public ASTNodeImpl<BreakNode, __LINE__> {};

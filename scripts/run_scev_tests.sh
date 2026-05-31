@@ -8,19 +8,25 @@ OUT_DIR="${ROOT_DIR}/tests/.out/scev"
 mkdir -p "${OUT_DIR}"
 
 if [[ ! -x "${COMPILER}" ]]; then
-  echo "compiler not found at ${COMPILER}; run cmake --build build -j first"
+  echo "compiler not found at ${COMPILER}; run scripts/build.sh first" >&2
   exit 1
 fi
 
-reverse_ir_file="${OUT_DIR}/reverse_address_lsr.after-scev.ir"
-"${COMPILER}" "${CASE_DIR}/reverse_address_lsr.sy" -S \
-  -o "${OUT_DIR}/reverse_address_lsr.rv.s" \
-  -O1 --target=riscv --verify-ir --print-after scev >"${reverse_ir_file}" 2>&1
+stats="${OUT_DIR}/reverse_address_lsr.stats"
+asm="${OUT_DIR}/reverse_address_lsr.rv.s"
+"${COMPILER}" "${CASE_DIR}/reverse_address_lsr.sy" -S -o "${asm}" \
+  -O1 --target=riscv --verify-ir --stats >"${stats}" 2>&1
+cat "${stats}"
 
-if ! grep -Eq 'int <-4>' "${reverse_ir_file}"; then
-  echo "expected SCEV LSR to use a -4 byte stride for reverse int-array traversal" >&2
-  tail -120 "${reverse_ir_file}" >&2
+if ! grep -Eq '\[self-mlir\].*affine-loops=[1-9].*conversion-failed=0' "${stats}"; then
+  echo "expected self-MLIR affine/SCEV-style loop recovery for reverse traversal" >&2
   exit 1
 fi
 
-echo "SCEV loop strength reduction tests passed."
+if ! grep -Eq 'li[[:space:]]+t6,[[:space:]]+1' "${asm}" ||
+   ! grep -Eq 'addw[[:space:]]+s[0-9]+,[[:space:]]+s[0-9]+,[[:space:]]+t6' "${asm}"; then
+  echo "expected native emitter to preserve the canonical +1 induction update" >&2
+  exit 1
+fi
+
+echo "self-MLIR SCEV/induction lowering tests passed."

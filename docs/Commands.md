@@ -49,6 +49,7 @@ Useful diagnostics:
 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1 --stats
 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1 --dump-pass-timing
 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1 --verify-ir
+SISY_DUMP_SELF_MLIR=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1 --stats
 ```
 
 ## Smoke And Regression
@@ -99,6 +100,17 @@ RUNTIME_SOFT_PERF=1 RUNTIME_PERF_TIMEOUT_SEC=30 \
   scripts/eval-runtime.sh official-riscv-perf riscv O1
 ```
 
+self-MLIR compile/stat baseline over the public RISC-V performance sources:
+
+```bash
+scripts/eval-self-mlir-perf-baseline.sh
+```
+
+The report is written to `tests/.out/self-mlir-perf-baseline/baseline.csv` and
+contains compile status, assembly size, self-MLIR op counts, native machine op
+counts, and local optimization stats. Case names are used only for reporting
+categories in this script, never as compiler triggers.
+
 ## Wide Compile Checks
 
 Compile all known 2026 RISC-V functional and performance sources:
@@ -118,6 +130,9 @@ semantic or structural recognizers are strict-mode opt-in, while ordinary
 generic passes keep bisection kill switches. Examples:
 
 ```bash
+SISY_ENABLE_SELF_AFFINE_OPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_MEMOPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_MACHINE_SCHED=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1

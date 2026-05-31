@@ -75,11 +75,11 @@ implementation of the MLIR object model and conversion contracts.
 - `scripts/run_mlir_core_tests.sh` and
   `scripts/run_dialect_conversion_tests.sh` are the new core gates that must
   pass before migrating default compilation stages onto the self-MLIR path.
-- Default compilation now builds the mandatory self-MLIR production gate
-  directly from the Sema-checked AST, verifies it, runs the DRR canonicalization
-  seed, and target-legalizes arithmetic into `rv_machine` or `arm_machine`
-  before the temporary legacy backend bridge is allowed to proceed.
-  `SISY_DUMP_SELF_MLIR=1` dumps this production module for debugging.
+- Default compilation now builds the mandatory self-MLIR production module
+  directly from the Sema-checked AST, verifies it, runs global/memref/affine
+  preparation, applies the DRR canonicalization seed, legalizes arithmetic into
+  `rv_machine` or `arm_machine`, and emits native assembly from the self-MLIR
+  module. `SISY_DUMP_SELF_MLIR=1` dumps this production module for debugging.
 
 ## Default Policy
 
@@ -92,15 +92,14 @@ compiler testcase.sy -S -o testcase.s -O1 --target=riscv
 and the default frontend path is:
 
 ```text
-AST -> self-MLIR production gate -> HIR/CFG legacy backend bridge
+AST -> self-MLIR -> dialect conversion -> rv_machine/arm_machine -> asm
 ```
 
-The final full-program assembler emission still uses the existing HIR/CFG +
-RV/ARM backend bridge while the machine-dialect backend is being completed, but
-the production self-MLIR gate no longer imports from HIR.  Every default
-non-legacy compile must pass the AST-origin self-MLIR verifier and target
-legalization first.  The native machine-dialect printer is present and covered
-for the initial straight-line integer slice.
+The production self-MLIR path no longer imports from HIR for ordinary
+compilation. Every default compile must pass the AST-origin self-MLIR verifier,
+target legalization, and native machine-dialect assembly emission. Historical
+legacy infrastructure is treated as compatibility material and test fixtures,
+not as the intended optimization substrate.
 
 The new infrastructure does not enable RVV, semantic helper replacement,
 fixed-output behavior, input/output precomputation, checksum triggers, or
@@ -108,12 +107,13 @@ source-name triggers.
 
 ## Next Migration Steps
 
-1. Replace the remaining HIR/CFG backend bridge with direct lowering from
-   self-MLIR `scf/cf/memref/arith` into machine dialects.
+1. Keep broadening the direct lowering from self-MLIR `scf/cf/memref/arith`
+   into machine dialects until the full SysY surface is covered by structured
+   region operations and block arguments.
 2. Port Mem2Reg, DCE, SCCP, LICM, SCEV, MemorySSA, affine transforms, and
    vectorization to `OperationPass<OpT>` over self-MLIR operations.
-3. Replace full RV/ARM lowering with `DialectConversion` into
-   `rv_machine`/`arm_machine`.
+3. Replace remaining hand-written lowering shortcuts with `DialectConversion`
+   into `rv_machine`/`arm_machine`.
 4. Move register allocation, live-range splitting, scheduling, and asm printing
    onto machine dialect operations.
 5. Delete legacy bridge files once default RISC-V and ARM gates are green on

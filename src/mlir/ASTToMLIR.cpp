@@ -125,6 +125,41 @@ bool isCompare(const sys::BinaryNode &node) {
          node.kind == sys::BinaryNode::Le || node.kind == sys::BinaryNode::Lt;
 }
 
+bool envDisabled(const char *name) {
+  const char *value = std::getenv(name);
+  return value && std::string(value) == "0";
+}
+
+void summarizeModule(Module &module, ProductionStats &stats) {
+  stats.affineLoops = 0;
+  stats.scfLoops = 0;
+  stats.memrefOps = 0;
+  stats.loadOps = 0;
+  stats.storeOps = 0;
+  stats.callOps = 0;
+  stats.machineDialectOps = 0;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    const std::string &name = op->name();
+    std::string dialect = op->dialect();
+    if (name == "affine.for")
+      stats.affineLoops++;
+    if (name == "scf.for" || name == "scf.while")
+      stats.scfLoops++;
+    if (dialect == "memref")
+      stats.memrefOps++;
+    if (name == "sysy.load" || name == "memref.load")
+      stats.loadOps++;
+    if (name == "sysy.store" || name == "memref.store")
+      stats.storeOps++;
+    if (name == "sysy.call")
+      stats.callOps++;
+    if (dialect == "rv_machine" || dialect == "arm_machine")
+      stats.machineDialectOps++;
+  }
+}
+
 class ASTToMLIR {
   Context &ctx;
   std::vector<std::map<std::string, Value>> values;
@@ -499,9 +534,14 @@ static const char *kASTCoreRules =
   "rule fold_muli_one arith.muli muli-one 9\n"
   "rule fold_select_same arith.select select-same 8\n"
   "rule fold_subi_same arith.subi subi-same 12\n"
+  "rule fold_subi_zero arith.subi subi-zero 10\n"
   "rule fold_muli_zero arith.muli muli-zero 11\n"
+  "rule fold_divi_one arith.divi divi-one 9\n"
+  "rule fold_remi_one arith.remi remi-one 9\n"
   "rule fold_andi_same arith.andi andi-same 7\n"
+  "rule fold_andi_zero arith.andi andi-zero 8\n"
   "rule fold_ori_same arith.ori ori-same 6\n"
+  "rule fold_ori_zero arith.ori ori-zero 7\n"
   "rule fold_double_noti arith.noti double-noti 15\n";
 
 } // namespace
@@ -519,12 +559,14 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   auto module = lowerFromAST(ctx, ast, target, &stats);
 
   // 1. AST lowering
-  runGlobalOpt(*module);
+  runGlobalOpt(*module, &stats.opt);
 
   // 2. High-level structure recovery and polyhedral preparation
-  runRaiseToAffine(*module);
-  runAffineLoopFusion(*module);
-  runAffineLoopInterchange(*module);
+  if (!envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
+    runRaiseToAffine(*module);
+    runAffineLoopFusion(*module);
+    runAffineLoopInterchange(*module);
+  }
 
   // 3. Inter-Procedural Optimizations (IPO)
   runPureFunctionDeduction(*module);
@@ -532,8 +574,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   runIPCP(*module);
 
   // 4. Global straight-line optimizations
-  runGlobalOpt(*module);
-  runMemoryOpt(*module);
+  runGlobalOpt(*module, &stats.opt);
+  runMemoryOpt(*module, &stats.opt);
   if (std::getenv("SISY_ENABLE_RVV"))
     runLoopVectorization(*module);
   auto before = verify(*module);
@@ -572,6 +614,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   stats.conversionFailed = convStats.failed;
   stats.conversionRollbacks = convStats.rollbacks;
   stats.mlirOpsAfter = (int) walk(*module).size();
+  summarizeModule(*module, stats);
   if (dump) {
     *dump << "===== self-MLIR production =====\n";
     print(*module, *dump);

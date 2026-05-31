@@ -4,7 +4,7 @@ This document is the source of truth for optimization legality in this
 repository. It describes what is acceptable in the default compiler profile and
 which existing experimental passes must stay opt-in.
 
-Last reviewed: 2026-05-30.
+Last reviewed: 2026-05-31.
 
 ## Core Rule
 
@@ -150,19 +150,30 @@ diagnosis rather than editing source defaults during a performance experiment.
 
 ## Current Default Direction
 
-The active RISC-V path should prefer:
+The active RISC-V path is now self-MLIR first:
 
-- affine legality improvements in `HIRAffine`/`HIRPolyhedral`;
-- generic 2D/3D tiling and dependence-preserving interchange;
-- dependence-proven reduction microtiling with cache/register pressure gates;
-- spill-aware register allocation and pre-RA scheduling;
-- range-driven `/2`, `%2`, and power-of-two folds;
-- branch-to-select conversion when CFG and SSA conditions are proven;
+```text
+AST -> self-MLIR(sysy/scf/memref/arith/affine)
+    -> dialect conversion
+    -> rv_machine/arm_machine
+    -> native asm
+```
+
+The legacy HIR/CFG vocabulary may still appear in old notes and removed
+experiments, but new default performance work should prefer:
+
+- affine legality improvements in self-MLIR `affine`/`scf` regions;
+- generic 2D/3D tiling, dependence-preserving interchange, border peeling, and
+  reduction scalar promotion driven by affine summaries;
+- self-MLIR `memref` and MemorySSA-backed LICM, DLE, DSE, and load forwarding;
+- DRR/canonicalization rules for local arithmetic identities, including
+  range-safe `/1`, `%1`, and branch-to-select cleanup;
 - source-constant table synthesis when every array element and every load index
   is proven under the boundary above;
 - prefix/final-value reduction and guarded bitwise-helper lowering under the
   proof boundaries above;
-- MemorySSA-backed LICM, DLE, and DSE.
+- machine-dialect address-mode folding, rematerialization, scheduling, and
+  spill-aware register allocation.
 
 For CRC, Huffman, FFT, convolution, matrix multiplication, transpose, and
 scheduling workloads, the acceptable path is to expose and optimize the

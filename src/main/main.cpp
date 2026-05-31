@@ -294,7 +294,27 @@ int main(int argc, char **argv) {
   }
 
   if (opts.stats) {
-    std::cerr << "[self-mlir] target=" << target << " source=ast frontend_path=self-mlir failed=0\n";
+    std::cerr << "[self-mlir] target=" << target
+              << " source=ast frontend_path=self-mlir failed=0"
+              << " ast-nodes=" << selfMLIRStats.hirOps
+              << " ops-before=" << selfMLIRStats.mlirOpsBefore
+              << " ops-after=" << selfMLIRStats.mlirOpsAfter
+              << " rewrites=" << selfMLIRStats.rewrites
+              << " affine-loops=" << selfMLIRStats.affineLoops
+              << " scf-loops=" << selfMLIRStats.scfLoops
+              << " memref-ops=" << selfMLIRStats.memrefOps
+              << " loads=" << selfMLIRStats.loadOps
+              << " stores=" << selfMLIRStats.storeOps
+              << " calls=" << selfMLIRStats.callOps
+              << " machine-ops=" << selfMLIRStats.machineDialectOps
+              << " globals-promoted=" << selfMLIRStats.opt.globalsPromoted
+              << " globals-erased=" << selfMLIRStats.opt.globalsErased
+              << " mem-blocks=" << selfMLIRStats.opt.memoryBlocks
+              << " mem-forwarded-loads=" << selfMLIRStats.opt.memoryForwardedLoads
+              << " mem-removed-stores=" << selfMLIRStats.opt.memoryRemovedStores
+              << " conversion-converted=" << selfMLIRStats.conversionConverted
+              << " conversion-failed=" << selfMLIRStats.conversionFailed
+              << "\n";
   }
 
   if (getenv("SISY_DUMP_SELF_MLIR")) {
@@ -316,6 +336,18 @@ int main(int argc, char **argv) {
     std::cerr << "  - " << (asmStats.error.empty() ? "emitNativeAssembly failed" : asmStats.error) << "\n";
     delete node;
     return 1;
+  }
+
+  if (opts.stats) {
+    std::cerr << "[native-asm] target=" << target
+              << " emitted=" << (asmStats.emitted ? 1 : 0)
+              << " functions=" << asmStats.functions
+              << " machine-ops=" << asmStats.machineOps
+              << " returns=" << asmStats.returns
+              << " unsupported=" << asmStats.unsupportedOps
+              << " legacy-ops=" << asmStats.legacyOps
+              << " phi-like-ops=" << asmStats.phiLikeOps
+              << "\n";
   }
 
   if (opts.outputFile.empty()) {

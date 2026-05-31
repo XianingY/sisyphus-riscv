@@ -38,6 +38,13 @@ for src in "${cases[@]}"; do
   "${COMPILER}" "${src}" -S -o "${asm}" -O1 --target=riscv --verify-ir --stats \
     >"${stats}" 2>&1
 
+  if ! grep -Eq '\[self-mlir\].*frontend_path=self-mlir.*failed=0' "${stats}" ||
+     ! grep -Eq '\[native-asm\].*emitted=1' "${stats}"; then
+    cat "${stats}" >&2
+    echo "default RISC-V path did not report a complete self-MLIR/native-asm compile for ${name}" >&2
+    exit 1
+  fi
+
   if grep -Eq '\bvsetvli\b|\bv[ls]e[0-9]+\.v\b|\bv[ls]se[0-9]+\.v\b' "${asm}"; then
     echo "default RISC-V path emitted RVV instructions for ${name}; use --enable-rvv for RVV" >&2
     exit 1

@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <map>
+#include <utility>
 #include <vector>
 #include <cassert>
 
@@ -59,6 +60,7 @@ class Parser {
   };
 
   std::vector<Token> tokens;
+  std::vector<std::pair<void *, bool>> ownedConstBuffers;
   size_t loc;
   TypeContext &ctx;
   
@@ -94,6 +96,10 @@ class Parser {
 
   // Const-fold the node.
   ConstValue earlyFold(ASTNode *node);
+  ConstValue makeIntConst(int value);
+  ConstValue makeFloatConst(float value);
+  int *trackIntBuffer(int *buffer);
+  float *trackFloatBuffer(float *buffer);
 
   ASTNode *primary();
   ASTNode *unary();
@@ -116,6 +122,7 @@ class Parser {
 
 public:
   Parser(const std::string &input, TypeContext &ctx);
+  ~Parser();
   ASTNode *parse();
 };
 

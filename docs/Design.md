@@ -26,7 +26,6 @@ Additional controls:
 - `--inline-threshold`, `--late-inline-threshold`
 - `--disable-loop-rotate`, `--enable-loop-rotate`, `--disable-const-unroll`
 - `--enable-experimental` (kept opt-in)
-- `--enable-hir-pipeline`, `--disable-hir-pipeline`, `--use-legacy-codegen`
 - `--dump-hir`, `--dump-cfg`, `--verify-hir`, `--verify-cfg`
 
 ## Pipeline
@@ -35,18 +34,18 @@ Additional controls:
 
 Default frontend path is dialect-based:
 
-- `AST -> HIR Build -> HIR Verify -> HIR Canonicalize -> HIR Verify -> HIR->CFG -> CFG Verify -> CFG->Legacy ModuleOp`
+- `AST -> self-MLIR(sysy/scf/memref/arith/affine) -> dialect conversion -> rv_machine/arm_machine -> asm`
 - Stage boundaries emit timing with `--dump-pass-timing` as `[stage-timing] ...`
-- Legacy frontend remains available with `--use-legacy-codegen` for A/B rollback during migration
 
 The key architectural split is intentional:
 
-- HIR keeps structured loops and array accesses visible long enough for affine
-  analysis and loop rewrites.
-- CFG provides explicit control-flow for SSA, MemorySSA-style analysis,
-  scalar optimization, and verifier checks.
-- The legacy `ModuleOp` adapter lets the mature mid-end and backends continue
-  to operate while the dialect pipeline is incrementally expanded.
+- self-MLIR keeps structured loops, regions, block arguments, memrefs, and
+  array accesses visible for affine and MemorySSA-style reasoning.
+- Dialect conversion makes the target legality boundary explicit before the
+  module reaches `rv_machine` or `arm_machine`.
+- The native machine-dialect emitter owns the default RISC-V/ARM assembly path;
+  legacy HIR/CFG notes are historical compatibility material, not the intended
+  production optimization substrate.
 
 ### O0 (stable baseline)
 
@@ -60,12 +59,13 @@ The key architectural split is intentional:
 
 ### O1 (performance pipeline)
 
-- Structured CFG optimization: const fold, inlining, loop cleanup, memory tidy, scalar transforms
-- FlattenCFG + SSA conversion (Mem2Reg)
-- Alias + DSE + DLE + DAE + GVN + LoopSimplify-style canonicalization,
-  hardened LoopRotate, LICM, and loop transforms
-- Late inline and cleanup rounds
-- Final schedule + target backend passes
+- AST lowering to self-MLIR, global/memref cleanup, affine loop recovery, loop
+  fusion/interchange when legality is proven, IPO summaries, and DRR
+  canonicalization.
+- Dialect conversion to machine operations with verifier checks before and
+  after canonicalization.
+- Native machine emission with default scalar RISC-V `rv64gc` or ARM64 code,
+  plus conservative address-mode folding and assembly-level accounting.
 
 ### O2 (aggressive profile on top of O1)
 
@@ -87,21 +87,14 @@ Default O1/O2 should only enable general compiler transformations. Semantic
 whole-function recognizers and algorithm helper replacements are strict-mode
 experiments, not architectural requirements. The intended optimization stack is:
 
-- HIR: affine loop legality, reduction privatization, fusion/interchange,
-  guarded-loop simplification, and optional tiling after dependence proof.
-  `AffineNestAnalysis` is the shared MLIR-like side table for loop domain,
-  access-rank, contiguity/stride, side-effect, reduction, and pressure summaries;
-  individual Linalg/Stenciling transforms should consume it instead of
-  reimplementing case-specific shape tests.
-- CFG/mid-end: SSA, MemorySSA-style load/store reasoning, alias analysis, LICM,
-  DSE/DLE, SCCP/range folds, SCEV, inlining, and select conversion.
-- Loop mid-end: canonical loop preheaders, guarded do-while rotation,
-  LCSSA-compatible exit-phi repair, and LICM load motion only from blocks
-  proven to execute after the guard.  Default RISC-V O1 rotation currently
-  skips store-containing loops; store motion still requires a stronger
-  guaranteed-execution proof than the loop guard alone provides.
-- Backend: target lowering, instruction scheduling, hotness-aware register
-  allocation, rematerialization-friendly decisions, and peepholes.
+- self-MLIR affine/scf: loop legality, fusion/interchange, guarded-loop
+  simplification, and optional tiling after dependence proof.
+- self-MLIR memref: SSA use-def cleanup, MemorySSA-style load/store reasoning,
+  alias queries, LICM, DSE/DLE, SCCP/range folds, SCEV-style induction facts,
+  inlining, and select conversion.
+- machine dialect: target legality, scheduling, hotness-aware register
+  allocation, rematerialization-friendly decisions, address-mode folding, and
+  peepholes.
 
 See `docs/Compliance.md` for pass families that must remain disabled by
 default.
@@ -111,7 +104,8 @@ default.
 ### RISC-V
 
 - Target ISA: rv64gc
-- Dedicated lowering, combine, DCE, register allocation, assembly dump
+- self-MLIR dialect conversion to `rv_machine`, native machine emission, and
+  conservative scalar peepholes
 - Assembly generation designed for large-address execution environments used by contest toolchains
 - Extra low-risk peephole cleanup in regalloc phase:
   - redundant `mv/li/addi` to zero register elimination
@@ -120,7 +114,8 @@ default.
 ### ARM64
 
 - Target ISA: ARMv8-A AArch64
-- Dedicated lowering, combine, ARM-specific cleanup, post-increment legalization, register allocation, assembly dump
+- self-MLIR dialect conversion to `arm_machine`, native machine emission, and
+  conservative scalar peepholes
 - Extra low-risk peephole cleanup in regalloc phase:
   - redundant `mov` and writes to `xzr` elimination
   - adjacent `add` + load/store address-offset folding with conservative guards
@@ -142,8 +137,10 @@ default.
 - `--dump-pass-timing` provides per-pass timing for optimization tuning
 ## LLVM/MLIR-Style Infrastructure
 
-The compiler now carries a shadow MLIR-style infrastructure layer documented in
-`docs/MLIRRoadmap.md`: restricted YAML op descriptors, generated descriptor
-tables, opt-in greedy canonicalization patterns, typed analysis-cache keys,
-MemRef alias side tables, and a target cost model. These pieces are deliberately
-introduced without changing the default RISC-V O1 legality boundary.
+The compiler now carries a production self-MLIR infrastructure layer documented
+in `docs/MLIRRoadmap.md`: hash-consed types/attrs/locations, Operation/Region/
+Block/BlockArgument IR, restricted YAML op descriptors, generated descriptor
+tables, DRR canonicalization patterns, typed analysis-cache keys, MemRef alias
+side tables, and a target cost model. These pieces preserve the default RISC-V
+O1 legality boundary: no RVV, no fixed-output helpers, and no benchmark-name
+triggers by default.

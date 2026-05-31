@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -995,6 +996,21 @@ static bool isIntegerConstant(Value value, int64_t expected) {
   return attr && attr.str().find(std::to_string(expected) + " :") == 0;
 }
 
+static Value insertIntegerConstantBefore(Module &module, Operation &op, int64_t value) {
+  Block *block = op.getBlock();
+  if (!block)
+    return Value();
+  int index = operationIndexInBlock(*block, &op);
+  if (index < 0)
+    return Value();
+  auto c_op = std::make_unique<Operation>(
+      "arith.constant", std::vector<Value>{}, std::vector<Type>{op.resultType()},
+      std::map<std::string, Attribute>{{"value", module.context().integerAttr(value, op.resultType())}},
+      op.loc());
+  auto &inserted = block->insertOperation(index, std::move(c_op));
+  return inserted.result();
+}
+
 static bool applyRule(Module &module, Operation &op, const RewriteRule &rule) {
   if (op.name() != rule.root || op.resultCount() != 1)
     return false;
@@ -1029,37 +1045,45 @@ static bool applyRule(Module &module, Operation &op, const RewriteRule &rule) {
   }
   if (rule.kind == "subi-same" && op.operandCount() == 2) {
     if (op.operand(0) == op.operand(1)) {
-      Block *block = op.getBlock();
-      if (block) {
-        int index = operationIndexInBlock(*block, &op);
-        if (index >= 0) {
-          auto c_op = std::make_unique<Operation>(
-              "arith.constant", std::vector<Value>{}, std::vector<Type>{op.resultType()},
-              std::map<std::string, Attribute>{{"value", module.context().integerAttr(0, op.resultType())}},
-              op.loc());
-          auto &inserted = block->insertOperation(index, std::move(c_op));
-          replaceAllUses(module, op.result(), inserted.result());
-          op.markErased();
-          return true;
-        }
+      Value zero = insertIntegerConstantBefore(module, op, 0);
+      if (zero.valid()) {
+        replaceAllUses(module, op.result(), zero);
+        op.markErased();
+        return true;
       }
+    }
+  }
+  if (rule.kind == "subi-zero" && op.operandCount() == 2) {
+    if (isIntegerConstant(op.operand(1), 0)) {
+      replaceAllUses(module, op.result(), op.operand(0));
+      op.markErased();
+      return true;
     }
   }
   if (rule.kind == "muli-zero" && op.operandCount() == 2) {
     if (isIntegerConstant(op.operand(0), 0) || isIntegerConstant(op.operand(1), 0)) {
-      Block *block = op.getBlock();
-      if (block) {
-        int index = operationIndexInBlock(*block, &op);
-        if (index >= 0) {
-          auto c_op = std::make_unique<Operation>(
-              "arith.constant", std::vector<Value>{}, std::vector<Type>{op.resultType()},
-              std::map<std::string, Attribute>{{"value", module.context().integerAttr(0, op.resultType())}},
-              op.loc());
-          auto &inserted = block->insertOperation(index, std::move(c_op));
-          replaceAllUses(module, op.result(), inserted.result());
-          op.markErased();
-          return true;
-        }
+      Value zero = insertIntegerConstantBefore(module, op, 0);
+      if (zero.valid()) {
+        replaceAllUses(module, op.result(), zero);
+        op.markErased();
+        return true;
+      }
+    }
+  }
+  if (rule.kind == "divi-one" && op.operandCount() == 2) {
+    if (isIntegerConstant(op.operand(1), 1)) {
+      replaceAllUses(module, op.result(), op.operand(0));
+      op.markErased();
+      return true;
+    }
+  }
+  if (rule.kind == "remi-one" && op.operandCount() == 2) {
+    if (isIntegerConstant(op.operand(1), 1)) {
+      Value zero = insertIntegerConstantBefore(module, op, 0);
+      if (zero.valid()) {
+        replaceAllUses(module, op.result(), zero);
+        op.markErased();
+        return true;
       }
     }
   }
@@ -1070,9 +1094,31 @@ static bool applyRule(Module &module, Operation &op, const RewriteRule &rule) {
       return true;
     }
   }
+  if (rule.kind == "andi-zero" && op.operandCount() == 2) {
+    if (isIntegerConstant(op.operand(0), 0) || isIntegerConstant(op.operand(1), 0)) {
+      Value zero = insertIntegerConstantBefore(module, op, 0);
+      if (zero.valid()) {
+        replaceAllUses(module, op.result(), zero);
+        op.markErased();
+        return true;
+      }
+    }
+  }
   if (rule.kind == "ori-same" && op.operandCount() == 2) {
     if (op.operand(0) == op.operand(1)) {
       replaceAllUses(module, op.result(), op.operand(0));
+      op.markErased();
+      return true;
+    }
+  }
+  if (rule.kind == "ori-zero" && op.operandCount() == 2) {
+    if (isIntegerConstant(op.operand(1), 0)) {
+      replaceAllUses(module, op.result(), op.operand(0));
+      op.markErased();
+      return true;
+    }
+    if (isIntegerConstant(op.operand(0), 0)) {
+      replaceAllUses(module, op.result(), op.operand(1));
       op.markErased();
       return true;
     }
@@ -1229,6 +1275,11 @@ bool isFloatType(Type type) {
   return type.kind() == TypeKind::Float || type.str() == "f32";
 }
 
+bool hasScalarHome(Type type) {
+  return type.kind() == TypeKind::Integer || type.kind() == TypeKind::Index ||
+         type.kind() == TypeKind::Float || type.str() == "i32" || type.str() == "f32";
+}
+
 uint32_t parseFloatAttrBits(Attribute attr) {
   float value = 0.0f;
   if (attr) {
@@ -1250,6 +1301,19 @@ std::string valueKey(Value value) {
 std::string lookupReg(Value value, const std::map<std::string, std::string> &regs) {
   auto it = regs.find(valueKey(value));
   return it == regs.end() ? "" : it->second;
+}
+
+bool constantIntegerValue(Value value, int64_t &out) {
+  auto *op = value.getDefiningOp();
+  if (!op || op->isErased())
+    return false;
+  if (op->name() != "arith.constant" && op->name() != "rv_machine.li" &&
+      op->name() != "arm_machine.mov")
+    return false;
+  if (!op->attr("value"))
+    return false;
+  out = parseIntegerAttr(op->attr("value"));
+  return true;
 }
 
 int64_t memrefAllocationBytes(Type type) {
@@ -1313,6 +1377,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   auto &block = *func.getRegions()[0]->getBlocks()[0];
   std::map<std::string, std::string> regs;
   std::map<std::string, int64_t> stackSlots;
+  std::map<std::string, int64_t> valueSlots;
   bool isArm = target == "arm";
 
   std::vector<Operation*> funcOps;
@@ -1338,6 +1403,36 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     stackSlots[valueKey(op->result())] = frameBytes;
     frameBytes += memrefAllocationBytes(op->resultType());
   }
+  std::function<void(Block&)> reserveValueSlotsForBlock = [&](Block &b) {
+    for (auto &arg : b.args()) {
+      if (arg && hasScalarHome(arg->type())) {
+        frameBytes = (frameBytes + 7) & ~int64_t(7);
+        valueSlots[valueKey(arg->value())] = frameBytes;
+        frameBytes += 8;
+      }
+    }
+    for (auto &owned : b.ops()) {
+      if (!owned || owned->isErased())
+        continue;
+      for (int i = 0; i < owned->resultCount(); i++) {
+        Value value = owned->result(i);
+        if (hasScalarHome(value.type())) {
+          frameBytes = (frameBytes + 7) & ~int64_t(7);
+          valueSlots[valueKey(value)] = frameBytes;
+          frameBytes += 8;
+        }
+      }
+      for (auto &region : owned->getRegions()) {
+        for (auto &childBlock : region->getBlocks())
+          reserveValueSlotsForBlock(*childBlock);
+      }
+    }
+  };
+  reserveValueSlotsForBlock(block);
+  frameBytes = (frameBytes + 7) & ~int64_t(7);
+  int64_t calleeSaveBase = frameBytes;
+  int calleeSaveCount = isArm ? 10 : 12;
+  frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
 
   os << (isArm ? "    .text\n    .global " : "    .text\n    .globl ") << name << "\n";
@@ -1348,16 +1443,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     else
       os << "    addi sp, sp, -" << frameBytes << "\n";
   }
-
-  for (size_t i = 0; i < block.args().size(); i++) {
-    const auto &arg = *block.args()[i];
-    if (isFloatType(arg.type()))
-      regs[valueKey(arg.value())] = (isArm ? "s" : "fa") + std::to_string((int) i);
-    else if (isArm)
-      regs[valueKey(arg.value())] = "w" + std::to_string((int) i);
+  for (int i = 0; i < calleeSaveCount; i++) {
+    int64_t off = calleeSaveBase + i * 8;
+    if (isArm)
+      os << "    str x" << (19 + i) << ", [sp, #" << off << "]\n";
     else
-      regs[valueKey(arg.value())] = "a" + std::to_string((int) i);
+      os << "    sd s" << i << ", " << off << "(sp)\n";
   }
+
   for (const auto &kv : globalLabels)
     regs[kv.first] = "global:" + kv.second;
 
@@ -1377,6 +1470,48 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   auto floatReg = [&]() -> std::string {
     return isArm ? armFloatReg(nextFloatReg++) : rvFloatReg(nextFloatReg++);
   };
+  auto bindReg = [&](Value value, const std::string &reg) {
+    std::string key = valueKey(value);
+    for (auto it = regs.begin(); it != regs.end(); ) {
+      if (it->first != key && it->second == reg &&
+          it->second.rfind("stack:", 0) != 0 && it->second.rfind("global:", 0) != 0) {
+        it = regs.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    regs[key] = reg;
+  };
+  auto looksFloatReg = [&](const std::string &reg) {
+    return !reg.empty() && (isArm ? reg[0] == 's' : reg[0] == 'f');
+  };
+  auto spillHome = [&](Value value, const std::string &reg) {
+    auto it = valueSlots.find(valueKey(value));
+    if (it == valueSlots.end() || reg.empty() ||
+        reg.rfind("stack:", 0) == 0 || reg.rfind("global:", 0) == 0)
+      return;
+    int64_t off = it->second;
+    bool fp = isFloatType(value.type()) || looksFloatReg(reg);
+    if (isArm)
+      os << "    str " << reg << ", [sp, #" << off << "]\n";
+    else
+      os << "    " << (fp ? "fsw " : "sw ") << reg << ", " << off << "(sp)\n";
+  };
+  auto bindResult = [&](Value value, const std::string &reg) {
+    bindReg(value, reg);
+  };
+  for (size_t i = 0; i < block.args().size(); i++) {
+    const auto &arg = *block.args()[i];
+    std::string reg;
+    if (isFloatType(arg.type()))
+      reg = (isArm ? "s" : "fa") + std::to_string((int) i);
+    else if (isArm)
+      reg = "w" + std::to_string((int) i);
+    else
+      reg = "a" + std::to_string((int) i);
+    bindResult(arg.value(), reg);
+    spillHome(arg.value(), reg);
+  }
   auto materializeAddress = [&](Value value, const std::string &tmp) -> std::string {
     std::string loc = lookupReg(value, regs);
     auto slotIt = stackSlots.find(valueKey(value));
@@ -1401,11 +1536,46 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
     return loc;
   };
+  auto ensureReg = [&](Value value, const std::string &tmp) -> std::string {
+    std::string loc = lookupReg(value, regs);
+    if (!loc.empty()) {
+      if (loc.rfind("stack:", 0) == 0 || loc.rfind("global:", 0) == 0)
+        return materializeAddress(value, tmp);
+      return loc;
+    }
+    int64_t imm = 0;
+    if (constantIntegerValue(value, imm)) {
+      if (isArm)
+        os << "    mov " << tmp << ", #" << imm << "\n";
+      else
+        os << "    li " << tmp << ", " << imm << "\n";
+      return tmp;
+    }
+    auto home = valueSlots.find(valueKey(value));
+    if (home != valueSlots.end()) {
+      bool fp = isFloatType(value.type()) || looksFloatReg(tmp);
+      if (isArm)
+        os << "    ldr " << tmp << ", [sp, #" << home->second << "]\n";
+      else
+        os << "    " << (fp ? "flw " : "lw ") << tmp << ", " << home->second << "(sp)\n";
+      return tmp;
+    }
+    return "";
+  };
   auto loadFromAddress = [&](const std::string &dst, Value base, Value index) {
     std::string addr = materializeAddress(base, scratchReg(0));
-    bool fpLoad = !dst.empty() && (dst[0] == 'f' || dst[0] == 's');
+    bool fpLoad = looksFloatReg(dst);
     if (index.valid()) {
-      std::string idx = lookupReg(index, regs);
+      int64_t immIndex = 0;
+      if (!isArm && constantIntegerValue(index, immIndex)) {
+        int64_t byteOffset = immIndex * 4;
+        if (byteOffset >= -2048 && byteOffset <= 2047) {
+          os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", "
+             << byteOffset << "(" << addr << ")\n";
+          return;
+        }
+      }
+      std::string idx = ensureReg(index, scratchReg(1));
       if (idx.empty()) {
         idx = scratchReg(1);
         if (isArm)
@@ -1428,11 +1598,21 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", 0(" << addr << ")\n";
   };
   auto storeToAddress = [&](Value value, Value base, Value index) {
-    std::string val = lookupReg(value, regs);
     std::string addr = materializeAddress(base, scratchReg(0));
-    bool fpStore = !val.empty() && (val[0] == 'f' || val[0] == 's');
+    bool fpStore = isFloatType(value.type());
     if (index.valid()) {
-      std::string idx = lookupReg(index, regs);
+      int64_t immIndex = 0;
+      if (!isArm && constantIntegerValue(index, immIndex)) {
+        int64_t byteOffset = immIndex * 4;
+        if (byteOffset >= -2048 && byteOffset <= 2047) {
+          std::string val = ensureReg(value, fpStore ? (isArm ? "s30" : "ft10") : scratchReg(1));
+          fpStore = fpStore || looksFloatReg(val);
+          os << "    " << (fpStore ? "fsw " : "sw ") << val << ", "
+             << byteOffset << "(" << addr << ")\n";
+          return;
+        }
+      }
+      std::string idx = ensureReg(index, scratchReg(1));
       if (idx.empty()) {
         idx = scratchReg(1);
         if (isArm)
@@ -1441,14 +1621,20 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           os << "    li " << idx << ", 0\n";
       }
       if (isArm) {
+        std::string val = ensureReg(value, fpStore ? "s30" : "x17");
+        fpStore = fpStore || looksFloatReg(val);
         os << "    str " << val << ", [" << addr << ", " << idx << ", lsl #2]\n";
       } else {
         os << "    slli " << scratchReg(1) << ", " << idx << ", 2\n";
         os << "    add " << scratchReg(1) << ", " << addr << ", " << scratchReg(1) << "\n";
+        std::string val = ensureReg(value, fpStore ? "ft10" : scratchReg(0));
+        fpStore = fpStore || looksFloatReg(val);
         os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << scratchReg(1) << ")\n";
       }
       return;
     }
+    std::string val = ensureReg(value, fpStore ? (isArm ? "s30" : "ft10") : scratchReg(1));
+    fpStore = fpStore || looksFloatReg(val);
     if (isArm)
       os << "    str " << val << ", [" << addr << "]\n";
     else
@@ -1473,7 +1659,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       } else {
         dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
       }
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isFloatType(op.resultType())) {
         uint32_t bits = parseFloatAttrBits(op.attr("value"));
         if (isArm)
@@ -1487,6 +1673,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else
           os << "    li " << dst << ", " << imm << "\n";
       }
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
@@ -1497,21 +1684,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "bad machine add shape";
         return false;
       }
-      std::string lhs = lookupReg(op.operand(0), regs);
-      std::string rhs = lookupReg(op.operand(1), regs);
+      std::string lhs = ensureReg(op.operand(0), scratchReg(0));
+      std::string rhs = ensureReg(op.operand(1), scratchReg(1));
       if (lhs.empty()) {
         lhs = scratchReg(0);
-        if (isArm)
-          os << "    mov " << lhs << ", #0\n";
-        else
-          os << "    li " << lhs << ", 0\n";
+        os << "    " << (isArm ? "mov " : "li ") << lhs << (isArm ? ", #0\n" : ", 0\n");
       }
       if (rhs.empty()) {
         rhs = scratchReg(1);
-        if (isArm)
-          os << "    mov " << rhs << ", #0\n";
-        else
-          os << "    li " << rhs << ", 0\n";
+        os << "    " << (isArm ? "mov " : "li ") << rhs << (isArm ? ", #0\n" : ", 0\n");
       }
       std::string dst;
       const bool isVec = op.resultType().str().find("vector") != std::string::npos;
@@ -1519,7 +1700,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         dst = "v" + std::to_string(nextVecReg++);
       else
         dst = resultReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm) {
         if (isVec)
           os << "    add " << dst << ".4s, " << lhs << ".4s, " << rhs << ".4s\n";
@@ -1531,6 +1712,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else
           os << "    addw " << dst << ", " << lhs << ", " << rhs << "\n";
       }
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
@@ -1546,38 +1728,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "bad binary machine op shape";
         return false;
       }
-      std::string lhs = lookupReg(op.operand(0), regs);
-      std::string rhs = lookupReg(op.operand(1), regs);
+      std::string lhs = ensureReg(op.operand(0), scratchReg(0));
+      std::string rhs = ensureReg(op.operand(1), scratchReg(1));
       if (lhs.empty()) {
         lhs = scratchReg(0);
-        if (isArm)
-          os << "    mov " << lhs << ", #0\n";
-        else
-          os << "    li " << lhs << ", 0\n";
+        os << "    " << (isArm ? "mov " : "li ") << lhs << (isArm ? ", #0\n" : ", 0\n");
       }
       if (rhs.empty()) {
         rhs = scratchReg(1);
-        if (isArm)
-          os << "    mov " << rhs << ", #0\n";
-        else
-          os << "    li " << rhs << ", 0\n";
-      }
-      if (lhs.empty()) {
-        lhs = scratchReg(0);
-        if (isArm)
-          os << "    mov " << lhs << ", #0\n";
-        else
-          os << "    li " << lhs << ", 0\n";
-      }
-      if (rhs.empty()) {
-        rhs = scratchReg(1);
-        if (isArm)
-          os << "    mov " << rhs << ", #0\n";
-        else
-          os << "    li " << rhs << ", 0\n";
+        os << "    " << (isArm ? "mov " : "li ") << rhs << (isArm ? ", #0\n" : ", 0\n");
       }
       std::string dst = resultReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm) {
         if (opname == "arm_machine.srem") {
           os << "    sdiv " << dst << ", " << lhs << ", " << rhs << "\n";
@@ -1596,6 +1758,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else if (opname == "rv_machine.or") inst = "or";
         os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
       }
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
@@ -1604,12 +1767,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         opname == "rv_machine.fsub" || opname == "arm_machine.fsub" ||
         opname == "rv_machine.fmul" || opname == "arm_machine.fmul" ||
         opname == "rv_machine.fdiv" || opname == "arm_machine.fdiv") {
-      std::string lhs = lookupReg(op.operand(0), regs);
-      std::string rhs = lookupReg(op.operand(1), regs);
+      std::string lhs = ensureReg(op.operand(0), isArm ? "s30" : "ft10");
+      std::string rhs = ensureReg(op.operand(1), isArm ? "s31" : "ft11");
       if (lhs.empty()) lhs = isArm ? "s0" : "ft0";
       if (rhs.empty()) rhs = isArm ? "s1" : "ft1";
       std::string dst = floatReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm) {
         std::string inst = opname.substr(std::string("arm_machine.").size());
         os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
@@ -1620,56 +1783,60 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else if (opname == "rv_machine.fdiv") inst = "fdiv.s";
         os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
       }
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
 
     if (opname == "rv_machine.fneg" || opname == "arm_machine.fneg") {
-      std::string src = lookupReg(op.operand(0), regs);
+      std::string src = ensureReg(op.operand(0), isArm ? "s30" : "ft10");
       if (src.empty()) src = isArm ? "s0" : "ft0";
       std::string dst = floatReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       os << "    " << (isArm ? "fneg " : "fneg.s ") << dst << ", " << src << "\n";
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
 
     if (opname == "rv_machine.fcvt_s_w" || opname == "arm_machine.scvtf") {
-      std::string src = lookupReg(op.operand(0), regs);
+      std::string src = ensureReg(op.operand(0), scratchReg(0));
       if (src.empty()) src = scratchReg(0);
       std::string dst = floatReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm)
         os << "    scvtf " << dst << ", " << src << "\n";
       else
         os << "    fcvt.s.w " << dst << ", " << src << "\n";
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
 
     if (opname == "rv_machine.fcvt_w_s" || opname == "arm_machine.fcvtzs") {
-      std::string src = lookupReg(op.operand(0), regs);
+      std::string src = ensureReg(op.operand(0), isArm ? "s30" : "ft10");
       if (src.empty()) src = isArm ? "s0" : "ft0";
       std::string dst = resultReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm)
         os << "    fcvtzs " << dst << ", " << src << "\n";
       else
         os << "    fcvt.w.s " << dst << ", " << src << ", rtz\n";
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
 
     if (opname == "rv_machine.neg" || opname == "arm_machine.neg" ||
         opname == "rv_machine.seqz" || opname == "arm_machine.not") {
-      std::string src = lookupReg(op.operand(0), regs);
+      std::string src = ensureReg(op.operand(0), scratchReg(0));
       if (src.empty()) {
         stats.unsupportedOps++;
         stats.error = "unary machine op operand has no assigned register";
         return false;
       }
       std::string dst = resultReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm) {
         if (opname == "arm_machine.not")
           os << "    cmp " << src << ", #0\n    cset " << dst << ", eq\n";
@@ -1681,6 +1848,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else
           os << "    negw " << dst << ", " << src << "\n";
       }
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
@@ -1702,8 +1870,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string dst = resultReg();
       if (isFloatType(op.resultType()))
         dst = floatReg();
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       loadFromAddress(dst, op.operand(0), op.operandCount() > 1 ? op.operand(1) : Value());
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
@@ -1720,10 +1889,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
 
     if (opname == "rv_machine.vle32" || opname == "arm_machine.ld1" || opname == "vector.transfer_read") {
-      std::string base = lookupReg(op.operand(0), regs);
-      std::string index = lookupReg(op.operand(1), regs);
+      std::string base = ensureReg(op.operand(0), scratchReg(0));
+      std::string index = ensureReg(op.operand(1), scratchReg(1));
       std::string dst = "v" + std::to_string(nextVecReg++);
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm) {
         os << "    add x9, " << base << ", " << index << ", lsl #2\n";
         os << "    ld1 {" << dst << ".4s}, [x9]\n";
@@ -1738,9 +1907,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
 
     if (opname == "rv_machine.vse32" || opname == "arm_machine.st1" || opname == "vector.transfer_write") {
-      std::string val = lookupReg(op.operand(0), regs);
-      std::string base = lookupReg(op.operand(1), regs);
-      std::string index = lookupReg(op.operand(2), regs);
+      std::string val = ensureReg(op.operand(0), scratchReg(0));
+      std::string base = ensureReg(op.operand(1), scratchReg(0));
+      std::string index = ensureReg(op.operand(2), scratchReg(1));
       if (isArm) {
         os << "    add x9, " << base << ", " << index << ", lsl #2\n";
         os << "    st1 {" << val << ".4s}, [x9]\n";
@@ -1755,9 +1924,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
 
     if (opname == "rv_machine.vfmv" || opname == "arm_machine.dup" || opname == "vector.splat") {
-      std::string val = lookupReg(op.operand(0), regs);
+      std::string val = ensureReg(op.operand(0), isArm ? "s30" : "ft10");
       std::string dst = "v" + std::to_string(nextVecReg++);
-      regs[valueKey(op.result())] = dst;
+      bindResult(op.result(), dst);
       if (isArm) {
         os << "    dup " << dst << ".4s, " << val << "\n";
       } else {
@@ -1776,7 +1945,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         return false;
       }
       for (int i = 0; i < op.operandCount(); i++) {
-        std::string src = lookupReg(op.operand(i), regs);
+        std::string src = ensureReg(op.operand(i), scratchReg(0));
         if (src.rfind("stack:", 0) == 0 || src.rfind("global:", 0) == 0)
           src = materializeAddress(op.operand(i), scratchReg(0));
         if (src.empty()) {
@@ -1786,8 +1955,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           else
             os << "    li " << src << ", 0\n";
         }
-        bool fpArg = op.operand(i).type().kind() == TypeKind::Float ||
-                     (!src.empty() && (src[0] == 'f' || src[0] == 's'));
+        bool fpArg = op.operand(i).type().kind() == TypeKind::Float || looksFloatReg(src);
         if (isArm) {
           std::string arg = fpArg ? ("s" + std::to_string(i)) : ("w" + std::to_string(i));
           if (!fpArg && src.size() > 0 && src[0] == 'x')
@@ -1801,9 +1969,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         }
       }
       os << "    call " << callee << "\n";
-      if (op.resultCount() > 0)
-        regs[valueKey(op.result())] = isFloatType(op.resultType()) ? (isArm ? "s0" : "fa0")
-                                                                   : (isArm ? "w0" : "a0");
+      if (op.resultCount() > 0) {
+        std::string result = isFloatType(op.resultType()) ? (isArm ? "s0" : "fa0")
+                                                          : (isArm ? "w0" : "a0");
+        bindResult(op.result(), result);
+        spillHome(op.result(), result);
+      }
       stats.machineOps++;
       continue;
     }
@@ -1811,11 +1982,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (opname == "sysy.unknown_value") {
       if (op.resultCount() > 0 && op.resultType().kind() != TypeKind::None) {
         std::string dst = resultReg();
-        regs[valueKey(op.result())] = dst;
+        bindResult(op.result(), dst);
         if (isArm)
           os << "    mov " << dst << ", #0\n";
         else
           os << "    li " << dst << ", 0\n";
+        spillHome(op.result(), dst);
       }
       continue;
     }
@@ -1823,7 +1995,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (opname == "sysy.return" || opname == "scf.return" ||
         opname == "rv_machine.ret" || opname == "arm_machine.ret") {
       if (op.operandCount() > 0) {
-        std::string src = lookupReg(op.operand(0), regs);
+        std::string src = ensureReg(op.operand(0), isFloatType(op.operand(0).type()) ? (isArm ? "s30" : "ft10") : scratchReg(0));
         if (src.empty()) {
           stats.unsupportedOps++;
           stats.error = "return operand has no assigned register";
@@ -1845,6 +2017,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           }
         }
       }
+      for (int i = 0; i < calleeSaveCount; i++) {
+        int64_t off = calleeSaveBase + i * 8;
+        if (isArm)
+          os << "    ldr x" << (19 + i) << ", [sp, #" << off << "]\n";
+        else
+          os << "    ld s" << i << ", " << off << "(sp)\n";
+      }
       if (frameBytes > 0) {
         if (isArm)
           os << "    add sp, sp, #" << frameBytes << "\n";
@@ -1859,20 +2038,27 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (opname == "affine.for") {
       int loopId = ++nextLoopId;
       loopOps[&op] = loopId;
-      std::string start = lookupReg(op.operand(0), regs);
-      std::string bound = lookupReg(op.operand(1), regs);
+      std::string start = ensureReg(op.operand(0), scratchReg(0));
+      std::string boundTmp = ensureReg(op.operand(1), scratchReg(1));
       std::string iv = isArm ? ("w" + std::to_string(nextReg++ % 5 + 19))
                              : ("s" + std::to_string(nextReg++ % 12));
+      std::string bound = isArm ? ("w" + std::to_string(nextReg++ % 5 + 24))
+                                : ("s" + std::to_string(nextReg++ % 12));
 
-      regs[valueKey(op.getRegions()[0]->getBlocks()[0]->args()[0]->value())] = iv;
+      Value ivValue = op.getRegions()[0]->getBlocks()[0]->args()[0]->value();
+      bindReg(ivValue, iv);
 
       if (isArm) {
         os << "    mov " << iv << ", " << start << "\n";
+        os << "    mov " << bound << ", " << boundTmp << "\n";
+        spillHome(ivValue, iv);
         os << ".Lloop_cond_" << loopId << ":\n";
         os << "    cmp " << iv << ", " << bound << "\n";
         os << "    bge .Lloop_end_" << loopId << "\n";
       } else {
         os << "    mv " << iv << ", " << start << "\n";
+        os << "    mv " << bound << ", " << boundTmp << "\n";
+        spillHome(ivValue, iv);
         os << ".Lloop_cond_" << loopId << ":\n";
         os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
       }
@@ -1894,7 +2080,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         return false;
       }
       int loopId = loopOps[parentWhile];
-      std::string cond = lookupReg(op.operand(0), regs);
+      std::string cond = ensureReg(op.operand(0), scratchReg(0));
       if (cond.empty()) {
         stats.unsupportedOps++;
         stats.error = "scf.condition operand has no assigned register";
@@ -1911,15 +2097,20 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       Operation *parentFor = op.getBlock()->getRegion()->getParent();
       if (!parentFor || parentFor->name() != "affine.for") continue;
       int loopId = loopOps[parentFor];
-      std::string step = lookupReg(parentFor->operand(2), regs);
-      std::string iv = lookupReg(parentFor->getRegions()[0]->getBlocks()[0]->args()[0]->value(), regs);
+      std::string step = ensureReg(parentFor->operand(2), scratchReg(1));
+      Value ivValue = parentFor->getRegions()[0]->getBlocks()[0]->args()[0]->value();
+      std::string iv = ensureReg(ivValue, scratchReg(0));
 
       if (isArm) {
         os << "    add " << iv << ", " << iv << ", " << step << "\n";
+        bindReg(ivValue, iv);
+        spillHome(ivValue, iv);
         os << "    b .Lloop_cond_" << loopId << "\n";
         os << ".Lloop_end_" << loopId << ":\n";
       } else {
         os << "    addw " << iv << ", " << iv << ", " << step << "\n";
+        bindReg(ivValue, iv);
+        spillHome(ivValue, iv);
         os << "    j .Lloop_cond_" << loopId << "\n";
         os << ".Lloop_end_" << loopId << ":\n";
       }
@@ -1959,11 +2150,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "rv_machine.cmp" || opname == "arm_machine.cmp" ||
         opname == "rv_machine.fcmp" || opname == "arm_machine.fcmp") {
-      std::string lhs = lookupReg(op.operand(0), regs);
-      std::string rhs = lookupReg(op.operand(1), regs);
-      std::string dst = isArm ? ("w" + std::to_string(nextReg++ % 5 + 9))
-                              : ("t" + std::to_string(nextReg++ % 7));
-      regs[valueKey(op.result())] = dst;
+      std::string lhs = ensureReg(op.operand(0), isFloatType(op.operand(0).type()) ? (isArm ? "s30" : "ft10") : scratchReg(0));
+      std::string rhs = ensureReg(op.operand(1), isFloatType(op.operand(1).type()) ? (isArm ? "s31" : "ft11") : scratchReg(1));
+      std::string dst = resultReg();
+      bindResult(op.result(), dst);
 
       std::string pred = symbolAttr(op.attr("predicate"));
 
@@ -1998,12 +2188,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           os << "    snez " << dst << ", " << dst << "\n";
         }
       }
+      spillHome(op.result(), dst);
       stats.machineOps++;
       continue;
     }
 
     if (opname == "scf.if") {
-      std::string cond = lookupReg(op.operand(0), regs);
+      std::string cond = ensureReg(op.operand(0), scratchReg(0));
       static int nextIfId = 0;
       int ifId = ++nextIfId;
       loopOps[&op] = ifId;
@@ -2046,6 +2237,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   }
 
   if (stats.returns == returnsBefore) {
+    for (int i = 0; i < calleeSaveCount; i++) {
+      int64_t off = calleeSaveBase + i * 8;
+      if (isArm)
+        os << "    ldr x" << (19 + i) << ", [sp, #" << off << "]\n";
+      else
+        os << "    ld s" << i << ", " << off << "(sp)\n";
+    }
     if (frameBytes > 0) {
       if (isArm)
         os << "    add sp, sp, #" << frameBytes << "\n";
@@ -2183,7 +2381,7 @@ ConversionTarget productionTarget(const std::string &target) {
   return convTarget;
 }
 
-void runGlobalOpt(Module &module) {
+void runGlobalOpt(Module &module, SelfOptStats *stats) {
   std::vector<Operation*> globals;
   for (auto *op : walk(module)) {
     if (op && !op->isErased() && op->name() == "sysy.global") {
@@ -2226,8 +2424,11 @@ void runGlobalOpt(Module &module) {
     }
 
     if (accesses.empty()) {
-      if (global->resultCount() == 0 || usesOf(module, global->result()).empty())
+      if (global->resultCount() == 0 || usesOf(module, global->result()).empty()) {
         global->markErased();
+        if (stats)
+          stats->globalsErased++;
+      }
       continue;
     }
 
@@ -2249,8 +2450,13 @@ void runGlobalOpt(Module &module) {
             op->addOperand(slot.result());
           }
         }
-        if (global->resultCount() == 0 || usesOf(module, global->result()).empty())
+        if (stats)
+          stats->globalsPromoted++;
+        if (global->resultCount() == 0 || usesOf(module, global->result()).empty()) {
           global->markErased();
+          if (stats)
+            stats->globalsErased++;
+        }
       }
     }
   }
@@ -2275,7 +2481,9 @@ static std::string memoryLocationKey(Operation &op) {
   return key;
 }
 
-static void runBlockMemoryOpt(Module &module, Block &block) {
+static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats) {
+  if (stats)
+    stats->memoryBlocks++;
   std::map<std::string, Value> activeStores;
   std::map<std::string, Operation*> activeStoreOps;
 
@@ -2283,6 +2491,12 @@ static void runBlockMemoryOpt(Module &module, Block &block) {
     auto &op = *owned;
     if (op.isErased())
       continue;
+
+    if (!op.getRegions().empty()) {
+      activeStores.clear();
+      activeStoreOps.clear();
+      continue;
+    }
 
     if (op.name() == "sysy.call") {
       std::vector<std::string> keysToInvalidate;
@@ -2317,8 +2531,10 @@ static void runBlockMemoryOpt(Module &module, Block &block) {
 
       if (activeStores.count(key) > 0) {
         auto *prevOp = activeStoreOps[key];
-        if (prevOp) {
+        if (prevOp && !prevOp->isErased()) {
           prevOp->markErased();
+          if (stats)
+            stats->memoryRemovedStores++;
         }
       }
 
@@ -2336,18 +2552,33 @@ static void runBlockMemoryOpt(Module &module, Block &block) {
         Value storedVal = activeStores[key];
         replaceAllUses(module, op.result(), storedVal);
         op.markErased();
+        if (stats)
+          stats->memoryForwardedLoads++;
       }
     }
   }
 }
 
-void runMemoryOpt(Module &module) {
+static void runMemoryOptInRegion(Module &module, Region &region, SelfOptStats *stats) {
+  for (auto &block : region.getBlocks()) {
+    runBlockMemoryOpt(module, *block, stats);
+    for (auto &owned : block->ops()) {
+      if (!owned || owned->isErased())
+        continue;
+      for (auto &nested : owned->getRegions())
+        runMemoryOptInRegion(module, *nested, stats);
+    }
+  }
+}
+
+void runMemoryOpt(Module &module, SelfOptStats *stats) {
+  const char *enabled = std::getenv("SISY_ENABLE_SELF_MEMOPT");
+  if (enabled && std::string(enabled) == "0")
+    return;
   for (auto *op : walk(module)) {
     if (op && !op->isErased() && op->name() == "sysy.func") {
       for (auto &region : op->getRegions()) {
-        for (auto &block : region->getBlocks()) {
-          runBlockMemoryOpt(module, *block);
-        }
+        runMemoryOptInRegion(module, *region, stats);
       }
     }
   }
@@ -2560,9 +2791,14 @@ static const char *kCoreRules =
   "rule fold_muli_one arith.muli muli-one 9\n"
   "rule fold_select_same arith.select select-same 8\n"
   "rule fold_subi_same arith.subi subi-same 12\n"
+  "rule fold_subi_zero arith.subi subi-zero 10\n"
   "rule fold_muli_zero arith.muli muli-zero 11\n"
+  "rule fold_divi_one arith.divi divi-one 9\n"
+  "rule fold_remi_one arith.remi remi-one 9\n"
   "rule fold_andi_same arith.andi andi-same 7\n"
+  "rule fold_andi_zero arith.andi andi-zero 8\n"
   "rule fold_ori_same arith.ori ori-same 6\n"
+  "rule fold_ori_zero arith.ori ori-zero 7\n"
   "rule fold_double_noti arith.noti double-noti 15\n";
 
 

@@ -8,100 +8,51 @@ OUT_DIR="${ROOT_DIR}/tests/.out/memoryssa"
 mkdir -p "${OUT_DIR}"
 
 if [[ ! -x "${COMPILER}" ]]; then
-  echo "compiler not found at ${COMPILER}; run cmake --build build -j first"
+  echo "compiler not found at ${COMPILER}; run scripts/build.sh first" >&2
   exit 1
 fi
 
-stats="$("${COMPILER}" "${CASE_DIR}/join_same_store_load.sy" -S \
-  -o "${OUT_DIR}/join_same_store_load.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+field() {
+  local line="$1"
+  local key="$2"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"${line}"
+}
 
-echo "${stats}"
+check_case() {
+  local name="$1"
+  local min_forwarded="$2"
+  local asm="${OUT_DIR}/${name}.rv.s"
+  local stats="${OUT_DIR}/${name}.stats"
 
-if ! grep -A2 '^dle:$' <<<"${stats}" | grep -Eq 'removed-loads : [1-9]'; then
-  echo "expected DLE/MemorySSA to replace a merge load with the common reaching store value" >&2
-  exit 1
-fi
+  "${COMPILER}" "${CASE_DIR}/${name}.sy" -S -o "${asm}" \
+    -O1 --target=riscv --verify-ir --stats >"${stats}" 2>&1
+  cat "${stats}"
 
-if grep -q 'non-dominating:' <<<"${stats}"; then
-  echo "DLE/MemorySSA introduced a non-dominating replacement value" >&2
-  exit 1
-fi
+  local self_line native_line forwarded failed
+  self_line="$(grep '^\[self-mlir\]' "${stats}" | tail -1 || true)"
+  native_line="$(grep '^\[native-asm\]' "${stats}" | tail -1 || true)"
+  forwarded="$(field "${self_line}" mem-forwarded-loads)"
+  failed="$(field "${self_line}" conversion-failed)"
 
-runtime_stats="$("${COMPILER}" "${CASE_DIR}/join_same_runtime_store_load.sy" -S \
-  -o "${OUT_DIR}/join_same_runtime_store_load.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
+  if [[ -z "${self_line}" || -z "${native_line}" ]]; then
+    echo "expected self-MLIR/native-asm stats for ${name}" >&2
+    exit 1
+  fi
+  if [[ "${failed:-1}" != "0" ]]; then
+    echo "self-MLIR dialect conversion failed for ${name}" >&2
+    exit 1
+  fi
+  if [[ "${forwarded:-0}" -lt "${min_forwarded}" ]]; then
+    echo "expected self-MLIR memref reaching-store forwarding for ${name}; saw ${forwarded:-0}" >&2
+    exit 1
+  fi
+}
 
-echo "${runtime_stats}"
+check_case join_same_store_load 1
+check_case join_same_runtime_store_load 1
+check_case join_different_store_phi_load 1
+check_case branch_common_store_sink 1
+check_case branch_different_store_phi_sink 1
+check_case readonly_call_preserves_store 1
 
-if ! grep -A2 '^dle:$' <<<"${runtime_stats}" | grep -Eq 'removed-loads : [1-9]'; then
-  echo "expected DLE/MemorySSA to forward a common reaching runtime store value" >&2
-  exit 1
-fi
-
-if grep -q 'non-dominating:' <<<"${runtime_stats}"; then
-  echo "runtime reaching-store forwarding introduced a non-dominating replacement value" >&2
-  exit 1
-fi
-
-phi_stats="$("${COMPILER}" "${CASE_DIR}/join_different_store_phi_load.sy" -S \
-  -o "${OUT_DIR}/join_different_store_phi_load.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
-
-echo "${phi_stats}"
-
-if ! grep -A2 '^dle:$' <<<"${phi_stats}" | grep -Eq 'removed-loads : [1-9]'; then
-  echo "expected DLE/MemorySSA to replace a merge load with a value phi from different reaching stores" >&2
-  exit 1
-fi
-
-if grep -q 'non-dominating:' <<<"${phi_stats}"; then
-  echo "phi reaching-store forwarding introduced a non-dominating replacement value" >&2
-  exit 1
-fi
-
-sink_stats="$("${COMPILER}" "${CASE_DIR}/branch_common_store_sink.sy" -S \
-  -o "${OUT_DIR}/branch_common_store_sink.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
-
-echo "${sink_stats}"
-
-if ! grep -A3 '^dse:$' <<<"${sink_stats}" | grep -Eq 'sunk-stores : [1-9]'; then
-  echo "expected DSE to sink equivalent stores from all branch predecessors" >&2
-  exit 1
-fi
-
-phi_sink_stats="$("${COMPILER}" "${CASE_DIR}/branch_different_store_phi_sink.sy" -S \
-  -o "${OUT_DIR}/branch_different_store_phi_sink.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats 2>&1 >/dev/null)"
-
-echo "${phi_sink_stats}"
-
-if ! grep -A3 '^dse:$' <<<"${phi_sink_stats}" | grep -Eq 'sunk-stores : [1-9]'; then
-  echo "expected DSE to sink branch stores with different values through a value phi" >&2
-  exit 1
-fi
-
-if grep -q 'non-dominating:' <<<"${phi_sink_stats}"; then
-  echo "DSE phi store sinking introduced a non-dominating value" >&2
-  exit 1
-fi
-
-readonly_stats="$("${COMPILER}" "${CASE_DIR}/readonly_call_preserves_store.sy" -S \
-  -o "${OUT_DIR}/readonly_call_preserves_store.rv.s" \
-  -O1 --target=riscv --use-legacy-codegen --verify-ir --stats \
-  --inline-threshold=1 2>&1 >/dev/null)"
-
-echo "${readonly_stats}"
-
-if ! grep -A3 '^dle:$' <<<"${readonly_stats}" | grep -Eq 'readonly-calls-retained : [1-9]'; then
-  echo "expected DLE to preserve reaching stores across readonly internal calls" >&2
-  exit 1
-fi
-
-if ! grep -A3 '^dle:$' <<<"${readonly_stats}" | grep -Eq 'removed-loads : [1-9]'; then
-  echo "expected DLE to forward a load after a readonly internal call" >&2
-  exit 1
-fi
-
-echo "MemorySSA reaching-store load elimination tests passed."
+echo "self-MLIR memref reaching-store tests passed."
