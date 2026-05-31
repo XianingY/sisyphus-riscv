@@ -6,6 +6,7 @@
 #include "../parse/Type.h"
 #include "../utils/DynamicCast.h"
 
+#include <algorithm>
 #include <map>
 #include <cstdlib>
 #include <sstream>
@@ -59,8 +60,15 @@ Type scalarType(Context &ctx, sys::Type *type) {
     return ctx.f(32);
   if (isa<sys::VoidType>(type))
     return ctx.noneType();
-  if (auto *ptr = dyn_cast<sys::PointerType>(type))
+  if (auto *ptr = dyn_cast<sys::PointerType>(type)) {
+    if (auto *arr = dyn_cast<sys::ArrayType>(ptr->pointee)) {
+      std::vector<int64_t> shape{-1};
+      for (int dim : arr->dims)
+        shape.push_back(dim);
+      return ctx.memref(shape, scalarType(ctx, arr->base));
+    }
     return ctx.memref({-1}, scalarType(ctx, ptr->pointee));
+  }
   if (auto *arr = dyn_cast<sys::ArrayType>(type))
     return scalarType(ctx, arr->base);
   return ctx.i(32);
@@ -73,8 +81,15 @@ Type storageType(Context &ctx, sys::Type *type) {
       shape.push_back(dim);
     return ctx.memref(shape, scalarType(ctx, arr->base));
   }
-  if (auto *ptr = dyn_cast<sys::PointerType>(type))
+  if (auto *ptr = dyn_cast<sys::PointerType>(type)) {
+    if (auto *arr = dyn_cast<sys::ArrayType>(ptr->pointee)) {
+      std::vector<int64_t> shape{-1};
+      for (int dim : arr->dims)
+        shape.push_back(dim);
+      return ctx.memref(shape, scalarType(ctx, arr->base));
+    }
     return ctx.memref({-1}, scalarType(ctx, ptr->pointee));
+  }
   return ctx.memref({1}, scalarType(ctx, type));
 }
 
@@ -131,6 +146,7 @@ bool envDisabled(const char *name) {
 }
 
 void summarizeModule(Module &module, ProductionStats &stats) {
+  stats.mlirOpsAfter = 0;
   stats.affineLoops = 0;
   stats.scfLoops = 0;
   stats.memrefOps = 0;
@@ -141,6 +157,7 @@ void summarizeModule(Module &module, ProductionStats &stats) {
   for (auto *op : walk(module)) {
     if (!op || op->isErased())
       continue;
+    stats.mlirOpsAfter++;
     const std::string &name = op->name();
     std::string dialect = op->dialect();
     if (name == "affine.for")
@@ -210,6 +227,98 @@ class ASTToMLIR {
   Value unknown(Builder &builder, sys::Type *type) {
     auto &op = builder.create("sysy.unknown_value", {}, {scalarType(ctx, type)}, {}, loc());
     return op.result();
+  }
+
+  Value emitIntConstant(int64_t value, Builder &builder) {
+    auto &op = builder.create("arith.constant", {}, {ctx.i(32)},
+                              {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc());
+    return op.result();
+  }
+
+  Value emitZeroConstant(sys::Type *type, Builder &builder) {
+    Type resultType = scalarType(ctx, type);
+    Attribute value = isa<sys::FloatType>(type)
+                          ? ctx.stringAttr("0.0")
+                          : ctx.integerAttr(0, resultType);
+    auto &op = builder.create("arith.constant", {}, {resultType},
+                              {{"value", value}}, loc());
+    return op.result();
+  }
+
+  std::vector<Value> emitArraySubscripts(std::size_t linear,
+                                         const std::vector<int> &dims,
+                                         Builder &builder) {
+    std::vector<std::size_t> raw(dims.size(), 0);
+    for (std::size_t i = dims.size(); i-- > 0;) {
+      int dim = dims[i] <= 0 ? 1 : dims[i];
+      raw[i] = linear % static_cast<std::size_t>(dim);
+      linear /= static_cast<std::size_t>(dim);
+    }
+
+    std::vector<Value> indices;
+    for (std::size_t index : raw)
+      indices.push_back(emitIntConstant(static_cast<int64_t>(index), builder));
+    return indices;
+  }
+
+  void emitZeroFillLoop(Value slot, sys::ArrayType *arr, Builder &builder,
+                        std::size_t depth = 0,
+                        std::vector<Value> indices = {}) {
+    if (!arr)
+      return;
+    if (depth >= arr->dims.size()) {
+      Value zero = emitZeroConstant(arr->base, builder);
+      std::vector<Value> operands{zero, slot};
+      operands.insert(operands.end(), indices.begin(), indices.end());
+      builder.create("memref.store", operands, {}, {}, loc());
+      return;
+    }
+
+    Value lower = emitIntConstant(0, builder);
+    Value upper = emitIntConstant(arr->dims[depth], builder);
+    Value step = emitIntConstant(1, builder);
+    auto &loop = builder.create("affine.for", {lower, upper, step}, {},
+                                {}, loc(), 1);
+    auto &body = loop.getRegions()[0]->addBlock();
+    auto &iv = body.addArgument(ctx.i(32), loc(), "iv");
+    Builder nested(ctx, &body);
+    indices.push_back(iv.value());
+    emitZeroFillLoop(slot, arr, nested, depth + 1, indices);
+    nested.create("affine.yield", {}, {}, {}, loc());
+  }
+
+  bool localArrayNeedsZeroFill(sys::LocalArrayNode *init, std::size_t count) const {
+    if (!init || !init->va || init->count < count)
+      return true;
+    for (std::size_t i = 0; i < count; i++)
+      if (!init->va[i])
+        return true;
+    return false;
+  }
+
+  void emitLocalArrayInit(sys::VarDeclNode *decl, sys::ArrayType *arr,
+                          sys::LocalArrayNode *init, Value slot,
+                          Builder &builder) {
+    if (!decl || !arr || !init)
+      return;
+    std::size_t count = arr->getSize();
+    bool zeroFilled = localArrayNeedsZeroFill(init, count);
+    if (zeroFilled)
+      emitZeroFillLoop(slot, arr, builder);
+
+    std::size_t initCount = std::min<std::size_t>(count, init->count);
+    for (std::size_t i = 0; i < initCount; i++) {
+      if (zeroFilled && (!init->va || !init->va[i]))
+        continue;
+      Value value = (init->va && init->va[i])
+                        ? emitExpr(init->va[i], builder)
+                        : emitZeroConstant(arr->base, builder);
+      std::vector<Value> operands{value, slot};
+      auto indices = emitArraySubscripts(i, arr->dims, builder);
+      operands.insert(operands.end(), indices.begin(), indices.end());
+      builder.create("memref.store", operands, {},
+                     {{"symbol", ctx.stringAttr(decl->name)}}, loc());
+    }
   }
 
   Value emitExpr(sys::ASTNode *node, Builder &builder) {
@@ -382,6 +491,14 @@ class ASTToMLIR {
       auto &slot = builder.create(decl->global ? "sysy.global" : "sysy.alloca",
                                   {}, {storageType(ctx, decl->type)}, attrs, loc());
       bindStorage(decl->name, slot.result());
+      if (!decl->global) {
+        if (auto *arr = dyn_cast<sys::ArrayType>(decl->type)) {
+          if (decl->init) {
+            if (auto *init = dyn_cast<sys::LocalArrayNode>(decl->init))
+              emitLocalArrayInit(decl, arr, init, slot.result(), builder);
+          }
+        }
+      }
       if (decl->init && !isa<sys::ConstArrayNode>(decl->init) &&
           !isa<sys::LocalArrayNode>(decl->init)) {
         Value value = emitExpr(decl->init, builder);
@@ -556,30 +673,61 @@ std::unique_ptr<Module> lowerFromAST(Context &ctx, const sys::ASTNode &ast,
 }
 
 std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNode &ast, const std::string &target,
+                                                 const OptimizationConfig &config,
                                                  ProductionStats &stats, std::ostream *dump) {
+  (void) ctx;
   stats = ProductionStats();
   auto module = lowerFromAST(ctx, ast, target, &stats);
+  OptimizationConfig effective = config;
+  if (envDisabled("SISY_ENABLE_SELF_WORKLIST"))
+    effective.enableDRRWorklist = false;
+  if (envDisabled("SISY_ENABLE_SELF_LINEAR_SCAN"))
+    effective.enableLinearScan = false;
+  if (envDisabled("SISY_ENABLE_SELF_SCHED"))
+    effective.enableScheduler = false;
+  if (envDisabled("SISY_ENABLE_SELF_INLINE"))
+    effective.enableInline = false;
+  if (envDisabled("SISY_ENABLE_SELF_ROT_HELPER"))
+    effective.enableRotateHelper = false;
+  if (envDisabled("SISY_ENABLE_SELF_POW2_STRENGTH"))
+    effective.enablePow2Strength = false;
 
   // 1. AST lowering
-  runGlobalOpt(*module, &stats.opt);
+  if (effective.enableGlobalOpt)
+    runGlobalOpt(*module, &stats.opt);
 
   // 2. High-level structure recovery and polyhedral preparation
-  if (!envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
-    runRaiseToAffine(*module);
-    runAffineLoopFusion(*module);
-    runAffineLoopInterchange(*module);
+  if (effective.enableAffine && !envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
+    stats.opt.affineWorklistItems += runRaiseToAffine(*module);
+    if (effective.enableLoopTiling)
+      runAffineLoopTiling(*module);
+    if (effective.enableLoopFusion)
+      runAffineLoopFusion(*module);
+    if (effective.enableLoopInterchange)
+      runAffineLoopInterchange(*module);
   }
 
-  // 3. Inter-Procedural Optimizations (IPO)
-  runPureFunctionDeduction(*module);
-  runInlining(*module);
-  runIPCP(*module);
+  // 3. Global straight-line optimizations.
+  if (effective.enableGlobalOpt)
+    runGlobalOpt(*module, &stats.opt);
+  if (effective.enableMemoryOpt)
+    runMemoryOpt(*module, &stats.opt);
+  if (effective.enableProvenBitwise)
+    runProvenBitwiseHelper(*module, &stats.opt);
+  if (effective.enableRotateHelper)
+    runRotateHelperFold(*module, &stats.opt);
 
-  // 4. Global straight-line optimizations
-  runGlobalOpt(*module, &stats.opt);
-  runMemoryOpt(*module, &stats.opt);
-  runProvenBitwiseHelper(*module, &stats.opt);
-  collectAffineNestSummary(*module, &stats.opt);
+  // 4. Conservative IPO runs after structural helper recognition so it does
+  // not destroy recognizable bitwise helper shapes.
+  if (effective.level != OptimizationConfig::Level::O0 && effective.enableInline) {
+    runPureFunctionDeduction(*module);
+    runInlining(*module, effective.inlineThreshold, &stats.opt);
+    runIPCP(*module);
+  }
+  if (effective.enableScheduler)
+    runLoopLocalScheduler(*module, &stats.opt);
+  if (effective.enableAffine)
+    collectAffineNestSummary(*module, &stats.opt);
   if (std::getenv("SISY_ENABLE_RVV"))
     runLoopVectorization(*module);
   auto before = verify(*module);
@@ -592,14 +740,18 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     return nullptr;
   }
 
-  std::vector<std::string> parseErrors;
-  auto rules = parseDRR(kASTCoreRules, parseErrors);
-  if (!parseErrors.empty()) {
-    stats.error = parseErrors.front();
-    return nullptr;
+  if (effective.enableDRR) {
+    std::vector<std::string> parseErrors;
+    auto rules = parseDRR(kASTCoreRules, parseErrors);
+    if (!parseErrors.empty()) {
+      stats.error = parseErrors.front();
+      return nullptr;
+    }
+    auto rewriteStats = applyGreedyPatterns(*module, rules, effective.enableDRRWorklist);
+    stats.rewrites = rewriteStats.rewrites;
+    stats.opt.worklistRewrites += rewriteStats.rewrites;
+    stats.opt.walksEliminated += rewriteStats.walksEliminated;
   }
-  auto rewriteStats = applyGreedyPatterns(*module, rules);
-  stats.rewrites = rewriteStats.rewrites;
 
   auto after = verify(*module);
   stats.verifyAfter = after.ok;
@@ -617,7 +769,6 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   stats.conversionConverted = convStats.converted;
   stats.conversionFailed = convStats.failed;
   stats.conversionRollbacks = convStats.rollbacks;
-  stats.mlirOpsAfter = (int) walk(*module).size();
   summarizeModule(*module, stats);
   if (dump) {
     *dump << "===== self-MLIR production =====\n";

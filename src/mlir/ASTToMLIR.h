@@ -17,7 +17,9 @@ std::unique_ptr<Module> lowerFromAST(Context &ctx, const sys::ASTNode &ast,
                                      ProductionStats *stats = nullptr);
 
 std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNode &ast, const std::string &target,
-                                                 ProductionStats &stats, std::ostream *dump = nullptr);
+                                                 const OptimizationConfig &config,
+                                                 ProductionStats &stats,
+                                                 std::ostream *dump = nullptr);
 
 } // namespace sys::mlir
 

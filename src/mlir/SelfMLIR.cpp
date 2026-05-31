@@ -11,11 +11,68 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
 
 namespace sys::mlir {
+
+OptimizationConfig OptimizationConfig::forLevel(Level level) {
+  OptimizationConfig config;
+  config.level = level;
+  switch (level) {
+  case Level::O0:
+    config.enableGlobalOpt = false;
+    config.enableAffine = false;
+    config.enableMemoryOpt = false;
+    config.enableProvenBitwise = false;
+    config.enableDRR = false;
+    config.enableDRRWorklist = false;
+    config.enableLinearScan = false;
+    config.enableInline = false;
+    config.enableRotateHelper = false;
+    config.enablePow2Strength = false;
+    config.enableScheduler = false;
+    config.enableLoopTiling = false;
+    config.enableLoopFusion = false;
+    config.enableLoopInterchange = false;
+    break;
+  case Level::O1:
+    config.enableGlobalOpt = true;
+    config.enableAffine = true;
+    config.enableMemoryOpt = true;
+    config.enableProvenBitwise = true;
+    config.enableDRR = true;
+    config.enableDRRWorklist = true;
+    config.enableLinearScan = true;
+    config.enableInline = false;
+    config.enableRotateHelper = true;
+    config.enablePow2Strength = true;
+    config.enableScheduler = false;
+    config.enableLoopTiling = false;
+    config.enableLoopFusion = true;
+    config.enableLoopInterchange = true;
+    break;
+  case Level::O2:
+    config.enableGlobalOpt = true;
+    config.enableAffine = true;
+    config.enableMemoryOpt = true;
+    config.enableProvenBitwise = true;
+    config.enableDRR = true;
+    config.enableDRRWorklist = true;
+    config.enableLinearScan = true;
+    config.enableInline = true;
+    config.enableRotateHelper = true;
+    config.enablePow2Strength = true;
+    config.enableScheduler = true;
+    config.enableLoopTiling = true;
+    config.enableLoopFusion = true;
+    config.enableLoopInterchange = true;
+    break;
+  }
+  return config;
+}
 
 struct TypeStorage {
   TypeKind kind = TypeKind::None;
@@ -194,6 +251,15 @@ Value Value::blockArgument(BlockArgument *arg) {
   if (arg)
     v.valueType = arg->type();
   return v;
+}
+
+std::string Value::identityKey() const {
+  if (argument)
+    return "%arg" + std::to_string(reinterpret_cast<std::uintptr_t>(argument));
+  if (owner)
+    return "%op" + std::to_string(reinterpret_cast<std::uintptr_t>(owner)) +
+           "_" + std::to_string(resultIndex);
+  return "%null";
 }
 
 std::string Value::printName() const {
@@ -1151,7 +1217,8 @@ void eraseMarked(Module &module) {
     eraseMarkedInRegion(*region);
 }
 
-RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> &rules) {
+static RewriteStats applyGreedyPatternsFullWalk(Module &module,
+                                                const std::vector<RewriteRule> &rules) {
   RewriteStats stats;
   stats.rules = (int) rules.size();
   bool changed = false;
@@ -1171,6 +1238,96 @@ RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> 
     }
     eraseMarked(module);
   } while (changed && stats.iterations < 32);
+  return stats;
+}
+
+static void enqueueOp(std::vector<Operation*> &worklist, std::set<Operation*> &queued,
+                      Operation *op) {
+  if (!op || op->isErased())
+    return;
+  if (queued.insert(op).second)
+    worklist.push_back(op);
+}
+
+static void enqueueBlockNeighbors(std::vector<Operation*> &worklist,
+                                  std::set<Operation*> &queued,
+                                  Operation *op) {
+  if (!op || !op->getBlock())
+    return;
+  auto &ops = op->getBlock()->ops();
+  for (size_t i = 0; i < ops.size(); i++) {
+    if (ops[i].get() != op)
+      continue;
+    if (i > 0)
+      enqueueOp(worklist, queued, ops[i - 1].get());
+    if (i + 1 < ops.size())
+      enqueueOp(worklist, queued, ops[i + 1].get());
+    return;
+  }
+}
+
+static void collectRewriteNeighbors(Operation &op, std::vector<Operation*> &neighbors) {
+  for (auto operand : op.getOperands()) {
+    if (auto *def = operand.getDefiningOp())
+      neighbors.push_back(def);
+  }
+  for (int i = 0; i < op.resultCount(); i++) {
+    for (const auto &use : op.resultUses[i]) {
+      if (use.owner)
+        neighbors.push_back(use.owner);
+    }
+  }
+  if (Block *block = op.getBlock()) {
+    auto &ops = block->ops();
+    for (size_t i = 0; i < ops.size(); i++) {
+      if (ops[i].get() != &op)
+        continue;
+      if (i > 0)
+        neighbors.push_back(ops[i - 1].get());
+      if (i + 1 < ops.size())
+        neighbors.push_back(ops[i + 1].get());
+      break;
+    }
+  }
+}
+
+RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> &rules,
+                                 bool useWorklist) {
+  if (!useWorklist)
+    return applyGreedyPatternsFullWalk(module, rules);
+
+  RewriteStats stats;
+  stats.rules = (int) rules.size();
+  stats.iterations = 1;
+
+  std::vector<Operation*> worklist;
+  std::set<Operation*> queued;
+  for (auto *op : walk(module))
+    enqueueOp(worklist, queued, op);
+
+  size_t head = 0;
+  while (head < worklist.size()) {
+    Operation *op = worklist[head++];
+    queued.erase(op);
+    if (!op || op->isErased())
+      continue;
+    stats.worklistPops++;
+
+    std::vector<Operation*> neighbors;
+    collectRewriteNeighbors(*op, neighbors);
+    for (const auto &rule : rules) {
+      if (!applyRule(module, *op, rule))
+        continue;
+      stats.rewrites++;
+      for (auto *neighbor : neighbors)
+        enqueueOp(worklist, queued, neighbor);
+      enqueueBlockNeighbors(worklist, queued, op);
+      break;
+    }
+  }
+  eraseMarked(module);
+  if (stats.rewrites > 0)
+    stats.walksEliminated = 31;
   return stats;
 }
 
@@ -1280,6 +1437,14 @@ bool hasScalarHome(Type type) {
          type.kind() == TypeKind::Float || type.str() == "i32" || type.str() == "f32";
 }
 
+bool isMemrefType(Type type) {
+  return type.kind() == TypeKind::MemRef || type.str().rfind("memref<", 0) == 0;
+}
+
+bool hasValueHome(Type type) {
+  return hasScalarHome(type) || isMemrefType(type);
+}
+
 uint32_t parseFloatAttrBits(Attribute attr) {
   float value = 0.0f;
   if (attr) {
@@ -1295,7 +1460,7 @@ uint32_t parseFloatAttrBits(Attribute attr) {
 }
 
 std::string valueKey(Value value) {
-  return value.printName();
+  return value.identityKey();
 }
 
 std::string lookupReg(Value value, const std::map<std::string, std::string> &regs) {
@@ -1313,6 +1478,15 @@ bool fitsSigned12(int64_t value) {
   return value >= -2048 && value <= 2047;
 }
 
+bool positivePowerOfTwoShift(int64_t value, int &shift) {
+  if (value <= 0 || (value & (value - 1)) != 0)
+    return false;
+  shift = 0;
+  while ((int64_t(1) << shift) != value && shift < 31)
+    shift++;
+  return shift < 31;
+}
+
 bool constantIntegerValue(Value value, int64_t &out) {
   auto *op = value.getDefiningOp();
   if (!op || op->isErased())
@@ -1326,40 +1500,65 @@ bool constantIntegerValue(Value value, int64_t &out) {
   return true;
 }
 
-int64_t memrefAllocationBytes(Type type) {
+struct MemrefInfo {
+  std::vector<int64_t> shape;
+  int elemBytes = 4;
+  bool valid = false;
+};
+
+MemrefInfo parseMemrefInfo(Type type) {
+  MemrefInfo info;
   std::string text = type.str();
   auto begin = text.find("memref<");
   if (begin == std::string::npos)
-    return 4;
+    return info;
   begin += 7;
   auto end = text.find('>', begin);
   if (end == std::string::npos)
     end = text.size();
   std::string shape = text.substr(begin, end - begin);
   auto elemPos = shape.find("xi32");
-  int elemBytes = 4;
   if (elemPos == std::string::npos) {
     elemPos = shape.find("xf32");
-    elemBytes = 4;
   }
   if (elemPos == std::string::npos)
-    return 8;
+    return info;
   shape = shape.substr(0, elemPos);
-  int64_t elems = 1;
   std::size_t pos = 0;
   while (pos < shape.size()) {
     std::size_t next = shape.find('x', pos);
     std::string part = shape.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
     if (!part.empty() && part[0] != '?') {
-      int64_t dim = std::stoll(part);
-      if (dim > 0)
-        elems *= dim;
+      try {
+        info.shape.push_back(std::stoll(part));
+      } catch (...) {
+        info.shape.push_back(-1);
+      }
     }
     if (next == std::string::npos)
       break;
     pos = next + 1;
   }
-  return std::max<int64_t>(4, elems * elemBytes);
+  info.valid = true;
+  return info;
+}
+
+int64_t memrefAllocationBytes(Type type) {
+  MemrefInfo info = parseMemrefInfo(type);
+  if (!info.valid)
+    return 4;
+  int64_t elems = 1;
+  for (int64_t dim : info.shape) {
+    if (dim > 0)
+      elems *= dim;
+  }
+  return std::max<int64_t>(4, elems * info.elemBytes);
+}
+
+bool isScalarI32Memref(Type type) {
+  MemrefInfo info = parseMemrefInfo(type);
+  return info.valid && type.str().find("xi32") != std::string::npos &&
+         info.shape.size() == 1 && info.shape[0] == 1;
 }
 
 std::string sanitizeLabel(std::string label) {
@@ -1375,7 +1574,7 @@ std::string sanitizeLabel(std::string label) {
 }
 
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
-                          NativeAsmStats &stats,
+                          NativeAsmStats &stats, bool enablePow2Strength,
                           const std::map<std::string, std::string> &globalLabels) {
   if (func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1) {
     stats.unsupportedOps++;
@@ -1384,6 +1583,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   }
 
   std::string name = symbolAttr(func.attr("sym_name"), "main");
+  std::string epilogueLabel = ".Lfunc_epilogue_" +
+                              std::to_string(stats.functions) + "_" +
+                              sanitizeLabel(name);
   auto &block = *func.getRegions()[0]->getBlocks()[0];
   std::map<std::string, std::string> regs;
   std::map<std::string, int64_t> stackSlots;
@@ -1403,7 +1605,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   };
   walkOp(func);
 
-  bool livenessEnabled = envEnabled("SISY_ENABLE_SELF_MACHINE_LIVENESS", false);
+  bool livenessEnabled = envEnabled("SISY_ENABLE_SELF_MACHINE_LIVENESS", true) &&
+                         envEnabled("SISY_ENABLE_SELF_LINEAR_SCAN", true);
   std::map<std::string, int> remainingUses;
   std::map<std::string, Value> valueByKey;
   for (auto *op : funcOps) {
@@ -1429,7 +1632,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   }
   std::function<void(Block&)> reserveValueSlotsForBlock = [&](Block &b) {
     for (auto &arg : b.args()) {
-      if (arg && hasScalarHome(arg->type())) {
+      if (arg && hasValueHome(arg->type())) {
         frameBytes = (frameBytes + 7) & ~int64_t(7);
         valueSlots[valueKey(arg->value())] = frameBytes;
         valueByKey[valueKey(arg->value())] = arg->value();
@@ -1441,7 +1644,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         continue;
       for (int i = 0; i < owned->resultCount(); i++) {
         Value value = owned->result(i);
-        if (hasScalarHome(value.type())) {
+        if (hasValueHome(value.type()) && owned->name() != "sysy.alloca" &&
+            owned->name() != "memref.alloca" && owned->name() != "sysy.global") {
           frameBytes = (frameBytes + 7) & ~int64_t(7);
           valueSlots[valueKey(value)] = frameBytes;
           valueByKey[valueKey(value)] = value;
@@ -1456,12 +1660,25 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   };
   reserveValueSlotsForBlock(block);
   frameBytes = (frameBytes + 7) & ~int64_t(7);
+  bool hasCall = false;
+  for (auto *op : funcOps) {
+    if (op && !op->isErased() && op->name() == "sysy.call") {
+      hasCall = true;
+      break;
+    }
+  }
+  int64_t returnAddressSlot = -1;
+  if (hasCall) {
+    returnAddressSlot = frameBytes;
+    frameBytes += 8;
+  }
   int64_t calleeSaveBase = frameBytes;
   int calleeSaveCount = isArm ? 10 : 12;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
 
   int nextReg = 0;
+  int nextLoopReg = 0;
   int nextVecReg = 0;
   int nextFloatReg = 0;
   int returnsBefore = stats.returns;
@@ -1533,6 +1750,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   os << (isArm ? "    .text\n    .global " : "    .text\n    .globl ") << name << "\n";
   os << name << ":\n";
   emitStackAdjust(true);
+  if (hasCall)
+    emitStackStore(isArm ? "x30" : "ra", returnAddressSlot, isArm ? "str" : "sd");
   for (int i = 0; i < calleeSaveCount; i++) {
     int64_t off = calleeSaveBase + i * 8;
     if (isArm)
@@ -1551,6 +1770,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return isArm ? armFloatReg(nextFloatReg++) : rvFloatReg(nextFloatReg++);
   };
   std::set<std::string> homeValid;
+  auto homeIsUsable = [&](Value value) {
+    return !livenessEnabled || homeValid.count(valueKey(value)) != 0;
+  };
   auto looksFloatReg = [&](const std::string &reg) {
     return !reg.empty() && (isArm ? reg[0] == 's' : reg[0] == 'f');
   };
@@ -1562,7 +1784,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return;
     int64_t off = it->second;
     bool fp = isFloatType(value.type()) || looksFloatReg(reg);
-    emitStackStore(reg, off, fp ? "fsw" : "sw");
+    bool ptr = isMemrefType(value.type());
+    emitStackStore(reg, off, ptr ? "sd" : (fp ? "fsw" : "sw"));
     homeValid.insert(valueKey(value));
     stats.liveSpills++;
   };
@@ -1593,6 +1816,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   };
   auto bindResult = [&](Value value, const std::string &reg) {
     bindReg(value, reg);
+  };
+  auto clobberPhysicalReg = [&](const std::string &reg) {
+    if (reg.empty())
+      return;
+    for (auto it = regs.begin(); it != regs.end(); ) {
+      if (it->second == reg) {
+        maybeSpillBeforeClobber(it->first, it->second, false);
+        it = regs.erase(it);
+      } else {
+        ++it;
+      }
+    }
   };
   auto consumeOperands = [&](Operation &op) {
     for (auto operand : op.getOperands()) {
@@ -1634,6 +1869,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     std::string reg;
     if (isFloatType(arg.type()))
       reg = (isArm ? "s" : "fa") + std::to_string((int) i);
+    else if (isArm && isMemrefType(arg.type()))
+      reg = "x" + std::to_string((int) i);
     else if (isArm)
       reg = "w" + std::to_string((int) i);
     else
@@ -1660,6 +1897,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         os << "    la " << tmp << ", " << label << "\n";
       return tmp;
     }
+    auto home = valueSlots.find(valueKey(value));
+    if (home != valueSlots.end() && isMemrefType(value.type()) && homeIsUsable(value)) {
+      emitStackLoad(tmp, home->second, "ld");
+      return tmp;
+    }
     return loc;
   };
   auto ensureReg = [&](Value value, const std::string &tmp) -> std::string {
@@ -1678,90 +1920,207 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return tmp;
     }
     auto home = valueSlots.find(valueKey(value));
-    if (home != valueSlots.end()) {
+    if (home != valueSlots.end() && homeIsUsable(value)) {
       bool fp = isFloatType(value.type()) || looksFloatReg(tmp);
-      emitStackLoad(tmp, home->second, fp ? "flw" : "lw");
+      bool ptr = isMemrefType(value.type());
+      emitStackLoad(tmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
       return tmp;
     }
     return "";
   };
-  auto loadFromAddress = [&](const std::string &dst, Value base, Value index) {
-    std::string addr = materializeAddress(base, scratchReg(0));
-    bool fpLoad = looksFloatReg(dst);
-    if (index.valid()) {
-      int64_t immIndex = 0;
-      if (!isArm && constantIntegerValue(index, immIndex)) {
-        int64_t byteOffset = immIndex * 4;
-        if (byteOffset >= -2048 && byteOffset <= 2047) {
-          os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", "
-             << byteOffset << "(" << addr << ")\n";
-          return;
+  auto reloadValue = [&](Value value, const std::string &tmp) -> std::string {
+    auto home = valueSlots.find(valueKey(value));
+    if (home != valueSlots.end() && homeIsUsable(value)) {
+      bool fp = isFloatType(value.type()) || looksFloatReg(tmp);
+      bool ptr = isMemrefType(value.type());
+      emitStackLoad(tmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
+      return tmp;
+    }
+    return ensureReg(value, tmp);
+  };
+  auto emitLinearizedIndex = [&](Value base, const std::vector<Value> &indices,
+                                 const std::string &result,
+                                 const std::string &tmp,
+                                 bool allowPartial) -> bool {
+    if (indices.empty())
+      return false;
+    MemrefInfo info = parseMemrefInfo(base.type());
+    bool needsShapedIndex = indices.size() > 1 ||
+                            (info.valid && info.shape.size() > 1);
+    if (needsShapedIndex) {
+      if (!info.valid || info.shape.size() < indices.size()) {
+        stats.unsupportedOps++;
+        stats.error = "multi-dimensional memref access lacks shaped memref type";
+        return false;
+      }
+      if (!allowPartial && info.shape.size() != indices.size()) {
+        stats.unsupportedOps++;
+        stats.error = "multi-dimensional memref access is missing trailing indices";
+        return false;
+      }
+      for (std::size_t i = 1; i < indices.size(); i++) {
+        if (info.shape[i] <= 0) {
+          stats.unsupportedOps++;
+          stats.error = "multi-dimensional memref access has unknown trailing dimension";
+          return false;
         }
       }
-      std::string idx = ensureReg(index, scratchReg(1));
-      if (idx.empty()) {
-        idx = scratchReg(1);
-        if (isArm)
-          os << "    mov " << idx << ", #0\n";
-        else
-          os << "    li " << idx << ", 0\n";
-      }
-      if (isArm) {
-        os << "    ldr " << dst << ", [" << addr << ", " << idx << ", lsl #2]\n";
-      } else {
-        os << "    slli " << scratchReg(1) << ", " << idx << ", 2\n";
-        os << "    add " << scratchReg(1) << ", " << addr << ", " << scratchReg(1) << "\n";
-        os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", 0(" << scratchReg(1) << ")\n";
-      }
-      return;
     }
+
+    std::string first = ensureReg(indices[0], result);
+    if (first.empty()) {
+      stats.unsupportedOps++;
+      stats.error = "memref index has no assigned register";
+      return false;
+    }
+    if (first != result) {
+      if (isArm)
+        os << "    mov " << result << ", " << first << "\n";
+      else
+        os << "    mv " << result << ", " << first << "\n";
+    }
+
+    for (std::size_t i = 1; i < indices.size(); i++) {
+      if (isArm) {
+        os << "    mov " << tmp << ", #" << info.shape[i] << "\n";
+        os << "    mul " << result << ", " << result << ", " << tmp << "\n";
+      } else {
+        os << "    li " << tmp << ", " << info.shape[i] << "\n";
+        os << "    mulw " << result << ", " << result << ", " << tmp << "\n";
+      }
+      std::string idx = ensureReg(indices[i], tmp);
+      if (idx.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "memref index has no assigned register";
+        return false;
+      }
+      if (isArm)
+        os << "    add " << result << ", " << result << ", " << idx << "\n";
+      else
+        os << "    addw " << result << ", " << result << ", " << idx << "\n";
+    }
+    if (needsShapedIndex && allowPartial && indices.size() < info.shape.size()) {
+      int64_t trailingElems = 1;
+      for (std::size_t i = indices.size(); i < info.shape.size(); i++) {
+        if (info.shape[i] <= 0) {
+          stats.unsupportedOps++;
+          stats.error = "partial memref access has unknown trailing dimension";
+          return false;
+        }
+        trailingElems *= info.shape[i];
+      }
+      if (trailingElems != 1) {
+        if (isArm) {
+          os << "    mov " << tmp << ", #" << trailingElems << "\n";
+          os << "    mul " << result << ", " << result << ", " << tmp << "\n";
+        } else {
+          os << "    li " << tmp << ", " << trailingElems << "\n";
+          os << "    mulw " << result << ", " << result << ", " << tmp << "\n";
+        }
+      }
+    }
+    return true;
+  };
+  auto computeAddress = [&](Value base, const std::vector<Value> &indices,
+                            const std::string &addrReg,
+                            const std::string &indexReg,
+                            const std::string &tmpReg,
+                            bool allowPartial,
+                            std::string &addrOut) -> bool {
+    if (indices.empty()) {
+      addrOut = materializeAddress(base, addrReg);
+      return !addrOut.empty();
+    }
+    if (!emitLinearizedIndex(base, indices, indexReg, tmpReg, allowPartial))
+      return false;
+    std::string baseAddr = materializeAddress(base, tmpReg);
+    if (isArm) {
+      os << "    add " << indexReg << ", " << baseAddr << ", "
+         << indexReg << ", lsl #2\n";
+    } else {
+      os << "    slli " << indexReg << ", " << indexReg << ", 2\n";
+      os << "    add " << indexReg << ", " << baseAddr << ", " << indexReg << "\n";
+    }
+    addrOut = indexReg;
+    return true;
+  };
+  auto loadFromAddress = [&](const std::string &dst, Value base,
+                             const std::vector<Value> &indices) -> bool {
+    bool fpLoad = looksFloatReg(dst);
+    if (!indices.empty()) {
+      int64_t immIndex = 0;
+      MemrefInfo info = parseMemrefInfo(base.type());
+      bool simpleRank = !info.valid || info.shape.size() <= 1;
+      if (simpleRank && indices.size() == 1 && !isArm &&
+          constantIntegerValue(indices[0], immIndex)) {
+        int64_t byteOffset = immIndex * 4;
+        if (byteOffset >= -2048 && byteOffset <= 2047) {
+          std::string addr = materializeAddress(base, scratchReg(0));
+          os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", "
+             << byteOffset << "(" << addr << ")\n";
+          return true;
+        }
+      }
+      std::string addr;
+      if (!computeAddress(base, indices, scratchReg(0), scratchReg(1),
+                          scratchReg(0), false, addr))
+        return false;
+      if (isArm) {
+        os << "    ldr " << dst << ", [" << addr << "]\n";
+      } else {
+        os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", 0(" << addr << ")\n";
+      }
+      return true;
+    }
+    std::string addr = materializeAddress(base, scratchReg(0));
     if (isArm)
       os << "    ldr " << dst << ", [" << addr << "]\n";
     else
       os << "    " << (fpLoad ? "flw " : "lw ") << dst << ", 0(" << addr << ")\n";
+    return true;
   };
-  auto storeToAddress = [&](Value value, Value base, Value index) {
-    std::string addr = materializeAddress(base, scratchReg(0));
+  auto storeToAddress = [&](Value value, Value base,
+                            const std::vector<Value> &indices) -> bool {
     bool fpStore = isFloatType(value.type());
-    if (index.valid()) {
+    if (!indices.empty()) {
       int64_t immIndex = 0;
-      if (!isArm && constantIntegerValue(index, immIndex)) {
+      MemrefInfo info = parseMemrefInfo(base.type());
+      bool simpleRank = !info.valid || info.shape.size() <= 1;
+      if (simpleRank && indices.size() == 1 && !isArm &&
+          constantIntegerValue(indices[0], immIndex)) {
         int64_t byteOffset = immIndex * 4;
         if (byteOffset >= -2048 && byteOffset <= 2047) {
+          std::string addr = materializeAddress(base, scratchReg(0));
           std::string val = ensureReg(value, fpStore ? (isArm ? "s30" : "ft10") : scratchReg(1));
           fpStore = fpStore || looksFloatReg(val);
           os << "    " << (fpStore ? "fsw " : "sw ") << val << ", "
              << byteOffset << "(" << addr << ")\n";
-          return;
+          return true;
         }
       }
-      std::string idx = ensureReg(index, scratchReg(1));
-      if (idx.empty()) {
-        idx = scratchReg(1);
-        if (isArm)
-          os << "    mov " << idx << ", #0\n";
-        else
-          os << "    li " << idx << ", 0\n";
-      }
+      std::string addr;
+      if (!computeAddress(base, indices, scratchReg(0), scratchReg(1),
+                          scratchReg(0), false, addr))
+        return false;
       if (isArm) {
-        std::string val = ensureReg(value, fpStore ? "s30" : "x17");
+        std::string val = ensureReg(value, fpStore ? "s30" : scratchReg(0));
         fpStore = fpStore || looksFloatReg(val);
-        os << "    str " << val << ", [" << addr << ", " << idx << ", lsl #2]\n";
+        os << "    str " << val << ", [" << addr << "]\n";
       } else {
-        os << "    slli " << scratchReg(1) << ", " << idx << ", 2\n";
-        os << "    add " << scratchReg(1) << ", " << addr << ", " << scratchReg(1) << "\n";
         std::string val = ensureReg(value, fpStore ? "ft10" : scratchReg(0));
         fpStore = fpStore || looksFloatReg(val);
-        os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << scratchReg(1) << ")\n";
+        os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << addr << ")\n";
       }
-      return;
+      return true;
     }
+    std::string addr = materializeAddress(base, scratchReg(0));
     std::string val = ensureReg(value, fpStore ? (isArm ? "s30" : "ft10") : scratchReg(1));
     fpStore = fpStore || looksFloatReg(val);
     if (isArm)
       os << "    str " << val << ", [" << addr << "]\n";
     else
       os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << addr << ")\n";
+    return true;
   };
 
   int nextLoopId = stats.functions * 10000;
@@ -1855,7 +2214,17 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       for (const auto &label : labelIt->second)
         os << label << "\n";
     }
-    consumeOperands(op);
+    bool operandsConsumed = false;
+    auto consumeAtEnd = [&]() {
+      if (!operandsConsumed) {
+        consumeOperands(op);
+        operandsConsumed = true;
+      }
+    };
+    struct ConsumeGuard {
+      std::function<void()> fn;
+      ~ConsumeGuard() { fn(); }
+    } consumeGuard{consumeAtEnd};
 
     if (opname == "rv_machine.li" || opname == "arm_machine.mov") {
       std::string dst;
@@ -1926,19 +2295,106 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       continue;
     }
 
-    if (opname == "rv_machine.subw" || opname == "arm_machine.sub" ||
-        opname == "rv_machine.mulw" || opname == "arm_machine.mul" ||
-        opname == "rv_machine.divw" || opname == "arm_machine.sdiv" ||
-        opname == "rv_machine.remw" || opname == "arm_machine.srem" ||
-        opname == "rv_machine.and" || opname == "arm_machine.and" ||
-        opname == "rv_machine.or" || opname == "arm_machine.orr" ||
-        opname == "rv_machine.xor" || opname == "arm_machine.eor") {
-      if (op.operandCount() != 2 || op.resultCount() != 1) {
-        stats.unsupportedOps++;
-        stats.error = "bad binary machine op shape";
-        return false;
-      }
-      std::string lhs = ensureReg(op.operand(0), scratchReg(0));
+	    if (opname == "rv_machine.subw" || opname == "arm_machine.sub" ||
+	        opname == "rv_machine.mulw" || opname == "arm_machine.mul" ||
+	        opname == "rv_machine.divw" || opname == "arm_machine.sdiv" ||
+	        opname == "rv_machine.remw" || opname == "arm_machine.srem" ||
+	        opname == "rv_machine.and" || opname == "arm_machine.and" ||
+	        opname == "rv_machine.or" || opname == "arm_machine.orr" ||
+	        opname == "rv_machine.xor" || opname == "arm_machine.eor") {
+	      if (op.operandCount() != 2 || op.resultCount() != 1) {
+	        stats.unsupportedOps++;
+	        stats.error = "bad binary machine op shape";
+	        return false;
+	      }
+	      if (!isArm && enablePow2Strength &&
+	          envEnabled("SISY_ENABLE_SELF_POW2_STRENGTH", true)) {
+	        int64_t imm = 0;
+	        int shift = 0;
+	        Value valueOperand;
+	        bool isMulPow2 = false;
+	        if (opname == "rv_machine.mulw") {
+	          if (constantIntegerValue(op.operand(1), imm) &&
+	              positivePowerOfTwoShift(imm, shift)) {
+	            valueOperand = op.operand(0);
+	            isMulPow2 = true;
+	          } else if (constantIntegerValue(op.operand(0), imm) &&
+	                     positivePowerOfTwoShift(imm, shift)) {
+	            valueOperand = op.operand(1);
+	            isMulPow2 = true;
+	          }
+	          if (isMulPow2) {
+	            std::string lhs = ensureReg(valueOperand, scratchReg(0));
+	            if (lhs.empty()) {
+	              lhs = scratchReg(0);
+	              os << "    li " << lhs << ", 0\n";
+	            }
+	            std::string dst = resultReg();
+	            bindResult(op.result(), dst);
+	            if (shift == 0)
+	              os << "    addiw " << dst << ", " << lhs << ", 0\n";
+	            else
+	              os << "    slliw " << dst << ", " << lhs << ", " << shift << "\n";
+	            if (shouldSpillDefinedValue(op.result()))
+	              spillHome(op.result(), dst);
+	            stats.machineOps++;
+	            stats.pow2StrengthReductions++;
+	            continue;
+	          }
+	        }
+	        if ((opname == "rv_machine.divw" || opname == "rv_machine.remw") &&
+	            constantIntegerValue(op.operand(1), imm) &&
+	            positivePowerOfTwoShift(imm, shift)) {
+	          std::string lhs = ensureReg(op.operand(0), scratchReg(0));
+	          if (lhs.empty()) {
+	            lhs = scratchReg(0);
+	            os << "    li " << lhs << ", 0\n";
+	          }
+	          std::string dst = resultReg();
+	          bindResult(op.result(), dst);
+	          if (shift == 0) {
+	            if (opname == "rv_machine.divw")
+	              os << "    addiw " << dst << ", " << lhs << ", 0\n";
+	            else
+	              os << "    li " << dst << ", 0\n";
+	          } else {
+	            int64_t mask = (int64_t(1) << shift) - 1;
+	            std::string tmp = lhs == scratchReg(1) ? scratchReg(0) : scratchReg(1);
+	            os << "    sraiw " << tmp << ", " << lhs << ", 31\n";
+	            if (fitsSigned12(mask)) {
+	              os << "    andi " << tmp << ", " << tmp << ", " << mask << "\n";
+	            } else {
+	              std::string maskReg;
+	              for (const char *candidate : {"t4", "t3", "t2", "t1", "t0", "t5", "t6"}) {
+	                std::string candidateReg(candidate);
+	                if (candidateReg != lhs && candidateReg != tmp && candidateReg != dst) {
+	                  maskReg = candidateReg;
+	                  break;
+	                }
+	              }
+	              if (maskReg.empty())
+	                maskReg = scratchReg(0);
+	              clobberPhysicalReg(maskReg);
+	              os << "    li " << maskReg << ", " << mask << "\n";
+	              os << "    and " << tmp << ", " << tmp << ", " << maskReg << "\n";
+	            }
+	            os << "    addw " << tmp << ", " << lhs << ", " << tmp << "\n";
+	            if (opname == "rv_machine.remw") {
+	              os << "    sraiw " << tmp << ", " << tmp << ", " << shift << "\n";
+	              os << "    slliw " << tmp << ", " << tmp << ", " << shift << "\n";
+	              os << "    subw " << dst << ", " << lhs << ", " << tmp << "\n";
+	            } else {
+	              os << "    sraiw " << dst << ", " << tmp << ", " << shift << "\n";
+	            }
+	          }
+	          if (shouldSpillDefinedValue(op.result()))
+	            spillHome(op.result(), dst);
+	          stats.machineOps++;
+	          stats.pow2StrengthReductions++;
+	          continue;
+	        }
+	      }
+	      std::string lhs = ensureReg(op.operand(0), scratchReg(0));
       std::string rhs = ensureReg(op.operand(1), scratchReg(1));
       if (lhs.empty()) {
         lhs = scratchReg(0);
@@ -2086,11 +2542,31 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "load without base address";
         return false;
       }
+      std::vector<Value> indices;
+      for (int i = 1; i < op.operandCount(); i++)
+        indices.push_back(op.operand(i));
+      if (parseMemrefInfo(op.resultType()).valid) {
+        std::string addr;
+        if (!computeAddress(op.operand(0), indices, scratchReg(0),
+                            scratchReg(1), scratchReg(0), true, addr))
+          return false;
+        bindResult(op.result(), addr);
+        if (livenessEnabled && (addr == scratchReg(0) || addr == scratchReg(1))) {
+          if (remainingUses[valueKey(op.result())] > 0)
+            spillHome(op.result(), addr);
+          regs.erase(valueKey(op.result()));
+        } else if (shouldSpillDefinedValue(op.result())) {
+          spillHome(op.result(), addr);
+        }
+        stats.machineOps++;
+        continue;
+      }
       std::string dst = resultReg();
       if (isFloatType(op.resultType()))
         dst = floatReg();
       bindResult(op.result(), dst);
-      loadFromAddress(dst, op.operand(0), op.operandCount() > 1 ? op.operand(1) : Value());
+      if (!loadFromAddress(dst, op.operand(0), indices))
+        return false;
       if (shouldSpillDefinedValue(op.result()))
         spillHome(op.result(), dst);
       stats.machineOps++;
@@ -2103,7 +2579,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "store without base address";
         return false;
       }
-      storeToAddress(op.operand(0), op.operand(1), op.operandCount() > 2 ? op.operand(2) : Value());
+      std::vector<Value> indices;
+      for (int i = 2; i < op.operandCount(); i++)
+        indices.push_back(op.operand(i));
+      if (!storeToAddress(op.operand(0), op.operand(1), indices))
+        return false;
       stats.machineOps++;
       continue;
     }
@@ -2157,6 +2637,102 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       continue;
     }
 
+    if (opname == "sysy.rotate_helper") {
+      if (op.operandCount() != 2 || op.resultCount() != 1) {
+        stats.unsupportedOps++;
+        stats.error = "bad rotate helper shape";
+        return false;
+      }
+      std::string direction = symbolAttr(op.attr("direction"));
+      int64_t maxShift = parseIntegerAttr(op.attr("max_shift"));
+      if ((direction != "left" && direction != "right") || maxShift < 1 || maxShift > 30) {
+        stats.unsupportedOps++;
+        stats.error = "bad rotate helper attributes";
+        return false;
+      }
+      std::string xReg = ensureReg(op.operand(0), scratchReg(0));
+      std::string nReg = ensureReg(op.operand(1), scratchReg(1));
+      if (xReg.empty() || nReg.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "rotate helper operand has no assigned register";
+        return false;
+      }
+      std::string dst = resultReg();
+      bindResult(op.result(), dst);
+
+      auto chooseTemp = [&](std::initializer_list<std::string> excluded) -> std::string {
+        std::set<std::string> used(excluded.begin(), excluded.end());
+        const std::vector<std::string> pool = isArm
+            ? std::vector<std::string>{"w16", "w17", "w15", "w14", "w13"}
+            : std::vector<std::string>{"t5", "t6", "t4", "t3", "t2"};
+        for (const auto &reg : pool) {
+          if (used.count(reg) == 0) {
+            clobberPhysicalReg(reg);
+            return reg;
+          }
+        }
+        return pool.front();
+      };
+      auto armW = [](std::string reg) {
+        if (!reg.empty() && reg[0] == 'x')
+          reg[0] = 'w';
+        return reg;
+      };
+
+      int labelId = ++nextLoopId;
+      std::string done = ".Lrot_done_" + std::to_string(labelId);
+      if (isArm) {
+        xReg = armW(xReg);
+        nReg = armW(nReg);
+        if (dst != xReg)
+          os << "    mov " << dst << ", " << xReg << "\n";
+        os << "    cmp " << nReg << ", #1\n";
+        os << "    blt " << done << "\n";
+        os << "    cmp " << nReg << ", #" << maxShift << "\n";
+        os << "    bgt " << done << "\n";
+        if (direction == "left") {
+          os << "    lsl " << dst << ", " << dst << ", " << nReg << "\n";
+        } else {
+          std::string mask = chooseTemp({dst, nReg});
+          std::string sign = chooseTemp({dst, nReg, mask});
+          os << "    mov " << mask << ", #1\n";
+          os << "    lsl " << mask << ", " << mask << ", " << nReg << "\n";
+          os << "    sub " << mask << ", " << mask << ", #1\n";
+          os << "    asr " << sign << ", " << dst << ", #31\n";
+          os << "    and " << mask << ", " << mask << ", " << sign << "\n";
+          os << "    add " << dst << ", " << dst << ", " << mask << "\n";
+          os << "    asr " << dst << ", " << dst << ", " << nReg << "\n";
+        }
+        os << done << ":\n";
+      } else {
+        if (dst != xReg)
+          os << "    mv " << dst << ", " << xReg << "\n";
+        std::string guardTmp = chooseTemp({dst, nReg});
+        os << "    li " << guardTmp << ", 1\n";
+        os << "    blt " << nReg << ", " << guardTmp << ", " << done << "\n";
+        os << "    li " << guardTmp << ", " << maxShift << "\n";
+        os << "    blt " << guardTmp << ", " << nReg << ", " << done << "\n";
+        if (direction == "left") {
+          os << "    sllw " << dst << ", " << dst << ", " << nReg << "\n";
+        } else {
+          std::string mask = guardTmp;
+          std::string sign = chooseTemp({dst, nReg, mask});
+          os << "    li " << mask << ", 1\n";
+          os << "    sllw " << mask << ", " << mask << ", " << nReg << "\n";
+          os << "    addiw " << mask << ", " << mask << ", -1\n";
+          os << "    sraiw " << sign << ", " << dst << ", 31\n";
+          os << "    and " << mask << ", " << mask << ", " << sign << "\n";
+          os << "    addw " << dst << ", " << dst << ", " << mask << "\n";
+          os << "    sraw " << dst << ", " << dst << ", " << nReg << "\n";
+        }
+        os << done << ":\n";
+      }
+      if (shouldSpillDefinedValue(op.result()))
+        spillHome(op.result(), dst);
+      stats.machineOps++;
+      continue;
+    }
+
     if (opname == "sysy.call") {
       std::string callee = symbolAttr(op.attr("callee"));
       if (callee.empty()) {
@@ -2180,12 +2756,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           std::string arg = fpArg ? ("s" + std::to_string(i)) : ("w" + std::to_string(i));
           if (!fpArg && src.size() > 0 && src[0] == 'x')
             arg = "x" + std::to_string(i);
-          if (src != arg)
+          if (src != arg) {
+            clobberPhysicalReg(arg);
             os << "    " << (fpArg ? "fmov " : "mov ") << arg << ", " << src << "\n";
+          }
         } else {
           std::string arg = fpArg ? ("fa" + std::to_string(i)) : ("a" + std::to_string(i));
-          if (src != arg)
+          if (src != arg) {
+            clobberPhysicalReg(arg);
             os << "    " << (fpArg ? "fmv.s " : "mv ") << arg << ", " << src << "\n";
+          }
         }
       }
       invalidateCallerSavedForCall();
@@ -2240,43 +2820,39 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           }
         }
       }
-      for (int i = 0; i < calleeSaveCount; i++) {
-        int64_t off = calleeSaveBase + i * 8;
-        if (isArm)
-          emitStackLoad("x" + std::to_string(19 + i), off, "ldr");
-        else
-          emitStackLoad("s" + std::to_string(i), off, "ld");
-      }
-      emitStackAdjust(false);
-      os << "    ret\n";
+      os << "    " << (isArm ? "b" : "j") << " " << epilogueLabel << "\n";
       stats.returns++;
       continue;
     }
 
     if (opname == "affine.for") {
       int loopId = loopOps[&op];
-      std::string start = ensureReg(op.operand(0), scratchReg(0));
-      std::string boundTmp = ensureReg(op.operand(1), scratchReg(1));
-      std::string iv = isArm ? ("w" + std::to_string(nextReg++ % 5 + 19))
-                             : ("s" + std::to_string(nextReg++ % 12));
-      std::string bound = isArm ? ("w" + std::to_string(nextReg++ % 5 + 24))
-                                : ("s" + std::to_string(nextReg++ % 12));
+      std::string start = reloadValue(op.operand(0), isArm ? "w16" : scratchReg(0));
+      std::string iv = isArm ? ("w" + std::to_string(nextLoopReg++ % 10 + 19))
+                             : ("s" + std::to_string(nextLoopReg++ % 12));
+      std::string boundScratch = isArm ? "w17" : scratchReg(1);
 
       Value ivValue = op.getRegions()[0]->getBlocks()[0]->args()[0]->value();
       bindReg(ivValue, iv);
+      std::string pinnedBound = ensureReg(op.operand(1), boundScratch);
+      if (!pinnedBound.empty())
+        spillHome(op.operand(1), pinnedBound);
+      std::string pinnedStep = ensureReg(op.operand(2), boundScratch);
+      if (!pinnedStep.empty())
+        spillHome(op.operand(2), pinnedStep);
 
       if (isArm) {
         os << "    mov " << iv << ", " << start << "\n";
-        os << "    mov " << bound << ", " << boundTmp << "\n";
         spillHome(ivValue, iv);
         os << ".Lloop_cond_" << loopId << ":\n";
+        std::string bound = reloadValue(op.operand(1), boundScratch);
         os << "    cmp " << iv << ", " << bound << "\n";
         os << "    bge .Lloop_end_" << loopId << "\n";
       } else {
         os << "    mv " << iv << ", " << start << "\n";
-        os << "    mv " << bound << ", " << boundTmp << "\n";
         spillHome(ivValue, iv);
         os << ".Lloop_cond_" << loopId << ":\n";
+        std::string bound = reloadValue(op.operand(1), boundScratch);
         os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
       }
       continue;
@@ -2456,25 +3032,27 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   for (const auto &label : functionEndLabels)
     os << label << "\n";
 
-  if (stats.returns == returnsBefore) {
-    for (int i = 0; i < calleeSaveCount; i++) {
-      int64_t off = calleeSaveBase + i * 8;
-      if (isArm)
-        emitStackLoad("x" + std::to_string(19 + i), off, "ldr");
-      else
-        emitStackLoad("s" + std::to_string(i), off, "ld");
-    }
-    emitStackAdjust(false);
-    os << "    ret\n";
+  if (stats.returns == returnsBefore)
     stats.returns++;
+  os << epilogueLabel << ":\n";
+  for (int i = 0; i < calleeSaveCount; i++) {
+    int64_t off = calleeSaveBase + i * 8;
+    if (isArm)
+      emitStackLoad("x" + std::to_string(19 + i), off, "ldr");
+    else
+      emitStackLoad("s" + std::to_string(i), off, "ld");
   }
+  if (hasCall)
+    emitStackLoad(isArm ? "x30" : "ra", returnAddressSlot, isArm ? "ldr" : "ld");
+  emitStackAdjust(false);
+  os << "    ret\n";
   return true;
 }
 
 } // namespace
 
 bool emitNativeAssembly(Module &module, const std::string &target, std::ostream &os,
-                        NativeAsmStats &stats) {
+                        NativeAsmStats &stats, bool enablePow2Strength) {
   stats = NativeAsmStats();
   if (target != "riscv" && target != "arm") {
     stats.error = "native asm target must be riscv|arm";
@@ -2491,6 +3069,7 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
   }
 
   std::map<std::string, std::string> globalLabels;
+  std::map<std::string, int64_t> scalarGlobalInits;
   for (auto *op : walk(module)) {
     if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
       continue;
@@ -2500,15 +3079,67 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     std::string label = ".Lglob_" + sanitizeLabel(name);
     globalLabels[valueKey(op->result())] = label;
   }
+  if (!module.body().getBlocks().empty()) {
+    std::map<std::string, Value> scalarGlobals;
+    for (auto &owned : module.body().getBlocks()[0]->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased() || op->name() != "sysy.global" ||
+          op->resultCount() == 0 || !isScalarI32Memref(op->resultType()))
+        continue;
+      scalarGlobals[valueKey(op->result())] = op->result();
+    }
+    for (auto &owned : module.body().getBlocks()[0]->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased() ||
+          (op->name() != "sysy.store" && op->name() != "memref.store") ||
+          op->operandCount() < 2)
+        continue;
+      auto globalIt = scalarGlobals.find(valueKey(op->operand(1)));
+      if (globalIt == scalarGlobals.end())
+        continue;
+      bool zeroIndex = true;
+      for (int i = 2; i < op->operandCount(); i++) {
+        int64_t index = 0;
+        if (!constantIntegerValue(op->operand(i), index) || index != 0) {
+          zeroIndex = false;
+          break;
+        }
+      }
+      int64_t init = 0;
+      if (zeroIndex && constantIntegerValue(op->operand(0), init) && init != 0)
+        scalarGlobalInits[globalIt->first] = init;
+    }
+  }
 
+  if (!scalarGlobalInits.empty()) {
+    os << "    .data\n";
+    for (auto *op : walk(module)) {
+      if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
+        continue;
+      auto labelIt = globalLabels.find(valueKey(op->result()));
+      auto initIt = scalarGlobalInits.find(valueKey(op->result()));
+      if (labelIt == globalLabels.end() || initIt == scalarGlobalInits.end())
+        continue;
+      os << "    .align 2\n" << labelIt->second << ":\n";
+      os << "    .word " << initIt->second << "\n";
+      stats.globalScalarInits++;
+    }
+  }
+
+  bool emittedBss = false;
   if (!globalLabels.empty()) {
-    os << "    .bss\n";
     for (auto *op : walk(module)) {
       if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
         continue;
       auto it = globalLabels.find(valueKey(op->result()));
       if (it == globalLabels.end())
         continue;
+      if (scalarGlobalInits.count(valueKey(op->result())) != 0)
+        continue;
+      if (!emittedBss) {
+        os << "    .bss\n";
+        emittedBss = true;
+      }
       os << "    .align 3\n" << it->second << ":\n";
       os << "    .zero " << memrefAllocationBytes(op->resultType()) << "\n";
     }
@@ -2519,10 +3150,11 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       continue;
     if (op->name() == "sysy.func") {
       stats.functions++;
-      if (!emitFunctionAssembly(*op, target, os, stats, globalLabels))
+      if (!emitFunctionAssembly(*op, target, os, stats, enablePow2Strength, globalLabels))
         return false;
     }
   }
+  stats.linearScanSpills = stats.liveSpills;
   stats.emitted = stats.functions > 0 && stats.unsupportedOps == 0;
   if (!stats.emitted && stats.error.empty())
     stats.error = "no self-MLIR functions emitted";
@@ -2598,6 +3230,64 @@ ConversionTarget productionTarget(const std::string &target) {
   return convTarget;
 }
 
+struct ModuleIndex {
+  std::vector<Operation*> ops;
+  std::vector<Operation*> globals;
+  std::vector<Operation*> functions;
+  std::map<std::string, std::vector<Operation*>> byName;
+  std::map<std::string, std::vector<Operation*>> symbolAccesses;
+  std::map<std::string, std::set<Operation*>> symbolFunctions;
+  std::map<std::string, int> valueUseCounts;
+};
+
+static Operation *enclosingFunction(Operation *op) {
+  if (!op)
+    return nullptr;
+  Block *currBlock = op->getBlock();
+  while (currBlock) {
+    Region *region = currBlock->getRegion();
+    if (!region)
+      break;
+    Operation *parentOp = region->getParent();
+    if (!parentOp)
+      break;
+    if (parentOp->name() == "sysy.func")
+      return parentOp;
+    currBlock = parentOp->getBlock();
+  }
+  return nullptr;
+}
+
+static ModuleIndex buildModuleIndex(Module &module) {
+  ModuleIndex index;
+  index.ops = walk(module);
+  for (auto *op : index.ops) {
+    if (!op || op->isErased())
+      continue;
+    index.byName[op->name()].push_back(op);
+    if (op->name() == "sysy.global")
+      index.globals.push_back(op);
+    if (op->name() == "sysy.func")
+      index.functions.push_back(op);
+    for (auto operand : op->getOperands()) {
+      if (operand.valid())
+        index.valueUseCounts[valueKey(operand)]++;
+    }
+    if (op->name() == "sysy.load" || op->name() == "sysy.store" ||
+        op->name() == "memref.load" || op->name() == "memref.store") {
+      std::string symbol = symbolAttr(op->attr("symbol"));
+      if (symbol.empty())
+        symbol = symbolAttr(op->attr("sym_name"));
+      if (!symbol.empty()) {
+        index.symbolAccesses[symbol].push_back(op);
+        if (auto *func = enclosingFunction(op))
+          index.symbolFunctions[symbol].insert(func);
+      }
+    }
+  }
+  return index;
+}
+
 void runGlobalOpt(Module &module, SelfOptStats *stats) {
   const bool promoteGlobals = envEnabled("SISY_ENABLE_SELF_GLOBAL_PROMOTE", false);
   int64_t promoteLimit = 4096;
@@ -2609,49 +3299,30 @@ void runGlobalOpt(Module &module, SelfOptStats *stats) {
     }
   }
 
-  std::vector<Operation*> globals;
-  for (auto *op : walk(module)) {
-    if (op && !op->isErased() && op->name() == "sysy.global") {
-      globals.push_back(op);
-    }
-  }
+  ModuleIndex index = buildModuleIndex(module);
+  if (stats && index.globals.size() > 1)
+    stats->walksEliminated += (int) index.globals.size() - 1;
 
-  for (auto *global : globals) {
+  for (auto *global : index.globals) {
     std::string gName = symbolAttr(global->attr("symbol"));
     if (gName.empty())
       gName = symbolAttr(global->attr("sym_name"));
     if (gName.empty())
       continue;
 
-    std::vector<Operation*> accesses;
-    std::set<Operation*> functions;
-    for (auto *op : walk(module)) {
-      if (!op || op->isErased())
-        continue;
-      if (op->name() == "sysy.load" || op->name() == "sysy.store" ||
-          op->name() == "memref.load" || op->name() == "memref.store") {
-        if (symbolAttr(op->attr("symbol")) == gName) {
-          accesses.push_back(op);
-          Block *currBlock = op->getBlock();
-          while (currBlock) {
-            Region *r = currBlock->getRegion();
-            if (!r)
-              break;
-            Operation *parentOp = r->getParent();
-            if (!parentOp)
-              break;
-            if (parentOp->name() == "sysy.func") {
-              functions.insert(parentOp);
-              break;
-            }
-            currBlock = parentOp->getBlock();
-          }
-        }
-      }
-    }
+    auto accessIt = index.symbolAccesses.find(gName);
+    const std::vector<Operation*> emptyAccesses;
+    const std::vector<Operation*> &accesses =
+        accessIt == index.symbolAccesses.end() ? emptyAccesses : accessIt->second;
+    auto funcIt = index.symbolFunctions.find(gName);
+    const std::set<Operation*> emptyFunctions;
+    const std::set<Operation*> &functions =
+        funcIt == index.symbolFunctions.end() ? emptyFunctions : funcIt->second;
 
     if (accesses.empty()) {
-      if (global->resultCount() == 0 || usesOf(module, global->result()).empty()) {
+      bool hasDirectUse = global->resultCount() > 0 &&
+                          index.valueUseCounts[valueKey(global->result())] > 0;
+      if (global->resultCount() == 0 || !hasDirectUse) {
         global->markErased();
         if (stats)
           stats->globalsErased++;
@@ -2671,8 +3342,13 @@ void runGlobalOpt(Module &module, SelfOptStats *stats) {
             std::map<std::string, Attribute>{{"symbol", module.context().stringAttr(gName)}},
             global->loc()));
 
+        int remainingDirectUses = global->resultCount() > 0
+                                      ? index.valueUseCounts[valueKey(global->result())]
+                                      : 0;
         for (auto *op : accesses) {
           if (op->operandCount() > 0) {
+            if (global->resultCount() > 0 && op->operand(0) == global->result())
+              remainingDirectUses = std::max(0, remainingDirectUses - 1);
             op->setOperand(0, slot.result());
           } else {
             op->addOperand(slot.result());
@@ -2680,7 +3356,8 @@ void runGlobalOpt(Module &module, SelfOptStats *stats) {
         }
         if (stats)
           stats->globalsPromoted++;
-        if (global->resultCount() == 0 || usesOf(module, global->result()).empty()) {
+        bool hasDirectUse = global->resultCount() > 0 && remainingDirectUses > 0;
+        if (global->resultCount() == 0 || !hasDirectUse) {
           global->markErased();
           if (stats)
             stats->globalsErased++;
@@ -2699,11 +3376,11 @@ static std::string memoryLocationKey(Operation &op) {
   std::string key = sym;
   if (op.name() == "memref.load") {
     for (int i = 1; i < op.operandCount(); i++) {
-      key += "," + op.operand(i).printName();
+      key += "," + valueKey(op.operand(i));
     }
   } else if (op.name() == "memref.store") {
     for (int i = 2; i < op.operandCount(); i++) {
-      key += "," + op.operand(i).printName();
+      key += "," + valueKey(op.operand(i));
     }
   }
   return key;
@@ -2813,11 +3490,76 @@ void runMemoryOpt(Module &module, SelfOptStats *stats) {
   eraseMarked(module);
 }
 
+static bool isSchedulableLoad(Operation *op) {
+  return op && !op->isErased() && op->getRegions().empty() &&
+         (op->name() == "sysy.load" || op->name() == "memref.load") &&
+         op->resultCount() > 0;
+}
+
+static bool isPureArithmeticForSchedule(Operation *op) {
+  return op && !op->isErased() && op->getRegions().empty() &&
+         op->dialect() == "arith" && !op->isTerminator();
+}
+
+static bool opUsesResultOf(Operation *user, Operation *def) {
+  if (!user || !def)
+    return false;
+  for (auto operand : user->getOperands()) {
+    if (operand.getDefiningOp() == def)
+      return true;
+  }
+  return false;
+}
+
+static void runLoopLocalSchedulerInRegion(Region &region, SelfOptStats *stats);
+
+static void runLoopLocalSchedulerInBlock(Block &block, SelfOptStats *stats) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (size_t i = 1; i < block.ops().size(); i++) {
+      Operation *load = block.ops()[i].get();
+      Operation *prev = block.ops()[i - 1].get();
+      if (!isSchedulableLoad(load) || !isPureArithmeticForSchedule(prev))
+        continue;
+      if (opUsesResultOf(load, prev))
+        continue;
+      auto moved = block.takeOperation(load);
+      block.insertOperation(i - 1, std::move(moved));
+      if (stats)
+        stats->schedulerMoves++;
+      changed = true;
+      if (i > 1)
+        i -= 2;
+    }
+  }
+
+  for (auto &owned : block.ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    for (auto &nested : owned->getRegions())
+      runLoopLocalSchedulerInRegion(*nested, stats);
+  }
+}
+
+static void runLoopLocalSchedulerInRegion(Region &region, SelfOptStats *stats) {
+  for (auto &block : region.getBlocks())
+    runLoopLocalSchedulerInBlock(*block, stats);
+}
+
+void runLoopLocalScheduler(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_SCHED", true))
+    return;
+  for (auto &region : module.op().getRegions())
+    runLoopLocalSchedulerInRegion(*region, stats);
+}
+
 namespace {
 
 enum class ProvenBitwiseKind {
   None,
   And,
+  Or,
   Xor,
 };
 
@@ -2899,6 +3641,15 @@ static bool isEqBitToOne(Value value, const std::set<std::string> &bitSlots) {
          matches(cmp->operand(1), cmp->operand(0));
 }
 
+static bool isOrOfEqBitToOne(Value value, const std::set<std::string> &bitSlots) {
+  auto *op = value.getDefiningOp();
+  if (!opHasName(op, {"arith.ori", "rv_machine.or", "arm_machine.orr"}) ||
+      op->operandCount() != 2)
+    return false;
+  return isEqBitToOne(op->operand(0), bitSlots) &&
+         isEqBitToOne(op->operand(1), bitSlots);
+}
+
 static bool isNeBetweenBitLoads(Value value, const std::set<std::string> &bitSlots) {
   auto *cmp = value.getDefiningOp();
   if (!opHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) ||
@@ -2924,23 +3675,94 @@ static bool isResultPlusPowerStore(Operation *store, Value resultSlot, Value pow
          (isLoadFromSlot(add->operand(1), resultSlot) && isLoadFromSlot(add->operand(0), powerSlot));
 }
 
-static bool valueStaticallyNonNegative(Value value) {
-  int64_t c = 0;
-  if (constantIntegerValue(value, c))
-    return c >= 0;
-  auto *op = value.getDefiningOp();
-  if (!op)
-    return false;
-  if (opHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp",
-                     "arith.noti", "rv_machine.seqz", "arm_machine.not"}))
-    return true;
-  if (opHasName(op, {"arith.andi", "rv_machine.and", "arm_machine.and"}) &&
-      op->operandCount() == 2) {
-    int64_t mask = 0;
-    return (constantIntegerValue(op->operand(0), mask) && mask >= 0) ||
-           (constantIntegerValue(op->operand(1), mask) && mask >= 0);
+static bool blockHasResultPlusPowerStore(Block &block, Value resultSlot, Value powerSlot) {
+  for (auto &owned : block.ops()) {
+    if (owned && !owned->isErased() &&
+        isResultPlusPowerStore(owned.get(), resultSlot, powerSlot))
+      return true;
   }
   return false;
+}
+
+static bool isShortCircuitOrIf(Operation *op, const std::set<std::string> &bitSlots,
+                               Value resultSlot, Value powerSlot) {
+  if (!op || op->name() != "scf.if" || op->operandCount() != 1 ||
+      op->getRegions().size() != 2 ||
+      op->getRegions()[0]->getBlocks().empty() ||
+      op->getRegions()[1]->getBlocks().empty())
+    return false;
+  if (!isEqBitToOne(op->operand(0), bitSlots))
+    return false;
+
+  Block &outerThen = *op->getRegions()[0]->getBlocks()[0];
+  Block &outerElse = *op->getRegions()[1]->getBlocks()[0];
+  if (!blockHasResultPlusPowerStore(outerThen, resultSlot, powerSlot))
+    return false;
+
+  Operation *innerIf = nullptr;
+  int innerIfCount = 0;
+  for (auto &owned : outerElse.ops()) {
+    Operation *child = owned.get();
+    if (!child || child->isErased() || child->name() == "scf.yield")
+      continue;
+    if (child->name() == "scf.if") {
+      innerIf = child;
+      innerIfCount++;
+    }
+  }
+  if (innerIfCount != 1 || !innerIf || innerIf->operandCount() != 1 ||
+      innerIf->getRegions().empty() || innerIf->getRegions()[0]->getBlocks().empty())
+    return false;
+  if (!isEqBitToOne(innerIf->operand(0), bitSlots))
+    return false;
+  Block &innerThen = *innerIf->getRegions()[0]->getBlocks()[0];
+  return blockHasResultPlusPowerStore(innerThen, resultSlot, powerSlot);
+}
+
+static bool valueStaticallyNonNegativeImpl(Value value, std::set<std::string> &visiting,
+                                           int depth, SelfOptStats *stats) {
+  if (!value.valid() || depth > 8)
+    return false;
+  std::string key = valueKey(value);
+  if (!visiting.insert(key).second)
+    return false;
+  int64_t c = 0;
+  if (constantIntegerValue(value, c)) {
+    visiting.erase(key);
+    return c >= 0;
+  }
+  auto *op = value.getDefiningOp();
+  if (!op) {
+    visiting.erase(key);
+    return false;
+  }
+  auto prove = [&](Value operand) {
+    return valueStaticallyNonNegativeImpl(operand, visiting, depth + 1, stats);
+  };
+  bool proven = false;
+  if (opHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp",
+                     "arith.noti", "rv_machine.seqz", "arm_machine.not"})) {
+    proven = true;
+  } else if (opHasName(op, {"arith.andi", "rv_machine.and", "arm_machine.and"}) &&
+      op->operandCount() == 2) {
+    int64_t mask = 0;
+    proven = (constantIntegerValue(op->operand(0), mask) && mask >= 0) ||
+             (constantIntegerValue(op->operand(1), mask) && mask >= 0) ||
+             prove(op->operand(0)) || prove(op->operand(1));
+  } else if (opHasName(op, {"arith.ori", "rv_machine.or", "arm_machine.orr",
+                            "arith.xori", "rv_machine.xor", "arm_machine.eor"}) &&
+             op->operandCount() == 2) {
+    proven = prove(op->operand(0)) && prove(op->operand(1));
+  }
+  visiting.erase(key);
+  if (proven && stats)
+    stats->bitwiseStaticProofs++;
+  return proven;
+}
+
+static bool valueStaticallyNonNegative(Value value, SelfOptStats *stats = nullptr) {
+  std::set<std::string> visiting;
+  return valueStaticallyNonNegativeImpl(value, visiting, 0, stats);
 }
 
 static ProvenBitwiseFunction classifyProvenBitwiseFunction(Operation &func,
@@ -3074,6 +3896,8 @@ static ProvenBitwiseFunction classifyProvenBitwiseFunction(Operation &func,
           isEqBitToOne(condOp->operand(0), bitSlots) &&
           isEqBitToOne(condOp->operand(1), bitSlots)) {
         condKind = ProvenBitwiseKind::And;
+      } else if (isOrOfEqBitToOne(op->operand(0), bitSlots)) {
+        condKind = ProvenBitwiseKind::Or;
       } else if (isNeBetweenBitLoads(op->operand(0), bitSlots)) {
         condKind = ProvenBitwiseKind::Xor;
       }
@@ -3081,6 +3905,10 @@ static ProvenBitwiseFunction classifyProvenBitwiseFunction(Operation &func,
       for (auto &thenOp : thenBlock.ops())
         if (thenOp && isResultPlusPowerStore(thenOp.get(), resultSlot, powerSlot))
           updatesResult = true;
+    } else if (op->name() == "scf.if" &&
+               isShortCircuitOrIf(op, bitSlots, resultSlot, powerSlot)) {
+      condKind = ProvenBitwiseKind::Or;
+      updatesResult = true;
     }
   }
 
@@ -3131,6 +3959,8 @@ static std::string bitwiseOpName(ProvenBitwiseKind kind) {
   switch (kind) {
   case ProvenBitwiseKind::And:
     return "arith.andi";
+  case ProvenBitwiseKind::Or:
+    return "arith.ori";
   case ProvenBitwiseKind::Xor:
     return "arith.xori";
   default:
@@ -3153,9 +3983,10 @@ static void lowerCallWithGuard(Module &module, Operation &call,
   if (directName.empty())
     return;
 
-  bool lhsNonNegative = valueStaticallyNonNegative(call.operand(0));
-  bool rhsNonNegative = valueStaticallyNonNegative(call.operand(1));
-  if (lhsNonNegative && rhsNonNegative) {
+  bool lhsNonNegative = valueStaticallyNonNegative(call.operand(0), stats);
+  bool rhsNonNegative = valueStaticallyNonNegative(call.operand(1), stats);
+  bool directSafe = lhsNonNegative && rhsNonNegative;
+  if (directSafe) {
     Operation *direct = insertBinary(*block, index, directName, call.operand(0), call.operand(1), type, loc);
     replaceAllUses(module, call.result(), direct->result());
     call.markErased();
@@ -3216,6 +4047,162 @@ static void lowerCallWithGuard(Module &module, Operation &call,
     stats->bitwiseGuardedCalls++;
 }
 
+enum class RotateHelperKind {
+  None,
+  Left,
+  Right,
+};
+
+struct RotateHelperFunction {
+  RotateHelperKind kind = RotateHelperKind::None;
+  std::map<int64_t, int64_t> factors;
+};
+
+static int64_t denseRotateMaxShift(const RotateHelperFunction &info) {
+  if (info.kind == RotateHelperKind::None || info.factors.empty())
+    return 0;
+  int64_t maxShift = info.factors.rbegin()->first;
+  if (maxShift <= 0 || maxShift > 30)
+    return 0;
+  for (int64_t shift = 1; shift <= maxShift; shift++) {
+    auto it = info.factors.find(shift);
+    if (it == info.factors.end() || it->second != (int64_t(1) << shift))
+      return 0;
+  }
+  return maxShift;
+}
+
+static bool isValueOrLoadFromSlot(Value value, Value slot, Value arg) {
+  if (value == arg)
+    return true;
+  return slot.valid() && isLoadFromSlot(value, slot);
+}
+
+static bool isEqToConst(Value value, Value slot, Value arg, int64_t &constant) {
+  auto *cmp = value.getDefiningOp();
+  if (!opHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) ||
+      cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "eq")
+    return false;
+  auto matches = [&](Value maybeValue, Value maybeConst) {
+    return isValueOrLoadFromSlot(maybeValue, slot, arg) &&
+           constantIntegerValue(maybeConst, constant);
+  };
+  return matches(cmp->operand(0), cmp->operand(1)) ||
+         matches(cmp->operand(1), cmp->operand(0));
+}
+
+static Operation *singleReturnInRegion(Operation *op) {
+  if (!op || op->getRegions().empty() || op->getRegions()[0]->getBlocks().empty())
+    return nullptr;
+  Operation *ret = nullptr;
+  for (auto &owned : op->getRegions()[0]->getBlocks()[0]->ops()) {
+    Operation *child = owned.get();
+    if (!child || child->isErased() || child->name() == "scf.yield")
+      continue;
+    if (opHasName(child, {"sysy.return", "scf.return"})) {
+      if (ret)
+        return nullptr;
+      ret = child;
+      continue;
+    }
+    if (ret)
+      return nullptr;
+    if (!opHasName(child, {"sysy.load", "memref.load", "arith.constant",
+                           "arith.addi", "arith.subi", "arith.muli",
+                           "arith.divi", "arith.remi", "arith.cmpi",
+                           "rv_machine.li", "rv_machine.addw",
+                           "rv_machine.subw", "rv_machine.mulw",
+                           "rv_machine.divw", "rv_machine.remw",
+                           "rv_machine.cmp", "arm_machine.mov",
+                           "arm_machine.add", "arm_machine.sub",
+                           "arm_machine.mul", "arm_machine.sdiv",
+                           "arm_machine.srem", "arm_machine.cmp"}))
+      return nullptr;
+  }
+  return ret;
+}
+
+static RotateHelperFunction classifyRotateHelperFunction(Operation &func) {
+  RotateHelperFunction info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  if (entry.args().size() != 2)
+    return info;
+  Value xArg = entry.args()[0]->value();
+  Value nArg = entry.args()[1]->value();
+  Value xSlot;
+  Value nSlot;
+  for (auto &owned : entry.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || !isStoreToSlot(op, op->operandCount() >= 2 ? op->operand(1) : Value()))
+      continue;
+    if (op->operandCount() >= 2 && op->operand(0) == xArg)
+      xSlot = op->operand(1);
+    if (op->operandCount() >= 2 && op->operand(0) == nArg)
+      nSlot = op->operand(1);
+  }
+
+  bool sawCase = false;
+  bool finalReturnsX = false;
+  RotateHelperKind kind = RotateHelperKind::None;
+  std::map<int64_t, int64_t> factors;
+  for (auto &owned : entry.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "scf.if") {
+      if (op->operandCount() != 1)
+        return {};
+      int64_t shift = 0;
+      if (!isEqToConst(op->operand(0), nSlot, nArg, shift) || shift < 1 || shift > 30)
+        return {};
+      Operation *ret = singleReturnInRegion(op);
+      if (!ret || ret->operandCount() != 1)
+        return {};
+      Operation *arith = ret->operand(0).getDefiningOp();
+      if (!arith || arith->operandCount() != 2)
+        return {};
+      int64_t factor = 0;
+      bool xFirst = isValueOrLoadFromSlot(arith->operand(0), xSlot, xArg) &&
+                    constantIntegerValue(arith->operand(1), factor);
+      bool xSecond = isValueOrLoadFromSlot(arith->operand(1), xSlot, xArg) &&
+                     constantIntegerValue(arith->operand(0), factor);
+      RotateHelperKind thisKind = RotateHelperKind::None;
+      if (opHasName(arith, {"arith.muli", "rv_machine.mulw", "arm_machine.mul"}) &&
+          (xFirst || xSecond)) {
+        thisKind = RotateHelperKind::Left;
+      } else if (opHasName(arith, {"arith.divi", "rv_machine.divw", "arm_machine.sdiv"}) &&
+                 xFirst) {
+        thisKind = RotateHelperKind::Right;
+      } else {
+        return {};
+      }
+      if (factor != (int64_t(1) << shift))
+        return {};
+      if (kind == RotateHelperKind::None)
+        kind = thisKind;
+      else if (kind != thisKind)
+        return {};
+      factors[shift] = factor;
+      sawCase = true;
+      continue;
+    }
+    if (opHasName(op, {"sysy.return", "scf.return"})) {
+      if (op->operandCount() != 1 || !isValueOrLoadFromSlot(op->operand(0), xSlot, xArg))
+        return {};
+      finalReturnsX = true;
+    }
+  }
+
+  if (sawCase && finalReturnsX && kind != RotateHelperKind::None) {
+    info.kind = kind;
+    info.factors = std::move(factors);
+  }
+  return info;
+}
+
 } // namespace
 
 void runProvenBitwiseHelper(Module &module, SelfOptStats *stats) {
@@ -3255,6 +4242,91 @@ void runProvenBitwiseHelper(Module &module, SelfOptStats *stats) {
     if (it == classified.end())
       continue;
     lowerCallWithGuard(module, *call, it->second.kind, stats);
+  }
+  eraseMarked(module);
+}
+
+void runRotateHelperFold(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_ROT_HELPER", true))
+    return;
+  std::map<std::string, RotateHelperFunction> helpers;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    auto info = classifyRotateHelperFunction(*op);
+    if (info.kind == RotateHelperKind::None)
+      continue;
+    std::string symbol = symbolAttr(op->attr("sym_name"));
+    if (!symbol.empty())
+      helpers[symbol] = std::move(info);
+  }
+  if (helpers.empty())
+    return;
+
+  std::vector<Operation*> calls;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.call" ||
+        op->operandCount() != 2 || op->resultCount() != 1)
+      continue;
+    std::string callee = symbolAttr(op->attr("callee"));
+    if (helpers.count(callee) != 0)
+      calls.push_back(op);
+  }
+
+  for (Operation *call : calls) {
+    if (!call || call->isErased())
+      continue;
+    auto helperIt = helpers.find(symbolAttr(call->attr("callee")));
+    if (helperIt == helpers.end())
+      continue;
+    int64_t shift = 0;
+    if (!constantIntegerValue(call->operand(1), shift))
+      shift = std::numeric_limits<int64_t>::min();
+    Block *block = call->getBlock();
+    if (!block)
+      continue;
+    int indexRaw = operationIndexInBlock(*block, call);
+    if (indexRaw < 0)
+      continue;
+    if (shift == std::numeric_limits<int64_t>::min()) {
+      int64_t maxShift = denseRotateMaxShift(helperIt->second);
+      if (maxShift <= 0)
+        continue;
+      auto replacement = std::make_unique<Operation>(
+          "sysy.rotate_helper",
+          std::vector<Value>{call->operand(0), call->operand(1)},
+          std::vector<Type>{call->resultType()},
+          std::map<std::string, Attribute>{
+              {"direction", module.context().stringAttr(
+                                helperIt->second.kind == RotateHelperKind::Left ? "left"
+                                                                                 : "right")},
+              {"max_shift", module.context().integerAttr(maxShift,
+                                                          module.context().i(32))}},
+          call->loc());
+      replaceOperation(module, *call, std::move(replacement));
+      if (stats)
+        stats->rotHelperFolds++;
+      continue;
+    }
+    if (shift <= 0 || helperIt->second.factors.count(shift) == 0) {
+      replaceAllUses(module, call->result(), call->operand(0));
+      call->markErased();
+      if (stats)
+        stats->rotHelperFolds++;
+      continue;
+    }
+    std::size_t index = (std::size_t) indexRaw;
+    int64_t factor = helperIt->second.factors[shift];
+    Operation *factorOp = insertConstant(module, *block, index, factor, call->resultType(), call->loc());
+    const std::string opName = helperIt->second.kind == RotateHelperKind::Left
+                                   ? "arith.muli"
+                                   : "arith.divi";
+    Operation *folded = insertBinary(*block, index, opName, call->operand(0),
+                                     factorOp->result(), call->resultType(), call->loc());
+    replaceAllUses(module, call->result(), folded->result());
+    call->markErased();
+    if (stats)
+      stats->rotHelperFolds++;
   }
   eraseMarked(module);
 }
@@ -3309,7 +4381,7 @@ void runLoopVectorization(Module &module) {
       std::set<std::string> activeValNames;
       for (auto *storeOp : stores) {
         if (storeOp->operandCount() >= 1) {
-          activeValNames.insert(storeOp->operand(0).printName());
+          activeValNames.insert(valueKey(storeOp->operand(0)));
         }
       }
 
@@ -3318,7 +4390,7 @@ void runLoopVectorization(Module &module) {
         if (!child || child->isErased())
           continue;
         if (child->resultCount() > 0) {
-          std::string resName = child->result().printName();
+          std::string resName = valueKey(child->result());
           if (activeValNames.count(resName) > 0) {
             if (child->name() == "memref.load") {
               loads.push_back(child);
@@ -3328,7 +4400,7 @@ void runLoopVectorization(Module &module) {
                        child->name() == "arith.muli" || child->name() == "arith.mulf") {
               ariths.push_back(child);
               for (int opIdx = 0; opIdx < child->operandCount(); opIdx++) {
-                activeValNames.insert(child->operand(opIdx).printName());
+                activeValNames.insert(valueKey(child->operand(opIdx)));
               }
             }
           }
@@ -3362,7 +4434,7 @@ void runLoopVectorization(Module &module) {
             loadBase = symbolAttr(loadOp->attr("sym_name"));
           if (storeBase == loadBase) {
             if (storeOp->operandCount() >= 3 && loadOp->operandCount() >= 2) {
-              if (storeOp->operand(2).printName() != loadOp->operand(1).printName()) {
+              if (valueKey(storeOp->operand(2)) != valueKey(loadOp->operand(1))) {
                 hasRAW = true;
                 break;
               }
@@ -3395,7 +4467,7 @@ void runLoopVectorization(Module &module) {
             "vector.transfer_read", std::vector<Value>{base, index}, std::vector<Type>{vecType},
             std::map<std::string, Attribute>{{"symbol", module.context().stringAttr(loadSym)}},
             loadOp->loc()));
-        vecLoads[loadOp->result().printName()] = vread.result();
+        vecLoads[valueKey(loadOp->result())] = vread.result();
       }
 
       std::map<std::string, Value> vecAriths;
@@ -3403,10 +4475,11 @@ void runLoopVectorization(Module &module) {
         std::vector<Value> vecOperands;
         for (int i = 0; i < arithOp->operandCount(); i++) {
           Value operand = arithOp->operand(i);
-          if (vecLoads.count(operand.printName())) {
-            vecOperands.push_back(vecLoads[operand.printName()]);
-          } else if (vecAriths.count(operand.printName())) {
-            vecOperands.push_back(vecAriths[operand.printName()]);
+          std::string operandKey = valueKey(operand);
+          if (vecLoads.count(operandKey)) {
+            vecOperands.push_back(vecLoads[operandKey]);
+          } else if (vecAriths.count(operandKey)) {
+            vecOperands.push_back(vecAriths[operandKey]);
           } else {
             auto &splat = body->insertOperation(insertIdx++, std::make_unique<Operation>(
                 "vector.splat", std::vector<Value>{operand}, std::vector<Type>{vecType},
@@ -3417,7 +4490,7 @@ void runLoopVectorization(Module &module) {
         auto &varith = body->insertOperation(insertIdx++, std::make_unique<Operation>(
             arithOp->name(), vecOperands, std::vector<Type>{vecType},
             arithOp->attrs(), arithOp->loc()));
-        vecAriths[arithOp->result().printName()] = varith.result();
+        vecAriths[valueKey(arithOp->result())] = varith.result();
       }
 
       for (auto *storeOp : stores) {
@@ -3429,10 +4502,11 @@ void runLoopVectorization(Module &module) {
           storeSym = symbolAttr(storeOp->attr("sym_name"));
 
         Value vecVal;
-        if (vecLoads.count(val.printName())) {
-          vecVal = vecLoads[val.printName()];
-        } else if (vecAriths.count(val.printName())) {
-          vecVal = vecAriths[val.printName()];
+        std::string valKey = valueKey(val);
+        if (vecLoads.count(valKey)) {
+          vecVal = vecLoads[valKey];
+        } else if (vecAriths.count(valKey)) {
+          vecVal = vecAriths[valKey];
         } else {
           auto &splat = body->insertOperation(insertIdx++, std::make_unique<Operation>(
               "vector.splat", std::vector<Value>{val}, std::vector<Type>{vecType},

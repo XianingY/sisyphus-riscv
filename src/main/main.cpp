@@ -281,9 +281,15 @@ int main(int argc, char **argv) {
   sys::mlir::ProductionStats selfMLIRStats;
   std::ostringstream dumpBuffer;
   const std::string target = opts.arm ? "arm" : "riscv";
+  auto optLevel = opts.o2 ? sys::mlir::OptimizationConfig::Level::O2
+                          : (opts.o1 ? sys::mlir::OptimizationConfig::Level::O1
+                                     : sys::mlir::OptimizationConfig::Level::O0);
+  auto optConfig = sys::mlir::OptimizationConfig::forLevel(optLevel);
+  optConfig.inlineThreshold = opts.inlineThreshold;
+  optConfig.lateInlineThreshold = opts.lateInlineThreshold;
 
   sys::mlir::Context mlirCtx;
-  auto module = sys::mlir::runProductionGateFromAST(mlirCtx, *node, target, selfMLIRStats, &dumpBuffer);
+  auto module = sys::mlir::runProductionGateFromAST(mlirCtx, *node, target, optConfig, selfMLIRStats, &dumpBuffer);
 
   if (!module) {
     std::cerr << "[stage-fail] file=" << opts.inputFile << " stage=self-mlir-production\n";
@@ -315,11 +321,22 @@ int main(int argc, char **argv) {
               << " bitwise-candidates=" << selfMLIRStats.opt.bitwiseCandidates
               << " bitwise-rewritten-calls=" << selfMLIRStats.opt.bitwiseRewrittenCalls
               << " bitwise-guarded-calls=" << selfMLIRStats.opt.bitwiseGuardedCalls
+              << " bitwise-static-proofs=" << selfMLIRStats.opt.bitwiseStaticProofs
               << " bitwise-reject-impure=" << selfMLIRStats.opt.bitwiseRejectImpure
               << " bitwise-reject-signed-unsafe=" << selfMLIRStats.opt.bitwiseRejectSignedUnsafe
+              << " inline-calls=" << selfMLIRStats.opt.inlineCalls
+              << " inline-functions=" << selfMLIRStats.opt.inlineFunctions
+              << " rot-helper-folds=" << selfMLIRStats.opt.rotHelperFolds
+              << " pow2-strength-reductions=" << selfMLIRStats.opt.pow2StrengthReductions
               << " affine-summary-loops=" << selfMLIRStats.opt.affineSummaryLoops
               << " affine-summary-memory-ops=" << selfMLIRStats.opt.affineSummaryMemoryOps
               << " affine-summary-side-effects=" << selfMLIRStats.opt.affineSummarySideEffects
+              << " walks-eliminated=" << selfMLIRStats.opt.walksEliminated
+              << " worklist-rewrites=" << selfMLIRStats.opt.worklistRewrites
+              << " affine-worklist-items=" << selfMLIRStats.opt.affineWorklistItems
+              << " linear-scan-spills=" << selfMLIRStats.opt.linearScanSpills
+              << " loop-address-cse=" << selfMLIRStats.opt.loopAddressCSE
+              << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed
               << "\n";
@@ -337,7 +354,9 @@ int main(int argc, char **argv) {
 
   sys::mlir::NativeAsmStats asmStats;
   std::ostringstream asmBuffer;
-  bool asmOk = sys::mlir::emitNativeAssembly(*module, opts.arm ? "arm" : "riscv", asmBuffer, asmStats);
+  bool asmOk = sys::mlir::emitNativeAssembly(*module, opts.arm ? "arm" : "riscv",
+                                             asmBuffer, asmStats,
+                                             optConfig.enablePow2Strength);
 
   if (!asmOk) {
     std::cerr << "[stage-fail] file=" << opts.inputFile << " stage=native-assembly\n";
@@ -358,6 +377,11 @@ int main(int argc, char **argv) {
               << " live-spills=" << asmStats.liveSpills
               << " dead-spills-avoided=" << asmStats.deadSpillsAvoided
               << " call-boundary-spills=" << asmStats.callBoundarySpills
+              << " linear-scan-spills=" << asmStats.linearScanSpills
+              << " global-scalar-inits=" << asmStats.globalScalarInits
+              << " pow2-strength-reductions=" << asmStats.pow2StrengthReductions
+              << " loop-address-cse=" << asmStats.loopAddressCSE
+              << " scheduler-moves=" << asmStats.schedulerMoves
               << "\n";
   }
 

@@ -129,6 +129,7 @@ public:
   BlockArgument *getBlockArgument() const { return argument; }
   unsigned getResultIndex() const { return resultIndex; }
   Type type() const { return valueType; }
+  std::string identityKey() const;
   std::string printName() const;
 
   bool operator==(Value other) const {
@@ -283,20 +284,61 @@ struct SelfOptStats {
   int bitwiseCandidates = 0;
   int bitwiseRewrittenCalls = 0;
   int bitwiseGuardedCalls = 0;
+  int bitwiseStaticProofs = 0;
   int bitwiseRejectImpure = 0;
   int bitwiseRejectSignedUnsafe = 0;
+  int inlineCalls = 0;
+  int inlineFunctions = 0;
+  int rotHelperFolds = 0;
+  int pow2StrengthReductions = 0;
   int affineSummaryLoops = 0;
   int affineSummaryMemoryOps = 0;
   int affineSummarySideEffects = 0;
   int machineLiveSpills = 0;
   int machineDeadSpillsAvoided = 0;
   int machineCallBoundarySpills = 0;
+  int walksEliminated = 0;
+  int worklistRewrites = 0;
+  int affineWorklistItems = 0;
+  int linearScanSpills = 0;
+  int loopAddressCSE = 0;
+  int schedulerMoves = 0;
+};
+
+struct OptimizationConfig {
+  enum class Level {
+    O0,
+    O1,
+    O2,
+  };
+
+  Level level = Level::O1;
+  bool enableGlobalOpt = true;
+  bool enableAffine = true;
+  bool enableMemoryOpt = true;
+  bool enableProvenBitwise = true;
+  bool enableDRR = true;
+  bool enableDRRWorklist = true;
+  bool enableLinearScan = true;
+  bool enableInline = true;
+  bool enableRotateHelper = true;
+  bool enablePow2Strength = true;
+  bool enableScheduler = false;
+  bool enableLoopTiling = false;
+  bool enableLoopFusion = true;
+  bool enableLoopInterchange = true;
+  int inlineThreshold = 200;
+  int lateInlineThreshold = 200;
+
+  static OptimizationConfig forLevel(Level level);
 };
 
 void runGlobalOpt(Module &module, SelfOptStats *stats = nullptr);
 void runMemoryOpt(Module &module, SelfOptStats *stats = nullptr);
 void runProvenBitwiseHelper(Module &module, SelfOptStats *stats = nullptr);
+void runRotateHelperFold(Module &module, SelfOptStats *stats = nullptr);
 void collectAffineNestSummary(Module &module, SelfOptStats *stats = nullptr);
+void runLoopLocalScheduler(Module &module, SelfOptStats *stats = nullptr);
 void runLoopVectorization(Module &module);
 void print(Module &module, std::ostream &os);
 std::vector<Operation*> walk(Module &module);
@@ -334,10 +376,13 @@ struct RewriteStats {
   int rules = 0;
   int rewrites = 0;
   int iterations = 0;
+  int worklistPops = 0;
+  int walksEliminated = 0;
 };
 
 std::vector<RewriteRule> parseDRR(const std::string &text, std::vector<std::string> &errors);
-RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> &rules);
+RewriteStats applyGreedyPatterns(Module &module, const std::vector<RewriteRule> &rules,
+                                 bool useWorklist = true);
 
 class ConversionTarget {
   std::set<std::string> legalDialects;
@@ -373,13 +418,18 @@ struct NativeAsmStats {
   int liveSpills = 0;
   int deadSpillsAvoided = 0;
   int callBoundarySpills = 0;
+  int linearScanSpills = 0;
+  int globalScalarInits = 0;
+  int pow2StrengthReductions = 0;
+  int loopAddressCSE = 0;
+  int schedulerMoves = 0;
   bool emitted = false;
   std::string error;
 };
 
 bool verifyLegacyFree(Module &module, NativeAsmStats *stats = nullptr);
 bool emitNativeAssembly(Module &module, const std::string &target, std::ostream &os,
-                        NativeAsmStats &stats);
+                        NativeAsmStats &stats, bool enablePow2Strength = true);
 
 struct ProductionStats {
   int hirOps = 0;

@@ -1,8 +1,18 @@
 #include "Polyhedral.h"
 #include <iostream>
 #include <set>
+#include <string>
 
 namespace sys::mlir {
+
+static std::string stringAttr(Attribute attr) {
+  if (!attr)
+    return "";
+  std::string text = attr.str();
+  if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+    return text.substr(1, text.size() - 2);
+  return text;
+}
 
 // Helper to find the original alloca for a loaded value, navigating back through basic block ops.
 static Operation* findAllocaForLoad(Operation *loadOp) {
@@ -61,149 +71,354 @@ static bool opOperandsDependOnRegion(Operation *op, Region *region) {
   return false;
 }
 
-void runRaiseToAffine(Module &module) {
-restart:
-  for (auto *op : walk(module)) {
-    if (!op || op->isErased()) continue;
-    if (op->name() == "scf.while") {
-      if (op->getRegions().size() < 2) continue;
-      if (op->getRegions()[0]->getBlocks().empty() || op->getRegions()[1]->getBlocks().empty()) continue;
+static bool isLoadFromAlloca(Operation *op, Operation *allocaOp) {
+  return op && (op->name() == "sysy.load" || op->name() == "memref.load") &&
+         op->operandCount() > 0 && op->operand(0).getDefiningOp() == allocaOp;
+}
 
-      Block *condBlock = op->getRegions()[0]->getBlocks()[0].get();
-      Block *body = op->getRegions()[1]->getBlocks()[0].get();
+static bool isStoreToAlloca(Operation *op, Operation *allocaOp) {
+  return op && op->name() == "sysy.store" && op->operandCount() >= 2 &&
+         op->operand(1).getDefiningOp() == allocaOp;
+}
 
-      if (condBlock->ops().empty() || condBlock->ops().back()->name() != "scf.condition") continue;
-      Operation *condOp = condBlock->ops().back().get();
-      if (condOp->operandCount() == 0) continue;
-
-      Operation *cmpOp = condOp->operand(0).getDefiningOp();
-      if (!cmpOp) continue;
-      if (cmpOp->name() != "arith.cmpi" && cmpOp->name() != "rv_machine.cmp" && cmpOp->name() != "arm_machine.cmp") continue;
-
-      // Need an induction variable and a bound.
-      Operation *ivLoad = cmpOp->operand(0).getDefiningOp();
-      Operation *boundOp = cmpOp->operand(1).getDefiningOp();
-
-      // Allow reversed operands for cmp (bound < iv). Not fully implemented yet, just assume IV < bound.
-      if (!ivLoad || !boundOp) continue;
-
-      Operation *allocaOp = findAllocaForLoad(ivLoad);
-      if (!allocaOp) continue;
-
-      // Found a candidate IV alloca. Now look for the step inside the loop body.
-      Operation *stepOp = nullptr;
-      Operation *ivStore = nullptr;
-      for (auto &owned : body->ops()) {
-        auto *child = owned.get();
-        if (child->name() == "sysy.store" && child->operandCount() >= 2) {
-          if (child->operand(1).getDefiningOp() == allocaOp) {
-            ivStore = child;
-            stepOp = child->operand(0).getDefiningOp();
-          }
-        }
-      }
-
-      if (!stepOp || !ivStore) continue;
-      if (stepOp->name() != "arith.addi" && stepOp->name() != "rv_machine.addw" && stepOp->name() != "arm_machine.add") continue;
-
-      // Need to find the start value. This is the last store to the alloca before the while loop.
-      Operation *startStore = nullptr;
-      Block *parentBlock = op->getBlock();
-      for (auto &sibling : parentBlock->ops()) {
-        if (sibling.get() == op) break;
-        if (sibling->name() == "sysy.store" && sibling->operandCount() >= 2) {
-          if (sibling->operand(1).getDefiningOp() == allocaOp) {
-            startStore = sibling.get();
-          }
-        }
-      }
-      if (!startStore) continue;
-
-      // Extract values:
-      Value startVal = startStore->operand(0);
-      Value boundVal = cmpOp->operand(1);
-
-      // Find step value (must be constant for affine)
-      Value stepVal;
-      if (stepOp->operand(0).getDefiningOp() && findAllocaForLoad(stepOp->operand(0).getDefiningOp()) == allocaOp) {
-        stepVal = stepOp->operand(1);
-      } else if (stepOp->operandCount() > 1 && stepOp->operand(1).getDefiningOp() && findAllocaForLoad(stepOp->operand(1).getDefiningOp()) == allocaOp) {
-        stepVal = stepOp->operand(0);
-      }
-      if (!stepVal.valid()) continue;
-
-      size_t insertIdx = 0;
-      for (size_t i = 0; i < parentBlock->ops().size(); i++) {
-        if (parentBlock->ops()[i].get() == op) { insertIdx = i; break; }
-      }
-
-      Region *condRegion = op->getRegions()[0].get();
-      Region *bodyRegion = op->getRegions()[1].get();
-      if ((blockInRegionTree(boundOp->getBlock(), condRegion) &&
-           opOperandsDependOnRegion(boundOp, condRegion)) ||
-          (blockInRegionTree(boundOp->getBlock(), bodyRegion) &&
-           opOperandsDependOnRegion(boundOp, bodyRegion)))
+static bool regionHasStoreToAlloca(Region *region, Operation *allocaOp,
+                                   Operation *exceptStore) {
+  if (!region)
+    return false;
+  for (auto &block : region->getBlocks()) {
+    for (auto &owned : block->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
         continue;
+      if (op != exceptStore && isStoreToAlloca(op, allocaOp))
+        return true;
+      for (auto &nested : op->getRegions()) {
+        if (regionHasStoreToAlloca(nested.get(), allocaOp, exceptStore))
+          return true;
+      }
+    }
+  }
+  return false;
+}
 
-      Operation *stepValOp = stepVal.getDefiningOp();
-      if (stepValOp &&
-          ((blockInRegionTree(stepValOp->getBlock(), condRegion) &&
-            opOperandsDependOnRegion(stepValOp, condRegion)) ||
-           (blockInRegionTree(stepValOp->getBlock(), bodyRegion) &&
-            opOperandsDependOnRegion(stepValOp, bodyRegion))))
+static bool regionHasCallTo(Region *region, const std::string &callee) {
+  if (!region || callee.empty())
+    return false;
+  for (auto &block : region->getBlocks()) {
+    for (auto &owned : block->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
         continue;
-
-      if (boundOp->getBlock() == condBlock || boundOp->getBlock() == body) {
-        auto hoisted = boundOp->getBlock()->takeOperation(boundOp);
-        hoisted->setBlock(parentBlock);
-        parentBlock->insertOperation(insertIdx, std::move(hoisted));
-        insertIdx++;
+      if (op->name() == "sysy.call" && stringAttr(op->attr("callee")) == callee)
+        return true;
+      for (auto &nested : op->getRegions()) {
+        if (regionHasCallTo(nested.get(), callee))
+          return true;
       }
+    }
+  }
+  return false;
+}
 
-      if (stepValOp && (stepValOp->getBlock() == condBlock || stepValOp->getBlock() == body)) {
-        auto hoisted = stepValOp->getBlock()->takeOperation(stepValOp);
-        hoisted->setBlock(parentBlock);
-        parentBlock->insertOperation(insertIdx, std::move(hoisted));
-        insertIdx++;
+static bool regionHasAnyCall(Region *region) {
+  if (!region)
+    return false;
+  for (auto &block : region->getBlocks()) {
+    for (auto &owned : block->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+      if (op->name() == "sysy.call")
+        return true;
+      for (auto &nested : op->getRegions()) {
+        if (regionHasAnyCall(nested.get()))
+          return true;
       }
+    }
+  }
+  return false;
+}
 
-      // Replace scf.while with affine.for in place
-      op->rename("affine.for");
-      if (op->operandCount() > 0) op->setOperand(0, startVal);
-      else op->addOperand(startVal);
-      if (op->operandCount() > 1) op->setOperand(1, boundVal);
-      else op->addOperand(boundVal);
-      if (op->operandCount() > 2) op->setOperand(2, stepVal);
-      else op->addOperand(stepVal);
+static Operation *enclosingFunction(Operation *op) {
+  if (!op)
+    return nullptr;
+  Block *block = op->getBlock();
+  while (block) {
+    Region *region = block->getRegion();
+    if (!region)
+      break;
+    Operation *parent = region->getParent();
+    if (!parent)
+      break;
+    if (parent->name() == "sysy.func")
+      return parent;
+    block = parent->getBlock();
+  }
+  return nullptr;
+}
 
-      // Erase the condBlock (we only need the body)
-      dropRegionOperandUses(*op->getRegions()[0]);
-      op->getRegions().erase(op->getRegions().begin());
-
-      // Add block argument for IV
-      auto &ivArg = body->addArgument(module.context().i(32), op->loc(), "iv");
-
-      // Rewrite body
-      for (auto &owned : body->ops()) {
-        if (owned.get() == ivStore) {
-          owned->markErased();
-          continue;
-        }
-        if (owned->name() == "sysy.load" && owned->operand(0).getDefiningOp() == allocaOp) {
-          replaceAllUses(module, owned->result(), ivArg.value());
-          owned->markErased();
-          continue;
-        }
+static bool opTreeHasLoadFromAlloca(Operation *op, Operation *allocaOp) {
+  if (!op || op->isErased())
+    return false;
+  if (isLoadFromAlloca(op, allocaOp))
+    return true;
+  for (auto &nested : op->getRegions()) {
+    for (auto &block : nested->getBlocks()) {
+      for (auto &owned : block->ops()) {
+        if (opTreeHasLoadFromAlloca(owned.get(), allocaOp))
+          return true;
       }
+    }
+  }
+  return false;
+}
 
-      if (!body->ops().empty() && body->ops().back()->name() == "scf.yield") {
-        body->ops().back()->rename("affine.yield");
+static bool bodyReadsIVAfterStepStore(Block *body, Operation *allocaOp,
+                                      Operation *ivStore) {
+  if (!body)
+    return false;
+  bool pastStepStore = false;
+  for (auto &owned : body->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op == ivStore) {
+      pastStepStore = true;
+      continue;
+    }
+    if (pastStepStore && opTreeHasLoadFromAlloca(op, allocaOp))
+      return true;
+  }
+  return false;
+}
+
+static void replaceLoadsFromAllocaInRegion(Module &module, Region *region,
+                                           Operation *allocaOp,
+                                           Value replacement) {
+  if (!region)
+    return;
+  for (auto &block : region->getBlocks()) {
+    for (auto &owned : block->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+      if (isLoadFromAlloca(op, allocaOp)) {
+        replaceAllUses(module, op->result(), replacement);
+        op->markErased();
+        continue;
       }
-      eraseMarked(module);
-      goto restart;
+      for (auto &nested : op->getRegions())
+        replaceLoadsFromAllocaInRegion(module, nested.get(), allocaOp,
+                                       replacement);
+    }
+  }
+}
+
+static bool tryRaiseWhileToAffine(Module &module, Operation *op) {
+  if (!op || op->isErased() || op->name() != "scf.while")
+    return false;
+  if (op->getRegions().size() < 2)
+    return false;
+  if (op->getRegions()[0]->getBlocks().empty() || op->getRegions()[1]->getBlocks().empty())
+    return false;
+
+  Block *condBlock = op->getRegions()[0]->getBlocks()[0].get();
+  Block *body = op->getRegions()[1]->getBlocks()[0].get();
+
+  if (condBlock->ops().empty() || condBlock->ops().back()->name() != "scf.condition")
+    return false;
+  Operation *condOp = condBlock->ops().back().get();
+  if (condOp->operandCount() == 0)
+    return false;
+
+  Operation *cmpOp = condOp->operand(0).getDefiningOp();
+  if (!cmpOp)
+    return false;
+  if (cmpOp->name() != "arith.cmpi" && cmpOp->name() != "rv_machine.cmp" &&
+      cmpOp->name() != "arm_machine.cmp")
+    return false;
+  if (stringAttr(cmpOp->attr("predicate")) != "lt")
+    return false;
+
+  Operation *ivLoad = cmpOp->operand(0).getDefiningOp();
+  Operation *boundOp = cmpOp->operand(1).getDefiningOp();
+  if (!ivLoad || !boundOp)
+    return false;
+
+  Operation *allocaOp = findAllocaForLoad(ivLoad);
+  if (!allocaOp)
+    return false;
+
+  Operation *stepOp = nullptr;
+  Operation *ivStore = nullptr;
+  for (auto &owned : body->ops()) {
+    auto *child = owned.get();
+    if (child->name() == "sysy.store" && child->operandCount() >= 2 &&
+        child->operand(1).getDefiningOp() == allocaOp) {
+      ivStore = child;
+      stepOp = child->operand(0).getDefiningOp();
+    }
+  }
+
+  if (!stepOp || !ivStore)
+    return false;
+  if (stepOp->name() != "arith.addi" && stepOp->name() != "rv_machine.addw" &&
+      stepOp->name() != "arm_machine.add")
+    return false;
+
+  Operation *startStore = nullptr;
+  Block *parentBlock = op->getBlock();
+  if (!parentBlock)
+    return false;
+  for (auto &sibling : parentBlock->ops()) {
+    if (sibling.get() == op)
+      break;
+    if (sibling->name() == "sysy.store" && sibling->operandCount() >= 2 &&
+        sibling->operand(1).getDefiningOp() == allocaOp) {
+      startStore = sibling.get();
+    }
+  }
+  if (!startStore)
+    return false;
+
+  Value startVal = startStore->operand(0);
+  Value boundVal = cmpOp->operand(1);
+
+  Value stepVal;
+  if (stepOp->operand(0).getDefiningOp() &&
+      findAllocaForLoad(stepOp->operand(0).getDefiningOp()) == allocaOp) {
+    stepVal = stepOp->operand(1);
+  } else if (stepOp->operandCount() > 1 && stepOp->operand(1).getDefiningOp() &&
+             findAllocaForLoad(stepOp->operand(1).getDefiningOp()) == allocaOp) {
+    stepVal = stepOp->operand(0);
+  }
+  if (!stepVal.valid())
+    return false;
+
+  size_t insertIdx = 0;
+  for (size_t i = 0; i < parentBlock->ops().size(); i++) {
+    if (parentBlock->ops()[i].get() == op) {
+      insertIdx = i;
+      break;
+    }
+  }
+
+  Region *condRegion = op->getRegions()[0].get();
+  Region *bodyRegion = op->getRegions()[1].get();
+  if (regionHasAnyCall(bodyRegion))
+    return false;
+  if (Operation *func = enclosingFunction(op)) {
+    if (regionHasCallTo(bodyRegion, stringAttr(func->attr("sym_name"))))
+      return false;
+  }
+  if (regionHasStoreToAlloca(bodyRegion, allocaOp, ivStore))
+    return false;
+  if (bodyReadsIVAfterStepStore(body, allocaOp, ivStore))
+    return false;
+  if ((blockInRegionTree(boundOp->getBlock(), condRegion) &&
+       opOperandsDependOnRegion(boundOp, condRegion)) ||
+      (blockInRegionTree(boundOp->getBlock(), bodyRegion) &&
+       opOperandsDependOnRegion(boundOp, bodyRegion)))
+    return false;
+
+  Operation *stepValOp = stepVal.getDefiningOp();
+  if (stepValOp &&
+      ((blockInRegionTree(stepValOp->getBlock(), condRegion) &&
+        opOperandsDependOnRegion(stepValOp, condRegion)) ||
+       (blockInRegionTree(stepValOp->getBlock(), bodyRegion) &&
+        opOperandsDependOnRegion(stepValOp, bodyRegion))))
+    return false;
+
+  if (boundOp->getBlock() == condBlock || boundOp->getBlock() == body) {
+    auto hoisted = boundOp->getBlock()->takeOperation(boundOp);
+    hoisted->setBlock(parentBlock);
+    parentBlock->insertOperation(insertIdx, std::move(hoisted));
+    insertIdx++;
+  }
+
+  if (stepValOp && (stepValOp->getBlock() == condBlock || stepValOp->getBlock() == body)) {
+    auto hoisted = stepValOp->getBlock()->takeOperation(stepValOp);
+    hoisted->setBlock(parentBlock);
+    parentBlock->insertOperation(insertIdx, std::move(hoisted));
+    insertIdx++;
+  }
+
+  op->rename("affine.for");
+  if (op->operandCount() > 0)
+    op->setOperand(0, startVal);
+  else
+    op->addOperand(startVal);
+  if (op->operandCount() > 1)
+    op->setOperand(1, boundVal);
+  else
+    op->addOperand(boundVal);
+  if (op->operandCount() > 2)
+    op->setOperand(2, stepVal);
+  else
+    op->addOperand(stepVal);
+
+  dropRegionOperandUses(*op->getRegions()[0]);
+  op->getRegions().erase(op->getRegions().begin());
+
+  auto &ivArg = body->addArgument(module.context().i(32), op->loc(), "iv");
+  ivStore->markErased();
+  replaceLoadsFromAllocaInRegion(module, op->getRegions()[0].get(),
+                                 allocaOp, ivArg.value());
+
+  if (!body->ops().empty() && body->ops().back()->name() == "scf.yield")
+    body->ops().back()->rename("affine.yield");
+  eraseMarked(module);
+  return true;
+}
+
+static void enqueueWhile(std::vector<Operation*> &worklist,
+                         std::set<Operation*> &queued,
+                         Operation *op) {
+  if (!op || op->isErased() || op->name() != "scf.while")
+    return;
+  if (queued.insert(op).second)
+    worklist.push_back(op);
+}
+
+static void enqueueWhileOpsInBlock(std::vector<Operation*> &worklist,
+                                   std::set<Operation*> &queued,
+                                   Block *block) {
+  if (!block)
+    return;
+  for (auto &owned : block->ops()) {
+    enqueueWhile(worklist, queued, owned.get());
+    for (auto &region : owned->getRegions()) {
+      for (auto &childBlock : region->getBlocks())
+        enqueueWhileOpsInBlock(worklist, queued, childBlock.get());
+    }
+  }
+}
+
+int runRaiseToAffine(Module &module) {
+  std::vector<Operation*> worklist;
+  std::set<Operation*> queued;
+  for (auto *op : walk(module))
+    enqueueWhile(worklist, queued, op);
+
+  int processed = 0;
+  size_t head = 0;
+  while (head < worklist.size()) {
+    Operation *op = worklist[head++];
+    queued.erase(op);
+    if (!op || op->isErased())
+      continue;
+    processed++;
+    Block *parentBlock = op->getBlock();
+    if (!tryRaiseWhileToAffine(module, op))
+      continue;
+    enqueueWhileOpsInBlock(worklist, queued, parentBlock);
+    for (auto &region : op->getRegions()) {
+      for (auto &block : region->getBlocks())
+        enqueueWhileOpsInBlock(worklist, queued, block.get());
     }
   }
   eraseMarked(module);
+  return processed;
 }
 
 void runAffineLoopTiling(Module &module) {

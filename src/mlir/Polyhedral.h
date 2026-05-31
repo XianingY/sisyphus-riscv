@@ -5,7 +5,7 @@
 
 namespace sys::mlir {
 
-void runRaiseToAffine(Module &module);
+int runRaiseToAffine(Module &module);
 void runAffineLoopTiling(Module &module);
 void runAffineLoopFusion(Module &module);
 void runAffineLoopInterchange(Module &module);

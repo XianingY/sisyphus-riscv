@@ -61,6 +61,54 @@ int bit_helper(int a, int b) {
 SYSY
 }
 
+write_or_helper() {
+  local file="$1"
+  cat >"${file}" <<'SYSY'
+int bit_helper(int a, int b) {
+  int bit_a, bit_b;
+  int len = 32, result = 0, power = 1;
+  while (len) {
+    bit_a = a % 2;
+    bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1 || bit_b == 1) {
+      result = result + power;
+    }
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+SYSY
+}
+
+write_short_circuit_or_helper() {
+  local file="$1"
+  cat >"${file}" <<'SYSY'
+int bit_helper(int a, int b) {
+  int bit_a, bit_b;
+  int len = 32, result = 0, power = 1;
+  while (len) {
+    bit_a = a % 2;
+    bit_b = b % 2;
+    a = a / 2;
+    b = b / 2;
+    if (bit_a == 1) {
+      result = result + power;
+    } else {
+      if (bit_b == 1) {
+        result = result + power;
+      }
+    }
+    power = power * 2;
+    len = len - 1;
+  }
+  return result;
+}
+SYSY
+}
+
 run_case() {
   local name="$1"
   local expect_key="$2"
@@ -101,6 +149,40 @@ run_case direct_and bitwise-rewritten-calls 1
 if ! grep -Eq '^[[:space:]]+and[[:space:]]' "${OUT_DIR}/direct_and.s" ||
    ! grep -Eq '^[[:space:]]+addiw[[:space:]]' "${OUT_DIR}/direct_and.s"; then
   echo "expected RISC-V bitwise lowering to sign-extend i32 and result" >&2
+  exit 1
+fi
+
+direct_or_sy="${OUT_DIR}/direct_or.sy"
+write_or_helper "${direct_or_sy}"
+cat >>"${direct_or_sy}" <<'SYSY'
+int main() {
+  putint(bit_helper(5, 2));
+  putch(10);
+  return 0;
+}
+SYSY
+: >"${OUT_DIR}/direct_or.in"
+printf '7\n' >"${OUT_DIR}/direct_or.out"
+run_case direct_or bitwise-rewritten-calls 1
+if ! grep -Eq '^[[:space:]]+or[[:space:]]' "${OUT_DIR}/direct_or.s"; then
+  echo "expected direct OR helper lowering" >&2
+  exit 1
+fi
+
+nested_or_sy="${OUT_DIR}/nested_or.sy"
+write_short_circuit_or_helper "${nested_or_sy}"
+cat >>"${nested_or_sy}" <<'SYSY'
+int main() {
+  putint(bit_helper(8, 4));
+  putch(10);
+  return 0;
+}
+SYSY
+: >"${OUT_DIR}/nested_or.in"
+printf '12\n' >"${OUT_DIR}/nested_or.out"
+run_case nested_or bitwise-rewritten-calls 1
+if ! grep -Eq '^[[:space:]]+or[[:space:]]' "${OUT_DIR}/nested_or.s"; then
+  echo "expected nested short-circuit OR helper lowering" >&2
   exit 1
 fi
 

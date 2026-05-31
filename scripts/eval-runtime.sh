@@ -162,10 +162,10 @@ mkdir -p "$(dirname "${INDEX_LOCK}")"
 if command -v flock >/dev/null 2>&1; then
   (
     flock -x 9
-    "${INDEX_SCRIPT}"
+    /bin/bash "${INDEX_SCRIPT}"
   ) 9>"${INDEX_LOCK}"
 else
-  "${INDEX_SCRIPT}"
+  /bin/bash "${INDEX_SCRIPT}"
 fi
 
 INDEX_CSV="${ROOT_DIR}/tests/.out/suites/index.csv"

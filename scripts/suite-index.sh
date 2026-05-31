@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,13 +19,13 @@ fi
 mkdir -p "${OUT_DIR}"
 printf 'suite,tier,kind,case_id,src,in,out,enabled\n' >"${OUT_CSV}"
 
-abs_path() {
-  python3 - "$1" <<'PY'
-import pathlib
-import sys
-print(pathlib.Path(sys.argv[1]).resolve())
-PY
+TMP_FILES=()
+cleanup() {
+  if [[ "${#TMP_FILES[@]}" -gt 0 ]]; then
+    rm -f "${TMP_FILES[@]}"
+  fi
 }
+trap cleanup EXIT
 
 emit_suite_cases() {
   local suite="$1"
@@ -33,24 +33,31 @@ emit_suite_cases() {
   local kind="$3"
   local root="${OFFICIAL_DIR}/${suite}"
   local enabled="1"
+  local list_file root_abs
 
   if [[ ! -d "${root}" ]]; then
     echo "error: missing suite dir '${root}'. run scripts/suite-sync.sh first."
     exit 1
   fi
 
-  while IFS= read -r -d '' src; do
+  root_abs="$(cd "${root}" && pwd -P)"
+  list_file="$(mktemp "${TMPDIR:-/tmp}/sisy-suite-index.XXXXXX")"
+  TMP_FILES+=("${list_file}")
+  find "${root_abs}" -type f -name '*.sy' -print | LC_ALL=C sort >"${list_file}"
+
+  while IFS= read -r src; do
     local rel case_id in_file out_file
-    rel="${src#${root}/}"
+    [[ -n "${src}" ]] || continue
+    rel="${src#${root_abs}/}"
     case_id="${rel%.*}"
     in_file="${src%.*}.in"
     out_file="${src%.*}.out"
 
     printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${suite}" "${tier}" "${kind}" "${case_id}" \
-      "$(abs_path "${src}")" "$(abs_path "${in_file}")" "$(abs_path "${out_file}")" "${enabled}" \
+      "${src}" "${in_file}" "${out_file}" "${enabled}" \
       >>"${OUT_CSV}"
-  done < <(find -L "${root}" -type f -name '*.sy' -print0 | sort -z)
+  done <"${list_file}"
 }
 
 emit_suite_cases "official-functional" "hard" "functional"
