@@ -47,9 +47,10 @@ These are appropriate for default use when verifier and regression checks pass:
 - self-MLIR DRR canonicalization for local pure folds such as `x + 0`,
   `x - 0`, `x * 1`, `x * 0`, `x / 1`, `x % 1`, `x & 0`, `x | 0`, and
   identical-arm select cleanup.
-- self-MLIR global/memref cleanup: single-function global promotion, recursive
-  block-local store/load forwarding, DSE of overwritten stores, readonly call
-  invalidation, and conservative nested-region traversal.
+- self-MLIR global/memref cleanup: recursive block-local store/load forwarding,
+  DSE of overwritten stores, readonly call invalidation, and conservative
+  nested-region traversal. Global-to-stack promotion is default-off because
+  large SysY arrays must remain in `.bss` for stable RISC-V board execution.
 - self-MLIR affine transforms: structure recovery, fusion, interchange,
   reduction privatization, invariant guard hoisting, partial unroll, and
   unroll-and-jam when dependence analysis proves legality.

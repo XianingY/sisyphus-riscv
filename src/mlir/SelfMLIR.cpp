@@ -1303,6 +1303,16 @@ std::string lookupReg(Value value, const std::map<std::string, std::string> &reg
   return it == regs.end() ? "" : it->second;
 }
 
+bool envEnabled(const char *name, bool defaultValue) {
+  if (const char *value = std::getenv(name))
+    return std::string(value) != "0";
+  return defaultValue;
+}
+
+bool fitsSigned12(int64_t value) {
+  return value >= -2048 && value <= 2047;
+}
+
 bool constantIntegerValue(Value value, int64_t &out) {
   auto *op = value.getDefiningOp();
   if (!op || op->isErased())
@@ -1393,9 +1403,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   };
   walkOp(func);
 
-  bool livenessEnabled = true;
-  if (const char *value = std::getenv("SISY_ENABLE_SELF_MACHINE_LIVENESS"))
-    livenessEnabled = std::string(value) != "0";
+  bool livenessEnabled = envEnabled("SISY_ENABLE_SELF_MACHINE_LIVENESS", false);
   std::map<std::string, int> remainingUses;
   std::map<std::string, Value> valueByKey;
   for (auto *op : funcOps) {
@@ -1453,25 +1461,6 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
 
-  os << (isArm ? "    .text\n    .global " : "    .text\n    .globl ") << name << "\n";
-  os << name << ":\n";
-  if (frameBytes > 0) {
-    if (isArm)
-      os << "    sub sp, sp, #" << frameBytes << "\n";
-    else
-      os << "    addi sp, sp, -" << frameBytes << "\n";
-  }
-  for (int i = 0; i < calleeSaveCount; i++) {
-    int64_t off = calleeSaveBase + i * 8;
-    if (isArm)
-      os << "    str x" << (19 + i) << ", [sp, #" << off << "]\n";
-    else
-      os << "    sd s" << i << ", " << off << "(sp)\n";
-  }
-
-  for (const auto &kv : globalLabels)
-    regs[kv.first] = "global:" + kv.second;
-
   int nextReg = 0;
   int nextVecReg = 0;
   int nextFloatReg = 0;
@@ -1482,6 +1471,79 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return n == 0 ? "x16" : "x17";
     return n == 0 ? "t5" : "t6";
   };
+  auto stackTmpFor = [&](const std::string &reg) -> std::string {
+    if (isArm)
+      return (reg == "x16" || reg == "w16" || reg == "s30") ? "x17" : "x16";
+    return reg == "t5" ? "t6" : "t5";
+  };
+  auto emitStackAdjust = [&](bool allocate) {
+    if (frameBytes <= 0)
+      return;
+    if (isArm) {
+      os << "    " << (allocate ? "sub" : "add") << " sp, sp, #" << frameBytes << "\n";
+      return;
+    }
+    if (fitsSigned12(frameBytes)) {
+      os << "    addi sp, sp, " << (allocate ? -frameBytes : frameBytes) << "\n";
+      return;
+    }
+    os << "    li " << scratchReg(0) << ", " << frameBytes << "\n";
+    os << "    " << (allocate ? "sub" : "add") << " sp, sp, " << scratchReg(0) << "\n";
+  };
+  auto materializeStackAddressRaw = [&](const std::string &tmp, int64_t off) {
+    if (isArm) {
+      os << "    add " << tmp << ", sp, #" << off << "\n";
+      return tmp;
+    }
+    if (fitsSigned12(off)) {
+      os << "    addi " << tmp << ", sp, " << off << "\n";
+    } else {
+      os << "    li " << tmp << ", " << off << "\n";
+      os << "    add " << tmp << ", sp, " << tmp << "\n";
+    }
+    return tmp;
+  };
+  auto emitStackStore = [&](const std::string &reg, int64_t off, const std::string &inst) {
+    if (isArm) {
+      os << "    str " << reg << ", [sp, #" << off << "]\n";
+      return;
+    }
+    if (fitsSigned12(off)) {
+      os << "    " << inst << " " << reg << ", " << off << "(sp)\n";
+      return;
+    }
+    std::string tmp = stackTmpFor(reg);
+    materializeStackAddressRaw(tmp, off);
+    os << "    " << inst << " " << reg << ", 0(" << tmp << ")\n";
+  };
+  auto emitStackLoad = [&](const std::string &reg, int64_t off, const std::string &inst) {
+    if (isArm) {
+      os << "    ldr " << reg << ", [sp, #" << off << "]\n";
+      return;
+    }
+    if (fitsSigned12(off)) {
+      os << "    " << inst << " " << reg << ", " << off << "(sp)\n";
+      return;
+    }
+    std::string tmp = stackTmpFor(reg);
+    materializeStackAddressRaw(tmp, off);
+    os << "    " << inst << " " << reg << ", 0(" << tmp << ")\n";
+  };
+
+  os << (isArm ? "    .text\n    .global " : "    .text\n    .globl ") << name << "\n";
+  os << name << ":\n";
+  emitStackAdjust(true);
+  for (int i = 0; i < calleeSaveCount; i++) {
+    int64_t off = calleeSaveBase + i * 8;
+    if (isArm)
+      emitStackStore("x" + std::to_string(19 + i), off, "str");
+    else
+      emitStackStore("s" + std::to_string(i), off, "sd");
+  }
+
+  for (const auto &kv : globalLabels)
+    regs[kv.first] = "global:" + kv.second;
+
   auto resultReg = [&]() -> std::string {
     return isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
   };
@@ -1500,10 +1562,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return;
     int64_t off = it->second;
     bool fp = isFloatType(value.type()) || looksFloatReg(reg);
-    if (isArm)
-      os << "    str " << reg << ", [sp, #" << off << "]\n";
-    else
-      os << "    " << (fp ? "fsw " : "sw ") << reg << ", " << off << "(sp)\n";
+    emitStackStore(reg, off, fp ? "fsw" : "sw");
     homeValid.insert(valueKey(value));
     stats.liveSpills++;
   };
@@ -1590,11 +1649,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       loc = "stack:" + std::to_string(slotIt->second);
     if (loc.rfind("stack:", 0) == 0) {
       int64_t off = std::stoll(loc.substr(6));
-      if (isArm)
-        os << "    add " << tmp << ", sp, #" << off << "\n";
-      else
-        os << "    addi " << tmp << ", sp, " << off << "\n";
-      return tmp;
+      return materializeStackAddressRaw(tmp, off);
     }
     if (loc.rfind("global:", 0) == 0) {
       std::string label = loc.substr(7);
@@ -1625,10 +1680,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     auto home = valueSlots.find(valueKey(value));
     if (home != valueSlots.end()) {
       bool fp = isFloatType(value.type()) || looksFloatReg(tmp);
-      if (isArm)
-        os << "    ldr " << tmp << ", [sp, #" << home->second << "]\n";
-      else
-        os << "    " << (fp ? "flw " : "lw ") << tmp << ", " << home->second << "(sp)\n";
+      emitStackLoad(tmp, home->second, fp ? "flw" : "lw");
       return tmp;
     }
     return "";
@@ -1714,12 +1766,95 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
   int nextLoopId = stats.functions * 10000;
   std::map<Operation*, int> loopOps;
+  std::map<Operation*, std::vector<std::string>> labelsBefore;
+  std::vector<std::string> functionEndLabels;
+
+  auto firstLiveOpInRegion = [](Region &region) -> Operation* {
+    for (auto &block : region.getBlocks()) {
+      for (auto &owned : block->ops()) {
+        if (owned && !owned->isErased())
+          return owned.get();
+      }
+    }
+    return nullptr;
+  };
+  auto regionEndsWith = [](Region &region, const std::string &opName) -> bool {
+    for (auto it = region.getBlocks().rbegin(); it != region.getBlocks().rend(); ++it) {
+      Block &block = **it;
+      for (auto opIt = block.ops().rbegin(); opIt != block.ops().rend(); ++opIt) {
+        if (*opIt && !(*opIt)->isErased())
+          return (*opIt)->name() == opName;
+      }
+    }
+    return false;
+  };
+  auto nextLiveOpAfter = [](Operation &op) -> Operation* {
+    Block *block = op.getBlock();
+    if (!block)
+      return nullptr;
+    bool seen = false;
+    for (auto &owned : block->ops()) {
+      if (!owned)
+        continue;
+      if (seen && !owned->isErased())
+        return owned.get();
+      if (owned.get() == &op)
+        seen = true;
+    }
+    return nullptr;
+  };
+  auto scheduleBefore = [&](Operation *op, std::string label) {
+    if (op)
+      labelsBefore[op].push_back(std::move(label));
+    else
+      functionEndLabels.push_back(std::move(label));
+  };
+  auto scheduleAfter = [&](Operation &op, std::string label) {
+    scheduleBefore(nextLiveOpAfter(op), std::move(label));
+  };
+
+  for (auto *op : funcOps) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "affine.for" || op->name() == "scf.while" ||
+        op->name() == "scf.if")
+      loopOps[op] = ++nextLoopId;
+  }
+
+  for (auto *op : funcOps) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "scf.if") {
+      int ifId = loopOps[op];
+      bool hasThen = !op->getRegions().empty();
+      bool hasElse = op->getRegions().size() > 1;
+      bool thenHasYield = hasThen && regionEndsWith(*op->getRegions()[0], "scf.yield");
+      bool elseHasYield = hasElse && regionEndsWith(*op->getRegions()[1], "scf.yield");
+      if (hasElse && !thenHasYield)
+        scheduleBefore(firstLiveOpInRegion(*op->getRegions()[1]), ".Lelse_" + std::to_string(ifId) + ":");
+      if ((hasElse && !elseHasYield) || (!hasElse && !thenHasYield))
+        scheduleAfter(*op, ".Lendif_" + std::to_string(ifId) + ":");
+    } else if (op->name() == "scf.while") {
+      if (op->getRegions().size() > 1 &&
+          !regionEndsWith(*op->getRegions()[1], "scf.yield"))
+        scheduleAfter(*op, ".Lwhile_end_" + std::to_string(loopOps[op]) + ":");
+    } else if (op->name() == "affine.for") {
+      if (!op->getRegions().empty() &&
+          !regionEndsWith(*op->getRegions()[0], "affine.yield"))
+        scheduleAfter(*op, ".Lloop_end_" + std::to_string(loopOps[op]) + ":");
+    }
+  }
 
   for (auto *opPtr : funcOps) {
     if (!opPtr || opPtr->isErased()) continue;
     Operation &op = *opPtr;
     std::string opname = op.name();
     if (opname == "sysy.func") continue;
+    auto labelIt = labelsBefore.find(&op);
+    if (labelIt != labelsBefore.end()) {
+      for (const auto &label : labelIt->second)
+        os << label << "\n";
+    }
     consumeOperands(op);
 
     if (opname == "rv_machine.li" || opname == "arm_machine.mov") {
@@ -2108,24 +2243,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       for (int i = 0; i < calleeSaveCount; i++) {
         int64_t off = calleeSaveBase + i * 8;
         if (isArm)
-          os << "    ldr x" << (19 + i) << ", [sp, #" << off << "]\n";
+          emitStackLoad("x" + std::to_string(19 + i), off, "ldr");
         else
-          os << "    ld s" << i << ", " << off << "(sp)\n";
+          emitStackLoad("s" + std::to_string(i), off, "ld");
       }
-      if (frameBytes > 0) {
-        if (isArm)
-          os << "    add sp, sp, #" << frameBytes << "\n";
-        else
-          os << "    addi sp, sp, " << frameBytes << "\n";
-      }
+      emitStackAdjust(false);
       os << "    ret\n";
       stats.returns++;
       continue;
     }
 
     if (opname == "affine.for") {
-      int loopId = ++nextLoopId;
-      loopOps[&op] = loopId;
+      int loopId = loopOps[&op];
       std::string start = ensureReg(op.operand(0), scratchReg(0));
       std::string boundTmp = ensureReg(op.operand(1), scratchReg(1));
       std::string iv = isArm ? ("w" + std::to_string(nextReg++ % 5 + 19))
@@ -2154,8 +2283,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
 
     if (opname == "scf.while") {
-      int loopId = ++nextLoopId;
-      loopOps[&op] = loopId;
+      int loopId = loopOps[&op];
       os << ".Lwhile_cond_" << loopId << ":\n";
       continue;
     }
@@ -2190,12 +2318,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string iv = ensureReg(ivValue, scratchReg(0));
 
       if (isArm) {
+        os << ".Lloop_latch_" << loopId << ":\n";
         os << "    add " << iv << ", " << iv << ", " << step << "\n";
         bindReg(ivValue, iv);
         spillHome(ivValue, iv);
         os << "    b .Lloop_cond_" << loopId << "\n";
         os << ".Lloop_end_" << loopId << ":\n";
       } else {
+        os << ".Lloop_latch_" << loopId << ":\n";
         os << "    addw " << iv << ", " << iv << ", " << step << "\n";
         bindReg(ivValue, iv);
         spillHome(ivValue, iv);
@@ -2228,7 +2358,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       const bool isContinue = opname == "sysy.continue";
       if (loop->name() == "affine.for") {
         os << "    " << (isArm ? "b" : "j") << " .Lloop_"
-           << (isContinue ? "cond_" : "end_") << loopId << "\n";
+           << (isContinue ? "latch_" : "end_") << loopId << "\n";
       } else {
         os << "    " << (isArm ? "b" : "j") << " .Lwhile_"
            << (isContinue ? "cond_" : "end_") << loopId << "\n";
@@ -2284,9 +2414,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "scf.if") {
       std::string cond = ensureReg(op.operand(0), scratchReg(0));
-      static int nextIfId = 0;
-      int ifId = ++nextIfId;
-      loopOps[&op] = ifId;
+      int ifId = loopOps[&op];
 
       if (isArm) {
         os << "    cbz " << cond << ", ." << (op.getRegions().size() > 1 ? "Lelse_" : "Lendif_") << ifId << "\n";
@@ -2325,20 +2453,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return false;
   }
 
+  for (const auto &label : functionEndLabels)
+    os << label << "\n";
+
   if (stats.returns == returnsBefore) {
     for (int i = 0; i < calleeSaveCount; i++) {
       int64_t off = calleeSaveBase + i * 8;
       if (isArm)
-        os << "    ldr x" << (19 + i) << ", [sp, #" << off << "]\n";
+        emitStackLoad("x" + std::to_string(19 + i), off, "ldr");
       else
-        os << "    ld s" << i << ", " << off << "(sp)\n";
+        emitStackLoad("s" + std::to_string(i), off, "ld");
     }
-    if (frameBytes > 0) {
-      if (isArm)
-        os << "    add sp, sp, #" << frameBytes << "\n";
-      else
-        os << "    addi sp, sp, " << frameBytes << "\n";
-    }
+    emitStackAdjust(false);
     os << "    ret\n";
     stats.returns++;
   }
@@ -2473,6 +2599,16 @@ ConversionTarget productionTarget(const std::string &target) {
 }
 
 void runGlobalOpt(Module &module, SelfOptStats *stats) {
+  const bool promoteGlobals = envEnabled("SISY_ENABLE_SELF_GLOBAL_PROMOTE", false);
+  int64_t promoteLimit = 4096;
+  if (const char *value = std::getenv("SISY_SELF_GLOBAL_PROMOTE_MAX_BYTES")) {
+    try {
+      promoteLimit = std::max<int64_t>(0, std::stoll(value));
+    } catch (...) {
+      promoteLimit = 4096;
+    }
+  }
+
   std::vector<Operation*> globals;
   for (auto *op : walk(module)) {
     if (op && !op->isErased() && op->name() == "sysy.global") {
@@ -2523,7 +2659,8 @@ void runGlobalOpt(Module &module, SelfOptStats *stats) {
       continue;
     }
 
-    if (functions.size() == 1) {
+    if (promoteGlobals && functions.size() == 1 &&
+        memrefAllocationBytes(global->resultType()) <= promoteLimit) {
       Operation *func = *functions.begin();
       auto &regions = func->getRegions();
       if (!regions.empty() && !regions[0]->getBlocks().empty()) {

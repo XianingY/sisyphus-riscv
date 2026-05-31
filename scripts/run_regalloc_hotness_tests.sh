@@ -28,7 +28,8 @@ compile_stats() {
 }
 
 stats="$(compile_stats riscv "${CASE_DIR}/nested_loop_hotness.sy" \
-  "${OUT_DIR}/nested_loop_hotness.rv.s" env)"
+  "${OUT_DIR}/nested_loop_hotness.rv.s" \
+  env SISY_ENABLE_SELF_MACHINE_LIVENESS=1)"
 echo "${stats}"
 
 self_line="$(grep '^\[self-mlir\]' <<<"${stats}" | tail -1 || true)"

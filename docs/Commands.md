@@ -91,7 +91,15 @@ RUNTIME_SOFT_PERF=1 RUNTIME_PERF_TIMEOUT_SEC=20 \
   scripts/eval-runtime.sh official-riscv-perf riscv O1
 ```
 
-Single-case runtime probe:
+Native smoke and single-case runtime probes:
+
+```bash
+scripts/run_native_riscv_runtime_smoke.sh
+SISY_REQUIRE_RISCV_RUNTIME=1 scripts/run_native_riscv_runtime_smoke.sh
+```
+
+The native smoke script reports `SKIP` instead of success when the local
+RISC-V GCC/QEMU toolchain is unavailable.
 
 ```bash
 SISY_OFFICIAL_SUITE_ROOT="$PWD/tests/.out/test2026-perf-suite-root" \

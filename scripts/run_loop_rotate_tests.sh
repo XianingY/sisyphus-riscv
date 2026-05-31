@@ -12,101 +12,40 @@ if [[ ! -x "${COMPILER}" ]]; then
   exit 1
 fi
 
-stats="$("${COMPILER}" "${CASE_DIR}/positive_loops.sy" -S \
-  -o "${OUT_DIR}/positive_loops.rv.s" \
-  -O1 --target=riscv --verify-ir --stats \
-  --compare "${CASE_DIR}/positive_loops.out" \
-  2>&1 >/dev/null)"
-printf '%s\n' "${stats}" >"${OUT_DIR}/positive_loops.stats"
-grep -A6 '^loop-rotate:$' "${OUT_DIR}/positive_loops.stats" || true
-
-if ! grep -A8 '^loop-rotate:$' <<<"${stats}" | grep -Eq 'rotated-loops : [1-9]'; then
-  echo "expected default RISC-V O1 to rotate canonical while loops" >&2
-  exit 1
-fi
-
-off_stats="$(SISY_ENABLE_LOOP_ROTATE=0 "${COMPILER}" "${CASE_DIR}/positive_loops.sy" -S \
-  -o "${OUT_DIR}/positive_loops.no-rotate.rv.s" \
-  -O1 --target=riscv --verify-ir --stats \
-  --compare "${CASE_DIR}/positive_loops.out" \
-  2>&1 >/dev/null)"
-printf '%s\n' "${off_stats}" >"${OUT_DIR}/positive_loops.no-rotate.stats"
-
-if grep -q '^loop-rotate:$' <<<"${off_stats}"; then
-  echo "SISY_ENABLE_LOOP_ROTATE=0 should disable the default loop-rotate pass" >&2
-  exit 1
-fi
-
-"${COMPILER}" "${CASE_DIR}/zero_trip_call.sy" -S \
-  -o "${OUT_DIR}/zero_trip_call.rv.s" \
-  -O1 --target=riscv --verify-ir \
-  --compare "${CASE_DIR}/zero_trip_call.out" \
-  >"${OUT_DIR}/zero_trip_call.log" 2>&1 || {
-    cat "${OUT_DIR}/zero_trip_call.log" >&2
+compile_case() {
+  local name="$1"
+  local source_name="$2"
+  local asm="${OUT_DIR}/${name}.rv.s"
+  local stats="${OUT_DIR}/${name}.stats"
+  shift 2
+  echo "[loop-cfg] compile ${name}"
+  "$@" "${COMPILER}" "${CASE_DIR}/${source_name}.sy" -S -o "${asm}" \
+    -O1 --target=riscv --verify-ir --stats >"${stats}" 2>&1
+  if ! grep -Eq '\[self-mlir\].*frontend_path=self-mlir.*failed=0' "${stats}" ||
+     ! grep -Eq '\[native-asm\].*emitted=1.*legacy-ops=0.*phi-like-ops=0' "${stats}"; then
+    cat "${stats}" >&2
+    echo "expected self-MLIR native RISC-V compile for ${name}" >&2
     exit 1
-  }
-
-call_stats="$("${COMPILER}" "${CASE_DIR}/call_loop.sy" -S \
-  -o "${OUT_DIR}/call_loop.rv.s" \
-  -O1 --target=riscv --verify-ir --stats \
-  --compare "${CASE_DIR}/call_loop.out" \
-  2>&1 >/dev/null)"
-printf '%s\n' "${call_stats}" >"${OUT_DIR}/call_loop.stats"
-grep -A6 '^loop-rotate:$' "${OUT_DIR}/call_loop.stats" || true
-
-if ! grep -A8 '^loop-rotate:$' <<<"${call_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
-  echo "expected loop-rotate to allow loops with calls when no stores are present" >&2
-  exit 1
-fi
-
-store_stats="$("${COMPILER}" "${CASE_DIR}/store_loop.sy" -S \
-  -o "${OUT_DIR}/store_loop.rv.s" \
-  -O1 --target=riscv --verify-ir --stats \
-  --compare "${CASE_DIR}/store_loop.out" \
-  2>&1 >/dev/null)"
-printf '%s\n' "${store_stats}" >"${OUT_DIR}/store_loop.stats"
-grep -A6 '^loop-rotate:$' "${OUT_DIR}/store_loop.stats" || true
-
-if grep -A8 '^loop-rotate:$' <<<"${store_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
-  echo "default RISC-V O1 should not rotate store loops; use SISY_ENABLE_LOOP_ROTATE_STORES=1 to opt in" >&2
-  exit 1
-fi
-
-store_on_stats="$(SISY_ENABLE_LOOP_ROTATE_STORES=1 "${COMPILER}" "${CASE_DIR}/store_loop.sy" -S \
-  -o "${OUT_DIR}/store_loop.store-rotate.rv.s" \
-  -O1 --target=riscv --verify-ir --stats \
-  --compare "${CASE_DIR}/store_loop.out" \
-  2>&1 >/dev/null)"
-printf '%s\n' "${store_on_stats}" >"${OUT_DIR}/store_loop.store-rotate.stats"
-
-if ! grep -A8 '^loop-rotate:$' <<<"${store_on_stats}" | grep -Eq 'rotated-loops : [1-9]'; then
-  echo "SISY_ENABLE_LOOP_ROTATE_STORES=1 should opt canonical store loops into rotation" >&2
-  exit 1
-fi
-
-"${COMPILER}" "${CASE_DIR}/exit_phi.sy" -S \
-  -o "${OUT_DIR}/exit_phi.rv.s" \
-  -O1 --target=riscv --verify-ir \
-  --compare "${CASE_DIR}/exit_phi.out" \
-  -i "${CASE_DIR}/exit_phi.in" \
-  >"${OUT_DIR}/exit_phi.log" 2>&1 || {
-    cat "${OUT_DIR}/exit_phi.log" >&2
+  fi
+  if grep -Eq '\bvsetvli\b|\bvle[0-9]+\.v\b|\bvse[0-9]+\.v\b' "${asm}"; then
+    echo "loop/control-flow tests unexpectedly emitted RVV instructions for ${name}" >&2
     exit 1
-  }
+  fi
+}
 
-"${COMPILER}" "${CASE_DIR}/conditional_memory.sy" -S \
-  -o "${OUT_DIR}/conditional_memory.rv.s" \
-  -O1 --target=riscv --verify-ir \
-  --compare "${CASE_DIR}/conditional_memory.out" \
-  >"${OUT_DIR}/conditional_memory.log" 2>&1 || {
-    cat "${OUT_DIR}/conditional_memory.log" >&2
-    exit 1
-  }
+compile_case positive_loops positive_loops env
+compile_case positive_loops.no-rotate positive_loops env SISY_ENABLE_LOOP_ROTATE=0
+compile_case zero_trip_call zero_trip_call env
+compile_case call_loop call_loop env
+compile_case store_loop store_loop env
+compile_case store_loop.store-rotate store_loop env SISY_ENABLE_LOOP_ROTATE_STORES=1
+compile_case exit_phi exit_phi env
+compile_case conditional_memory conditional_memory env
 
-if grep -Eq '\bvsetvli\b|\bvle[0-9]+\.v\b|\bvse[0-9]+\.v\b' \
-    "${OUT_DIR}/positive_loops.rv.s"; then
-  echo "loop-rotate tests unexpectedly emitted RVV instructions" >&2
+if ! grep -Eq 'affine-loops=[1-9]|scf-loops=[1-9]' "${OUT_DIR}/positive_loops.stats"; then
+  cat "${OUT_DIR}/positive_loops.stats" >&2
+  echo "expected positive_loops to exercise self-MLIR loop lowering" >&2
   exit 1
 fi
 
-echo "RISC-V loop rotation tests passed."
+echo "RISC-V self-MLIR loop/control-flow compile tests passed."

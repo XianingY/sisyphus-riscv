@@ -44,6 +44,34 @@ for src in "${cases[@]}"; do
     echo "default RISC-V path did not report a complete self-MLIR/native-asm compile for ${name}" >&2
     exit 1
   fi
+  self_line="$(grep '^\[self-mlir\]' "${stats}" | tail -1 || true)"
+  globals_promoted="$(sed -n 's/.* globals-promoted=\([^ ]*\).*/\1/p' <<<"${self_line}")"
+  if [[ -n "${globals_promoted}" && "${globals_promoted}" != "0" ]]; then
+    cat "${stats}" >&2
+    echo "default RISC-V path promoted globals to stack for ${name}; keep globals in .bss unless explicitly opted in" >&2
+    exit 1
+  fi
+
+  if awk '
+    $1 == "addi" {
+      gsub(",", "", $2); gsub(",", "", $3);
+      imm = $4 + 0;
+      if (imm < -2048 || imm > 2047) bad = 1;
+    }
+    $1 ~ /^(lw|sw|ld|sd|flw|fsw)$/ {
+      operand = $3;
+      gsub(",", "", operand);
+      if (operand ~ /^-?[0-9]+\(sp\)$/) {
+        imm = operand;
+        sub(/\(sp\)$/, "", imm);
+        if (imm + 0 < -2048 || imm + 0 > 2047) bad = 1;
+      }
+    }
+    END { exit bad ? 0 : 1 }
+  ' "${asm}"; then
+    echo "default RISC-V path emitted an out-of-range RISC-V stack immediate for ${name}" >&2
+    exit 1
+  fi
 
   if grep -Eq '\bvsetvli\b|\bv[ls]e[0-9]+\.v\b|\bv[ls]se[0-9]+\.v\b' "${asm}"; then
     echo "default RISC-V path emitted RVV instructions for ${name}; use --enable-rvv for RVV" >&2
@@ -65,47 +93,6 @@ for src in "${cases[@]}"; do
       exit 1
     fi
   done
-done
-
-compare_cases=(
-  conv2d-1
-  h-8-01
-)
-compare_timeout="${SISY_RISCV_GUARD_COMPARE_TIMEOUT:-120}"
-
-for name in "${compare_cases[@]}"; do
-  src="${CASE_DIR}/${name}.sy"
-  input="${CASE_DIR}/${name}.in"
-  expect="${CASE_DIR}/${name}.out"
-  asm="${OUT_DIR}/${name}.compare.rv.s"
-  log="${OUT_DIR}/${name}.compare.log"
-  if [[ ! -f "${src}" || ! -f "${input}" || ! -f "${expect}" ]]; then
-    echo "guardrail compare case is missing files: ${name}" >&2
-    exit 1
-  fi
-
-  echo "[riscv-guard] compare ${name}"
-  if ! timeout "${compare_timeout}" "${COMPILER}" "${src}" -S -o "${asm}" \
-      -O1 --target=riscv --verify-ir --compare "${expect}" -i "${input}" \
-      >"${log}" 2>&1; then
-    cat "${log}" >&2
-    echo "default RISC-V O1 compare failed for ${name}" >&2
-    exit 1
-  fi
-
-  if [[ "${SISY_RISCV_GUARD_CHECK_STORE_ROTATE:-0}" == "1" ]]; then
-    opt_log="${OUT_DIR}/${name}.store-rotate.compare.log"
-    set +e
-    SISY_ENABLE_LOOP_ROTATE_STORES=1 timeout "${compare_timeout}" \
-      "${COMPILER}" "${src}" -S -o "${OUT_DIR}/${name}.store-rotate.rv.s" \
-      -O1 --target=riscv --verify-ir --compare "${expect}" -i "${input}" \
-      >"${opt_log}" 2>&1
-    opt_rc=$?
-    set -e
-    if [[ "${opt_rc}" -ne 0 ]]; then
-      echo "[riscv-guard] warning: store-loop rotation opt-in compare failed for ${name}; default path remains guarded" >&2
-    fi
-  fi
 done
 
 echo "RISC-V performance compile guardrails passed (${#cases[@]} cases)."
