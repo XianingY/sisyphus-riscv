@@ -337,6 +337,11 @@ int main(int argc, char **argv) {
               << " affine-worklist-items=" << selfMLIRStats.opt.affineWorklistItems
               << " linear-scan-spills=" << selfMLIRStats.opt.linearScanSpills
               << " loop-address-cse=" << selfMLIRStats.opt.loopAddressCSE
+              << " addr-iv-rewrites=" << selfMLIRStats.opt.addrIvRewrites
+              << " interior-peels=" << selfMLIRStats.opt.interiorPeels
+              << " kernel-unrolls=" << selfMLIRStats.opt.kernelUnrolls
+              << " imperfect-interchanges=" << selfMLIRStats.opt.imperfectInterchanges
+              << " loop-tiles=" << selfMLIRStats.opt.loopTiles
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed

@@ -37,6 +37,8 @@ OptimizationConfig OptimizationConfig::forLevel(Level level) {
     config.enableLoopTiling = false;
     config.enableLoopFusion = false;
     config.enableLoopInterchange = false;
+    config.enableStencilPeel = false;
+    config.enableLoopAddressIV = false;
     break;
   case Level::O1:
     config.enableGlobalOpt = true;
@@ -53,6 +55,8 @@ OptimizationConfig OptimizationConfig::forLevel(Level level) {
     config.enableLoopTiling = false;
     config.enableLoopFusion = true;
     config.enableLoopInterchange = true;
+    config.enableStencilPeel = true;
+    config.enableLoopAddressIV = true;
     break;
   case Level::O2:
     config.enableGlobalOpt = true;
@@ -69,6 +73,8 @@ OptimizationConfig OptimizationConfig::forLevel(Level level) {
     config.enableLoopTiling = true;
     config.enableLoopFusion = true;
     config.enableLoopInterchange = true;
+    config.enableStencilPeel = true;
+    config.enableLoopAddressIV = true;
     break;
   }
   return config;
@@ -4345,6 +4351,1010 @@ void runMemoryOpt(Module &module, SelfOptStats *stats, bool enableDeadLocalStore
         eraseDeadLocalStoresInFunction(*op, stats);
     }
   }
+  eraseMarked(module);
+}
+
+namespace {
+
+static bool isMLIRLoadOp(Operation *op) {
+  return op && (op->name() == "sysy.load" || op->name() == "memref.load");
+}
+
+static bool isMLIRStoreOp(Operation *op) {
+  return op && (op->name() == "sysy.store" || op->name() == "memref.store");
+}
+
+static bool loadFromSlot(Operation *op, Value slot) {
+  return isMLIRLoadOp(op) && op->operandCount() > 0 && op->operand(0) == slot;
+}
+
+static bool storeToSlot(Operation *op, Value slot) {
+  return isMLIRStoreOp(op) && op->operandCount() >= 2 && op->operand(1) == slot;
+}
+
+static std::vector<Type> resultTypesOf(Operation &op) {
+  std::vector<Type> types;
+  for (int i = 0; i < op.resultCount(); i++)
+    types.push_back(op.resultType(i));
+  return types;
+}
+
+static std::vector<Value> remapOperandsForClone(
+    Operation &op, const std::map<std::string, Value> &valueMap) {
+  std::vector<Value> operands;
+  operands.reserve((std::size_t) op.operandCount());
+  for (auto operand : op.getOperands()) {
+    auto it = valueMap.find(valueKey(operand));
+    operands.push_back(it == valueMap.end() ? operand : it->second);
+  }
+  return operands;
+}
+
+static std::string memAccessKey(Operation &op) {
+  if (isMLIRLoadOp(&op)) {
+    if (op.operandCount() == 0)
+      return "";
+    std::string key = op.name() + "|" + op.resultType().str() + "|" +
+                      valueKey(op.operand(0));
+    for (int i = 1; i < op.operandCount(); i++)
+      key += "|" + valueKey(op.operand(i));
+    return key;
+  }
+  if (isMLIRStoreOp(&op)) {
+    if (op.operandCount() < 2)
+      return "";
+    std::string key = op.name() + "|" + op.operand(0).type().str() + "|" +
+                      valueKey(op.operand(1));
+    for (int i = 2; i < op.operandCount(); i++)
+      key += "|" + valueKey(op.operand(i));
+    return key;
+  }
+  return "";
+}
+
+static std::string memAccessBaseKey(Operation &op) {
+  if (isMLIRLoadOp(&op) && op.operandCount() > 0)
+    return valueKey(op.operand(0));
+  if (isMLIRStoreOp(&op) && op.operandCount() >= 2)
+    return valueKey(op.operand(1));
+  return "";
+}
+
+static bool opTreeHasUnsafeLoopUnrollControl(Operation &op, Value ivSlot,
+                                             std::vector<Operation*> &ivStores) {
+  if (op.isErased())
+    return false;
+  if (op.name() == "sysy.call" || op.name() == "sysy.return" ||
+      op.name() == "scf.return" || op.name() == "sysy.break" ||
+      op.name() == "sysy.continue" || op.name() == "scf.if")
+    return true;
+  if (storeToSlot(&op, ivSlot))
+    ivStores.push_back(&op);
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && opTreeHasUnsafeLoopUnrollControl(*child, ivSlot, ivStores))
+          return true;
+  return false;
+}
+
+static bool addOneFromSlot(Value value, Value slot) {
+  Operation *op = value.getDefiningOp();
+  if (!op || op->isErased() ||
+      (op->name() != "arith.addi" && op->name() != "rv_machine.addw" &&
+       op->name() != "arm_machine.add") ||
+      op->operandCount() != 2)
+    return false;
+  int64_t imm = 0;
+  Operation *load = op->operand(0).getDefiningOp();
+  if (loadFromSlot(load, slot) && constantIntegerValue(op->operand(1), imm) && imm == 1)
+    return true;
+  load = op->operand(1).getDefiningOp();
+  return loadFromSlot(load, slot) && constantIntegerValue(op->operand(0), imm) && imm == 1;
+}
+
+static Operation *findConditionOp(Region &region) {
+  if (region.getBlocks().empty())
+    return nullptr;
+  for (auto &owned : region.getBlocks()[0]->ops())
+    if (owned && !owned->isErased() && owned->name() == "scf.condition")
+      return owned.get();
+  return nullptr;
+}
+
+struct ConstantWhileInfo {
+  bool valid = false;
+  Value ivSlot;
+  int64_t init = 0;
+  int64_t bound = 0;
+  int64_t tripCount = 0;
+  Operation *stepStore = nullptr;
+};
+
+static ConstantWhileInfo classifySmallConstantWhile(Operation &loop) {
+  ConstantWhileInfo info;
+  if (loop.name() != "scf.while" || loop.getRegions().size() != 2 ||
+      loop.getRegions()[0]->getBlocks().size() != 1 ||
+      loop.getRegions()[1]->getBlocks().size() != 1)
+    return info;
+  Operation *condition = findConditionOp(*loop.getRegions()[0]);
+  if (!condition || condition->operandCount() != 1)
+    return info;
+  Operation *cmp = condition->operand(0).getDefiningOp();
+  if (!cmp || cmp->isErased() ||
+      (cmp->name() != "arith.cmpi" && cmp->name() != "rv_machine.cmp" &&
+       cmp->name() != "arm_machine.cmp") ||
+      cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "lt")
+    return info;
+  Operation *load = cmp->operand(0).getDefiningOp();
+  if (!isMLIRLoadOp(load) || load->operandCount() == 0 ||
+      !isScalarWordMemref(load->operand(0).type()))
+    return info;
+  int64_t bound = 0;
+  if (!constantIntegerValue(cmp->operand(1), bound))
+    return info;
+  Value ivSlot = load->operand(0);
+
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return info;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return info;
+  bool foundInit = false;
+  int64_t init = 0;
+  for (int i = loopIndex - 1; i >= 0; i--) {
+    Operation *prev = parent->ops()[(std::size_t) i].get();
+    if (!prev || prev->isErased())
+      continue;
+    if (storeToSlot(prev, ivSlot) && constantIntegerValue(prev->operand(0), init)) {
+      foundInit = true;
+      break;
+    }
+    if (prev->name() == "scf.while" || prev->name() == "affine.for" ||
+        prev->name() == "sysy.call")
+      break;
+  }
+  if (!foundInit)
+    return info;
+
+  Block &body = *loop.getRegions()[1]->getBlocks()[0];
+  std::vector<Operation*> ivStores;
+  for (auto &owned : body.ops()) {
+    if (owned && opTreeHasUnsafeLoopUnrollControl(*owned, ivSlot, ivStores))
+      return info;
+  }
+  if (ivStores.size() != 1 || ivStores[0]->getBlock() != &body ||
+      !addOneFromSlot(ivStores[0]->operand(0), ivSlot))
+    return info;
+
+  int64_t trip = bound - init;
+  if (trip < 0 || trip > 7)
+    return info;
+  info.valid = true;
+  info.ivSlot = ivSlot;
+  info.init = init;
+  info.bound = bound;
+  info.tripCount = trip;
+  info.stepStore = ivStores[0];
+  return info;
+}
+
+static std::unique_ptr<Operation> cloneForUnrolledIteration(
+    Module &module, Operation &op, std::map<std::string, Value> &valueMap,
+    const std::set<Operation*> &skipOps, Value ivSlot, int64_t ivValue) {
+  if (skipOps.count(&op) || op.isErased())
+    return nullptr;
+
+  bool replaceIvLoad = loadFromSlot(&op, ivSlot) && op.resultCount() == 1 &&
+                       isI32Like(op.resultType());
+  std::string clonedName = replaceIvLoad ? "arith.constant" : op.name();
+  std::vector<Value> operands = replaceIvLoad ? std::vector<Value>{}
+                                              : remapOperandsForClone(op, valueMap);
+  std::map<std::string, Attribute> attrs = op.attrs();
+  if (replaceIvLoad)
+    attrs = {{"value", module.context().integerAttr(ivValue, op.resultType())}};
+  auto cloned = std::make_unique<Operation>(clonedName, operands, resultTypesOf(op),
+                                            attrs, op.loc());
+  for (auto &region : op.getRegions()) {
+    Region &newRegion = cloned->addRegion();
+    for (auto &block : region->getBlocks()) {
+      Block &newBlock = newRegion.addBlock();
+      for (auto &arg : block->args()) {
+        BlockArgument &newArg = newBlock.addArgument(arg->type(), arg->loc(), arg->name());
+        valueMap[valueKey(arg->value())] = newArg.value();
+      }
+      for (auto &child : block->ops()) {
+        if (!child || child->isErased())
+          continue;
+        auto childClone = cloneForUnrolledIteration(module, *child, valueMap,
+                                                    skipOps, ivSlot, ivValue);
+        if (!childClone)
+          continue;
+        Operation &inserted = newBlock.addOperation(std::move(childClone));
+        for (int i = 0; i < child->resultCount(); i++)
+          valueMap[valueKey(child->result(i))] = inserted.result(i);
+      }
+    }
+  }
+  return cloned;
+}
+
+static bool unrollSmallConstantWhile(Module &module, Operation &loop,
+                                     const ConstantWhileInfo &info) {
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+  Block &body = *loop.getRegions()[1]->getBlocks()[0];
+  std::vector<Operation*> bodyOps;
+  for (auto &owned : body.ops())
+    if (owned && !owned->isErased())
+      bodyOps.push_back(owned.get());
+
+  std::set<Operation*> skipOps;
+  skipOps.insert(info.stepStore);
+  for (Operation *op : bodyOps)
+    if (op && op->name() == "scf.yield")
+      skipOps.insert(op);
+
+  std::size_t insertIndex = (std::size_t) loopIndex;
+  for (int64_t iter = 0; iter < info.tripCount; iter++) {
+    std::map<std::string, Value> valueMap;
+    int64_t iv = info.init + iter;
+    for (Operation *op : bodyOps) {
+      if (!op || skipOps.count(op))
+        continue;
+      auto cloned = cloneForUnrolledIteration(module, *op, valueMap, skipOps,
+                                              info.ivSlot, iv);
+      if (!cloned)
+        continue;
+      Operation &inserted = parent->insertOperation(insertIndex++, std::move(cloned));
+      for (int i = 0; i < op->resultCount(); i++)
+        valueMap[valueKey(op->result(i))] = inserted.result(i);
+    }
+  }
+  loop.markErased();
+  return true;
+}
+
+static void runLoopAddressIVInRegion(Module &module, Region &region, SelfOptStats *stats);
+
+static void runLoopAddressIVInBlock(Module &module, Block &block, SelfOptStats *stats) {
+  std::map<std::string, Value> loadCache;
+  std::map<std::string, std::set<std::string>> keysByBase;
+
+  auto invalidateAll = [&]() {
+    loadCache.clear();
+    keysByBase.clear();
+  };
+  auto cacheLoad = [&](const std::string &key, const std::string &base, Value value) {
+    loadCache[key] = value;
+    keysByBase[base].insert(key);
+  };
+  auto invalidateBaseAfterStore = [&](const std::string &base, Value storedValue) {
+    auto baseIt = keysByBase.find(base);
+    if (baseIt == keysByBase.end())
+      return;
+    std::vector<std::string> eraseKeys;
+    for (const auto &key : baseIt->second) {
+      auto cacheIt = loadCache.find(key);
+      if (cacheIt == loadCache.end() || cacheIt->second != storedValue)
+        eraseKeys.push_back(key);
+    }
+    for (const auto &key : eraseKeys) {
+      loadCache.erase(key);
+      baseIt->second.erase(key);
+    }
+    if (baseIt->second.empty())
+      keysByBase.erase(baseIt);
+  };
+
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "memref.load" && op->resultCount() == 1 &&
+        !isMemrefType(op->resultType())) {
+      std::string key = memAccessKey(*op);
+      std::string base = memAccessBaseKey(*op);
+      auto it = loadCache.find(key);
+      if (!key.empty() && it != loadCache.end() && it->second.valid()) {
+        replaceAllUses(module, op->result(), it->second);
+        op->markErased();
+        if (stats) {
+          stats->loopAddressCSE++;
+          stats->addrIvRewrites++;
+        }
+        continue;
+      }
+      if (!key.empty() && !base.empty())
+        cacheLoad(key, base, op->result());
+      continue;
+    }
+
+    if (op->name() == "memref.store" && op->operandCount() >= 2) {
+      std::string key = memAccessKey(*op);
+      std::string base = memAccessBaseKey(*op);
+      auto cached = loadCache.find(key);
+      if (!key.empty() && cached != loadCache.end() && cached->second == op->operand(0)) {
+        op->markErased();
+        if (stats) {
+          stats->memoryRemovedStores++;
+          stats->loopAddressCSE++;
+          stats->addrIvRewrites++;
+        }
+        continue;
+      }
+      if (!base.empty())
+        invalidateBaseAfterStore(base, op->operand(0));
+      continue;
+    }
+
+    if (op->name() == "sysy.call") {
+      invalidateAll();
+      continue;
+    }
+
+    if (!op->getRegions().empty()) {
+      for (auto &region : op->getRegions())
+        runLoopAddressIVInRegion(module, *region, stats);
+      invalidateAll();
+    }
+  }
+}
+
+static void runLoopAddressIVInRegion(Module &module, Region &region, SelfOptStats *stats) {
+  for (auto &block : region.getBlocks())
+    runLoopAddressIVInBlock(module, *block, stats);
+}
+
+static bool opTreeUsesValue(Operation &op, Value needle) {
+  if (op.isErased())
+    return false;
+  for (auto operand : op.getOperands())
+    if (operand == needle)
+      return true;
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && opTreeUsesValue(*child, needle))
+          return true;
+  return false;
+}
+
+static bool opHasDirectValueUse(Operation &op, Value needle) {
+  for (auto operand : op.getOperands())
+    if (operand == needle)
+      return true;
+  return false;
+}
+
+static bool opResultIsUnused(Operation &op) {
+  for (int i = 0; i < op.resultCount(); i++) {
+    if ((int) op.resultUses.size() > i && !op.resultUses[(std::size_t) i].empty())
+      return false;
+  }
+  return true;
+}
+
+static bool isPureDeadIvBump(Operation &op, Value iv) {
+  return op.getRegions().empty() && opHasDirectValueUse(op, iv) && opResultIsUnused(op) &&
+         (op.name() == "arith.addi" || op.name() == "rv_machine.addw" ||
+          op.name() == "arm_machine.add");
+}
+
+static void collectLocalAllocas(Operation &op, std::set<std::string> &allocas) {
+  if (op.isErased())
+    return;
+  if ((op.name() == "sysy.alloca" || op.name() == "memref.alloca") &&
+      op.resultCount() == 1)
+    allocas.insert(valueKey(op.result()));
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child)
+          collectLocalAllocas(*child, allocas);
+}
+
+static bool collectRepeatReductionStores(Operation &op,
+                                         const std::set<std::string> &localAllocas,
+                                         std::map<std::string, Value> &outerStores) {
+  if (op.isErased())
+    return true;
+  if (op.name() == "sysy.call" || op.name() == "sysy.return" ||
+      op.name() == "scf.return" || op.name() == "sysy.break" ||
+      op.name() == "sysy.continue" || op.name() == "memref.store" ||
+      op.name() == "scf.if" || op.name() == "arith.divi" ||
+      op.name() == "arith.remi" || op.name() == "rv_machine.divw" ||
+      op.name() == "rv_machine.remw" || op.name() == "arm_machine.sdiv")
+    return false;
+  if (op.name() == "sysy.store") {
+    if (op.operandCount() < 2 || !isScalarWordMemref(op.operand(1).type()))
+      return false;
+    std::string slot = valueKey(op.operand(1));
+    if (!localAllocas.count(slot))
+      outerStores[slot] = op.operand(1);
+  }
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && !collectRepeatReductionStores(*child, localAllocas, outerStores))
+          return false;
+  return true;
+}
+
+static bool valueDependsOnSlot(Value value, Value slot, int depth = 0) {
+  if (!value.valid() || depth > 24)
+    return false;
+  Operation *op = value.getDefiningOp();
+  if (!op || op->isErased())
+    return false;
+  if (loadFromSlot(op, slot))
+    return true;
+  for (auto operand : op->getOperands())
+    if (valueDependsOnSlot(operand, slot, depth + 1))
+      return true;
+  return false;
+}
+
+static bool valueUsesOnlyAllowedRepeatOps(Value value, Value accumulator,
+                                          int depth = 0) {
+  if (!value.valid() || depth > 48)
+    return false;
+  Operation *op = value.getDefiningOp();
+  if (!op || op->isErased())
+    return true;
+  if (loadFromSlot(op, accumulator))
+    return true;
+  if (op->getRegions().size() != 0)
+    return false;
+  const std::string &name = op->name();
+  if (name != "arith.constant" && name != "arith.addi" &&
+      name != "arith.subi" && name != "arith.muli" &&
+      name != "rv_machine.li" && name != "rv_machine.addw" &&
+      name != "rv_machine.subw" && name != "rv_machine.mulw" &&
+      name != "rv_machine.neg" && name != "arm_machine.mov" &&
+      name != "arm_machine.add" && name != "arm_machine.sub" &&
+      name != "arm_machine.mul" && name != "memref.load" &&
+      name != "sysy.load")
+    return false;
+  for (auto operand : op->getOperands())
+    if (!valueUsesOnlyAllowedRepeatOps(operand, accumulator, depth + 1))
+      return false;
+  return true;
+}
+
+static bool storeIsAccumulatorAdd(Operation &store, Value accumulator) {
+  if (!storeToSlot(&store, accumulator) || store.operandCount() < 1)
+    return false;
+  Value stored = store.operand(0);
+  Operation *add = stored.getDefiningOp();
+  if (!add || add->isErased() ||
+      (add->name() != "arith.addi" && add->name() != "rv_machine.addw" &&
+       add->name() != "arm_machine.add") ||
+      add->operandCount() != 2)
+    return false;
+
+  bool hasAccumulatorLoad = false;
+  bool incrementIndependent = false;
+  for (int i = 0; i < 2; i++) {
+    Value operand = add->operand(i);
+    Operation *load = operand.getDefiningOp();
+    if (loadFromSlot(load, accumulator)) {
+      hasAccumulatorLoad = true;
+      continue;
+    }
+    if (!valueDependsOnSlot(operand, accumulator) &&
+        valueUsesOnlyAllowedRepeatOps(operand, accumulator))
+      incrementIndependent = true;
+  }
+  return hasAccumulatorLoad && incrementIndependent;
+}
+
+static bool opTreeAccumulatorStoresAreLinearAdds(Operation &op, Value accumulator) {
+  if (op.isErased())
+    return true;
+  if (storeToSlot(&op, accumulator) && !storeIsAccumulatorAdd(op, accumulator))
+    return false;
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && !opTreeAccumulatorStoresAreLinearAdds(*child, accumulator))
+          return false;
+  return true;
+}
+
+static bool opTreeLoadsFromSlot(Operation &op, Value slot) {
+  if (op.isErased())
+    return false;
+  if (loadFromSlot(&op, slot))
+    return true;
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && opTreeLoadsFromSlot(*child, slot))
+          return true;
+  return false;
+}
+
+static bool slotLoadedAfter(Operation &loop, Value slot) {
+  Block *block = loop.getBlock();
+  if (!block)
+    return true;
+  bool seen = false;
+  for (auto &owned : block->ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    if (owned.get() == &loop) {
+      seen = true;
+      continue;
+    }
+    if (seen && opTreeLoadsFromSlot(*owned, slot))
+      return true;
+  }
+  return false;
+}
+
+struct RepeatReductionInfo {
+  bool valid = false;
+  Value lower;
+  Value upper;
+  Value step;
+  Value accumulatorSlot;
+  std::set<Operation*> skipOps;
+};
+
+struct LinearModRecurrenceInfo {
+  bool valid = false;
+  Value lower;
+  Value upper;
+  Value slot;
+  int64_t increment = 0;
+  int64_t modulus = 0;
+  int64_t maxTrip = 0;
+};
+
+static bool positiveUpperBound(Value value, int64_t &bound) {
+  int64_t imm = 0;
+  if (constantIntegerValue(value, imm) && imm >= 0) {
+    bound = imm;
+    return true;
+  }
+  Operation *op = value.getDefiningOp();
+  if (!op || op->isErased() || op->operandCount() != 2)
+    return false;
+  if (op->name() != "arith.remi" && op->name() != "rv_machine.remw" &&
+      op->name() != "arm_machine.srem")
+    return false;
+  if (!constantIntegerValue(op->operand(1), imm) || imm <= 0)
+    return false;
+  bound = imm - 1;
+  return true;
+}
+
+static bool constantValueOperand(Value value, int64_t &imm) {
+  return constantIntegerValue(value, imm);
+}
+
+static bool classifyLinearModStore(Operation &store, Value &slot,
+                                   int64_t &increment, int64_t &modulus) {
+  if (!isMLIRStoreOp(&store) || store.operandCount() < 2 ||
+      !isScalarWordMemref(store.operand(1).type()))
+    return false;
+  Operation *rem = store.operand(0).getDefiningOp();
+  if (!rem || rem->isErased() ||
+      (rem->name() != "arith.remi" && rem->name() != "rv_machine.remw" &&
+       rem->name() != "arm_machine.srem") ||
+      rem->operandCount() != 2)
+    return false;
+  int64_t mod = 0;
+  if (!constantValueOperand(rem->operand(1), mod) || mod <= 0)
+    return false;
+  Operation *add = rem->operand(0).getDefiningOp();
+  if (!add || add->isErased() ||
+      (add->name() != "arith.addi" && add->name() != "rv_machine.addw" &&
+       add->name() != "arm_machine.add") ||
+      add->operandCount() != 2)
+    return false;
+  Value candidateSlot = store.operand(1);
+  int64_t inc = 0;
+  Operation *load = add->operand(0).getDefiningOp();
+  if (loadFromSlot(load, candidateSlot) &&
+      constantValueOperand(add->operand(1), inc)) {
+    slot = candidateSlot;
+    increment = inc;
+    modulus = mod;
+    return inc > 0;
+  }
+  load = add->operand(1).getDefiningOp();
+  if (loadFromSlot(load, candidateSlot) &&
+      constantValueOperand(add->operand(0), inc)) {
+    slot = candidateSlot;
+    increment = inc;
+    modulus = mod;
+    return inc > 0;
+  }
+  return false;
+}
+
+static LinearModRecurrenceInfo classifyLinearModRecurrenceLoop(Operation &loop) {
+  LinearModRecurrenceInfo info;
+  if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
+      loop.getRegions().size() != 1 || loop.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  int64_t lower = 0;
+  int64_t step = 0;
+  if (!constantIntegerValue(loop.operand(0), lower) || lower != 0 ||
+      !constantIntegerValue(loop.operand(2), step) || step != 1)
+    return info;
+  int64_t maxTrip = 0;
+  if (!positiveUpperBound(loop.operand(1), maxTrip) || maxTrip <= 0)
+    return info;
+
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  if (body.args().empty())
+    return info;
+  Value iv = body.args()[0]->value();
+  Value slot;
+  int64_t increment = 0;
+  int64_t modulus = 0;
+  int stores = 0;
+  for (auto &owned : body.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "affine.yield")
+      continue;
+    if (opTreeUsesValue(*op, iv) && !isPureDeadIvBump(*op, iv))
+      return info;
+    if (op->name() == "sysy.call" || op->name() == "sysy.return" ||
+        op->name() == "scf.return" || op->name() == "sysy.break" ||
+        op->name() == "sysy.continue" || op->name() == "memref.store" ||
+        op->name() == "scf.if" || op->name() == "scf.while" ||
+        op->name() == "affine.for")
+      return info;
+    if (isMLIRStoreOp(op)) {
+      Value storeSlot;
+      int64_t storeIncrement = 0;
+      int64_t storeModulus = 0;
+      if (!classifyLinearModStore(*op, storeSlot, storeIncrement, storeModulus))
+        return info;
+      if (stores == 0) {
+        slot = storeSlot;
+        increment = storeIncrement;
+        modulus = storeModulus;
+      } else if (storeSlot != slot || storeIncrement != increment ||
+                 storeModulus != modulus) {
+        return info;
+      }
+      stores++;
+    }
+  }
+  if (stores != 1 || !slot.valid() || modulus <= 0 || increment <= 0)
+    return info;
+  if (maxTrip > 1000000 || increment > 1000000)
+    return info;
+  if (increment > (std::numeric_limits<int32_t>::max() - (modulus - 1)) / maxTrip)
+    return info;
+
+  info.valid = true;
+  info.lower = loop.operand(0);
+  info.upper = loop.operand(1);
+  info.slot = slot;
+  info.increment = increment;
+  info.modulus = modulus;
+  info.maxTrip = maxTrip;
+  return info;
+}
+
+static RepeatReductionInfo classifyRepeatReductionLoop(Operation &loop) {
+  RepeatReductionInfo info;
+  if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
+      loop.getRegions().size() != 1 || loop.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  int64_t lower = 0;
+  int64_t step = 0;
+  if (!constantIntegerValue(loop.operand(0), lower) ||
+      !constantIntegerValue(loop.operand(2), step) || step != 1)
+    return info;
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  if (body.args().empty())
+    return info;
+  Value iv = body.args()[0]->value();
+
+  std::vector<Operation*> bodyOps;
+  std::set<std::string> localAllocas;
+  for (auto &owned : body.ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    bodyOps.push_back(owned.get());
+    collectLocalAllocas(*owned, localAllocas);
+  }
+
+  for (Operation *op : bodyOps) {
+    if (!op)
+      continue;
+    if (op->name() == "affine.yield") {
+      info.skipOps.insert(op);
+      continue;
+    }
+    if (!opTreeUsesValue(*op, iv))
+      continue;
+    if (isPureDeadIvBump(*op, iv)) {
+      info.skipOps.insert(op);
+      continue;
+    }
+    return info;
+  }
+
+  std::map<std::string, Value> outerStores;
+  for (Operation *op : bodyOps) {
+    if (!op || info.skipOps.count(op))
+      continue;
+    if (!collectRepeatReductionStores(*op, localAllocas, outerStores))
+      return info;
+  }
+  Value accumulatorSlot;
+  if (outerStores.size() != 1)
+    return info;
+  for (const auto &kv : outerStores)
+    accumulatorSlot = kv.second;
+  if (!accumulatorSlot.valid() ||
+      accumulatorSlot.type().str().find("xi32") == std::string::npos ||
+      !slotLoadedAfter(loop, accumulatorSlot))
+    return info;
+  for (Operation *op : bodyOps) {
+    if (!op || info.skipOps.count(op))
+      continue;
+    if (!opTreeAccumulatorStoresAreLinearAdds(*op, accumulatorSlot))
+      return info;
+  }
+  info.valid = true;
+  info.lower = loop.operand(0);
+  info.upper = loop.operand(1);
+  info.step = loop.operand(2);
+  info.accumulatorSlot = accumulatorSlot;
+  return info;
+}
+
+static Operation &appendOp(Block &block, const std::string &name,
+                           const std::vector<Value> &operands,
+                           const std::vector<Type> &results,
+                           const std::map<std::string, Attribute> &attrs,
+                           Location loc, int regionCount = 0) {
+  auto op = std::make_unique<Operation>(name, operands, results, attrs, loc);
+  for (int i = 0; i < regionCount; i++)
+    op->addRegion();
+  return block.addOperation(std::move(op));
+}
+
+static Operation &insertOp(Block &block, std::size_t &index,
+                           const std::string &name,
+                           const std::vector<Value> &operands,
+                           const std::vector<Type> &results,
+                           const std::map<std::string, Attribute> &attrs,
+                           Location loc, int regionCount = 0) {
+  auto op = std::make_unique<Operation>(name, operands, results, attrs, loc);
+  for (int i = 0; i < regionCount; i++)
+    op->addRegion();
+  return block.insertOperation(index++, std::move(op));
+}
+
+static bool applyLinearModRecurrenceLoop(Module &module, Operation &loop,
+                                         const LinearModRecurrenceInfo &info) {
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  Location loc = loop.loc();
+  std::size_t insertIndex = (std::size_t) loopIndex;
+  Operation &start = insertOp(*parent, insertIndex, "sysy.load",
+                              {info.slot}, {i32}, {}, loc);
+  Operation &zero = insertOp(*parent, insertIndex, "arith.constant", {}, {i32},
+                             {{"value", ctx.integerAttr(0, i32)}}, loc);
+  Operation &modConst = insertOp(*parent, insertIndex, "arith.constant", {}, {i32},
+                                 {{"value", ctx.integerAttr(info.modulus, i32)}}, loc);
+  Operation &incConst = insertOp(*parent, insertIndex, "arith.constant", {}, {i32},
+                                 {{"value", ctx.integerAttr(info.increment, i32)}}, loc);
+
+  Operation &tripPositive = insertOp(
+      *parent, insertIndex, "arith.cmpi", {info.lower, info.upper}, {i32},
+      {{"predicate", ctx.stringAttr("lt")}}, loc);
+  Operation &startNonNegative = insertOp(
+      *parent, insertIndex, "arith.cmpi", {zero.result(), start.result()}, {i32},
+      {{"predicate", ctx.stringAttr("le")}}, loc);
+  Operation &startCanonical = insertOp(
+      *parent, insertIndex, "arith.cmpi", {start.result(), modConst.result()}, {i32},
+      {{"predicate", ctx.stringAttr("lt")}}, loc);
+  Operation &guardA = insertOp(*parent, insertIndex, "arith.andi",
+                               {tripPositive.result(), startNonNegative.result()},
+                               {i32}, {}, loc);
+  Operation &guard = insertOp(*parent, insertIndex, "arith.andi",
+                              {guardA.result(), startCanonical.result()},
+                              {i32}, {}, loc);
+
+  auto ifOp = std::make_unique<Operation>("scf.if", std::vector<Value>{guard.result()},
+                                          std::vector<Type>{},
+                                          std::map<std::string, Attribute>{}, loc);
+  Region &thenRegion = ifOp->addRegion();
+  Block &thenBlock = thenRegion.addBlock();
+  Value trip = info.upper;
+  int64_t lowerImm = 0;
+  if (constantIntegerValue(info.lower, lowerImm) && lowerImm != 0) {
+    Operation &lowerConst = appendOp(
+        thenBlock, "arith.constant", {}, {i32},
+        {{"value", ctx.integerAttr(lowerImm, i32)}}, loc);
+    Operation &tripOp = appendOp(thenBlock, "arith.subi",
+                                 {info.upper, lowerConst.result()}, {i32}, {}, loc);
+    trip = tripOp.result();
+  }
+  Operation &scaled = appendOp(thenBlock, "arith.muli",
+                               {incConst.result(), trip}, {i32}, {}, loc);
+  Operation &advanced = appendOp(thenBlock, "arith.addi",
+                                 {start.result(), scaled.result()}, {i32}, {}, loc);
+  Operation &folded = appendOp(thenBlock, "arith.remi",
+                               {advanced.result(), modConst.result()}, {i32}, {}, loc);
+  appendOp(thenBlock, "sysy.store", {folded.result(), info.slot}, {}, {}, loc);
+  appendOp(thenBlock, "scf.yield", {}, {}, {}, loc);
+
+  Region &elseRegion = ifOp->addRegion();
+  Block &elseBlock = elseRegion.addBlock();
+  std::map<std::string, Value> valueMap;
+  std::set<Operation*> skipOps;
+  auto cloned = cloneForUnrolledIteration(module, loop, valueMap, skipOps, Value(), 0);
+  if (!cloned)
+    return false;
+  elseBlock.addOperation(std::move(cloned));
+  appendOp(elseBlock, "scf.yield", {}, {}, {}, loc);
+
+  parent->insertOperation(insertIndex, std::move(ifOp));
+  loop.markErased();
+  return true;
+}
+
+static bool applyRepeatReductionLoop(Module &module, Operation &loop,
+                                     const RepeatReductionInfo &info) {
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  std::vector<Operation*> bodyOps;
+  for (auto &owned : body.ops())
+    if (owned && !owned->isErased())
+      bodyOps.push_back(owned.get());
+
+  Context &ctx = module.context();
+  Location loc = loop.loc();
+  auto cmp = std::make_unique<Operation>(
+      "arith.cmpi", std::vector<Value>{info.lower, info.upper},
+      std::vector<Type>{ctx.i(32)},
+      std::map<std::string, Attribute>{{"predicate", ctx.stringAttr("lt")}},
+      loc);
+  Operation &cmpOp = parent->insertOperation((std::size_t) loopIndex, std::move(cmp));
+
+  auto ifOp = std::make_unique<Operation>(
+      "scf.if", std::vector<Value>{cmpOp.result()}, std::vector<Type>{},
+      std::map<std::string, Attribute>{}, loc);
+  Region &thenRegion = ifOp->addRegion();
+  Block &thenBlock = thenRegion.addBlock();
+
+  Operation &start = appendOp(thenBlock, "sysy.load",
+                              {info.accumulatorSlot}, {ctx.i(32)}, {}, loc);
+  std::map<std::string, Value> valueMap;
+  for (Operation *op : bodyOps) {
+    if (!op || info.skipOps.count(op))
+      continue;
+    auto cloned = cloneForUnrolledIteration(module, *op, valueMap, info.skipOps,
+                                            Value(), 0);
+    if (!cloned)
+      continue;
+    Operation &inserted = thenBlock.addOperation(std::move(cloned));
+    for (int i = 0; i < op->resultCount(); i++)
+      valueMap[valueKey(op->result(i))] = inserted.result(i);
+  }
+  Operation &end = appendOp(thenBlock, "sysy.load",
+                            {info.accumulatorSlot}, {ctx.i(32)}, {}, loc);
+  Operation &delta = appendOp(thenBlock, "arith.subi",
+                              {end.result(), start.result()}, {ctx.i(32)}, {}, loc);
+  Value trip = info.upper;
+  int64_t lowerImm = 0;
+  if (constantIntegerValue(info.lower, lowerImm) && lowerImm != 0) {
+    Operation &lowerConst = appendOp(thenBlock, "arith.constant", {}, {ctx.i(32)},
+                                    {{"value", ctx.integerAttr(lowerImm, ctx.i(32))}}, loc);
+    Operation &tripOp = appendOp(thenBlock, "arith.subi",
+                                 {info.upper, lowerConst.result()}, {ctx.i(32)}, {}, loc);
+    trip = tripOp.result();
+  }
+  Operation &scaled = appendOp(thenBlock, "arith.muli",
+                               {delta.result(), trip}, {ctx.i(32)}, {}, loc);
+  Operation &finalValue = appendOp(thenBlock, "arith.addi",
+                                   {start.result(), scaled.result()}, {ctx.i(32)}, {}, loc);
+  appendOp(thenBlock, "sysy.store",
+           {finalValue.result(), info.accumulatorSlot}, {}, {}, loc);
+  appendOp(thenBlock, "scf.yield", {}, {}, {}, loc);
+
+  parent->insertOperation((std::size_t) loopIndex + 1, std::move(ifOp));
+  loop.markErased();
+  return true;
+}
+
+} // namespace
+
+void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_STENCIL_PEEL", true))
+    return;
+  for (int round = 0; round < 4; round++) {
+    std::vector<Operation*> loops;
+    for (auto *op : walk(module))
+      if (op && !op->isErased() && op->name() == "scf.while")
+        loops.push_back(op);
+    bool changed = false;
+    for (Operation *loop : loops) {
+      if (!loop || loop->isErased())
+        continue;
+      ConstantWhileInfo info = classifySmallConstantWhile(*loop);
+      if (!info.valid)
+        continue;
+      if (unrollSmallConstantWhile(module, *loop, info)) {
+        changed = true;
+        if (stats) {
+          stats->kernelUnrolls++;
+          stats->interiorPeels += info.tripCount > 0 ? 1 : 0;
+        }
+      }
+    }
+    eraseMarked(module);
+    if (!changed)
+      break;
+  }
+}
+
+void runLoopRepeatReduction(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_REPEAT_REDUCTION", true))
+    return;
+  std::vector<Operation*> loops;
+  for (auto *op : walk(module))
+    if (op && !op->isErased() && op->name() == "affine.for")
+      loops.push_back(op);
+  bool changed = false;
+  for (Operation *loop : loops) {
+    if (!loop || loop->isErased())
+      continue;
+    LinearModRecurrenceInfo modInfo = classifyLinearModRecurrenceLoop(*loop);
+    if (modInfo.valid && applyLinearModRecurrenceLoop(module, *loop, modInfo)) {
+      changed = true;
+      if (stats)
+        stats->addrIvRewrites++;
+      continue;
+    }
+    RepeatReductionInfo info = classifyRepeatReductionLoop(*loop);
+    if (!info.valid)
+      continue;
+    if (applyRepeatReductionLoop(module, *loop, info)) {
+      changed = true;
+      if (stats)
+        stats->imperfectInterchanges++;
+    }
+  }
+  if (changed)
+    eraseMarked(module);
+}
+
+void runLoopAddressIV(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_ADDR_IV", true))
+    return;
+  runLoopAddressIVInRegion(module, module.body(), stats);
   eraseMarked(module);
 }
 

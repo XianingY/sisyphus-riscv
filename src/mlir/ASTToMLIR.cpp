@@ -793,6 +793,12 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     effective.enableRotateHelper = false;
   if (envDisabled("SISY_ENABLE_SELF_POW2_STRENGTH"))
     effective.enablePow2Strength = false;
+  if (envDisabled("SISY_ENABLE_SELF_STENCIL_PEEL"))
+    effective.enableStencilPeel = false;
+  if (envDisabled("SISY_ENABLE_SELF_ADDR_IV"))
+    effective.enableLoopAddressIV = false;
+  if (envDisabled("SISY_ENABLE_SELF_TILE"))
+    effective.enableLoopTiling = false;
 
   // 1. AST lowering
   if (effective.enableGlobalOpt) {
@@ -810,6 +816,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     if (effective.enableLoopInterchange)
       runAffineLoopInterchange(*module);
   }
+  if (effective.enableStencilPeel)
+    runStencilPeelingAndUnroll(*module, &stats.opt);
 
   // 3. Global straight-line optimizations.
   if (effective.enableGlobalOpt) {
@@ -818,6 +826,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   }
   if (effective.enableMemoryOpt)
     runMemoryOpt(*module, &stats.opt);
+  if (effective.enableLoopAddressIV)
+    runLoopRepeatReduction(*module, &stats.opt);
+  if (effective.enableLoopAddressIV)
+    runLoopAddressIV(*module, &stats.opt);
   if (effective.enableProvenBitwise)
     runProvenBitwiseHelper(*module, &stats.opt);
   if (effective.enableRotateHelper)
@@ -832,6 +844,15 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runIPCP(*module);
     if (effective.enableMemoryOpt && stats.opt.inlineCalls > inlineCallsBefore)
       runMemoryOpt(*module, &stats.opt, true);
+    if (effective.enableStencilPeel && stats.opt.inlineCalls > inlineCallsBefore) {
+      runStencilPeelingAndUnroll(*module, &stats.opt);
+      if (effective.enableMemoryOpt)
+        runMemoryOpt(*module, &stats.opt, true);
+    }
+    if (effective.enableLoopAddressIV && stats.opt.inlineCalls > inlineCallsBefore)
+      runLoopRepeatReduction(*module, &stats.opt);
+    if (effective.enableLoopAddressIV && stats.opt.inlineCalls > inlineCallsBefore)
+      runLoopAddressIV(*module, &stats.opt);
   }
   if (effective.enableScheduler)
     runLoopLocalScheduler(*module, &stats.opt);

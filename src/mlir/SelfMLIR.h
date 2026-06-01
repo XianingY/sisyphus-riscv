@@ -304,6 +304,11 @@ struct SelfOptStats {
   int linearScanSpills = 0;
   int loopAddressCSE = 0;
   int schedulerMoves = 0;
+  int interiorPeels = 0;
+  int kernelUnrolls = 0;
+  int imperfectInterchanges = 0;
+  int loopTiles = 0;
+  int addrIvRewrites = 0;
 };
 
 struct OptimizationConfig {
@@ -328,6 +333,8 @@ struct OptimizationConfig {
   bool enableLoopTiling = false;
   bool enableLoopFusion = true;
   bool enableLoopInterchange = true;
+  bool enableStencilPeel = true;
+  bool enableLoopAddressIV = true;
   int inlineThreshold = 200;
   int lateInlineThreshold = 200;
 
@@ -340,6 +347,9 @@ void runMemoryOpt(Module &module, SelfOptStats *stats = nullptr,
                   bool enableDeadLocalStores = false);
 void runProvenBitwiseHelper(Module &module, SelfOptStats *stats = nullptr);
 void runRotateHelperFold(Module &module, SelfOptStats *stats = nullptr);
+void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats = nullptr);
+void runLoopRepeatReduction(Module &module, SelfOptStats *stats = nullptr);
+void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void collectAffineNestSummary(Module &module, SelfOptStats *stats = nullptr);
 void runLoopLocalScheduler(Module &module, SelfOptStats *stats = nullptr);
 void runLoopVectorization(Module &module);
