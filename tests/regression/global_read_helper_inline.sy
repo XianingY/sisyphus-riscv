@@ -1,0 +1,15 @@
+int MOD;
+
+int hash(int x) {
+  return x % MOD;
+}
+
+int main() {
+  MOD = 7;
+  putint(hash(17));
+  putch(10);
+  MOD = 5;
+  putint(hash(17));
+  putch(10);
+  return 0;
+}

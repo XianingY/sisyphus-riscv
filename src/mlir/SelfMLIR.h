@@ -281,6 +281,7 @@ struct SelfOptStats {
   int memoryBlocks = 0;
   int memoryForwardedLoads = 0;
   int memoryRemovedStores = 0;
+  int readonlyGlobalConstants = 0;
   int bitwiseCandidates = 0;
   int bitwiseRewrittenCalls = 0;
   int bitwiseGuardedCalls = 0;
@@ -334,7 +335,9 @@ struct OptimizationConfig {
 };
 
 void runGlobalOpt(Module &module, SelfOptStats *stats = nullptr);
-void runMemoryOpt(Module &module, SelfOptStats *stats = nullptr);
+void runReadonlyGlobalScalarPropagation(Module &module, SelfOptStats *stats = nullptr);
+void runMemoryOpt(Module &module, SelfOptStats *stats = nullptr,
+                  bool enableDeadLocalStores = false);
 void runProvenBitwiseHelper(Module &module, SelfOptStats *stats = nullptr);
 void runRotateHelperFold(Module &module, SelfOptStats *stats = nullptr);
 void collectAffineNestSummary(Module &module, SelfOptStats *stats = nullptr);
@@ -421,6 +424,8 @@ struct NativeAsmStats {
   int linearScanSpills = 0;
   int globalScalarInits = 0;
   int pow2StrengthReductions = 0;
+  int tailCalls = 0;
+  int calleeSaveSlots = 0;
   int loopAddressCSE = 0;
   int schedulerMoves = 0;
   bool emitted = false;

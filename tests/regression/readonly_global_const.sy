@@ -1,0 +1,9 @@
+const int BASE = 16;
+const int WIDTH = 5;
+
+int main() {
+  int x = BASE * WIDTH + WIDTH;
+  putint(x);
+  putch(10);
+  return 0;
+}

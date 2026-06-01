@@ -795,8 +795,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     effective.enablePow2Strength = false;
 
   // 1. AST lowering
-  if (effective.enableGlobalOpt)
+  if (effective.enableGlobalOpt) {
     runGlobalOpt(*module, &stats.opt);
+    runReadonlyGlobalScalarPropagation(*module, &stats.opt);
+  }
 
   // 2. High-level structure recovery and polyhedral preparation
   if (effective.enableAffine && !envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
@@ -810,8 +812,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   }
 
   // 3. Global straight-line optimizations.
-  if (effective.enableGlobalOpt)
+  if (effective.enableGlobalOpt) {
     runGlobalOpt(*module, &stats.opt);
+    runReadonlyGlobalScalarPropagation(*module, &stats.opt);
+  }
   if (effective.enableMemoryOpt)
     runMemoryOpt(*module, &stats.opt);
   if (effective.enableProvenBitwise)
@@ -823,8 +827,11 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   // not destroy recognizable bitwise helper shapes.
   if (effective.level != OptimizationConfig::Level::O0 && effective.enableInline) {
     runPureFunctionDeduction(*module);
+    int inlineCallsBefore = stats.opt.inlineCalls;
     runInlining(*module, effective.inlineThreshold, &stats.opt);
     runIPCP(*module);
+    if (effective.enableMemoryOpt && stats.opt.inlineCalls > inlineCallsBefore)
+      runMemoryOpt(*module, &stats.opt, true);
   }
   if (effective.enableScheduler)
     runLoopLocalScheduler(*module, &stats.opt);

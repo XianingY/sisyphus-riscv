@@ -46,10 +46,10 @@ OptimizationConfig OptimizationConfig::forLevel(Level level) {
     config.enableDRR = true;
     config.enableDRRWorklist = true;
     config.enableLinearScan = true;
-    config.enableInline = false;
+    config.enableInline = true;
     config.enableRotateHelper = true;
     config.enablePow2Strength = true;
-    config.enableScheduler = false;
+    config.enableScheduler = true;
     config.enableLoopTiling = false;
     config.enableLoopFusion = true;
     config.enableLoopInterchange = true;
@@ -1409,8 +1409,11 @@ std::string symbolAttr(Attribute attr, const std::string &fallback = "") {
 }
 
 std::string rvResultReg(int index) {
-  static const char *regs[] = {"t0", "t1", "t2", "t3", "t4"};
-  return regs[index % 5];
+  static const char *regs[] = {
+    "t0", "t1", "t2", "t3", "t4",
+    "a2", "a3", "a4", "a5", "a6", "a7",
+  };
+  return regs[index % 11];
 }
 
 std::string armResultReg(int index) {
@@ -1419,8 +1422,11 @@ std::string armResultReg(int index) {
 }
 
 std::string rvFloatReg(int index) {
-  static const char *regs[] = {"ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7"};
-  return regs[index % 8];
+  static const char *regs[] = {
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+    "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
+  };
+  return regs[index % 14];
 }
 
 std::string armFloatReg(int index) {
@@ -1629,6 +1635,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   std::string epilogueLabel = ".Lfunc_epilogue_" +
                               std::to_string(stats.functions) + "_" +
                               sanitizeLabel(name);
+  std::string bodyEntryLabel = ".Lfunc_body_" +
+                               std::to_string(stats.functions) + "_" +
+                               sanitizeLabel(name);
   auto &block = *func.getRegions()[0]->getBlocks()[0];
   std::map<std::string, std::string> regs;
   std::map<std::string, int64_t> stackSlots;
@@ -1744,7 +1753,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     frameBytes += 8;
   }
   int64_t calleeSaveBase = frameBytes;
-  int calleeSaveCount = isArm ? 10 : 12;
+  int maxCalleeSaveCount = isArm ? 10 : 12;
+  int affineLoopCount = 0;
+  for (auto *op : funcOps)
+    if (op && !op->isErased() && op->name() == "affine.for")
+      affineLoopCount++;
+  int calleeSaveCount = std::min(maxCalleeSaveCount, affineLoopCount);
+  stats.calleeSaveSlots += calleeSaveCount;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
 
@@ -1830,6 +1845,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     else
       emitStackStore("s" + std::to_string(i), off, "sd");
   }
+  os << bodyEntryLabel << ":\n";
 
   for (const auto &kv : globalLabels)
     regs[kv.first] = "global:" + kv.second;
@@ -2254,6 +2270,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   std::map<Operation*, std::string> loopIvRegs;
   std::map<Operation*, std::vector<std::string>> labelsBefore;
   std::vector<std::string> functionEndLabels;
+  std::set<Operation*> tailReturnSkips;
 
   auto firstLiveOpInRegion = [](Region &region) -> Operation* {
     for (auto &block : region.getBlocks()) {
@@ -2867,6 +2884,63 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "call without callee attr";
         return false;
       }
+      Operation *tailReturn = nextLiveOpAfter(op);
+      bool selfTailCall = envEnabled("SISY_ENABLE_SELF_TAIL_CALL", true) &&
+                          callee == name && op.operandCount() <= 2 &&
+                          tailReturn &&
+                          (tailReturn->name() == "sysy.return" ||
+                           tailReturn->name() == "scf.return");
+      if (selfTailCall) {
+        for (auto operand : op.getOperands()) {
+          if (isFloatType(operand.type()) || isMemrefType(operand.type())) {
+            selfTailCall = false;
+            break;
+          }
+        }
+      }
+      if (selfTailCall) {
+        if (op.resultCount() == 0) {
+          selfTailCall = tailReturn->operandCount() == 0;
+        } else {
+          selfTailCall = tailReturn->operandCount() == 1 &&
+                         tailReturn->operand(0) == op.result() &&
+                         op.resultUses.size() == 1 &&
+                         op.resultUses[0].size() == 1 &&
+                         op.resultUses[0][0].owner == tailReturn;
+        }
+      }
+      if (selfTailCall) {
+        std::vector<std::string> staged;
+        for (int i = 0; i < op.operandCount(); i++) {
+          std::string tmp = isArm ? ("w" + std::to_string(16 + i)) : scratchReg(i);
+          std::string src = ensureReg(op.operand(i), tmp);
+          if (src.rfind("stack:", 0) == 0 || src.rfind("global:", 0) == 0)
+            src = materializeAddress(op.operand(i), tmp);
+          if (src.empty()) {
+            if (isArm)
+              os << "    mov " << tmp << ", #0\n";
+            else
+              os << "    li " << tmp << ", 0\n";
+          } else if (src != tmp) {
+            os << "    " << (isArm ? "mov " : "mv ") << tmp << ", " << src << "\n";
+          }
+          staged.push_back(tmp);
+        }
+        for (int i = 0; i < (int) staged.size(); i++) {
+          std::string arg = isArm ? ("w" + std::to_string(i))
+                                  : ("a" + std::to_string(i));
+          if (staged[i] != arg) {
+            clobberPhysicalReg(arg);
+            os << "    " << (isArm ? "mov " : "mv ") << arg << ", "
+               << staged[i] << "\n";
+          }
+        }
+        os << "    " << (isArm ? "b" : "j") << " " << bodyEntryLabel << "\n";
+        tailReturnSkips.insert(tailReturn);
+        stats.tailCalls++;
+        stats.machineOps++;
+        continue;
+      }
       invalidateCallerSavedForCall();
       int outgoingIntRegs = 0;
       int outgoingFpRegs = 0;
@@ -2951,6 +3025,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "sysy.return" || opname == "scf.return" ||
         opname == "rv_machine.ret" || opname == "arm_machine.ret") {
+      if (tailReturnSkips.count(&op) != 0) {
+        stats.returns++;
+        continue;
+      }
       if (op.operandCount() > 0) {
         std::string src = ensureReg(op.operand(0), isFloatType(op.operand(0).type()) ? (isArm ? "s30" : "ft10") : scratchReg(0));
         if (src.empty()) {
@@ -3146,6 +3224,70 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           os << "    snez " << dst << ", " << dst << "\n";
         }
       }
+      if (shouldSpillDefinedValue(op.result()))
+        spillHome(op.result(), dst);
+      stats.machineOps++;
+      continue;
+    }
+
+    if (opname == "rv_machine.select" || opname == "arm_machine.select") {
+      if (op.operandCount() != 3 || op.resultCount() != 1) {
+        stats.unsupportedOps++;
+        stats.error = "bad select shape";
+        return false;
+      }
+      bool fpSelect = isFloatType(op.resultType());
+      std::string cond = ensureReg(op.operand(0), scratchReg(0));
+      if (cond.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "select operand has no assigned register";
+        return false;
+      }
+      auto chooseDst = [&]() {
+        for (int attempt = 0; attempt < 20; attempt++) {
+          std::string candidate = fpSelect ? floatReg() : resultReg();
+          if (candidate != cond)
+            return candidate;
+        }
+        return fpSelect ? floatReg() : resultReg();
+      };
+      auto moveReg = [&](const std::string &dst, const std::string &src) {
+        if (dst == src)
+          return;
+        if (isArm)
+          os << "    " << (fpSelect ? "fmov " : "mov ") << dst << ", " << src << "\n";
+        else
+          os << "    " << (fpSelect ? "fmv.s " : "mv ") << dst << ", " << src << "\n";
+      };
+      auto moveOperand = [&](const std::string &dst, Value value,
+                             const std::string &tmp) {
+        std::string src = ensureReg(value, tmp);
+        if (src.empty())
+          return false;
+        moveReg(dst, src);
+        return true;
+      };
+      std::string dst = chooseDst();
+      bindResult(op.result(), dst);
+      int labelId = ++nextLoopId;
+      std::string done = ".Lselect_done_" + std::to_string(labelId);
+      std::string valueTmp = fpSelect ? (isArm ? "s30" : "ft10")
+                                      : (cond == scratchReg(1) ? scratchReg(0) : scratchReg(1));
+      if (!moveOperand(dst, op.operand(2), valueTmp)) {
+        stats.unsupportedOps++;
+        stats.error = "select false operand has no assigned register";
+        return false;
+      }
+      if (isArm)
+        os << "    cbz " << cond << ", " << done << "\n";
+      else
+        os << "    beqz " << cond << ", " << done << "\n";
+      if (!moveOperand(dst, op.operand(1), valueTmp)) {
+        stats.unsupportedOps++;
+        stats.error = "select true operand has no assigned register";
+        return false;
+      }
+      os << done << ":\n";
       if (shouldSpillDefinedValue(op.result()))
         spillHome(op.result(), dst);
       stats.machineOps++;
@@ -3551,6 +3693,149 @@ void runGlobalOpt(Module &module, SelfOptStats *stats) {
   }
 }
 
+void runReadonlyGlobalScalarPropagation(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_READONLY_GLOBALS", true))
+    return;
+  if (module.body().getBlocks().empty())
+    return;
+
+  struct ScalarGlobal {
+    Value value;
+    std::string symbol;
+    Attribute initAttr;
+    bool hasInit = false;
+    bool invalid = false;
+  };
+
+  std::map<std::string, ScalarGlobal> globalsByKey;
+  std::map<std::string, std::string> keyBySymbol;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.global" ||
+        op->resultCount() == 0 || !isScalarWordMemref(op->resultType()))
+      continue;
+    if (op->resultType().str().find("xi32") == std::string::npos)
+      continue;
+    std::string symbol = symbolAttr(op->attr("symbol"));
+    if (symbol.empty())
+      symbol = symbolAttr(op->attr("sym_name"));
+    if (symbol.empty())
+      continue;
+    std::string key = valueKey(op->result());
+    ScalarGlobal info;
+    info.value = op->result();
+    info.symbol = symbol;
+    globalsByKey[key] = info;
+    keyBySymbol[symbol] = key;
+  }
+  if (globalsByKey.empty())
+    return;
+
+  auto zeroIndices = [](Operation &op) {
+    int start = -1;
+    if (op.name() == "sysy.load" || op.name() == "memref.load")
+      start = 1;
+    else if (op.name() == "sysy.store" || op.name() == "memref.store")
+      start = 2;
+    if (start < 0)
+      return false;
+    for (int i = start; i < op.operandCount(); i++) {
+      int64_t index = 0;
+      if (!constantIntegerValue(op.operand(i), index) || index != 0)
+        return false;
+    }
+    return true;
+  };
+
+  auto candidateKeyForAccess = [&](Operation &op, bool store) -> std::string {
+    int baseIndex = store ? 1 : 0;
+    if (op.operandCount() > baseIndex) {
+      std::string key = valueKey(op.operand(baseIndex));
+      if (globalsByKey.count(key) != 0)
+        return key;
+    }
+    std::string symbol = symbolAttr(op.attr("symbol"));
+    if (symbol.empty())
+      symbol = symbolAttr(op.attr("sym_name"));
+    auto it = keyBySymbol.find(symbol);
+    return it == keyBySymbol.end() ? "" : it->second;
+  };
+
+  Block *moduleBlock = module.body().getBlocks()[0].get();
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    bool isStore = op->name() == "sysy.store" || op->name() == "memref.store";
+    if (!isStore)
+      continue;
+    std::string key = candidateKeyForAccess(*op, true);
+    if (key.empty())
+      continue;
+    auto &global = globalsByKey[key];
+    bool isModuleInit = op->getBlock() == moduleBlock && zeroIndices(*op);
+    int64_t ignored = 0;
+    auto *def = op->operandCount() > 0 ? op->operand(0).getDefiningOp() : nullptr;
+    if (isModuleInit && !global.hasInit && op->operandCount() > 0 &&
+        constantIntegerValue(op->operand(0), ignored) && def && def->attr("value")) {
+      global.initAttr = def->attr("value");
+      global.hasInit = true;
+      continue;
+    }
+    global.invalid = true;
+  }
+
+  for (auto &kv : globalsByKey) {
+    auto uses = usesOf(module, kv.second.value);
+    for (const auto &use : uses) {
+      Operation *owner = use.owner;
+      if (!owner || owner->isErased())
+        continue;
+      bool allowedLoad = (owner->name() == "sysy.load" || owner->name() == "memref.load") &&
+                         use.operandIndex == 0;
+      bool allowedStore = (owner->name() == "sysy.store" || owner->name() == "memref.store") &&
+                          use.operandIndex == 1;
+      if (!allowedLoad && !allowedStore) {
+        kv.second.invalid = true;
+        break;
+      }
+    }
+  }
+
+  int replaced = 0;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() ||
+        (op->name() != "sysy.load" && op->name() != "memref.load") ||
+        op->resultCount() != 1 || !hasScalarHome(op->resultType()))
+      continue;
+    std::string key = candidateKeyForAccess(*op, false);
+    if (key.empty())
+      continue;
+    auto it = globalsByKey.find(key);
+    if (it == globalsByKey.end() || it->second.invalid || !zeroIndices(*op))
+      continue;
+    Block *block = op->getBlock();
+    if (!block)
+      continue;
+    int index = operationIndexInBlock(*block, op);
+    if (index < 0)
+      continue;
+    Attribute valueAttr = it->second.hasInit
+                              ? it->second.initAttr
+                              : module.context().integerAttr(0, op->resultType());
+    auto constant = std::make_unique<Operation>(
+        "arith.constant", std::vector<Value>{}, std::vector<Type>{op->resultType()},
+        std::map<std::string, Attribute>{{"value", valueAttr}}, op->loc());
+    auto &inserted = block->insertOperation((std::size_t) index, std::move(constant));
+    replaceAllUses(module, op->result(), inserted.result());
+    op->markErased();
+    replaced++;
+  }
+  if (replaced > 0) {
+    if (stats)
+      stats->readonlyGlobalConstants += replaced;
+    eraseMarked(module);
+  }
+}
+
 static std::string memoryLocationKey(Operation &op) {
   auto baseKey = [&]() -> std::string {
     int baseIndex = -1;
@@ -3591,6 +3876,93 @@ static std::string memoryBaseKey(Operation &op) {
   if (sym.empty())
     sym = symbolAttr(op.attr("sym_name"));
   return sym.empty() ? "" : "s:" + sym;
+}
+
+static bool isLocalAllocaOp(Operation *op) {
+  return op && (op->name() == "sysy.alloca" || op->name() == "memref.alloca") &&
+         op->resultCount() == 1;
+}
+
+static void collectAllocaUseInfo(Operation &op, const std::set<std::string> &allocas,
+                                 std::set<std::string> &loaded,
+                                 std::set<std::string> &escaped) {
+  if (op.isErased())
+    return;
+  auto classifyOperand = [&](int index, Value operand) {
+    std::string key = valueKey(operand);
+    if (allocas.count(key) == 0)
+      return;
+    bool baseLoad = (op.name() == "sysy.load" || op.name() == "memref.load") &&
+                    index == 0;
+    bool baseStore = (op.name() == "sysy.store" || op.name() == "memref.store") &&
+                     index == 1;
+    if (baseLoad)
+      loaded.insert(key);
+    else if (!baseStore)
+      escaped.insert(key);
+  };
+  for (int i = 0; i < op.operandCount(); i++)
+    classifyOperand(i, op.operand(i));
+  for (auto &region : op.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &child : block->ops()) {
+        if (child)
+          collectAllocaUseInfo(*child, allocas, loaded, escaped);
+      }
+    }
+  }
+}
+
+static void eraseDeadLocalStoresInFunction(Operation &func, SelfOptStats *stats) {
+  if (func.getRegions().empty() || func.getRegions()[0]->getBlocks().empty())
+    return;
+  std::vector<Operation*> nestedOps;
+  std::function<void(Operation&)> collect = [&](Operation &op) {
+    nestedOps.push_back(&op);
+    for (auto &region : op.getRegions()) {
+      for (auto &block : region->getBlocks()) {
+        for (auto &child : block->ops()) {
+          if (child && !child->isErased())
+            collect(*child);
+        }
+      }
+    }
+  };
+  collect(func);
+
+  std::set<std::string> allocas;
+  for (auto *op : nestedOps) {
+    if (isLocalAllocaOp(op))
+      allocas.insert(valueKey(op->result()));
+  }
+  if (allocas.empty())
+    return;
+
+  std::set<std::string> loaded;
+  std::set<std::string> escaped;
+  collectAllocaUseInfo(func, allocas, loaded, escaped);
+
+  std::set<std::string> deadAllocas;
+  for (const auto &key : allocas) {
+    if (loaded.count(key) == 0 && escaped.count(key) == 0)
+      deadAllocas.insert(key);
+  }
+  if (deadAllocas.empty())
+    return;
+
+  for (auto *op : nestedOps) {
+    if (!op || op->isErased())
+      continue;
+    if ((op->name() == "sysy.store" || op->name() == "memref.store") &&
+        op->operandCount() >= 2 &&
+        deadAllocas.count(valueKey(op->operand(1))) != 0) {
+      op->markErased();
+      if (stats)
+        stats->memoryRemovedStores++;
+    } else if (isLocalAllocaOp(op) && deadAllocas.count(valueKey(op->result())) != 0) {
+      op->markErased();
+    }
+  }
 }
 
 static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats) {
@@ -3682,7 +4054,7 @@ static void runMemoryOptInRegion(Module &module, Region &region, SelfOptStats *s
   }
 }
 
-void runMemoryOpt(Module &module, SelfOptStats *stats) {
+void runMemoryOpt(Module &module, SelfOptStats *stats, bool enableDeadLocalStores) {
   const char *enabled = std::getenv("SISY_ENABLE_SELF_MEMOPT");
   if (enabled && std::string(enabled) == "0")
     return;
@@ -3691,6 +4063,8 @@ void runMemoryOpt(Module &module, SelfOptStats *stats) {
       for (auto &region : op->getRegions()) {
         runMemoryOptInRegion(module, *region, stats);
       }
+      if (enableDeadLocalStores)
+        eraseDeadLocalStoresInFunction(*op, stats);
     }
   }
   eraseMarked(module);

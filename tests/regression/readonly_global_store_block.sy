@@ -1,0 +1,12 @@
+int BASE = 16;
+
+void touch() {
+  BASE = 7;
+}
+
+int main() {
+  touch();
+  putint(BASE);
+  putch(10);
+  return 0;
+}

@@ -318,6 +318,7 @@ int main(int argc, char **argv) {
               << " mem-blocks=" << selfMLIRStats.opt.memoryBlocks
               << " mem-forwarded-loads=" << selfMLIRStats.opt.memoryForwardedLoads
               << " mem-removed-stores=" << selfMLIRStats.opt.memoryRemovedStores
+              << " readonly-global-constants=" << selfMLIRStats.opt.readonlyGlobalConstants
               << " bitwise-candidates=" << selfMLIRStats.opt.bitwiseCandidates
               << " bitwise-rewritten-calls=" << selfMLIRStats.opt.bitwiseRewrittenCalls
               << " bitwise-guarded-calls=" << selfMLIRStats.opt.bitwiseGuardedCalls
@@ -380,6 +381,8 @@ int main(int argc, char **argv) {
               << " linear-scan-spills=" << asmStats.linearScanSpills
               << " global-scalar-inits=" << asmStats.globalScalarInits
               << " pow2-strength-reductions=" << asmStats.pow2StrengthReductions
+              << " tail-calls=" << asmStats.tailCalls
+              << " callee-save-slots=" << asmStats.calleeSaveSlots
               << " loop-address-cse=" << asmStats.loopAddressCSE
               << " scheduler-moves=" << asmStats.schedulerMoves
               << "\n";
