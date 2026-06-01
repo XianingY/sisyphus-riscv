@@ -1,0 +1,14 @@
+int fib_like(int n, int bias) {
+  if (n <= 1) {
+    return n + bias;
+  }
+  return fib_like(n - 1, bias) + fib_like(n - 2, bias) - bias;
+}
+
+int main() {
+  putint(fib_like(12, 3));
+  putch(10);
+  putint(fib_like(12, 4));
+  putch(10);
+  return 0;
+}

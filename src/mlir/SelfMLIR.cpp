@@ -1610,6 +1610,131 @@ std::vector<uint32_t> parseGlobalInitWords(Attribute attr) {
   return words;
 }
 
+std::string sanitizeLabel(std::string label);
+
+struct MemoFunctionInfo {
+  bool enabled = false;
+  int argCount = 0;
+  int capacity = 65536;
+  std::string validLabel;
+  std::string key0Label;
+  std::string key1Label;
+  std::string valueLabel;
+  std::string depthLabel;
+  std::string epochLabel;
+};
+
+bool isI32Like(Type type) {
+  return type.kind() == TypeKind::Integer || type.kind() == TypeKind::Index ||
+         type.str() == "i32" || type.str() == "index";
+}
+
+bool isLocalAllocaValue(Value value, const std::set<std::string> &localAllocas) {
+  return value.valid() && localAllocas.count(valueKey(value)) != 0;
+}
+
+MemoFunctionInfo classifyMemoFunction(Operation &func, int ordinal) {
+  MemoFunctionInfo info;
+  if (!envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", true))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty() || name == "main")
+    return info;
+
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  int argCount = (int) entry.args().size();
+  if (argCount < 1 || argCount > 2)
+    return info;
+  for (auto &arg : entry.args()) {
+    if (!arg || !isI32Like(arg->type()) || isMemrefType(arg->type()) ||
+        isFloatType(arg->type()))
+      return info;
+  }
+
+  std::vector<Operation*> ops;
+  std::function<void(Operation&)> collect = [&](Operation &op) {
+    ops.push_back(&op);
+    for (auto &region : op.getRegions())
+      for (auto &block : region->getBlocks())
+        for (auto &child : block->ops())
+          if (child && !child->isErased())
+            collect(*child);
+  };
+  collect(func);
+
+  std::set<std::string> localAllocas;
+  for (auto *op : ops) {
+    if (op && !op->isErased() &&
+        (op->name() == "sysy.alloca" || op->name() == "memref.alloca") &&
+        op->resultCount() == 1)
+      localAllocas.insert(valueKey(op->result()));
+  }
+
+  bool sawRecursiveCall = false;
+  int nonTailRecursiveCalls = 0;
+  bool sawReturnValue = false;
+  for (auto *op : ops) {
+    if (!op || op->isErased() || op == &func)
+      continue;
+
+    if (op->name() == "sysy.call") {
+      if (symbolAttr(op->attr("callee")) != name || op->operandCount() != argCount ||
+          op->resultCount() != 1 || !isI32Like(op->resultType()))
+        return {};
+      for (auto operand : op->getOperands()) {
+        if (!operand.valid() || isFloatType(operand.type()) || isMemrefType(operand.type()))
+          return {};
+      }
+      bool tailReturned = false;
+      if (op->resultCount() == 1 && op->resultUses.size() == 1 &&
+          op->resultUses[0].size() == 1) {
+        Operation *user = op->resultUses[0][0].owner;
+        tailReturned = user && (user->name() == "sysy.return" ||
+                                user->name() == "scf.return");
+      }
+      if (!tailReturned)
+        nonTailRecursiveCalls++;
+      sawRecursiveCall = true;
+      continue;
+    }
+
+    if (op->name() == "sysy.store" || op->name() == "memref.store") {
+      if (op->operandCount() < 2 || !isLocalAllocaValue(op->operand(1), localAllocas))
+        return {};
+      continue;
+    }
+
+    if (op->name() == "sysy.return" || op->name() == "scf.return") {
+      if (op->operandCount() != 1 || !isI32Like(op->operand(0).type()))
+        return {};
+      sawReturnValue = true;
+      continue;
+    }
+
+    if (op->name() == "memref.alloca") {
+      return {};
+    }
+  }
+
+  if (!sawRecursiveCall || nonTailRecursiveCalls == 0 || !sawReturnValue)
+    return info;
+
+  std::string stem = ".Lmemo_" + std::to_string(ordinal) + "_" + sanitizeLabel(name);
+  info.enabled = true;
+  info.argCount = argCount;
+  info.validLabel = stem + "_valid";
+  info.key0Label = stem + "_key0";
+  info.key1Label = stem + "_key1";
+  info.valueLabel = stem + "_value";
+  info.depthLabel = stem + "_depth";
+  info.epochLabel = stem + "_epoch";
+  return info;
+}
+
 std::string sanitizeLabel(std::string label) {
   if (label.empty())
     label = "anon";
@@ -1624,7 +1749,8 @@ std::string sanitizeLabel(std::string label) {
 
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
                           NativeAsmStats &stats, bool enablePow2Strength,
-                          const std::map<std::string, std::string> &globalLabels) {
+                          const std::map<std::string, std::string> &globalLabels,
+                          const std::map<std::string, MemoFunctionInfo> &memoFunctions) {
   if (func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1) {
     stats.unsupportedOps++;
     stats.error = "native asm currently requires one-region/one-block functions";
@@ -1632,6 +1758,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   }
 
   std::string name = symbolAttr(func.attr("sym_name"), "main");
+  auto memoItForFunc = memoFunctions.find(name);
+  const MemoFunctionInfo *memoInfo =
+      (target == "riscv" && memoItForFunc != memoFunctions.end() &&
+       memoItForFunc->second.enabled)
+          ? &memoItForFunc->second
+          : nullptr;
   std::string epilogueLabel = ".Lfunc_epilogue_" +
                               std::to_string(stats.functions) + "_" +
                               sanitizeLabel(name);
@@ -2080,6 +2212,108 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
     return ensureReg(value, actualTmp);
   };
+  std::vector<int64_t> memoArgSlots;
+  if (memoInfo) {
+    for (int i = 0; i < memoInfo->argCount && i < (int) block.args().size(); i++) {
+      auto it = valueSlots.find(valueKey(block.args()[i]->value()));
+      if (it != valueSlots.end())
+        memoArgSlots.push_back(it->second);
+    }
+    if ((int) memoArgSlots.size() != memoInfo->argCount)
+      memoInfo = nullptr;
+  }
+  auto emitMemoIndexFromArgRegs = [&](const MemoFunctionInfo &memo) {
+    os << "    mv t2, a0\n";
+    if (memo.argCount > 1) {
+      os << "    li t3, 131\n";
+      os << "    mulw t2, t2, t3\n";
+      os << "    xor t2, t2, a1\n";
+    }
+    os << "    li t3, " << (memo.capacity - 1) << "\n";
+    os << "    and t2, t2, t3\n";
+    os << "    slli t2, t2, 2\n";
+  };
+  auto emitMemoIndexFromArgSlots = [&](const MemoFunctionInfo &memo) {
+    emitStackLoad("t0", memoArgSlots[0], "lw");
+    if (memo.argCount > 1)
+      emitStackLoad("t1", memoArgSlots[1], "lw");
+    os << "    mv t2, t0\n";
+    if (memo.argCount > 1) {
+      os << "    li t3, 131\n";
+      os << "    mulw t2, t2, t3\n";
+      os << "    xor t2, t2, t1\n";
+    }
+    os << "    li t3, " << (memo.capacity - 1) << "\n";
+    os << "    and t2, t2, t3\n";
+    os << "    slli t2, t2, 2\n";
+  };
+  auto emitMemoLookup = [&](const MemoFunctionInfo &memo) {
+    std::string skipEpoch = ".Lmemo_skip_epoch_" + std::to_string(stats.functions) +
+                            "_" + sanitizeLabel(name);
+    std::string epochReady = ".Lmemo_epoch_ready_" + std::to_string(stats.functions) +
+                             "_" + sanitizeLabel(name);
+    std::string miss = ".Lmemo_miss_" + std::to_string(stats.functions) +
+                       "_" + sanitizeLabel(name);
+    os << "    la t0, " << memo.depthLabel << "\n";
+    os << "    lw t1, 0(t0)\n";
+    os << "    bnez t1, " << skipEpoch << "\n";
+    os << "    la t5, " << memo.epochLabel << "\n";
+    os << "    lw t6, 0(t5)\n";
+    os << "    addi t6, t6, 1\n";
+    os << "    bnez t6, " << epochReady << "\n";
+    os << "    li t6, 1\n";
+    os << epochReady << ":\n";
+    os << "    sw t6, 0(t5)\n";
+    os << skipEpoch << ":\n";
+    os << "    addi t1, t1, 1\n";
+    os << "    sw t1, 0(t0)\n";
+    emitMemoIndexFromArgRegs(memo);
+    os << "    la t5, " << memo.epochLabel << "\n";
+    os << "    lw t5, 0(t5)\n";
+    os << "    la t3, " << memo.validLabel << "\n";
+    os << "    add t3, t3, t2\n";
+    os << "    lw t4, 0(t3)\n";
+    os << "    bne t4, t5, " << miss << "\n";
+    os << "    la t3, " << memo.key0Label << "\n";
+    os << "    add t3, t3, t2\n";
+    os << "    lw t4, 0(t3)\n";
+    os << "    bne t4, a0, " << miss << "\n";
+    if (memo.argCount > 1) {
+      os << "    la t3, " << memo.key1Label << "\n";
+      os << "    add t3, t3, t2\n";
+      os << "    lw t4, 0(t3)\n";
+      os << "    bne t4, a1, " << miss << "\n";
+    }
+    os << "    la t3, " << memo.valueLabel << "\n";
+    os << "    add t3, t3, t2\n";
+    os << "    lw a0, 0(t3)\n";
+    os << "    j " << epilogueLabel << "\n";
+    os << miss << ":\n";
+    stats.memoLookups++;
+    stats.memoFallbacks++;
+  };
+  auto emitMemoStore = [&](const MemoFunctionInfo &memo) {
+    emitMemoIndexFromArgSlots(memo);
+    os << "    la t3, " << memo.key0Label << "\n";
+    os << "    add t3, t3, t2\n";
+    os << "    sw t0, 0(t3)\n";
+    if (memo.argCount > 1) {
+      os << "    la t3, " << memo.key1Label << "\n";
+      os << "    add t3, t3, t2\n";
+      os << "    sw t1, 0(t3)\n";
+    }
+    os << "    la t3, " << memo.valueLabel << "\n";
+    os << "    add t3, t3, t2\n";
+    os << "    sw a0, 0(t3)\n";
+    os << "    la t3, " << memo.validLabel << "\n";
+    os << "    add t3, t3, t2\n";
+    os << "    la t5, " << memo.epochLabel << "\n";
+    os << "    lw t5, 0(t5)\n";
+    os << "    sw t5, 0(t3)\n";
+    stats.memoStores++;
+  };
+  if (memoInfo)
+    emitMemoLookup(*memoInfo);
   auto emitLinearizedIndex = [&](Value base, const std::vector<Value> &indices,
                                  const std::string &result,
                                  const std::string &tmp,
@@ -2886,7 +3120,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
       Operation *tailReturn = nextLiveOpAfter(op);
       bool selfTailCall = envEnabled("SISY_ENABLE_SELF_TAIL_CALL", true) &&
-                          callee == name && op.operandCount() <= 2 &&
+                          !memoInfo && callee == name && op.operandCount() <= 2 &&
                           tailReturn &&
                           (tailReturn->name() == "sysy.return" ||
                            tailReturn->name() == "scf.return");
@@ -3051,6 +3285,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
             os << "    mv a0, " << src << "\n";
           }
         }
+        if (memoInfo && !isFloatType(op.operand(0).type()))
+          emitMemoStore(*memoInfo);
       }
       os << "    " << (isArm ? "b" : "j") << " " << epilogueLabel << "\n";
       stats.returns++;
@@ -3341,6 +3577,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   if (stats.returns == returnsBefore)
     stats.returns++;
   os << epilogueLabel << ":\n";
+  if (memoInfo) {
+    os << "    la t0, " << memoInfo->depthLabel << "\n";
+    os << "    lw t1, 0(t0)\n";
+    os << "    addi t1, t1, -1\n";
+    os << "    sw t1, 0(t0)\n";
+  }
   for (int i = 0; i < calleeSaveCount; i++) {
     int64_t off = calleeSaveBase + i * 8;
     if (isArm)
@@ -3388,6 +3630,20 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     auto words = parseGlobalInitWords(op->attr("init_words"));
     if (!words.empty())
       globalWordInits[valueKey(op->result())] = std::move(words);
+  }
+  std::map<std::string, MemoFunctionInfo> memoFunctions;
+  if (target == "riscv" && envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", true)) {
+    int memoOrdinal = 0;
+    for (auto *op : walk(module)) {
+      if (!op || op->isErased() || op->name() != "sysy.func")
+        continue;
+      MemoFunctionInfo memo = classifyMemoFunction(*op, ++memoOrdinal);
+      if (!memo.enabled)
+        continue;
+      std::string name = symbolAttr(op->attr("sym_name"));
+      memoFunctions[name] = memo;
+    }
+    stats.memoFunctions = (int) memoFunctions.size();
   }
   if (!module.body().getBlocks().empty()) {
     std::map<std::string, Value> scalarGlobals;
@@ -3452,6 +3708,27 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
   }
 
   bool emittedBss = false;
+  if (!memoFunctions.empty()) {
+    os << "    .bss\n";
+    emittedBss = true;
+    for (const auto &kv : memoFunctions) {
+      const auto &memo = kv.second;
+      os << "    .align 3\n" << memo.validLabel << ":\n";
+      os << "    .zero " << (int64_t) memo.capacity * 4 << "\n";
+      os << "    .align 3\n" << memo.key0Label << ":\n";
+      os << "    .zero " << (int64_t) memo.capacity * 4 << "\n";
+      if (memo.argCount > 1) {
+        os << "    .align 3\n" << memo.key1Label << ":\n";
+        os << "    .zero " << (int64_t) memo.capacity * 4 << "\n";
+      }
+      os << "    .align 3\n" << memo.valueLabel << ":\n";
+      os << "    .zero " << (int64_t) memo.capacity * 4 << "\n";
+      os << "    .align 2\n" << memo.depthLabel << ":\n";
+      os << "    .zero 4\n";
+      os << "    .align 2\n" << memo.epochLabel << ":\n";
+      os << "    .zero 4\n";
+    }
+  }
   if (!globalLabels.empty()) {
     for (auto *op : walk(module)) {
       if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
@@ -3476,7 +3753,8 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       continue;
     if (op->name() == "sysy.func") {
       stats.functions++;
-      if (!emitFunctionAssembly(*op, target, os, stats, enablePow2Strength, globalLabels))
+      if (!emitFunctionAssembly(*op, target, os, stats, enablePow2Strength,
+                                globalLabels, memoFunctions))
         return false;
     }
   }

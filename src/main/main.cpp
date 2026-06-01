@@ -383,6 +383,10 @@ int main(int argc, char **argv) {
               << " pow2-strength-reductions=" << asmStats.pow2StrengthReductions
               << " tail-calls=" << asmStats.tailCalls
               << " callee-save-slots=" << asmStats.calleeSaveSlots
+              << " memo-functions=" << asmStats.memoFunctions
+              << " memo-lookups=" << asmStats.memoLookups
+              << " memo-stores=" << asmStats.memoStores
+              << " memo-fallbacks=" << asmStats.memoFallbacks
               << " loop-address-cse=" << asmStats.loopAddressCSE
               << " scheduler-moves=" << asmStats.schedulerMoves
               << "\n";

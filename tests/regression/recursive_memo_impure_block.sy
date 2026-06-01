@@ -1,0 +1,19 @@
+int G;
+
+int f(int n) {
+  if (n == 0) {
+    return G;
+  }
+  G = G + 1;
+  return f(n - 1) + G;
+}
+
+int main() {
+  G = 1;
+  putint(f(3));
+  putch(10);
+  G = 1;
+  putint(f(3));
+  putch(10);
+  return 0;
+}

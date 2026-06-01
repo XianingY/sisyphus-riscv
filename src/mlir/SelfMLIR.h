@@ -426,6 +426,10 @@ struct NativeAsmStats {
   int pow2StrengthReductions = 0;
   int tailCalls = 0;
   int calleeSaveSlots = 0;
+  int memoFunctions = 0;
+  int memoLookups = 0;
+  int memoStores = 0;
+  int memoFallbacks = 0;
   int loopAddressCSE = 0;
   int schedulerMoves = 0;
   bool emitted = false;
