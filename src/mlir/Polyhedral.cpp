@@ -139,6 +139,26 @@ static bool regionHasAnyCall(Region *region) {
   return false;
 }
 
+static bool regionHasLoopControl(Region *region) {
+  if (!region)
+    return false;
+  for (auto &block : region->getBlocks()) {
+    for (auto &owned : block->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+      if (op->name() == "sysy.break" || op->name() == "sysy.continue" ||
+          op->name() == "sysy.return")
+        return true;
+      for (auto &nested : op->getRegions()) {
+        if (regionHasLoopControl(nested.get()))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 static Operation *enclosingFunction(Operation *op) {
   if (!op)
     return nullptr;
@@ -173,6 +193,18 @@ static bool opTreeHasLoadFromAlloca(Operation *op, Operation *allocaOp) {
   return false;
 }
 
+static bool opTreeHasStoreToAlloca(Operation *op, Operation *allocaOp) {
+  if (!op || !allocaOp || op->isErased())
+    return false;
+  if (isStoreToAlloca(op, allocaOp))
+    return true;
+  for (auto &nested : op->getRegions()) {
+    if (regionHasStoreToAlloca(nested.get(), allocaOp, nullptr))
+      return true;
+  }
+  return false;
+}
+
 static bool bodyReadsIVAfterStepStore(Block *body, Operation *allocaOp,
                                       Operation *ivStore) {
   if (!body)
@@ -187,6 +219,45 @@ static bool bodyReadsIVAfterStepStore(Block *body, Operation *allocaOp,
       continue;
     }
     if (pastStepStore && opTreeHasLoadFromAlloca(op, allocaOp))
+      return true;
+  }
+  return false;
+}
+
+static bool blockStoresAllocaBetween(Block *block, Operation *begin,
+                                     Operation *end, Operation *allocaOp) {
+  if (!block || !begin || !end || !allocaOp)
+    return false;
+  bool inRange = false;
+  for (auto &owned : block->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op == begin) {
+      inRange = true;
+      continue;
+    }
+    if (op == end)
+      return false;
+    if (inRange && opTreeHasStoreToAlloca(op, allocaOp))
+      return true;
+  }
+  return false;
+}
+
+static bool blockReadsAllocaAfter(Block *block, Operation *anchor, Operation *allocaOp) {
+  if (!block || !anchor || !allocaOp)
+    return false;
+  bool pastAnchor = false;
+  for (auto &owned : block->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op == anchor) {
+      pastAnchor = true;
+      continue;
+    }
+    if (pastAnchor && opTreeHasLoadFromAlloca(op, allocaOp))
       return true;
   }
   return false;
@@ -280,6 +351,8 @@ static bool tryRaiseWhileToAffine(Module &module, Operation *op) {
   }
   if (!startStore)
     return false;
+  if (blockStoresAllocaBetween(parentBlock, startStore, op, allocaOp))
+    return false;
 
   Value startVal = startStore->operand(0);
   Value boundVal = cmpOp->operand(1);
@@ -305,6 +378,8 @@ static bool tryRaiseWhileToAffine(Module &module, Operation *op) {
 
   Region *condRegion = op->getRegions()[0].get();
   Region *bodyRegion = op->getRegions()[1].get();
+  if (regionHasLoopControl(bodyRegion))
+    return false;
   if (regionHasAnyCall(bodyRegion))
     return false;
   if (Operation *func = enclosingFunction(op)) {
@@ -314,6 +389,8 @@ static bool tryRaiseWhileToAffine(Module &module, Operation *op) {
   if (regionHasStoreToAlloca(bodyRegion, allocaOp, ivStore))
     return false;
   if (bodyReadsIVAfterStepStore(body, allocaOp, ivStore))
+    return false;
+  if (blockReadsAllocaAfter(parentBlock, op, allocaOp))
     return false;
   if ((blockInRegionTree(boundOp->getBlock(), condRegion) &&
        opOperandsDependOnRegion(boundOp, condRegion)) ||

@@ -1488,6 +1488,8 @@ bool positivePowerOfTwoShift(int64_t value, int &shift) {
 }
 
 bool constantIntegerValue(Value value, int64_t &out) {
+  if (isFloatType(value.type()))
+    return false;
   auto *op = value.getDefiningOp();
   if (!op || op->isErased())
     return false;
@@ -1555,10 +1557,51 @@ int64_t memrefAllocationBytes(Type type) {
   return std::max<int64_t>(4, elems * info.elemBytes);
 }
 
-bool isScalarI32Memref(Type type) {
+bool isScalarWordMemref(Type type) {
   MemrefInfo info = parseMemrefInfo(type);
-  return info.valid && type.str().find("xi32") != std::string::npos &&
-         info.shape.size() == 1 && info.shape[0] == 1;
+  return info.valid && info.shape.size() == 1 && info.shape[0] == 1 &&
+         (type.str().find("xi32") != std::string::npos ||
+          type.str().find("xf32") != std::string::npos);
+}
+
+bool constantScalarWordBits(Value value, uint32_t &bits) {
+  auto *op = value.getDefiningOp();
+  if (!op || op->isErased() ||
+      (op->name() != "arith.constant" && op->name() != "rv_machine.li" &&
+       op->name() != "arm_machine.mov") ||
+      !op->attr("value"))
+    return false;
+  if (isFloatType(value.type())) {
+    bits = parseFloatAttrBits(op->attr("value"));
+    return true;
+  }
+  int64_t init = 0;
+  if (!constantIntegerValue(value, init))
+    return false;
+  bits = static_cast<uint32_t>(init);
+  return true;
+}
+
+std::vector<uint32_t> parseGlobalInitWords(Attribute attr) {
+  std::vector<uint32_t> words;
+  std::string text = symbolAttr(attr);
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    std::size_t next = text.find(',', pos);
+    std::string part = text.substr(pos, next == std::string::npos ? std::string::npos
+                                                                   : next - pos);
+    try {
+      unsigned long value = std::stoul(part, nullptr, 0);
+      words.push_back(static_cast<uint32_t>(value));
+    } catch (...) {
+      words.clear();
+      return words;
+    }
+    if (next == std::string::npos)
+      break;
+    pos = next + 1;
+  }
+  return words;
 }
 
 std::string sanitizeLabel(std::string label) {
@@ -1620,7 +1663,35 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
   }
 
-  int64_t frameBytes = 0;
+  auto overflowArgBytes = [&](Operation *call) -> int64_t {
+    if (!call || call->name() != "sysy.call")
+      return 0;
+    int intRegs = 0;
+    int fpRegs = 0;
+    int stackSlots = 0;
+    for (auto operand : call->getOperands()) {
+      if (isFloatType(operand.type())) {
+        if (fpRegs < 8)
+          fpRegs++;
+        else
+          stackSlots++;
+      } else {
+        if (intRegs < 8)
+          intRegs++;
+        else
+          stackSlots++;
+      }
+    }
+    return stackSlots * 8;
+  };
+
+  int64_t outgoingArgBase = 0;
+  int64_t outgoingArgBytes = 0;
+  for (auto *op : funcOps)
+    if (op && !op->isErased())
+      outgoingArgBytes = std::max(outgoingArgBytes, overflowArgBytes(op));
+
+  int64_t frameBytes = outgoingArgBytes;
   for (auto *op : funcOps) {
     if (!op || op->isErased())
       continue;
@@ -1742,7 +1813,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       os << "    " << inst << " " << reg << ", " << off << "(sp)\n";
       return;
     }
-    std::string tmp = stackTmpFor(reg);
+    std::string tmp = (!reg.empty() && reg[0] == 'f') ? stackTmpFor(reg) : reg;
     materializeStackAddressRaw(tmp, off);
     os << "    " << inst << " " << reg << ", 0(" << tmp << ")\n";
   };
@@ -1775,6 +1846,25 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   };
   auto looksFloatReg = [&](const std::string &reg) {
     return !reg.empty() && (isArm ? reg[0] == 's' : reg[0] == 'f');
+  };
+  auto floatScratchReg = [&]() -> std::string {
+    return isArm ? "s30" : "ft10";
+  };
+  auto intScratchForFloatBits = [&]() -> std::string {
+    return isArm ? "w16" : "t5";
+  };
+  auto scratchForValue = [&](Value value, const std::string &preferred) -> std::string {
+    if (isFloatType(value.type()) && !looksFloatReg(preferred))
+      return floatScratchReg();
+    return preferred;
+  };
+  auto emitFloatBitsToReg = [&](const std::string &dst, uint32_t bits) {
+    if (isArm)
+      os << "    mov " << intScratchForFloatBits() << ", #" << bits
+         << "\n    fmov " << dst << ", " << intScratchForFloatBits() << "\n";
+    else
+      os << "    li " << intScratchForFloatBits() << ", " << bits
+         << "\n    fmv.w.x " << dst << ", " << intScratchForFloatBits() << "\n";
   };
   std::function<void(Value, const std::string&)> spillHome =
       [&](Value value, const std::string &reg) {
@@ -1864,20 +1954,44 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
     }
   };
+  int incomingIntRegs = 0;
+  int incomingFpRegs = 0;
+  int incomingStackSlots = 0;
   for (size_t i = 0; i < block.args().size(); i++) {
     const auto &arg = *block.args()[i];
+    bool fpArg = isFloatType(arg.type());
+    bool ptrArg = isMemrefType(arg.type());
     std::string reg;
-    if (isFloatType(arg.type()))
-      reg = (isArm ? "s" : "fa") + std::to_string((int) i);
-    else if (isArm && isMemrefType(arg.type()))
-      reg = "x" + std::to_string((int) i);
-    else if (isArm)
-      reg = "w" + std::to_string((int) i);
-    else
-      reg = "a" + std::to_string((int) i);
+    if (fpArg) {
+      if (incomingFpRegs < 8) {
+        reg = (isArm ? "s" : "fa") + std::to_string(incomingFpRegs++);
+      } else {
+        int64_t off = frameBytes + incomingStackSlots++ * 8;
+        reg = floatScratchReg();
+        emitStackLoad(reg, off, isArm ? "ldr" : "flw");
+      }
+    } else {
+      if (incomingIntRegs < 8) {
+        if (isArm && ptrArg)
+          reg = "x" + std::to_string(incomingIntRegs);
+        else if (isArm)
+          reg = "w" + std::to_string(incomingIntRegs);
+        else
+          reg = "a" + std::to_string(incomingIntRegs);
+        incomingIntRegs++;
+      } else {
+        int64_t off = frameBytes + incomingStackSlots++ * 8;
+        reg = ptrArg ? scratchReg(0) : (isArm ? "w16" : scratchReg(0));
+        emitStackLoad(reg, off, ptrArg ? (isArm ? "ldr" : "ld") : (isArm ? "ldr" : "lw"));
+      }
+    }
     bindResult(arg.value(), reg);
+    bool shouldKeepInScratch = reg != scratchReg(0) && reg != scratchReg(1) &&
+                               reg != floatScratchReg();
     if (!livenessEnabled || remainingUses[valueKey(arg.value())] > 0)
       spillHome(arg.value(), reg);
+    if (!shouldKeepInScratch)
+      regs.erase(valueKey(arg.value()));
   }
   auto materializeAddress = [&](Value value, const std::string &tmp) -> std::string {
     std::string loc = lookupReg(value, regs);
@@ -1905,38 +2019,50 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return loc;
   };
   auto ensureReg = [&](Value value, const std::string &tmp) -> std::string {
+    std::string actualTmp = scratchForValue(value, tmp);
     std::string loc = lookupReg(value, regs);
     if (!loc.empty()) {
       if (loc.rfind("stack:", 0) == 0 || loc.rfind("global:", 0) == 0)
-        return materializeAddress(value, tmp);
+        return materializeAddress(value, actualTmp);
       return loc;
     }
     int64_t imm = 0;
     if (constantIntegerValue(value, imm)) {
       if (isArm)
-        os << "    mov " << tmp << ", #" << imm << "\n";
+        os << "    mov " << actualTmp << ", #" << imm << "\n";
       else
-        os << "    li " << tmp << ", " << imm << "\n";
-      return tmp;
+        os << "    li " << actualTmp << ", " << imm << "\n";
+      return actualTmp;
+    }
+    if (isFloatType(value.type())) {
+      auto *op = value.getDefiningOp();
+      if (op && !op->isErased() &&
+          (op->name() == "arith.constant" || op->name() == "rv_machine.li" ||
+           op->name() == "arm_machine.mov") &&
+          op->attr("value")) {
+        emitFloatBitsToReg(actualTmp, parseFloatAttrBits(op->attr("value")));
+        return actualTmp;
+      }
     }
     auto home = valueSlots.find(valueKey(value));
     if (home != valueSlots.end() && homeIsUsable(value)) {
-      bool fp = isFloatType(value.type()) || looksFloatReg(tmp);
+      bool fp = isFloatType(value.type()) || looksFloatReg(actualTmp);
       bool ptr = isMemrefType(value.type());
-      emitStackLoad(tmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
-      return tmp;
+      emitStackLoad(actualTmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
+      return actualTmp;
     }
     return "";
   };
   auto reloadValue = [&](Value value, const std::string &tmp) -> std::string {
+    std::string actualTmp = scratchForValue(value, tmp);
     auto home = valueSlots.find(valueKey(value));
     if (home != valueSlots.end() && homeIsUsable(value)) {
-      bool fp = isFloatType(value.type()) || looksFloatReg(tmp);
+      bool fp = isFloatType(value.type()) || looksFloatReg(actualTmp);
       bool ptr = isMemrefType(value.type());
-      emitStackLoad(tmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
-      return tmp;
+      emitStackLoad(actualTmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
+      return actualTmp;
     }
-    return ensureReg(value, tmp);
+    return ensureReg(value, actualTmp);
   };
   auto emitLinearizedIndex = [&](Value base, const std::vector<Value> &indices,
                                  const std::string &result,
@@ -2125,6 +2251,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
   int nextLoopId = stats.functions * 10000;
   std::map<Operation*, int> loopOps;
+  std::map<Operation*, std::string> loopIvRegs;
   std::map<Operation*, std::vector<std::string>> labelsBefore;
   std::vector<std::string> functionEndLabels;
 
@@ -2740,31 +2867,58 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "call without callee attr";
         return false;
       }
+      invalidateCallerSavedForCall();
+      int outgoingIntRegs = 0;
+      int outgoingFpRegs = 0;
+      int outgoingStackSlots = 0;
       for (int i = 0; i < op.operandCount(); i++) {
-        std::string src = ensureReg(op.operand(i), scratchReg(0));
+        Value operand = op.operand(i);
+        bool fpArg = isFloatType(operand.type());
+        bool ptrArg = isMemrefType(operand.type());
+        std::string src = ensureReg(operand, fpArg ? floatScratchReg() : scratchReg(0));
         if (src.rfind("stack:", 0) == 0 || src.rfind("global:", 0) == 0)
-          src = materializeAddress(op.operand(i), scratchReg(0));
+          src = materializeAddress(operand, scratchReg(0));
         if (src.empty()) {
-          src = scratchReg(0);
-          if (isArm)
-            os << "    mov " << src << ", #0\n";
-          else
-            os << "    li " << src << ", 0\n";
+          if (fpArg) {
+            src = floatScratchReg();
+            emitFloatBitsToReg(src, 0);
+          } else {
+            src = scratchReg(0);
+            if (isArm)
+              os << "    mov " << src << ", #0\n";
+            else
+              os << "    li " << src << ", 0\n";
+          }
         }
-        bool fpArg = op.operand(i).type().kind() == TypeKind::Float || looksFloatReg(src);
-        if (isArm) {
-          std::string arg = fpArg ? ("s" + std::to_string(i)) : ("w" + std::to_string(i));
-          if (!fpArg && src.size() > 0 && src[0] == 'x')
-            arg = "x" + std::to_string(i);
-          if (src != arg) {
-            clobberPhysicalReg(arg);
-            os << "    " << (fpArg ? "fmov " : "mov ") << arg << ", " << src << "\n";
+
+        if (fpArg) {
+          if (outgoingFpRegs < 8) {
+            std::string arg = (isArm ? "s" : "fa") + std::to_string(outgoingFpRegs++);
+            if (src != arg) {
+              clobberPhysicalReg(arg);
+              os << "    " << (isArm ? "fmov " : "fmv.s ") << arg << ", " << src << "\n";
+            }
+          } else {
+            emitStackStore(src, outgoingArgBase + outgoingStackSlots++ * 8,
+                           isArm ? "str" : "fsw");
           }
         } else {
-          std::string arg = fpArg ? ("fa" + std::to_string(i)) : ("a" + std::to_string(i));
-          if (src != arg) {
-            clobberPhysicalReg(arg);
-            os << "    " << (fpArg ? "fmv.s " : "mv ") << arg << ", " << src << "\n";
+          if (outgoingIntRegs < 8) {
+            std::string arg;
+            if (isArm && ptrArg)
+              arg = "x" + std::to_string(outgoingIntRegs);
+            else if (isArm)
+              arg = "w" + std::to_string(outgoingIntRegs);
+            else
+              arg = "a" + std::to_string(outgoingIntRegs);
+            outgoingIntRegs++;
+            if (src != arg) {
+              clobberPhysicalReg(arg);
+              os << "    " << (isArm ? "mov " : "mv ") << arg << ", " << src << "\n";
+            }
+          } else {
+            emitStackStore(src, outgoingArgBase + outgoingStackSlots++ * 8,
+                           ptrArg ? (isArm ? "str" : "sd") : (isArm ? "str" : "sw"));
           }
         }
       }
@@ -2827,12 +2981,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "affine.for") {
       int loopId = loopOps[&op];
-      std::string start = reloadValue(op.operand(0), isArm ? "w16" : scratchReg(0));
       std::string iv = isArm ? ("w" + std::to_string(nextLoopReg++ % 10 + 19))
                              : ("s" + std::to_string(nextLoopReg++ % 12));
       std::string boundScratch = isArm ? "w17" : scratchReg(1);
 
       Value ivValue = op.getRegions()[0]->getBlocks()[0]->args()[0]->value();
+      loopIvRegs[&op] = iv;
       bindReg(ivValue, iv);
       std::string pinnedBound = ensureReg(op.operand(1), boundScratch);
       if (!pinnedBound.empty())
@@ -2840,6 +2994,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string pinnedStep = ensureReg(op.operand(2), boundScratch);
       if (!pinnedStep.empty())
         spillHome(op.operand(2), pinnedStep);
+      std::string start = reloadValue(op.operand(0), isArm ? "w16" : scratchReg(0));
 
       if (isArm) {
         os << "    mov " << iv << ", " << start << "\n";
@@ -2891,7 +3046,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       int loopId = loopOps[parentFor];
       std::string step = ensureReg(parentFor->operand(2), scratchReg(1));
       Value ivValue = parentFor->getRegions()[0]->getBlocks()[0]->args()[0]->value();
-      std::string iv = ensureReg(ivValue, scratchReg(0));
+      std::string preferredIv = loopIvRegs.count(parentFor) ? loopIvRegs[parentFor]
+                                                            : scratchReg(0);
+      std::string iv = ensureReg(ivValue, preferredIv);
+      if (iv != preferredIv) {
+        if (isArm)
+          os << "    mov " << preferredIv << ", " << iv << "\n";
+        else
+          os << "    mv " << preferredIv << ", " << iv << "\n";
+        iv = preferredIv;
+      }
 
       if (isArm) {
         os << ".Lloop_latch_" << loopId << ":\n";
@@ -3069,7 +3233,8 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
   }
 
   std::map<std::string, std::string> globalLabels;
-  std::map<std::string, int64_t> scalarGlobalInits;
+  std::map<std::string, uint32_t> scalarGlobalInits;
+  std::map<std::string, std::vector<uint32_t>> globalWordInits;
   for (auto *op : walk(module)) {
     if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
       continue;
@@ -3078,13 +3243,16 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       name = symbolAttr(op->attr("sym_name"));
     std::string label = ".Lglob_" + sanitizeLabel(name);
     globalLabels[valueKey(op->result())] = label;
+    auto words = parseGlobalInitWords(op->attr("init_words"));
+    if (!words.empty())
+      globalWordInits[valueKey(op->result())] = std::move(words);
   }
   if (!module.body().getBlocks().empty()) {
     std::map<std::string, Value> scalarGlobals;
     for (auto &owned : module.body().getBlocks()[0]->ops()) {
       Operation *op = owned.get();
       if (!op || op->isErased() || op->name() != "sysy.global" ||
-          op->resultCount() == 0 || !isScalarI32Memref(op->resultType()))
+          op->resultCount() == 0 || !isScalarWordMemref(op->resultType()))
         continue;
       scalarGlobals[valueKey(op->result())] = op->result();
     }
@@ -3105,24 +3273,39 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
           break;
         }
       }
-      int64_t init = 0;
-      if (zeroIndex && constantIntegerValue(op->operand(0), init) && init != 0)
-        scalarGlobalInits[globalIt->first] = init;
+      uint32_t bits = 0;
+      if (zeroIndex && constantScalarWordBits(op->operand(0), bits) && bits != 0)
+        scalarGlobalInits[globalIt->first] = bits;
     }
   }
 
-  if (!scalarGlobalInits.empty()) {
+  if (!scalarGlobalInits.empty() || !globalWordInits.empty()) {
     os << "    .data\n";
     for (auto *op : walk(module)) {
       if (!op || op->isErased() || op->name() != "sysy.global" || op->resultCount() == 0)
         continue;
       auto labelIt = globalLabels.find(valueKey(op->result()));
+      if (labelIt == globalLabels.end())
+        continue;
+      auto wordIt = globalWordInits.find(valueKey(op->result()));
       auto initIt = scalarGlobalInits.find(valueKey(op->result()));
-      if (labelIt == globalLabels.end() || initIt == scalarGlobalInits.end())
+      if (wordIt == globalWordInits.end() && initIt == scalarGlobalInits.end())
         continue;
       os << "    .align 2\n" << labelIt->second << ":\n";
-      os << "    .word " << initIt->second << "\n";
-      stats.globalScalarInits++;
+      if (wordIt != globalWordInits.end()) {
+        for (std::size_t i = 0; i < wordIt->second.size(); i++) {
+          if (i % 8 == 0)
+            os << "    .word ";
+          else
+            os << ", ";
+          os << wordIt->second[i];
+          if (i % 8 == 7 || i + 1 == wordIt->second.size())
+            os << "\n";
+        }
+      } else {
+        os << "    .word " << initIt->second << "\n";
+        stats.globalScalarInits++;
+      }
     }
   }
 
@@ -3134,7 +3317,8 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       auto it = globalLabels.find(valueKey(op->result()));
       if (it == globalLabels.end())
         continue;
-      if (scalarGlobalInits.count(valueKey(op->result())) != 0)
+      if (scalarGlobalInits.count(valueKey(op->result())) != 0 ||
+          globalWordInits.count(valueKey(op->result())) != 0)
         continue;
       if (!emittedBss) {
         os << "    .bss\n";
@@ -3368,22 +3552,45 @@ void runGlobalOpt(Module &module, SelfOptStats *stats) {
 }
 
 static std::string memoryLocationKey(Operation &op) {
+  auto baseKey = [&]() -> std::string {
+    int baseIndex = -1;
+    if (op.name() == "sysy.load" || op.name() == "memref.load")
+      baseIndex = 0;
+    else if (op.name() == "sysy.store" || op.name() == "memref.store")
+      baseIndex = 1;
+    if (baseIndex >= 0 && op.operandCount() > baseIndex)
+      return "v:" + valueKey(op.operand(baseIndex));
+    std::string sym = symbolAttr(op.attr("symbol"));
+    if (sym.empty())
+      sym = symbolAttr(op.attr("sym_name"));
+    return sym.empty() ? "" : "s:" + sym;
+  };
+
+  std::string key = baseKey();
+  if (key.empty())
+    return "";
+  if (op.name() == "memref.load") {
+    for (int i = 1; i < op.operandCount(); i++)
+      key += "," + valueKey(op.operand(i));
+  } else if (op.name() == "memref.store") {
+    for (int i = 2; i < op.operandCount(); i++)
+      key += "," + valueKey(op.operand(i));
+  }
+  return key;
+}
+
+static std::string memoryBaseKey(Operation &op) {
+  if (op.name() == "sysy.load" || op.name() == "memref.load") {
+    if (op.operandCount() > 0)
+      return "v:" + valueKey(op.operand(0));
+  } else if (op.name() == "sysy.store" || op.name() == "memref.store") {
+    if (op.operandCount() > 1)
+      return "v:" + valueKey(op.operand(1));
+  }
   std::string sym = symbolAttr(op.attr("symbol"));
   if (sym.empty())
     sym = symbolAttr(op.attr("sym_name"));
-  if (sym.empty())
-    return "";
-  std::string key = sym;
-  if (op.name() == "memref.load") {
-    for (int i = 1; i < op.operandCount(); i++) {
-      key += "," + valueKey(op.operand(i));
-    }
-  } else if (op.name() == "memref.store") {
-    for (int i = 2; i < op.operandCount(); i++) {
-      key += "," + valueKey(op.operand(i));
-    }
-  }
-  return key;
+  return sym.empty() ? "" : "s:" + sym;
 }
 
 static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats) {
@@ -3420,12 +3627,11 @@ static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats)
       if (key.empty())
         continue;
 
-      std::string baseSym = symbolAttr(op.attr("symbol"));
-      if (baseSym.empty())
-        baseSym = symbolAttr(op.attr("sym_name"));
+      std::string base = memoryBaseKey(op);
       std::vector<std::string> keysToInvalidate;
       for (const auto &kv : activeStores) {
-        if (kv.first != key && !baseSym.empty() && kv.first.find(baseSym) == 0) {
+        if (kv.first != key && !base.empty() &&
+            (kv.first == base || kv.first.rfind(base + ",", 0) == 0)) {
           keysToInvalidate.push_back(kv.first);
         }
       }
@@ -3633,12 +3839,25 @@ static bool isEqBitToOne(Value value, const std::set<std::string> &bitSlots) {
       cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "eq")
     return false;
   auto matches = [&](Value maybeBit, Value maybeOne) {
+    if (isConst(maybeOne, 1) && bitSlots.count(valueKey(maybeBit)) != 0)
+      return true;
     auto *load = maybeBit.getDefiningOp();
     return isConst(maybeOne, 1) && opHasName(load, {"sysy.load", "memref.load"}) &&
            load->operandCount() > 0 && bitSlots.count(valueKey(load->operand(0))) != 0;
   };
   return matches(cmp->operand(0), cmp->operand(1)) ||
          matches(cmp->operand(1), cmp->operand(0));
+}
+
+static bool isTruthOfEqBitToOne(Value value, const std::set<std::string> &bitSlots) {
+  if (isEqBitToOne(value, bitSlots))
+    return true;
+  auto *cmp = value.getDefiningOp();
+  if (!opHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) ||
+      cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "ne")
+    return false;
+  return (isEqBitToOne(cmp->operand(0), bitSlots) && isConst(cmp->operand(1), 0)) ||
+         (isEqBitToOne(cmp->operand(1), bitSlots) && isConst(cmp->operand(0), 0));
 }
 
 static bool isOrOfEqBitToOne(Value value, const std::set<std::string> &bitSlots) {
@@ -3656,6 +3875,8 @@ static bool isNeBetweenBitLoads(Value value, const std::set<std::string> &bitSlo
       cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "ne")
     return false;
   for (int i = 0; i < 2; i++) {
+    if (bitSlots.count(valueKey(cmp->operand(i))) != 0)
+      continue;
     auto *load = cmp->operand(i).getDefiningOp();
     if (!opHasName(load, {"sysy.load", "memref.load"}) || load->operandCount() == 0 ||
         bitSlots.count(valueKey(load->operand(0))) == 0)
@@ -3680,6 +3901,67 @@ static bool blockHasResultPlusPowerStore(Block &block, Value resultSlot, Value p
     if (owned && !owned->isErased() &&
         isResultPlusPowerStore(owned.get(), resultSlot, powerSlot))
       return true;
+  }
+  return false;
+}
+
+static bool blockStoresConstToSlot(Block &block, Value slot, int64_t constant) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (op && !op->isErased() && isStoreToSlot(op, slot) &&
+        isConst(op->operand(0), constant))
+      return true;
+  }
+  return false;
+}
+
+static bool blockStoresTruthToSlot(Block &block, Value slot,
+                                   const std::set<std::string> &bitSlots) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (op && !op->isErased() && isStoreToSlot(op, slot) &&
+        isTruthOfEqBitToOne(op->operand(0), bitSlots))
+      return true;
+  }
+  return false;
+}
+
+static bool isShortCircuitLogicIf(Operation *op,
+                                  const std::set<std::string> &bitSlots,
+                                  Value &slot, ProvenBitwiseKind &kind) {
+  if (!op || op->name() != "scf.if" || op->operandCount() != 1 ||
+      op->getRegions().size() != 2 ||
+      op->getRegions()[0]->getBlocks().empty() ||
+      op->getRegions()[1]->getBlocks().empty() ||
+      !isTruthOfEqBitToOne(op->operand(0), bitSlots))
+    return false;
+  Block &thenBlock = *op->getRegions()[0]->getBlocks()[0];
+  Block &elseBlock = *op->getRegions()[1]->getBlocks()[0];
+  auto considerStore = [&](Block &block) -> Value {
+    for (auto &owned : block.ops()) {
+      Operation *store = owned.get();
+      if (store && !store->isErased() && isStoreToSlot(store, store->operandCount() >= 2
+                                                                  ? store->operand(1)
+                                                                  : Value()))
+        return store->operand(1);
+    }
+    return Value();
+  };
+  Value thenSlot = considerStore(thenBlock);
+  Value elseSlot = considerStore(elseBlock);
+  if (!thenSlot.valid() || thenSlot != elseSlot)
+    return false;
+  if (blockStoresTruthToSlot(thenBlock, thenSlot, bitSlots) &&
+      blockStoresConstToSlot(elseBlock, thenSlot, 0)) {
+    slot = thenSlot;
+    kind = ProvenBitwiseKind::And;
+    return true;
+  }
+  if (blockStoresConstToSlot(thenBlock, thenSlot, 1) &&
+      blockStoresTruthToSlot(elseBlock, thenSlot, bitSlots)) {
+    slot = thenSlot;
+    kind = ProvenBitwiseKind::Or;
+    return true;
   }
   return false;
 }
@@ -3851,8 +4133,10 @@ static ProvenBitwiseFunction classifyProvenBitwiseFunction(Operation &func,
 
   Block &body = *loop->getRegions()[1]->getBlocks()[0];
   std::set<std::string> bitSlots;
+  std::set<std::string> bitRefs;
   std::set<std::string> paramsWithRem;
   std::set<std::string> paramsWithDiv;
+  std::map<std::string, ProvenBitwiseKind> logicSlotKinds;
   bool doublesPower = false;
   bool decrementsLen = false;
   bool updatesResult = false;
@@ -3880,6 +4164,8 @@ static ProvenBitwiseFunction classifyProvenBitwiseFunction(Operation &func,
         if (isBinaryWithConst(op->operand(0), "arith.remi", "rv_machine.remw",
                               "arm_machine.srem", paramSlot, 2)) {
           bitSlots.insert(valueKey(op->operand(1)));
+          bitRefs.insert(valueKey(op->operand(1)));
+          bitRefs.insert(valueKey(op->operand(0)));
           paramsWithRem.insert(paramKey);
         }
         if (isStoreToSlot(op, paramSlot) &&
@@ -3888,25 +4174,37 @@ static ProvenBitwiseFunction classifyProvenBitwiseFunction(Operation &func,
           paramsWithDiv.insert(paramKey);
       }
     }
+    Value logicSlot;
+    ProvenBitwiseKind logicKind = ProvenBitwiseKind::None;
+    if (isShortCircuitLogicIf(op, bitRefs, logicSlot, logicKind))
+      logicSlotKinds[valueKey(logicSlot)] = logicKind;
+
     if (op->name() == "scf.if" && op->operandCount() == 1 &&
         op->getRegions().size() == 1 && !op->getRegions()[0]->getBlocks().empty()) {
       auto *condOp = op->operand(0).getDefiningOp();
       if (opHasName(condOp, {"arith.andi", "rv_machine.and", "arm_machine.and"}) &&
           condOp->operandCount() == 2 &&
-          isEqBitToOne(condOp->operand(0), bitSlots) &&
-          isEqBitToOne(condOp->operand(1), bitSlots)) {
+          isEqBitToOne(condOp->operand(0), bitRefs) &&
+          isEqBitToOne(condOp->operand(1), bitRefs)) {
         condKind = ProvenBitwiseKind::And;
-      } else if (isOrOfEqBitToOne(op->operand(0), bitSlots)) {
+      } else if (isOrOfEqBitToOne(op->operand(0), bitRefs)) {
         condKind = ProvenBitwiseKind::Or;
-      } else if (isNeBetweenBitLoads(op->operand(0), bitSlots)) {
+      } else if (isNeBetweenBitLoads(op->operand(0), bitRefs)) {
         condKind = ProvenBitwiseKind::Xor;
+      } else {
+        auto *load = op->operand(0).getDefiningOp();
+        if (opHasName(load, {"sysy.load", "memref.load"}) && load->operandCount() > 0) {
+          auto logicIt = logicSlotKinds.find(valueKey(load->operand(0)));
+          if (logicIt != logicSlotKinds.end())
+            condKind = logicIt->second;
+        }
       }
       Block &thenBlock = *op->getRegions()[0]->getBlocks()[0];
       for (auto &thenOp : thenBlock.ops())
         if (thenOp && isResultPlusPowerStore(thenOp.get(), resultSlot, powerSlot))
           updatesResult = true;
     } else if (op->name() == "scf.if" &&
-               isShortCircuitOrIf(op, bitSlots, resultSlot, powerSlot)) {
+               isShortCircuitOrIf(op, bitRefs, resultSlot, powerSlot)) {
       condKind = ProvenBitwiseKind::Or;
       updatesResult = true;
     }

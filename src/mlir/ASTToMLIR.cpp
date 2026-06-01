@@ -7,8 +7,12 @@
 #include "../utils/DynamicCast.h"
 
 #include <algorithm>
-#include <map>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -235,6 +239,42 @@ class ASTToMLIR {
     return op.result();
   }
 
+  std::string floatAttrText(float value) {
+    std::ostringstream os;
+    os << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
+    return os.str();
+  }
+
+  std::string globalArrayInitWords(sys::ArrayType *arr, sys::ConstArrayNode *init) {
+    if (!arr || !init)
+      return "";
+    std::size_t count = 1;
+    for (int dim : arr->dims) {
+      if (dim <= 0)
+        return "";
+      count *= static_cast<std::size_t>(dim);
+    }
+    if (count == 0 || (!init->isFloat && !init->vi) || (init->isFloat && !init->vf))
+      return "";
+
+    std::ostringstream os;
+    bool anyNonZero = false;
+    for (std::size_t i = 0; i < count; i++) {
+      uint32_t bits = 0;
+      if (init->isFloat) {
+        static_assert(sizeof(float) == sizeof(uint32_t), "expected 32-bit float");
+        std::memcpy(&bits, &init->vf[i], sizeof(bits));
+      } else {
+        bits = static_cast<uint32_t>(init->vi[i]);
+      }
+      anyNonZero = anyNonZero || bits != 0;
+      if (i)
+        os << ",";
+      os << bits;
+    }
+    return anyNonZero ? os.str() : "";
+  }
+
   Value emitZeroConstant(sys::Type *type, Builder &builder) {
     Type resultType = scalarType(ctx, type);
     Attribute value = isa<sys::FloatType>(type)
@@ -321,6 +361,55 @@ class ASTToMLIR {
     }
   }
 
+  Value emitBoolValue(Value input, Builder &builder) {
+    bool fp = input.type().kind() == TypeKind::Float || input.type().str() == "f32";
+    Type zeroType = fp ? ctx.f(32) : ctx.i(32);
+    Attribute zeroAttr = fp ? ctx.stringAttr("0.0")
+                            : ctx.integerAttr(0, ctx.i(32));
+    auto &zero = builder.create("arith.constant", {}, {zeroType},
+                                {{"value", zeroAttr}}, loc());
+    auto &cmp = builder.create(fp ? "arith.cmpf" : "arith.cmpi",
+                               {input, zero.result()}, {ctx.i(32)},
+                               {{"predicate", ctx.stringAttr("ne")}}, loc());
+    return cmp.result();
+  }
+
+  Value emitLogicalExpr(sys::BinaryNode *binary, Builder &builder) {
+    auto &slot = builder.create("sysy.alloca", {}, {ctx.memref({1}, ctx.i(32))},
+                                {{"symbol", ctx.stringAttr(".logic")}}, loc());
+    Value lhs = emitBoolValue(emitExpr(binary->l, builder), builder);
+    auto &branch = builder.create("scf.if", {lhs}, {}, {}, loc(), 2);
+
+    auto emitConstStore = [&](Region &region, int value) {
+      auto &block = region.addBlock();
+      Builder nested(ctx, &block);
+      Value constant = emitIntConstant(value, nested);
+      nested.create("sysy.store", {constant, slot.result()}, {},
+                    {{"symbol", ctx.stringAttr(".logic")}}, loc());
+      nested.create("scf.yield", {}, {}, {}, loc());
+    };
+    auto emitRhsStore = [&](Region &region) {
+      auto &block = region.addBlock();
+      Builder nested(ctx, &block);
+      Value rhs = emitBoolValue(emitExpr(binary->r, nested), nested);
+      nested.create("sysy.store", {rhs, slot.result()}, {},
+                    {{"symbol", ctx.stringAttr(".logic")}}, loc());
+      nested.create("scf.yield", {}, {}, {}, loc());
+    };
+
+    if (binary->kind == sys::BinaryNode::And) {
+      emitRhsStore(*branch.getRegions()[0]);
+      emitConstStore(*branch.getRegions()[1], 0);
+    } else {
+      emitConstStore(*branch.getRegions()[0], 1);
+      emitRhsStore(*branch.getRegions()[1]);
+    }
+
+    auto &load = builder.create("sysy.load", {slot.result()}, {ctx.i(32)},
+                                {{"symbol", ctx.stringAttr(".logic")}}, loc());
+    return load.result();
+  }
+
   Value emitExpr(sys::ASTNode *node, Builder &builder) {
     if (!node)
       return unknown(builder, nullptr);
@@ -331,7 +420,7 @@ class ASTToMLIR {
     }
     if (auto *f = dyn_cast<sys::FloatNode>(node)) {
       auto &op = builder.create("arith.constant", {}, {ctx.f(32)},
-                                {{"value", ctx.stringAttr(std::to_string(f->value))}}, loc());
+                                {{"value", ctx.stringAttr(floatAttrText(f->value))}}, loc());
       return op.result();
     }
     if (auto *ref = dyn_cast<sys::VarRefNode>(node)) {
@@ -361,7 +450,10 @@ class ASTToMLIR {
         return op.result();
       }
       if (unary->kind == sys::UnaryNode::Not) {
-        auto &op = builder.create("arith.noti", {input}, {ctx.i(32)}, {}, loc());
+        Value truth = emitBoolValue(input, builder);
+        Value zero = emitIntConstant(0, builder);
+        auto &op = builder.create("arith.cmpi", {truth, zero}, {ctx.i(32)},
+                                  {{"predicate", ctx.stringAttr("eq")}}, loc());
         return op.result();
       }
       auto &op = builder.create(isa<sys::FloatType>(node->type) ? "arith.negf" : "arith.negi",
@@ -369,6 +461,9 @@ class ASTToMLIR {
       return op.result();
     }
     if (auto *binary = dyn_cast<sys::BinaryNode>(node)) {
+      if (binary->kind == sys::BinaryNode::And ||
+          binary->kind == sys::BinaryNode::Or)
+        return emitLogicalExpr(binary, builder);
       Value lhs = emitExpr(binary->l, builder);
       Value rhs = emitExpr(binary->r, builder);
       bool fp = isa<sys::FloatType>(binary->l ? binary->l->type : nullptr) ||
@@ -487,6 +582,13 @@ class ASTToMLIR {
           shape += std::to_string(arr->dims[i]);
         }
         attrs["shape"] = ctx.stringAttr(shape);
+        if (decl->global) {
+          if (auto *init = dyn_cast<sys::ConstArrayNode>(decl->init)) {
+            std::string words = globalArrayInitWords(arr, init);
+            if (!words.empty())
+              attrs["init_words"] = ctx.stringAttr(words);
+          }
+        }
       }
       auto &slot = builder.create(decl->global ? "sysy.global" : "sysy.alloca",
                                   {}, {storageType(ctx, decl->type)}, attrs, loc());
