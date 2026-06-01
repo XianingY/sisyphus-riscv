@@ -327,6 +327,7 @@ int main(int argc, char **argv) {
               << " bitwise-reject-signed-unsafe=" << selfMLIRStats.opt.bitwiseRejectSignedUnsafe
               << " inline-calls=" << selfMLIRStats.opt.inlineCalls
               << " inline-functions=" << selfMLIRStats.opt.inlineFunctions
+              << " raised-selects=" << selfMLIRStats.opt.raisedSelects
               << " rot-helper-folds=" << selfMLIRStats.opt.rotHelperFolds
               << " pow2-strength-reductions=" << selfMLIRStats.opt.pow2StrengthReductions
               << " affine-summary-loops=" << selfMLIRStats.opt.affineSummaryLoops
@@ -346,6 +347,8 @@ int main(int argc, char **argv) {
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed
               << "\n";
+    std::cerr << "select:\n"
+              << "  raised-selects : " << selfMLIRStats.opt.raisedSelects << "\n";
   }
 
   if (getenv("SISY_DUMP_SELF_MLIR")) {

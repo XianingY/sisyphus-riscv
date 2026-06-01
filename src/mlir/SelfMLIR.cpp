@@ -1,4 +1,5 @@
 #include "SelfMLIR.h"
+#include "Polyhedral.h"
 
 
 #include "../parse/ASTNode.h"
@@ -1894,9 +1895,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   int maxCalleeSaveCount = isArm ? 10 : 12;
   int affineLoopCount = 0;
   for (auto *op : funcOps)
-    if (op && !op->isErased() && op->name() == "affine.for")
-      affineLoopCount++;
-  int calleeSaveCount = std::min(maxCalleeSaveCount, affineLoopCount);
+    if (op && !op->isErased()) {
+      if (op->name() == "affine.for")
+        affineLoopCount++;
+    }
+  bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", false) &&
+                          affineLoopCount >= 2;
+  int calleeSaveCount = regAlloc2Enabled
+                            ? maxCalleeSaveCount
+                            : std::min(maxCalleeSaveCount, affineLoopCount);
   stats.calleeSaveSlots += calleeSaveCount;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
@@ -1989,7 +1996,17 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     regs[kv.first] = "global:" + kv.second;
 
   auto resultReg = [&]() -> std::string {
-    return isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
+    if (isArm)
+      return armResultReg(nextReg++);
+    if (regAlloc2Enabled && calleeSaveCount >= 12) {
+      static const char *regs[] = {
+        "t0", "t1", "t2", "t3", "t4",
+        "a2", "a3", "a4", "a5", "a6", "a7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+      };
+      return regs[(nextReg++) % (int)(sizeof(regs) / sizeof(regs[0]))];
+    }
+    return rvResultReg(nextReg++);
   };
   auto floatReg = [&]() -> std::string {
     return isArm ? armFloatReg(nextFloatReg++) : rvFloatReg(nextFloatReg++);
@@ -2020,11 +2037,20 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       os << "    li " << intScratchForFloatBits() << ", " << bits
          << "\n    fmv.w.x " << dst << ", " << intScratchForFloatBits() << "\n";
   };
-  std::function<void(Value, const std::string&)> spillHome =
-      [&](Value value, const std::string &reg) {
+  auto isDeferredHomeReg = [&](const std::string &reg) {
+    if (!regAlloc2Enabled || reg.size() < 2 || reg[0] != 's')
+      return false;
+    if (reg == "s8" || reg == "s9" || reg == "s10" || reg == "s11")
+      return false;
+    return true;
+  };
+  auto spillHome =
+      [&](Value value, const std::string &reg, bool force = false) {
     auto it = valueSlots.find(valueKey(value));
     if (it == valueSlots.end() || reg.empty() ||
         reg.rfind("stack:", 0) == 0 || reg.rfind("global:", 0) == 0)
+      return;
+    if (!force && isDeferredHomeReg(reg) && remainingUses[valueKey(value)] > 0)
       return;
     int64_t off = it->second;
     bool fp = isFloatType(value.type()) || looksFloatReg(reg);
@@ -2040,7 +2066,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         remainingUses[key] <= 0 || homeValid.count(key) != 0 ||
         valueByKey.count(key) == 0)
       return;
-    spillHome(valueByKey[key], reg);
+    spillHome(valueByKey[key], reg, true);
     if (callBoundary)
       stats.callBoundarySpills++;
   };
@@ -2588,6 +2614,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
   }
 
+  std::set<std::string> emittedLabels;
+  auto emitLabel = [&](const std::string &label) {
+    if (emittedLabels.insert(label).second)
+      os << label << "\n";
+  };
+
   for (auto *opPtr : funcOps) {
     if (!opPtr || opPtr->isErased()) continue;
     Operation &op = *opPtr;
@@ -2596,7 +2628,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     auto labelIt = labelsBefore.find(&op);
     if (labelIt != labelsBefore.end()) {
       for (const auto &label : labelIt->second)
-        os << label << "\n";
+        emitLabel(label);
     }
     bool operandsConsumed = false;
     auto consumeAtEnd = [&]() {
@@ -3109,7 +3141,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           os << "    addw " << dst << ", " << dst << ", " << mask << "\n";
           os << "    sraw " << dst << ", " << dst << ", " << nReg << "\n";
         }
-        os << done << ":\n";
+      emitLabel(done + ":");
       }
       if (shouldSpillDefinedValue(op.result()))
         spillHome(op.result(), dst);
@@ -3301,8 +3333,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "affine.for") {
       int loopId = loopOps[&op];
-      std::string iv = isArm ? ("w" + std::to_string(nextLoopReg++ % 10 + 19))
-                             : ("s" + std::to_string(nextLoopReg++ % 12));
+      std::string iv;
+      if (isArm) {
+        iv = "w" + std::to_string(nextLoopReg++ % 10 + 19);
+      } else if (regAlloc2Enabled && calleeSaveCount >= 12) {
+        static const char *ivRegs[] = {"s11", "s10", "s9", "s8"};
+        iv = ivRegs[(nextLoopReg++) % (int)(sizeof(ivRegs) / sizeof(ivRegs[0]))];
+      } else {
+        iv = "s" + std::to_string(nextLoopReg++ % 12);
+      }
       std::string boundScratch = isArm ? "w17" : scratchReg(1);
 
       Value ivValue = op.getRegions()[0]->getBlocks()[0]->args()[0]->value();
@@ -3310,23 +3349,23 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       bindReg(ivValue, iv);
       std::string pinnedBound = ensureReg(op.operand(1), boundScratch);
       if (!pinnedBound.empty())
-        spillHome(op.operand(1), pinnedBound);
+        spillHome(op.operand(1), pinnedBound, true);
       std::string pinnedStep = ensureReg(op.operand(2), boundScratch);
       if (!pinnedStep.empty())
-        spillHome(op.operand(2), pinnedStep);
+        spillHome(op.operand(2), pinnedStep, true);
       std::string start = reloadValue(op.operand(0), isArm ? "w16" : scratchReg(0));
 
       if (isArm) {
         os << "    mov " << iv << ", " << start << "\n";
-        spillHome(ivValue, iv);
-        os << ".Lloop_cond_" << loopId << ":\n";
+        spillHome(ivValue, iv, true);
+        emitLabel(".Lloop_cond_" + std::to_string(loopId) + ":");
         std::string bound = reloadValue(op.operand(1), boundScratch);
         os << "    cmp " << iv << ", " << bound << "\n";
         os << "    bge .Lloop_end_" << loopId << "\n";
       } else {
         os << "    mv " << iv << ", " << start << "\n";
-        spillHome(ivValue, iv);
-        os << ".Lloop_cond_" << loopId << ":\n";
+        spillHome(ivValue, iv, true);
+        emitLabel(".Lloop_cond_" + std::to_string(loopId) + ":");
         std::string bound = reloadValue(op.operand(1), boundScratch);
         os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
       }
@@ -3335,7 +3374,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "scf.while") {
       int loopId = loopOps[&op];
-      os << ".Lwhile_cond_" << loopId << ":\n";
+      emitLabel(".Lwhile_cond_" + std::to_string(loopId) + ":");
       continue;
     }
 
@@ -3364,6 +3403,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       Operation *parentFor = op.getBlock()->getRegion()->getParent();
       if (!parentFor || parentFor->name() != "affine.for") continue;
       int loopId = loopOps[parentFor];
+      bool isLoopBodyTerminator =
+          op.getBlock() && !parentFor->getRegions().empty() &&
+          op.getBlock()->getRegion() == parentFor->getRegions()[0].get();
+      if (!isLoopBodyTerminator) {
+        os << "    " << (isArm ? "b" : "j") << " .Lloop_latch_" << loopId << "\n";
+        continue;
+      }
       std::string step = ensureReg(parentFor->operand(2), scratchReg(1));
       Value ivValue = parentFor->getRegions()[0]->getBlocks()[0]->args()[0]->value();
       std::string preferredIv = loopIvRegs.count(parentFor) ? loopIvRegs[parentFor]
@@ -3378,19 +3424,19 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
 
       if (isArm) {
-        os << ".Lloop_latch_" << loopId << ":\n";
+        emitLabel(".Lloop_latch_" + std::to_string(loopId) + ":");
         os << "    add " << iv << ", " << iv << ", " << step << "\n";
         bindReg(ivValue, iv);
-        spillHome(ivValue, iv);
+        spillHome(ivValue, iv, true);
         os << "    b .Lloop_cond_" << loopId << "\n";
-        os << ".Lloop_end_" << loopId << ":\n";
+        emitLabel(".Lloop_end_" + std::to_string(loopId) + ":");
       } else {
-        os << ".Lloop_latch_" << loopId << ":\n";
+        emitLabel(".Lloop_latch_" + std::to_string(loopId) + ":");
         os << "    addw " << iv << ", " << iv << ", " << step << "\n";
         bindReg(ivValue, iv);
-        spillHome(ivValue, iv);
+        spillHome(ivValue, iv, true);
         os << "    j .Lloop_cond_" << loopId << "\n";
-        os << ".Lloop_end_" << loopId << ":\n";
+        emitLabel(".Lloop_end_" + std::to_string(loopId) + ":");
       }
       continue;
     }
@@ -3529,7 +3575,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "select true operand has no assigned register";
         return false;
       }
-      os << done << ":\n";
+        emitLabel(done + ":");
       if (shouldSpillDefinedValue(op.result()))
         spillHome(op.result(), dst);
       stats.machineOps++;
@@ -3557,16 +3603,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         bool hasElse = parent->getRegions().size() > 1;
         if (thenRegion && hasElse) {
           os << "    " << (isArm ? "b" : "j") << " .Lendif_" << ifId << "\n";
-          os << ".Lelse_" << ifId << ":\n";
+          emitLabel(".Lelse_" + std::to_string(ifId) + ":");
         } else {
-          os << ".Lendif_" << ifId << ":\n";
+          emitLabel(".Lendif_" + std::to_string(ifId) + ":");
         }
         continue;
       }
       if (parent && parent->name() == "scf.while") {
         int loopId = loopOps[parent];
         os << "    " << (isArm ? "b" : "j") << " .Lwhile_cond_" << loopId << "\n";
-        os << ".Lwhile_end_" << loopId << ":\n";
+        emitLabel(".Lwhile_end_" + std::to_string(loopId) + ":");
         continue;
       }
       continue;
@@ -3578,7 +3624,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   }
 
   for (const auto &label : functionEndLabels)
-    os << label << "\n";
+    emitLabel(label);
 
   if (stats.returns == returnsBefore)
     stats.returns++;
@@ -5289,7 +5335,159 @@ static bool applyRepeatReductionLoop(Module &module, Operation &loop,
   return true;
 }
 
+static bool isScalarLocalSlot(Value value) {
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return false;
+  if (def->name() != "sysy.alloca" && def->name() != "memref.alloca")
+    return false;
+  return value.type().str().find("memref<1xi32") != std::string::npos;
+}
+
+static bool isSelectSpeculatableOp(Operation *op) {
+  if (!op || op->isErased() || op->isTerminator() || !op->getRegions().empty())
+    return false;
+  if (isMLIRLoadOp(op))
+    return op->operandCount() > 0 && isScalarLocalSlot(op->operand(0));
+  const std::string &name = op->name();
+  return name == "arith.constant" || name == "arith.addi" ||
+         name == "arith.subi" || name == "arith.muli" ||
+         name == "arith.cmpi" || name == "rv_machine.li" ||
+         name == "rv_machine.addw" || name == "rv_machine.subw" ||
+         name == "rv_machine.mulw" || name == "rv_machine.cmp" ||
+         name == "rv_machine.and" || name == "rv_machine.or" ||
+         name == "rv_machine.xor" || name == "rv_machine.neg" ||
+         name == "rv_machine.seqz";
+}
+
+static bool promoteIfStoresToSelects(Module &module, Operation &ifOp,
+                                     SelfOptStats *stats) {
+  if (ifOp.name() != "scf.if" || ifOp.operandCount() != 1 ||
+      ifOp.getRegions().size() != 1)
+    return false;
+  if (ifOp.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block *parent = ifOp.getBlock();
+  if (!parent)
+    return false;
+  int ifIndex = operationIndexInBlock(*parent, &ifOp);
+  if (ifIndex < 0)
+    return false;
+
+  Block &thenBlock = *ifOp.getRegions()[0]->getBlocks()[0];
+  std::vector<Operation*> pureOps;
+  std::vector<std::pair<Value, Value>> stores;
+  std::set<std::string> storeSlots;
+  for (auto &owned : thenBlock.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "scf.yield")
+      continue;
+    if (isMLIRStoreOp(op)) {
+      if (op->operandCount() < 2 || !isScalarLocalSlot(op->operand(1)))
+        return false;
+      std::string slotKey = valueKey(op->operand(1));
+      if (!storeSlots.insert(slotKey).second)
+        return false;
+      stores.push_back({op->operand(1), op->operand(0)});
+      continue;
+    }
+    if (!isSelectSpeculatableOp(op))
+      return false;
+    pureOps.push_back(op);
+  }
+  if (stores.empty())
+    return false;
+
+  for (Operation *op : pureOps) {
+    if (isMLIRLoadOp(op) && op->operandCount() > 0 &&
+        storeSlots.count(valueKey(op->operand(0))) != 0)
+      return false;
+  }
+  std::set<std::string> pureResults;
+  for (Operation *op : pureOps) {
+    for (int i = 0; i < op->resultCount(); i++)
+      pureResults.insert(valueKey(op->result(i)));
+  }
+  for (const auto &store : stores) {
+    Operation *def = store.second.getDefiningOp();
+    if (def && def->getBlock() == &thenBlock &&
+        pureResults.count(valueKey(store.second)) == 0)
+      return false;
+  }
+
+  std::map<std::string, Value> valueMap;
+  std::size_t insertIndex = (std::size_t) ifIndex;
+  for (Operation *op : pureOps) {
+    auto cloned = std::make_unique<Operation>(
+        op->name(), remapOperandsForClone(*op, valueMap),
+        resultTypesOf(*op), op->attrs(), op->loc());
+    Operation &inserted = parent->insertOperation(insertIndex++, std::move(cloned));
+    for (int i = 0; i < op->resultCount(); i++)
+      valueMap[valueKey(op->result(i))] = inserted.result(i);
+  }
+
+  Context &ctx = module.context();
+  int promoted = 0;
+  for (const auto &store : stores) {
+    Value slot = store.first;
+    Value trueValue = store.second;
+    auto mapped = valueMap.find(valueKey(trueValue));
+    if (mapped != valueMap.end())
+      trueValue = mapped->second;
+    Operation *trueDef = trueValue.getDefiningOp();
+    if (trueDef && trueDef->getBlock() == &thenBlock)
+      return false;
+
+    Operation &oldValue = parent->insertOperation(
+        insertIndex++,
+        std::make_unique<Operation>("sysy.load", std::vector<Value>{slot},
+                                    std::vector<Type>{ctx.i(32)},
+                                    std::map<std::string, Attribute>{},
+                                    ifOp.loc()));
+    Operation &select = parent->insertOperation(
+        insertIndex++,
+        std::make_unique<Operation>("arith.select",
+                                    std::vector<Value>{ifOp.operand(0), trueValue,
+                                                       oldValue.result()},
+                                    std::vector<Type>{ctx.i(32)},
+                                    std::map<std::string, Attribute>{},
+                                    ifOp.loc()));
+    parent->insertOperation(
+        insertIndex++,
+        std::make_unique<Operation>("sysy.store",
+                                    std::vector<Value>{select.result(), slot},
+                                    std::vector<Type>{},
+                                    std::map<std::string, Attribute>{},
+                                    ifOp.loc()));
+    promoted++;
+  }
+
+  ifOp.markErased();
+  if (stats)
+    stats->raisedSelects += promoted;
+  return promoted > 0;
+}
+
 } // namespace
+
+void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_SELECT_PROMOTION", true))
+    return;
+  std::vector<Operation*> ifs;
+  for (auto *op : walk(module))
+    if (op && !op->isErased() && op->name() == "scf.if")
+      ifs.push_back(op);
+  bool changed = false;
+  for (Operation *op : ifs) {
+    if (!op || op->isErased())
+      continue;
+    changed |= promoteIfStoresToSelects(module, *op, stats);
+  }
+  if (changed)
+    eraseMarked(module);
+}
 
 void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_STENCIL_PEEL", true))
@@ -5318,6 +5516,14 @@ void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
     if (!changed)
       break;
   }
+}
+
+void runLoopTiling(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_TILE", true))
+    return;
+  runAffineLoopTiling(module);
+  if (stats)
+    stats->loopTiles += 0; // counting handled in collectAffineNestSummary
 }
 
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats) {
@@ -6297,6 +6503,7 @@ void collectAffineNestSummary(Module &module, SelfOptStats *stats) {
   stats->affineSummaryLoops = 0;
   stats->affineSummaryMemoryOps = 0;
   stats->affineSummarySideEffects = 0;
+  stats->loopTiles = 0;
   for (auto *op : walk(module)) {
     if (!op || op->isErased())
       continue;
@@ -6307,6 +6514,24 @@ void collectAffineNestSummary(Module &module, SelfOptStats *stats) {
       stats->affineSummaryMemoryOps++;
     if (op->name() == "sysy.call")
       stats->affineSummarySideEffects++;
+    if (op->name() == "affine.for" && op->operandCount() >= 3) {
+      auto step = op->operand(2);
+      if (step.isOperationResult()) {
+        Operation *def = step.getDefiningOp();
+        if (def && def->name() == "arith.constant") {
+          int64_t val = 0;
+          Attribute a = def->attr("value");
+          if (a) {
+            std::string s = a.str();
+            if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
+              s = s.substr(1, s.size() - 2);
+            try { val = std::stoll(s); } catch (...) { val = 0; }
+            if (val != 1)
+              stats->loopTiles++;
+          }
+        }
+      }
+    }
   }
 }
 

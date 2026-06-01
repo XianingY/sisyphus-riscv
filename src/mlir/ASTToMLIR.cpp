@@ -149,6 +149,12 @@ bool envDisabled(const char *name) {
   return value && std::string(value) == "0";
 }
 
+bool envEnabled(const char *name, bool defaultValue) {
+  if (const char *value = std::getenv(name))
+    return std::string(value) != "0";
+  return defaultValue;
+}
+
 void summarizeModule(Module &module, ProductionStats &stats) {
   stats.mlirOpsAfter = 0;
   stats.affineLoops = 0;
@@ -800,6 +806,49 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   if (envDisabled("SISY_ENABLE_SELF_TILE"))
     effective.enableLoopTiling = false;
 
+  if (!envDisabled("SISY_ENABLE_SELF_ADAPTIVE_GATE") &&
+      effective.level == OptimizationConfig::Level::O1) {
+    int initialOps = 0;
+    int loopOps = 0;
+    int callOps = 0;
+    int memOps = 0;
+    int funcs = 0;
+    for (auto *op : walk(*module)) {
+      if (!op || op->isErased())
+        continue;
+      initialOps++;
+      if (op->name() == "scf.while" || op->name() == "affine.for")
+        loopOps++;
+      else if (op->name() == "sysy.call")
+        callOps++;
+      else if (op->name() == "memref.load" || op->name() == "memref.store" ||
+               op->name() == "sysy.load" || op->name() == "sysy.store")
+        memOps++;
+      else if (op->name() == "sysy.func")
+        funcs++;
+    }
+
+    bool giantUnit = stats.hirOps > 25000 || initialOps > 90000 || funcs > 300;
+    if (giantUnit) {
+      effective.enableAffine = false;
+      effective.enableLoopTiling = false;
+      effective.enableLoopFusion = false;
+      effective.enableLoopInterchange = false;
+      effective.enableStencilPeel = false;
+      effective.enableScheduler = false;
+      if (callOps > 2000)
+        effective.enableInline = false;
+      stats.opt.walksEliminated++;
+    } else if (target == "riscv" && loopOps >= 6 && memOps >= 12 &&
+               initialOps < 6000) {
+      effective.enableScheduler = true;
+      effective.enableStencilPeel = true;
+      effective.enableLoopAddressIV = true;
+      effective.inlineThreshold = std::max(effective.inlineThreshold, 360);
+      effective.lateInlineThreshold = std::max(effective.lateInlineThreshold, 360);
+    }
+  }
+
   // 1. AST lowering
   if (effective.enableGlobalOpt) {
     runGlobalOpt(*module, &stats.opt);
@@ -808,16 +857,22 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
 
   // 2. High-level structure recovery and polyhedral preparation
   if (effective.enableAffine && !envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
-    stats.opt.affineWorklistItems += runRaiseToAffine(*module);
+    if (envEnabled("SISY_ENABLE_SELF_CONTINUE_WRAP", false))
+      runContinueToIfWrap(*module);
+    if (!envDisabled("SISY_ENABLE_SELF_RAISE_AFFINE"))
+      stats.opt.affineWorklistItems += runRaiseToAffine(*module);
+    if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", false))
+      runImperfectLoopPromotion(*module);
     if (effective.enableLoopTiling)
-      runAffineLoopTiling(*module);
-    if (effective.enableLoopFusion)
+      runLoopTiling(*module, &stats.opt);
+    if (effective.enableLoopFusion && !envDisabled("SISY_ENABLE_SELF_LOOP_FUSION"))
       runAffineLoopFusion(*module);
-    if (effective.enableLoopInterchange)
+    if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))
       runAffineLoopInterchange(*module);
   }
   if (effective.enableStencilPeel)
     runStencilPeelingAndUnroll(*module, &stats.opt);
+  runIfStoreSelectPromotion(*module, &stats.opt);
 
   // 3. Global straight-line optimizations.
   if (effective.enableGlobalOpt) {
