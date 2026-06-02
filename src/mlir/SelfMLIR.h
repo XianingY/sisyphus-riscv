@@ -307,6 +307,11 @@ struct SelfOptStats {
   int linearScanSpills = 0;
   int loopAddressCSE = 0;
   int schedulerMoves = 0;
+  int polyNests = 0;
+  int polyDepsProved = 0;
+  int polyPermutations = 0;
+  int polyTiles = 0;
+  int reductionBlocks = 0;
   int interiorPeels = 0;
   int kernelUnrolls = 0;
   int imperfectInterchanges = 0;
@@ -359,6 +364,8 @@ void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats = nullptr);
 void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats = nullptr);
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats = nullptr);
 void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
+void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats = nullptr);
+void runParityProductCompareStrength(Module &module, SelfOptStats *stats = nullptr);
 void collectAffineNestSummary(Module &module, SelfOptStats *stats = nullptr);
 void runLoopLocalScheduler(Module &module, SelfOptStats *stats = nullptr);
 void runLoopVectorization(Module &module);
@@ -456,6 +463,7 @@ struct NativeAsmStats {
   int memoFallbacks = 0;
   int loopAddressCSE = 0;
   int schedulerMoves = 0;
+  int lsraWeightedSpills = 0;
   bool emitted = false;
   int semanticKernels = 0;
   int triangularTransposeKernels = 0;

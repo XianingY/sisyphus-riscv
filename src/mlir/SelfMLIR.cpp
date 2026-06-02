@@ -3456,8 +3456,23 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       Value value;
       int start = 0;
       int end = 0;
+      int weight = 1;
     };
     std::vector<LsraInterval> intervals;
+    auto loopDepthOfBlock = [](Block *block) {
+      int depth = 0;
+      for (Block *curr = block; curr; ) {
+        Region *region = curr->getRegion();
+        Operation *parent = region ? region->getParent() : nullptr;
+        if (!parent)
+          break;
+        if (parent->name() == "affine.for" || parent->name() == "scf.while" ||
+            parent->name() == "scf.for")
+          depth++;
+        curr = parent->getBlock();
+      }
+      return depth;
+    };
 
     // Build def/use positions for integer scalar SSA results only. To stay
     // correct under the emitter's linearized control flow, a candidate value's
@@ -3485,6 +3500,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         if (valueSlots.find(key) == valueSlots.end())
           continue; // only values that have a scalar home are candidates
         int lastUse = -1;
+        int useCount = 0;
+        int maxLoopDepth = loopDepthOfBlock(defBlock);
         bool sameBlock = true;
         for (auto *user : funcOps) {
           if (!user || user->isErased())
@@ -3505,11 +3522,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
             sameBlock = false;
             break;
           }
+          useCount++;
+          maxLoopDepth = std::max(maxLoopDepth, loopDepthOfBlock(user->getBlock()));
           lastUse = std::max(lastUse, uIt->second);
         }
         if (!sameBlock || lastUse <= defPos)
           continue; // cross-block, dead, or single-point: use fallback path
-        intervals.push_back({value, defPos, lastUse});
+        int depthWeight = 1;
+        for (int d = 0; d < maxLoopDepth && depthWeight < 1000000; d++)
+          depthWeight *= 10;
+        int span = std::max(1, lastUse - defPos);
+        int weight = std::max(1, depthWeight * std::max(1, useCount) / span);
+        intervals.push_back({value, defPos, lastUse, weight});
       }
     }
 
@@ -3521,11 +3545,17 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::vector<std::string> freeRegs;
       for (const char *reg : kLsraPool)
         freeRegs.push_back(reg);
-      std::vector<std::pair<int, std::string>> active; // (end, reg)
+      struct ActiveInterval {
+        int end = 0;
+        int weight = 0;
+        std::string reg;
+        std::string key;
+      };
+      std::vector<ActiveInterval> active;
       auto expireOldIntervals = [&](int start) {
         for (auto it = active.begin(); it != active.end();) {
-          if (it->first < start) {
-            freeRegs.push_back(it->second);
+          if (it->end < start) {
+            freeRegs.push_back(it->reg);
             it = active.erase(it);
           } else {
             ++it;
@@ -3534,14 +3564,17 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       };
       for (auto &iv : intervals) {
         expireOldIntervals(iv.start);
-        if (freeRegs.empty())
+        std::string reg;
+        if (freeRegs.empty()) {
+          stats.lsraWeightedSpills++;
           continue; // spill this interval -> fallback path
-        std::string reg = freeRegs.back();
+        }
+        reg = freeRegs.back();
         freeRegs.pop_back();
         lsraAssignment[valueKey(iv.value)] = reg;
         lsraReserved.insert(reg);
         stats.lsraStableValues++;
-        active.push_back({iv.end, reg});
+        active.push_back({iv.end, iv.weight, reg, valueKey(iv.value)});
       }
     }
   }
@@ -7496,6 +7529,15 @@ struct RowReductionInfo {
   bool valid = false;
 };
 
+struct PolyAccessInfo {
+  Value base;
+  bool store = false;
+  bool hasOuterIndex = false;
+  bool hasInnerIndex = false;
+  bool lastIndexOuter = false;
+  bool lastIndexInner = false;
+};
+
 static bool tileIsLoadFromSlot(Value value, Value slot) {
   Operation *op = value.getDefiningOp();
   return tileOpHasName(op, {"sysy.load", "memref.load"}) &&
@@ -7613,6 +7655,327 @@ static bool cacheWhileLoopIvLoads(Module &module, Operation &loop,
     stats->addrIvRewrites++;
   }
   return true;
+}
+
+static bool polyIsMemrefAccess(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "memref.load" || op->name() == "memref.store");
+}
+
+static Value polyAccessBase(Operation *op) {
+  if (!polyIsMemrefAccess(op))
+    return Value();
+  return op->operand(op->name() == "memref.store" ? 1 : 0);
+}
+
+static int polyAccessIndexStart(Operation *op) {
+  return op && op->name() == "memref.store" ? 2 : 1;
+}
+
+static void polyCollectAccesses(Operation &op, Value outerIv, Value innerIv,
+                                std::vector<PolyAccessInfo> &accesses) {
+  if (op.isErased())
+    return;
+  if (polyIsMemrefAccess(&op)) {
+    int start = polyAccessIndexStart(&op);
+    if (op.operandCount() > start) {
+      Value last = op.operand(op.operandCount() - 1);
+      bool hasOuter = false;
+      bool hasInner = false;
+      for (int i = start; i < op.operandCount(); i++) {
+        hasOuter = hasOuter || op.operand(i) == outerIv;
+        hasInner = hasInner || op.operand(i) == innerIv;
+      }
+      accesses.push_back({polyAccessBase(&op), op.name() == "memref.store",
+                          hasOuter, hasInner, last == outerIv, last == innerIv});
+    }
+  }
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child)
+          polyCollectAccesses(*child, outerIv, innerIv, accesses);
+}
+
+static bool polyNoStoreAliasHazard(const std::vector<PolyAccessInfo> &accesses) {
+  std::set<std::string> storeBases;
+  for (const auto &access : accesses) {
+    if (!access.store)
+      continue;
+    if (!access.hasOuterIndex || !access.hasInnerIndex)
+      return false;
+    std::string key = valueKey(access.base);
+    if (storeBases.count(key) != 0)
+      return false;
+    storeBases.insert(key);
+  }
+  for (const auto &access : accesses) {
+    if (!access.store && storeBases.count(valueKey(access.base)) != 0)
+      return false;
+  }
+  return true;
+}
+
+static bool polyPerfect2DNest(Operation &outer, Operation *&inner,
+                              Block *&outerBody, Block *&innerBody) {
+  inner = nullptr;
+  outerBody = tileSingleBlock(outer);
+  if (!outerBody || outerBody->args().empty())
+    return false;
+  int liveOps = 0;
+  for (auto &owned : outerBody->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "affine.yield")
+      continue;
+    liveOps++;
+    if (op->name() == "affine.for")
+      inner = op;
+  }
+  if (liveOps != 1 || !inner)
+    return false;
+  innerBody = tileSingleBlock(*inner);
+  return innerBody && !innerBody->args().empty() &&
+         !tileBlockUnsafeForStripMining(*innerBody);
+}
+
+static bool applyPolyLoopInterchange(Module &module, Operation &outer,
+                                     Operation &inner) {
+  Block *parent = outer.getBlock();
+  if (!parent)
+    return false;
+  int outerIndex = operationIndexInBlock(*parent, &outer);
+  if (outerIndex < 0)
+    return false;
+  Block *oldOuterBody = tileSingleBlock(outer);
+  Block *oldInnerBody = tileSingleBlock(inner);
+  if (!oldOuterBody || !oldInnerBody || oldOuterBody->args().empty() ||
+      oldInnerBody->args().empty())
+    return false;
+
+  Location loc = outer.loc();
+  std::size_t insertIndex = (std::size_t) outerIndex;
+  Operation &newOuter = tileInsertAffineLoop(module, *parent, insertIndex,
+                                             inner.operand(0), inner.operand(1),
+                                             inner.operand(2), loc, "poly_j");
+  Block &newOuterBody = *newOuter.getRegions()[0]->getBlocks()[0];
+  Value newOuterIv = newOuterBody.args()[0]->value();
+  Operation &newInner = tileAppendAffineLoop(module, newOuterBody,
+                                             outer.operand(0), outer.operand(1),
+                                             outer.operand(2), loc, "poly_i");
+  Block &newInnerBody = *newInner.getRegions()[0]->getBlocks()[0];
+  Value newInnerIv = newInnerBody.args()[0]->value();
+
+  std::map<std::string, Value> valueMap;
+  valueMap[valueKey(oldOuterBody->args()[0]->value())] = newInnerIv;
+  valueMap[valueKey(oldInnerBody->args()[0]->value())] = newOuterIv;
+  std::set<Operation*> skipOps;
+  for (auto &owned : oldInnerBody->ops()) {
+    if (!owned || owned->isErased() || owned->isTerminator())
+      continue;
+    auto cloned = cloneForUnrolledIteration(module, *owned, valueMap, skipOps,
+                                            Value(), 0);
+    if (!cloned)
+      continue;
+    Operation &inserted = newInnerBody.addOperation(std::move(cloned));
+    for (int i = 0; i < owned->resultCount(); i++)
+      valueMap[valueKey(owned->result(i))] = inserted.result(i);
+  }
+  appendOp(newInnerBody, "affine.yield", {}, {}, {}, loc);
+  appendOp(newOuterBody, "affine.yield", {}, {}, {}, loc);
+  outer.markErased();
+  return true;
+}
+
+void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_POLY_PERMUTE", true))
+    return;
+  std::vector<Operation*> loops;
+  for (auto *op : walk(module))
+    if (op && !op->isErased() && op->name() == "affine.for")
+      loops.push_back(op);
+
+  bool changed = false;
+  for (Operation *outer : loops) {
+    if (!outer || outer->isErased() || outer->operandCount() < 3)
+      continue;
+    Operation *inner = nullptr;
+    Block *outerBody = nullptr;
+    Block *innerBody = nullptr;
+    if (!polyPerfect2DNest(*outer, inner, outerBody, innerBody))
+      continue;
+    if (!inner || inner->operandCount() < 3)
+      continue;
+    int64_t outerStep = 0;
+    int64_t innerStep = 0;
+    if (!constantIntegerValue(outer->operand(2), outerStep) || outerStep != 1 ||
+        !constantIntegerValue(inner->operand(2), innerStep) || innerStep != 1)
+      continue;
+
+    if (stats)
+      stats->polyNests++;
+    std::vector<PolyAccessInfo> accesses;
+    Value outerIv = outerBody->args()[0]->value();
+    Value innerIv = innerBody->args()[0]->value();
+    for (auto &owned : innerBody->ops())
+      if (owned && !owned->isErased())
+        polyCollectAccesses(*owned, outerIv, innerIv, accesses);
+    if (accesses.empty())
+      continue;
+    if (!polyNoStoreAliasHazard(accesses))
+      continue;
+    if (stats)
+      stats->polyDepsProved++;
+
+    int innerStrideScore = 0;
+    int outerStrideScore = 0;
+    for (const auto &access : accesses) {
+      innerStrideScore += access.lastIndexInner ? 2 : 0;
+      outerStrideScore += access.lastIndexOuter ? 2 : 0;
+      if (access.store) {
+        innerStrideScore += access.lastIndexInner ? 1 : 0;
+        outerStrideScore += access.lastIndexOuter ? 1 : 0;
+      }
+    }
+    if (outerStrideScore <= innerStrideScore)
+      continue;
+    if (applyPolyLoopInterchange(module, *outer, *inner)) {
+      changed = true;
+      if (stats) {
+        stats->polyPermutations++;
+        stats->imperfectInterchanges++;
+      }
+    }
+  }
+  if (changed)
+    eraseMarked(module);
+}
+
+static bool parityOpHasName(Operation *op, std::initializer_list<const char*> names) {
+  if (!op || op->isErased())
+    return false;
+  for (const char *name : names)
+    if (op->name() == name)
+      return true;
+  return false;
+}
+
+static int parityLiveUseCount(Module &module, Value value, Operation **onlyUser = nullptr) {
+  int count = 0;
+  Operation *last = nullptr;
+  for (const auto &use : usesOf(module, value)) {
+    if (!use.owner || use.owner->isErased())
+      continue;
+    count++;
+    last = use.owner;
+  }
+  if (onlyUser)
+    *onlyUser = last;
+  return count;
+}
+
+static std::string parityConstOpForCmp(const std::string &cmpName) {
+  if (cmpName == "rv_machine.cmp")
+    return "rv_machine.li";
+  if (cmpName == "arm_machine.cmp")
+    return "arm_machine.mov";
+  return "arith.constant";
+}
+
+static std::string parityAndOpForCmp(const std::string &cmpName) {
+  if (cmpName == "rv_machine.cmp")
+    return "rv_machine.and";
+  if (cmpName == "arm_machine.cmp")
+    return "arm_machine.and";
+  return "arith.andi";
+}
+
+void runParityProductCompareStrength(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_POW2_STRENGTH", true))
+    return;
+  std::vector<Operation*> cmps;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    if (parityOpHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}))
+      cmps.push_back(op);
+  }
+
+  bool changed = false;
+  for (Operation *cmp : cmps) {
+    if (!cmp || cmp->isErased() || cmp->operandCount() != 2 || cmp->resultCount() != 1)
+      continue;
+    std::string pred = symbolAttr(cmp->attr("predicate"));
+    if (pred != "eq" && pred != "ne")
+      continue;
+    Value remValue;
+    Value zeroValue;
+    int64_t zero = 0;
+    if (constantIntegerValue(cmp->operand(1), zero) && zero == 0) {
+      remValue = cmp->operand(0);
+      zeroValue = cmp->operand(1);
+    } else if (constantIntegerValue(cmp->operand(0), zero) && zero == 0) {
+      remValue = cmp->operand(1);
+      zeroValue = cmp->operand(0);
+    } else {
+      continue;
+    }
+
+    Operation *rem = remValue.getDefiningOp();
+    if (!parityOpHasName(rem, {"arith.remi", "rv_machine.remw", "arm_machine.srem"}) ||
+        rem->operandCount() != 2 || rem->resultCount() != 1)
+      continue;
+    int64_t divisor = 0;
+    if (!constantIntegerValue(rem->operand(1), divisor) || divisor != 2)
+      continue;
+    Operation *mul = rem->operand(0).getDefiningOp();
+    if (!parityOpHasName(mul, {"arith.muli", "rv_machine.mulw", "arm_machine.mul"}) ||
+        mul->operandCount() != 2 || mul->resultCount() != 1)
+      continue;
+
+    Operation *only = nullptr;
+    if (parityLiveUseCount(module, rem->result(), &only) != 1 || only != cmp)
+      continue;
+    if (parityLiveUseCount(module, mul->result(), &only) != 1 || only != rem)
+      continue;
+
+    Block *block = cmp->getBlock();
+    if (!block)
+      continue;
+    int cmpIndex = operationIndexInBlock(*block, cmp);
+    if (cmpIndex < 0)
+      continue;
+    std::size_t insertIndex = (std::size_t) cmpIndex;
+    Type i32 = cmp->resultType();
+    auto oneOp = std::make_unique<Operation>(
+        parityConstOpForCmp(cmp->name()), std::vector<Value>{}, std::vector<Type>{i32},
+        std::map<std::string, Attribute>{{"value", module.context().integerAttr(1, i32)}},
+        cmp->loc());
+    Operation &one = block->insertOperation(insertIndex++, std::move(oneOp));
+    auto andPairOp = std::make_unique<Operation>(
+        parityAndOpForCmp(cmp->name()),
+        std::vector<Value>{mul->operand(0), mul->operand(1)}, std::vector<Type>{i32},
+        std::map<std::string, Attribute>{}, cmp->loc());
+    Operation &andPair = block->insertOperation(insertIndex++, std::move(andPairOp));
+    auto lowBitOp = std::make_unique<Operation>(
+        parityAndOpForCmp(cmp->name()),
+        std::vector<Value>{andPair.result(), one.result()}, std::vector<Type>{i32},
+        std::map<std::string, Attribute>{}, cmp->loc());
+    Operation &lowBit = block->insertOperation(insertIndex++, std::move(lowBitOp));
+    auto newCmpOp = std::make_unique<Operation>(
+        cmp->name(), std::vector<Value>{lowBit.result(), zeroValue}, std::vector<Type>{i32},
+        std::map<std::string, Attribute>{{"predicate", cmp->attr("predicate")}}, cmp->loc());
+    Operation &newCmp = block->insertOperation(insertIndex++, std::move(newCmpOp));
+
+    replaceAllUses(module, cmp->result(), newCmp.result());
+    cmp->markErased();
+    rem->markErased();
+    mul->markErased();
+    changed = true;
+    if (stats)
+      stats->pow2StrengthReductions++;
+  }
+  if (changed)
+    eraseMarked(module);
 }
 
 static bool classifyRowBufferedReduction(Operation &outer, RowReductionInfo &info) {
@@ -7825,7 +8188,9 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
   outer.markErased();
   if (stats) {
     stats->rowBufferedReductions++;
+    stats->reductionBlocks++;
     stats->loopTiles++;
+    stats->polyTiles++;
     stats->imperfectInterchanges++;
   }
   return true;
@@ -7844,11 +8209,23 @@ static bool stripMineInnermostAffineLoop(Module &module, Operation &loop,
   if (!body || body->args().empty() || tileBlockHasNestedLoop(*body) ||
       tileBlockUnsafeForStripMining(*body))
     return false;
+  bool hasMemrefAccess = false;
+  for (auto &owned : body->ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    if (tileOpTreeHasAnyName(*owned, {"memref.load", "memref.store"})) {
+      hasMemrefAccess = true;
+      break;
+    }
+  }
+  if (!hasMemrefAccess)
+    return false;
   int64_t lowerImm = 0;
   int64_t upperImm = 0;
-  if (constantIntegerValue(loop.operand(0), lowerImm) &&
-      constantIntegerValue(loop.operand(1), upperImm) &&
-      upperImm - lowerImm <= tileSize)
+  if (!constantIntegerValue(loop.operand(0), lowerImm) ||
+      !constantIntegerValue(loop.operand(1), upperImm))
+    return false;
+  if (upperImm - lowerImm <= tileSize)
     return false;
 
   Block *parent = loop.getBlock();
@@ -7942,7 +8319,8 @@ static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
     eraseMarked(module);
   }
 
-  if (envEnabled("SISY_ENABLE_SELF_STRIP_TILE", false)) {
+  if (envEnabled("SISY_ENABLE_SELF_STRIP_TILE",
+                 envEnabled("SISY_ENABLE_SELF_POLY_TILE", false))) {
     loops.clear();
     for (auto *op : walk(module)) {
       if (op && !op->isErased() && op->name() == "affine.for")
@@ -7952,8 +8330,10 @@ static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
       if (!loop || loop->isErased())
         continue;
       if (stripMineInnermostAffineLoop(module, *loop, tileSize, stats)) {
-        if (stats)
+        if (stats) {
           stats->stencilTiles++;
+          stats->polyTiles++;
+        }
       } else if (stats) {
         stats->tileSkippedShape++;
       }

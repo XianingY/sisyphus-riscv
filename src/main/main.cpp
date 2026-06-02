@@ -354,6 +354,11 @@ int main(int argc, char **argv) {
               << " linear-scan-spills=" << selfMLIRStats.opt.linearScanSpills
               << " loop-address-cse=" << selfMLIRStats.opt.loopAddressCSE
               << " addr-iv-rewrites=" << selfMLIRStats.opt.addrIvRewrites
+              << " poly-nests=" << selfMLIRStats.opt.polyNests
+              << " poly-deps-proved=" << selfMLIRStats.opt.polyDepsProved
+              << " poly-permutations=" << selfMLIRStats.opt.polyPermutations
+              << " poly-tiles=" << selfMLIRStats.opt.polyTiles
+              << " reduction-blocks=" << selfMLIRStats.opt.reductionBlocks
               << " interior-peels=" << selfMLIRStats.opt.interiorPeels
               << " kernel-unrolls=" << selfMLIRStats.opt.kernelUnrolls
               << " imperfect-interchanges=" << selfMLIRStats.opt.imperfectInterchanges
@@ -424,6 +429,7 @@ int main(int argc, char **argv) {
               << " memo-fallbacks=" << asmStats.memoFallbacks
               << " loop-address-cse=" << asmStats.loopAddressCSE
               << " scheduler-moves=" << asmStats.schedulerMoves
+              << " lsra-weighted-spills=" << asmStats.lsraWeightedSpills
               << " semantic-kernels=" << asmStats.semanticKernels
               << " triangular-transpose-kernels=" << asmStats.triangularTransposeKernels
               << " modular-multiply-kernels=" << asmStats.modularMultiplyKernels

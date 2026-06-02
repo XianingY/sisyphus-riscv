@@ -803,6 +803,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     effective.enableStencilPeel = false;
   if (envDisabled("SISY_ENABLE_SELF_ADDR_IV"))
     effective.enableLoopAddressIV = false;
+  if (envDisabled("SISY_ENABLE_SELF_POLY_TILE"))
+    effective.enableLoopTiling = false;
+  if (envDisabled("SISY_ENABLE_SELF_POLY_PERMUTE"))
+    effective.enableLoopInterchange = false;
   if (envEnabled("SISY_ENABLE_SELF_TILE", effective.enableLoopTiling))
     effective.enableLoopTiling = true;
   if (envDisabled("SISY_ENABLE_SELF_TILE"))
@@ -873,7 +877,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     if (effective.enableLoopFusion && !envDisabled("SISY_ENABLE_SELF_LOOP_FUSION"))
       runAffineLoopFusion(*module);
     if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))
-      runAffineLoopInterchange(*module);
+      runPolyhedralLoopPermutation(*module, &stats.opt);
   }
   if (effective.enableStencilPeel)
     runStencilPeelingAndUnroll(*module, &stats.opt);
@@ -959,6 +963,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   stats.conversionConverted = convStats.converted;
   stats.conversionFailed = convStats.failed;
   stats.conversionRollbacks = convStats.rollbacks;
+  if (effective.enablePow2Strength)
+    runParityProductCompareStrength(*module, &stats.opt);
   summarizeModule(*module, stats);
   if (dump) {
     *dump << "===== self-MLIR production =====\n";
