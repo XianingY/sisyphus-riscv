@@ -358,6 +358,10 @@ int main(int argc, char **argv) {
               << " imperfect-interchanges=" << selfMLIRStats.opt.imperfectInterchanges
               << " loop-tiles=" << selfMLIRStats.opt.loopTiles
               << " tile-loops=" << selfMLIRStats.opt.loopTiles
+              << " tile-skipped-alias=" << selfMLIRStats.opt.tileSkippedAlias
+              << " tile-skipped-shape=" << selfMLIRStats.opt.tileSkippedShape
+              << " stencil-tiles=" << selfMLIRStats.opt.stencilTiles
+              << " row-buffered-reductions=" << selfMLIRStats.opt.rowBufferedReductions
               << " slider-loads-saved=" << selfMLIRStats.opt.sliderLoadsSaved
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted

@@ -310,6 +310,10 @@ struct SelfOptStats {
   int kernelUnrolls = 0;
   int imperfectInterchanges = 0;
   int loopTiles = 0;
+  int tileSkippedAlias = 0;
+  int tileSkippedShape = 0;
+  int stencilTiles = 0;
+  int rowBufferedReductions = 0;
   int addrIvRewrites = 0;
   int sliderLoadsSaved = 0;
 };

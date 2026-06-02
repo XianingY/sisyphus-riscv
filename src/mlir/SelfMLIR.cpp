@@ -53,7 +53,7 @@ OptimizationConfig OptimizationConfig::forLevel(Level level) {
     config.enableRotateHelper = true;
     config.enablePow2Strength = true;
     config.enableScheduler = true;
-    config.enableLoopTiling = false;
+    config.enableLoopTiling = true;
     config.enableLoopFusion = true;
     config.enableLoopInterchange = true;
     config.enableStencilPeel = true;
@@ -5522,12 +5522,635 @@ void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
   }
 }
 
+static bool tileOpHasName(Operation *op, std::initializer_list<const char*> names) {
+  if (!op)
+    return false;
+  for (const char *name : names) {
+    if (op->name() == name)
+      return true;
+  }
+  return false;
+}
+
+static Block *tileSingleBlock(Operation &op) {
+  if (op.getRegions().size() != 1 || op.getRegions()[0]->getBlocks().size() != 1)
+    return nullptr;
+  return op.getRegions()[0]->getBlocks()[0].get();
+}
+
+static Value tileFirstBlockArg(Operation &op) {
+  Block *block = tileSingleBlock(op);
+  if (!block || block->args().empty())
+    return Value();
+  return block->args()[0]->value();
+}
+
+static bool tileOpTreeHasAnyName(Operation &op, std::initializer_list<const char*> names) {
+  if (tileOpHasName(&op, names))
+    return true;
+  for (auto &region : op.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &child : block->ops()) {
+        if (child && tileOpTreeHasAnyName(*child, names))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool tileBlockHasNestedLoop(Block &block) {
+  for (auto &owned : block.ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    if (tileOpHasName(owned.get(), {"affine.for", "scf.while", "scf.for"}))
+      return true;
+    for (auto &region : owned->getRegions()) {
+      for (auto &childBlock : region->getBlocks()) {
+        if (tileBlockHasNestedLoop(*childBlock))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool tileBlockUnsafeForStripMining(Block &block) {
+  for (auto &owned : block.ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    if (tileOpHasName(owned.get(), {"sysy.call", "sysy.return", "sysy.break",
+                                    "sysy.continue", "scf.if", "scf.while",
+                                    "scf.for", "affine.for", "scf.condition",
+                                    "sysy.alloca", "memref.alloca"}))
+      return true;
+    for (auto &region : owned->getRegions()) {
+      for (auto &childBlock : region->getBlocks()) {
+        if (tileBlockUnsafeForStripMining(*childBlock))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static Operation *tileSingleDirectAffineChild(Block &block) {
+  Operation *found = nullptr;
+  for (auto &owned : block.ops()) {
+    if (!owned || owned->isErased() || owned->name() != "affine.for")
+      continue;
+    if (found)
+      return nullptr;
+    found = owned.get();
+  }
+  return found;
+}
+
+static Value tileAppendIntConstant(Module &module, Block &block, int64_t value,
+                                   Location loc) {
+  Operation &op = appendOp(
+      block, "rv_machine.li", {}, {module.context().i(32)},
+      {{"value", module.context().integerAttr(value, module.context().i(32))}},
+      loc);
+  return op.result();
+}
+
+static Value tileMaterializeValue(Module &module, Block &block, Value value,
+                                  Location loc) {
+  int64_t imm = 0;
+  if (constantIntegerValue(value, imm))
+    return tileAppendIntConstant(module, block, imm, loc);
+  Operation *def = value.getDefiningOp();
+  if (def && !def->isErased() && def->resultCount() == 1 &&
+      tileOpHasName(def, {"sysy.load", "memref.load", "rv_machine.li",
+                          "arith.constant", "arith.addi", "arith.subi",
+                          "rv_machine.addw", "rv_machine.subw"})) {
+    Operation &clone = appendOp(block, def->name(), def->getOperands(),
+                                resultTypesOf(*def), def->attrs(), loc);
+    return clone.result();
+  }
+  return value;
+}
+
+static Operation &tileAppendAffineLoop(Module &module, Block &block, Value lower,
+                                       Value upper, Value step, Location loc,
+                                       const std::string &ivName) {
+  Operation &loop = appendOp(block, "affine.for", {lower, upper, step}, {},
+                             {}, loc, 1);
+  loop.getRegions()[0]->addBlock().addArgument(module.context().i(32), loc, ivName);
+  return loop;
+}
+
+static Operation &tileInsertAffineLoop(Module &module, Block &block, std::size_t &index,
+                                       Value lower, Value upper, Value step,
+                                       Location loc, const std::string &ivName) {
+  Operation &loop = insertOp(block, index, "affine.for", {lower, upper, step},
+                             {}, {}, loc, 1);
+  loop.getRegions()[0]->addBlock().addArgument(module.context().i(32), loc, ivName);
+  return loop;
+}
+
+static Value tileAppendMinValue(Module &module, Block &block, Value lhs, Value rhs,
+                                Location loc) {
+  Operation &cmp = appendOp(
+      block, "rv_machine.cmp", {lhs, rhs}, {module.context().i(32)},
+      {{"predicate", module.context().stringAttr("gt")}}, loc);
+  Operation &sel = appendOp(block, "arith.select", {cmp.result(), rhs, lhs},
+                            {module.context().i(32)}, {}, loc);
+  return sel.result();
+}
+
+static bool tileSame2DIndices(Operation *op, Value first, Value second,
+                              int firstOperandIndex) {
+  return op && op->operandCount() > firstOperandIndex + 1 &&
+         op->operand(firstOperandIndex) == first &&
+         op->operand(firstOperandIndex + 1) == second;
+}
+
+struct RowReductionInfo {
+  Operation *outer = nullptr;
+  Operation *jLoop = nullptr;
+  Operation *kLoop = nullptr;
+  Operation *finalStore = nullptr;
+  Operation *lhsLoad = nullptr;
+  Operation *rhsLoad = nullptr;
+  bool valid = false;
+};
+
+static bool tileIsLoadFromSlot(Value value, Value slot) {
+  Operation *op = value.getDefiningOp();
+  return tileOpHasName(op, {"sysy.load", "memref.load"}) &&
+         op->operandCount() > 0 && op->operand(0) == slot;
+}
+
+static bool tileIsStoreToSlot(Operation *op, Value slot) {
+  return tileOpHasName(op, {"sysy.store", "memref.store"}) &&
+         op->operandCount() >= 2 && op->operand(1) == slot;
+}
+
+static bool tileOpTreeStoresSlot(Operation &op, Value slot) {
+  if (tileIsStoreToSlot(&op, slot))
+    return true;
+  for (auto &region : op.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &child : block->ops()) {
+        if (child && tileOpTreeStoresSlot(*child, slot))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool tileValueIsSlotPlusConst(Value value, Value slot) {
+  Operation *op = value.getDefiningOp();
+  if (!tileOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) ||
+      op->operandCount() != 2)
+    return false;
+  auto isLoad = [&](Value v) { return tileIsLoadFromSlot(v, slot); };
+  int64_t imm = 0;
+  return (isLoad(op->operand(0)) && constantIntegerValue(op->operand(1), imm)) ||
+         (isLoad(op->operand(1)) && constantIntegerValue(op->operand(0), imm));
+}
+
+static void tileReplaceLoadsFromSlot(Module &module, Operation &op, Value slot,
+                                     Value replacement, int &count) {
+  if (tileOpHasName(&op, {"sysy.load", "memref.load"}) &&
+      op.operandCount() > 0 && op.operand(0) == slot && op.resultCount() == 1) {
+    replaceAllUses(module, op.result(), replacement);
+    op.markErased();
+    count++;
+    return;
+  }
+  for (auto &region : op.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &child : block->ops()) {
+        if (child && !child->isErased())
+          tileReplaceLoadsFromSlot(module, *child, slot, replacement, count);
+      }
+    }
+  }
+}
+
+static bool cacheWhileLoopIvLoads(Module &module, Operation &loop,
+                                  SelfOptStats *stats) {
+  if (loop.name() != "scf.while" || loop.getRegions().size() < 2 ||
+      loop.getRegions()[0]->getBlocks().empty() ||
+      loop.getRegions()[1]->getBlocks().empty())
+    return false;
+  Block &cond = *loop.getRegions()[0]->getBlocks()[0];
+  Block &body = *loop.getRegions()[1]->getBlocks()[0];
+  if (tileBlockHasNestedLoop(body))
+    return false;
+  if (cond.ops().empty() || cond.ops().back()->name() != "scf.condition" ||
+      cond.ops().back()->operandCount() == 0)
+    return false;
+  Operation *cmp = cond.ops().back()->operand(0).getDefiningOp();
+  if (!tileOpHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) ||
+      cmp->operandCount() < 2)
+    return false;
+  Operation *condLoad = cmp->operand(0).getDefiningOp();
+  if (!tileOpHasName(condLoad, {"sysy.load", "memref.load"}) ||
+      condLoad->operandCount() == 0 || condLoad->resultCount() != 1)
+    return false;
+  Value slot = condLoad->operand(0);
+
+  int stepIndex = -1;
+  for (std::size_t i = 0; i < body.ops().size(); i++) {
+    Operation *op = body.ops()[i].get();
+    if (!op || op->isErased())
+      continue;
+    if (tileIsStoreToSlot(op, slot)) {
+      if (!tileValueIsSlotPlusConst(op->operand(0), slot))
+        return false;
+      if (stepIndex >= 0)
+        return false;
+      stepIndex = (int) i;
+    } else if (tileOpTreeStoresSlot(*op, slot)) {
+      return false;
+    }
+  }
+  if (stepIndex <= 0)
+    return false;
+
+  std::size_t insertIndex = 0;
+  Operation &cached = insertOp(body, insertIndex, condLoad->name(), {slot},
+                               resultTypesOf(*condLoad), condLoad->attrs(),
+                               loop.loc());
+  stepIndex++;
+  int replaced = 0;
+  for (int i = 1; i < stepIndex && i < (int) body.ops().size(); i++) {
+    Operation *op = body.ops()[(std::size_t) i].get();
+    if (!op || op->isErased())
+      continue;
+    tileReplaceLoadsFromSlot(module, *op, slot, cached.result(), replaced);
+  }
+  if (replaced == 0) {
+    cached.markErased();
+    return false;
+  }
+  if (stats) {
+    stats->loopAddressCSE += replaced;
+    stats->addrIvRewrites++;
+  }
+  return true;
+}
+
+static bool classifyRowBufferedReduction(Operation &outer, RowReductionInfo &info) {
+  if (outer.name() != "affine.for" || outer.operandCount() < 3)
+    return false;
+  int64_t step = 0;
+  if (!constantIntegerValue(outer.operand(2), step) || step != 1)
+    return false;
+  Block *outerBody = tileSingleBlock(outer);
+  if (!outerBody || outerBody->args().empty())
+    return false;
+  Operation *jLoop = tileSingleDirectAffineChild(*outerBody);
+  if (!jLoop || jLoop->operandCount() < 3)
+    return false;
+  if (tileOpTreeHasAnyName(*jLoop, {"sysy.call", "sysy.return", "sysy.break",
+                                    "sysy.continue", "scf.if", "scf.while"}))
+    return false;
+  int64_t jStep = 0;
+  if (!constantIntegerValue(jLoop->operand(2), jStep) || jStep != 1)
+    return false;
+  Block *jBody = tileSingleBlock(*jLoop);
+  if (!jBody || jBody->args().empty())
+    return false;
+  Operation *kLoop = tileSingleDirectAffineChild(*jBody);
+  if (!kLoop || kLoop->operandCount() < 3)
+    return false;
+  int64_t kStep = 0;
+  if (!constantIntegerValue(kLoop->operand(2), kStep) || kStep != 1)
+    return false;
+  Block *kBody = tileSingleBlock(*kLoop);
+  if (!kBody || kBody->args().empty() || tileBlockHasNestedLoop(*kBody))
+    return false;
+
+  Value iIv = tileFirstBlockArg(outer);
+  Value jIv = tileFirstBlockArg(*jLoop);
+  Value kIv = tileFirstBlockArg(*kLoop);
+
+  std::vector<Value> accumulatorCandidates;
+  for (auto &owned : jBody->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (tileOpHasName(op, {"sysy.alloca", "memref.alloca"}) &&
+        op->resultCount() == 1 && isScalarWordMemref(op->resultType()))
+      accumulatorCandidates.push_back(op->result());
+  }
+  if (accumulatorCandidates.empty())
+    return false;
+
+  Operation *finalStore = nullptr;
+  Operation *sumStore = nullptr;
+  Operation *lhsLoad = nullptr;
+  Operation *rhsLoad = nullptr;
+  for (Value sumSlot : accumulatorCandidates) {
+    finalStore = nullptr;
+    sumStore = nullptr;
+    lhsLoad = nullptr;
+    rhsLoad = nullptr;
+
+    for (auto &owned : jBody->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased() || op->name() != "memref.store" ||
+          op->operandCount() < 4)
+        continue;
+      if (!tileIsLoadFromSlot(op->operand(0), sumSlot))
+        continue;
+      if (!tileSame2DIndices(op, iIv, jIv, 2))
+        continue;
+      finalStore = op;
+    }
+    if (!finalStore)
+      continue;
+
+    for (auto &owned : kBody->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased() || !tileIsStoreToSlot(op, sumSlot))
+        continue;
+      Operation *add = op->operand(0).getDefiningOp();
+      if (!tileOpHasName(add, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) ||
+          add->operandCount() != 2)
+        continue;
+      Value product;
+      if (tileIsLoadFromSlot(add->operand(0), sumSlot))
+        product = add->operand(1);
+      else if (tileIsLoadFromSlot(add->operand(1), sumSlot))
+        product = add->operand(0);
+      else
+        continue;
+      Operation *mul = product.getDefiningOp();
+      if (!tileOpHasName(mul, {"arith.muli", "rv_machine.mulw", "arm_machine.mul"}) ||
+          mul->operandCount() != 2)
+        continue;
+      Operation *a = mul->operand(0).getDefiningOp();
+      Operation *b = mul->operand(1).getDefiningOp();
+      if (!tileOpHasName(a, {"memref.load"}) || !tileOpHasName(b, {"memref.load"}))
+        continue;
+      bool aIsLhs = tileSame2DIndices(a, iIv, kIv, 1) &&
+                    tileSame2DIndices(b, kIv, jIv, 1);
+      bool bIsLhs = tileSame2DIndices(b, iIv, kIv, 1) &&
+                    tileSame2DIndices(a, kIv, jIv, 1);
+      if (!aIsLhs && !bIsLhs)
+        continue;
+      lhsLoad = aIsLhs ? a : b;
+      rhsLoad = aIsLhs ? b : a;
+      sumStore = op;
+    }
+    if (sumStore && lhsLoad && rhsLoad)
+      break;
+  }
+  if (!sumStore || !lhsLoad || !rhsLoad)
+    return false;
+  MemrefInfo outInfo = parseMemrefInfo(finalStore->operand(1).type());
+  if (!outInfo.valid || outInfo.shape.size() < 2 || outInfo.shape[1] <= 0)
+    return false;
+
+  info.outer = &outer;
+  info.jLoop = jLoop;
+  info.kLoop = kLoop;
+  info.finalStore = finalStore;
+  info.lhsLoad = lhsLoad;
+  info.rhsLoad = rhsLoad;
+  info.valid = true;
+  return true;
+}
+
+static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &info,
+                                      SelfOptStats *stats) {
+  Operation &outer = *info.outer;
+  Block *parent = outer.getBlock();
+  if (!parent)
+    return false;
+  int outerIndex = operationIndexInBlock(*parent, &outer);
+  if (outerIndex < 0)
+    return false;
+  Context &ctx = module.context();
+  Location loc = outer.loc();
+  Type i32 = ctx.i(32);
+  MemrefInfo outInfo = parseMemrefInfo(info.finalStore->operand(1).type());
+  int64_t rowElements = outInfo.shape.size() >= 2 && outInfo.shape[1] > 0
+                            ? outInfo.shape[1]
+                            : 1024;
+
+  std::size_t insertIndex = (std::size_t) outerIndex;
+  Operation &rowBuf = insertOp(
+      *parent, insertIndex, "sysy.alloca", {}, {ctx.memref({rowElements}, i32)},
+      {{"symbol", ctx.stringAttr(".tile_rowbuf")}}, loc);
+  Operation &newOuter = tileInsertAffineLoop(module, *parent, insertIndex,
+                                             outer.operand(0), outer.operand(1),
+                                             outer.operand(2), loc, "i");
+  Block &outerBody = *newOuter.getRegions()[0]->getBlocks()[0];
+  Value iIv = outerBody.args()[0]->value();
+  Value jLower = tileMaterializeValue(module, outerBody, info.jLoop->operand(0), loc);
+  Value jUpper = tileMaterializeValue(module, outerBody, info.jLoop->operand(1), loc);
+  Value jStep = tileMaterializeValue(module, outerBody, info.jLoop->operand(2), loc);
+  Value kLower = tileMaterializeValue(module, outerBody, info.kLoop->operand(0), loc);
+  Value kUpper = tileMaterializeValue(module, outerBody, info.kLoop->operand(1), loc);
+  Value kStep = tileMaterializeValue(module, outerBody, info.kLoop->operand(2), loc);
+
+  Operation &zeroLoop = tileAppendAffineLoop(module, outerBody, jLower, jUpper,
+                                             jStep, loc, "j");
+  {
+    Block &body = *zeroLoop.getRegions()[0]->getBlocks()[0];
+    Value jIv = body.args()[0]->value();
+    Value zero = tileAppendIntConstant(module, body, 0, loc);
+    appendOp(body, "memref.store", {zero, rowBuf.result(), jIv}, {}, {}, loc);
+    appendOp(body, "affine.yield", {}, {}, {}, loc);
+  }
+
+  Operation &kLoop = tileAppendAffineLoop(module, outerBody, kLower, kUpper,
+                                          kStep, loc, "k");
+  {
+    Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
+    Value kIv = kBody.args()[0]->value();
+    Operation &lhs = appendOp(kBody, "memref.load",
+                              {info.lhsLoad->operand(0), iIv, kIv}, {i32},
+                              info.lhsLoad->attrs(), loc);
+    Operation &jLoop = tileAppendAffineLoop(module, kBody, jLower, jUpper,
+                                            jStep, loc, "j");
+    Block &jBody = *jLoop.getRegions()[0]->getBlocks()[0];
+    Value jIv = jBody.args()[0]->value();
+    Operation &old = appendOp(jBody, "memref.load", {rowBuf.result(), jIv},
+                              {i32}, {}, loc);
+    Operation &rhs = appendOp(jBody, "memref.load",
+                              {info.rhsLoad->operand(0), kIv, jIv}, {i32},
+                              info.rhsLoad->attrs(), loc);
+    Operation &prod = appendOp(jBody, "rv_machine.mulw",
+                               {lhs.result(), rhs.result()}, {i32}, {}, loc);
+    Operation &sum = appendOp(jBody, "rv_machine.addw",
+                              {old.result(), prod.result()}, {i32}, {}, loc);
+    appendOp(jBody, "memref.store", {sum.result(), rowBuf.result(), jIv},
+             {}, {}, loc);
+    appendOp(jBody, "affine.yield", {}, {}, {}, loc);
+    appendOp(kBody, "affine.yield", {}, {}, {}, loc);
+  }
+
+  Operation &writeLoop = tileAppendAffineLoop(module, outerBody, jLower, jUpper,
+                                              jStep, loc, "j");
+  {
+    Block &body = *writeLoop.getRegions()[0]->getBlocks()[0];
+    Value jIv = body.args()[0]->value();
+    Operation &val = appendOp(body, "memref.load", {rowBuf.result(), jIv},
+                              {i32}, {}, loc);
+    appendOp(body, "memref.store",
+             {val.result(), info.finalStore->operand(1), iIv, jIv},
+             {}, info.finalStore->attrs(), loc);
+    appendOp(body, "affine.yield", {}, {}, {}, loc);
+  }
+  appendOp(outerBody, "affine.yield", {}, {}, {}, loc);
+
+  outer.markErased();
+  if (stats) {
+    stats->rowBufferedReductions++;
+    stats->loopTiles++;
+    stats->imperfectInterchanges++;
+  }
+  return true;
+}
+
+static bool stripMineInnermostAffineLoop(Module &module, Operation &loop,
+                                         int64_t tileSize, SelfOptStats *stats) {
+  (void) stats;
+  if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
+      loop.getRegions().size() != 1)
+    return false;
+  int64_t step = 0;
+  if (!constantIntegerValue(loop.operand(2), step) || step != 1)
+    return false;
+  Block *body = tileSingleBlock(loop);
+  if (!body || body->args().empty() || tileBlockHasNestedLoop(*body) ||
+      tileBlockUnsafeForStripMining(*body))
+    return false;
+  int64_t lowerImm = 0;
+  int64_t upperImm = 0;
+  if (constantIntegerValue(loop.operand(0), lowerImm) &&
+      constantIntegerValue(loop.operand(1), upperImm) &&
+      upperImm - lowerImm <= tileSize)
+    return false;
+
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+
+  Context &ctx = module.context();
+  Location loc = loop.loc();
+  std::size_t insertIndex = (std::size_t) loopIndex;
+  Operation &tileConst = insertOp(
+      *parent, insertIndex, "rv_machine.li", {}, {ctx.i(32)},
+      {{"value", ctx.integerAttr(tileSize, ctx.i(32))}}, loc);
+  Value tileStep = tileConst.result();
+  Operation &tileLoop = tileInsertAffineLoop(module, *parent, insertIndex,
+                                             loop.operand(0), loop.operand(1),
+                                             tileStep, loc, "tile");
+  Block &tileBody = *tileLoop.getRegions()[0]->getBlocks()[0];
+  Value tileIv = tileBody.args()[0]->value();
+  Operation &tileEndRaw = appendOp(tileBody, "rv_machine.addw",
+                                   {tileIv, tileStep}, {ctx.i(32)}, {}, loc);
+  Value tileEnd = tileAppendMinValue(module, tileBody, tileEndRaw.result(),
+                                     loop.operand(1), loc);
+  Operation &inner = tileAppendAffineLoop(module, tileBody, tileIv, tileEnd,
+                                          loop.operand(2), loc, "iv");
+  Block &innerBody = *inner.getRegions()[0]->getBlocks()[0];
+  Value oldIv = body->args()[0]->value();
+  Value newIv = innerBody.args()[0]->value();
+  std::map<std::string, Value> valueMap;
+  valueMap[valueKey(oldIv)] = newIv;
+  std::set<Operation*> skipOps;
+  for (auto &owned : body->ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    auto cloned = cloneForUnrolledIteration(module, *owned, valueMap, skipOps,
+                                            Value(), 0);
+    if (!cloned)
+      continue;
+    Operation &inserted = innerBody.addOperation(std::move(cloned));
+    for (int i = 0; i < owned->resultCount(); i++)
+      valueMap[valueKey(owned->result(i))] = inserted.result(i);
+  }
+  appendOp(tileBody, "affine.yield", {}, {}, {}, loc);
+  loop.markErased();
+  return true;
+}
+
+static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
+  int64_t tileSize = 32;
+  if (const char *ts = std::getenv("SISY_SELF_TILE_SIZE")) {
+    try {
+      tileSize = std::stoll(ts);
+    } catch (...) {
+      tileSize = 32;
+    }
+    if (tileSize <= 1)
+      tileSize = 32;
+  }
+
+  std::vector<Operation*> whileLoops;
+  if (envEnabled("SISY_ENABLE_SELF_WHILE_IV_CACHE", true)) {
+    for (auto *op : walk(module)) {
+      if (op && !op->isErased() && op->name() == "scf.while")
+        whileLoops.push_back(op);
+    }
+    for (Operation *loop : whileLoops) {
+      if (loop && !loop->isErased())
+        cacheWhileLoopIvLoads(module, *loop, stats);
+    }
+    eraseMarked(module);
+  }
+
+  std::vector<Operation*> loops;
+  if (envEnabled("SISY_ENABLE_SELF_ROW_BUFFER_TILE", true)) {
+    for (auto *op : walk(module)) {
+      if (op && !op->isErased() && op->name() == "affine.for")
+        loops.push_back(op);
+    }
+    for (Operation *loop : loops) {
+      if (!loop || loop->isErased())
+        continue;
+      RowReductionInfo info;
+      if (classifyRowBufferedReduction(*loop, info)) {
+        applyRowBufferedReduction(module, info, stats);
+      } else if (stats) {
+        stats->tileSkippedShape++;
+      }
+    }
+    eraseMarked(module);
+  }
+
+  if (envEnabled("SISY_ENABLE_SELF_STRIP_TILE", false)) {
+    loops.clear();
+    for (auto *op : walk(module)) {
+      if (op && !op->isErased() && op->name() == "affine.for")
+        loops.push_back(op);
+    }
+    for (Operation *loop : loops) {
+      if (!loop || loop->isErased())
+        continue;
+      if (stripMineInnermostAffineLoop(module, *loop, tileSize, stats)) {
+        if (stats)
+          stats->stencilTiles++;
+      } else if (stats) {
+        stats->tileSkippedShape++;
+      }
+    }
+    eraseMarked(module);
+  }
+}
+
 void runLoopTiling(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_TILE", true))
     return;
-  runAffineLoopTiling(module);
-  if (stats)
-    stats->loopTiles += 0; // counting handled in collectAffineNestSummary
+  if (envEnabled("SISY_ENABLE_SELF_TILE_LEGACY", false)) {
+    runAffineLoopTiling(module);
+    return;
+  }
+  runSafeLoopTiling(module, stats);
 }
 
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats) {
@@ -6507,7 +7130,6 @@ void collectAffineNestSummary(Module &module, SelfOptStats *stats) {
   stats->affineSummaryLoops = 0;
   stats->affineSummaryMemoryOps = 0;
   stats->affineSummarySideEffects = 0;
-  stats->loopTiles = 0;
   for (auto *op : walk(module)) {
     if (!op || op->isErased())
       continue;
@@ -6519,22 +7141,9 @@ void collectAffineNestSummary(Module &module, SelfOptStats *stats) {
     if (op->name() == "sysy.call")
       stats->affineSummarySideEffects++;
     if (op->name() == "affine.for" && op->operandCount() >= 3) {
-      auto step = op->operand(2);
-      if (step.isOperationResult()) {
-        Operation *def = step.getDefiningOp();
-        if (def && def->name() == "arith.constant") {
-          int64_t val = 0;
-          Attribute a = def->attr("value");
-          if (a) {
-            std::string s = a.str();
-            if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
-              s = s.substr(1, s.size() - 2);
-            try { val = std::stoll(s); } catch (...) { val = 0; }
-            if (val != 1)
-              stats->loopTiles++;
-          }
-        }
-      }
+      int64_t step = 1;
+      if (constantIntegerValue(op->operand(2), step) && step != 1)
+        stats->loopTiles++;
     }
   }
 }
