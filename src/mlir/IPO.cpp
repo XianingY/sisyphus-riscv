@@ -162,6 +162,288 @@ static bool isReturnOp(Operation *op) {
   return op && (op->name() == "sysy.return" || op->name() == "scf.return");
 }
 
+static bool isIntegerScalar(Type type) {
+  return type.kind() == TypeKind::Integer || type.kind() == TypeKind::Index;
+}
+
+static bool isMemref(Type type) {
+  return type.kind() == TypeKind::MemRef;
+}
+
+static bool allResultsUnused(Operation *op) {
+  if (!op || op->resultCount() == 0)
+    return false;
+  for (int i = 0; i < op->resultCount(); i++) {
+    if (!op->resultUses[i].empty())
+      return false;
+  }
+  return true;
+}
+
+static bool isPureDeadOp(Operation *op) {
+  if (!op || op->isErased() || !op->getRegions().empty())
+    return false;
+  if (op->name() == "sysy.load" || op->name() == "memref.load" ||
+      op->name() == "arith.constant" || op->name() == "arith.addi" ||
+      op->name() == "arith.subi" || op->name() == "arith.muli" ||
+      op->name() == "arith.divi" || op->name() == "arith.remi" ||
+      op->name() == "arith.cmpi" || op->name() == "arith.andi" ||
+      op->name() == "arith.ori" || op->name() == "arith.xori" ||
+      op->name() == "rv_machine.li" || op->name() == "rv_machine.addw" ||
+      op->name() == "rv_machine.subw" || op->name() == "rv_machine.mulw" ||
+      op->name() == "rv_machine.divw" || op->name() == "rv_machine.remw" ||
+      op->name() == "rv_machine.cmp" || op->name() == "rv_machine.and" ||
+      op->name() == "rv_machine.or" || op->name() == "rv_machine.xor")
+    return allResultsUnused(op);
+  return false;
+}
+
+static bool isScalarStoreToLocal(Operation *op,
+                                 const std::set<std::string> &localAllocas) {
+  return isStoreOp(op) && op->operandCount() >= 2 &&
+         localAllocas.count(op->operand(1).identityKey()) != 0;
+}
+
+static bool isLoadFromLocalOrGlobal(Operation *op,
+                                    const std::set<std::string> &localAllocas) {
+  if (!isLoadOp(op) || op->operandCount() == 0)
+    return false;
+  Value base = op->operand(0);
+  if (localAllocas.count(base.identityKey()) != 0)
+    return true;
+  Operation *def = base.getDefiningOp();
+  return def && !def->isErased() && def->name() == "sysy.global" &&
+         base.type().kind() == TypeKind::MemRef;
+}
+
+static bool functionHasPureShape(Operation &func,
+                                 const std::set<std::string> &pureNames) {
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  std::string name = symAttr(func.attr("sym_name"));
+  if (name.empty())
+    return false;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  for (auto &arg : entry.args()) {
+    if (!arg || !isIntegerScalar(arg->type()))
+      return false;
+  }
+
+  std::set<std::string> localAllocas;
+  std::function<bool(Operation&)> visit = [&](Operation &op) -> bool {
+    if (op.isErased())
+      return true;
+    if (op.name() == "sysy.alloca" || op.name() == "memref.alloca") {
+      if (op.resultCount() != 1 || !isMemref(op.resultType()))
+        return false;
+      localAllocas.insert(op.result().identityKey());
+      return true;
+    }
+    if (isStoreOp(&op) && !isScalarStoreToLocal(&op, localAllocas))
+      return false;
+    if (isLoadOp(&op) && !isLoadFromLocalOrGlobal(&op, localAllocas))
+      return false;
+    if (op.name() == "sysy.call") {
+      std::string callee = symAttr(op.attr("callee"));
+      if (callee != name && pureNames.count(callee) == 0)
+        return false;
+    }
+    for (auto &region : op.getRegions())
+      for (auto &block : region->getBlocks())
+        for (auto &child : block->ops())
+          if (child && !visit(*child))
+            return false;
+    return true;
+  };
+
+  for (auto &owned : entry.ops())
+    if (owned && !visit(*owned))
+      return false;
+  return true;
+}
+
+static std::set<std::string> deducePureIntegerFunctions(Module &module) {
+  SymbolTable symbols = buildSymbolTable(module);
+  std::set<std::string> pure;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &kv : symbols.all()) {
+      if (pure.count(kv.first) != 0)
+        continue;
+      if (functionHasPureShape(*kv.second, pure)) {
+        pure.insert(kv.first);
+        changed = true;
+      }
+    }
+  }
+  return pure;
+}
+
+static void collectDefinedValues(Operation &op, std::set<std::string> &defined) {
+  for (int i = 0; i < op.resultCount(); i++)
+    defined.insert(op.result(i).identityKey());
+  for (auto &region : op.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &arg : block->args())
+        if (arg)
+          defined.insert(arg->value().identityKey());
+      for (auto &child : block->ops())
+        if (child && !child->isErased())
+          collectDefinedValues(*child, defined);
+    }
+  }
+}
+
+static void collectStoredBases(Operation &op, std::set<std::string> &storedBases) {
+  if (isStoreOp(&op) && op.operandCount() >= 2)
+    storedBases.insert(op.operand(1).identityKey());
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && !child->isErased())
+          collectStoredBases(*child, storedBases);
+}
+
+static bool canCloneInvariantOp(Operation *op,
+                                const std::set<std::string> &pureNames,
+                                const std::set<std::string> &storedBases) {
+  if (!op || op->isErased() || !op->getRegions().empty() || op->resultCount() != 1)
+    return false;
+  if (op->name() == "sysy.load" || op->name() == "memref.load")
+    return op->operandCount() > 0 &&
+           storedBases.count(op->operand(0).identityKey()) == 0;
+  if (op->name() == "arith.constant" || op->name() == "rv_machine.li" ||
+      op->name() == "arith.addi" || op->name() == "arith.subi" ||
+      op->name() == "arith.muli" || op->name() == "arith.divi" ||
+      op->name() == "arith.remi" || op->name() == "arith.cmpi" ||
+      op->name() == "arith.andi" || op->name() == "arith.ori" ||
+      op->name() == "arith.xori" || op->name() == "rv_machine.addw" ||
+      op->name() == "rv_machine.subw" || op->name() == "rv_machine.mulw" ||
+      op->name() == "rv_machine.divw" || op->name() == "rv_machine.remw" ||
+      op->name() == "rv_machine.cmp" || op->name() == "rv_machine.and" ||
+      op->name() == "rv_machine.or" || op->name() == "rv_machine.xor")
+    return true;
+  if (op->name() == "sysy.call")
+    return pureNames.count(symAttr(op->attr("callee"))) != 0;
+  return false;
+}
+
+static Value cloneInvariantValue(Value value, Block &targetBlock,
+                                 std::size_t &insertIndex,
+                                 const std::set<std::string> &definedInside,
+                                 const std::set<std::string> &storedBases,
+                                 const std::set<std::string> &pureNames,
+                                 std::map<std::string, Value> &cloned) {
+  if (!value.valid())
+    return Value();
+  std::string key = value.identityKey();
+  auto clonedIt = cloned.find(key);
+  if (clonedIt != cloned.end())
+    return clonedIt->second;
+  if (definedInside.count(key) == 0)
+    return value;
+  Operation *def = value.getDefiningOp();
+  if (!canCloneInvariantOp(def, pureNames, storedBases))
+    return Value();
+
+  std::vector<Value> operands;
+  for (auto operand : def->getOperands()) {
+    Value remapped = cloneInvariantValue(operand, targetBlock, insertIndex,
+                                         definedInside, storedBases, pureNames,
+                                         cloned);
+    if (!remapped.valid())
+      return Value();
+    operands.push_back(remapped);
+  }
+  auto clone = std::make_unique<Operation>(def->name(), operands, resultTypes(*def),
+                                           def->attrs(), def->loc());
+  Operation &inserted = targetBlock.insertOperation(insertIndex++, std::move(clone));
+  Value result = inserted.result();
+  cloned[key] = result;
+  return result;
+}
+
+static bool eraseDeadPureOpsInRegion(Region &region) {
+  bool changed = false;
+  for (auto &block : region.getBlocks()) {
+    for (auto &owned : block->ops()) {
+      if (owned && !owned->isErased()) {
+        for (auto &nested : owned->getRegions())
+          changed |= eraseDeadPureOpsInRegion(*nested);
+      }
+    }
+    for (auto it = block->ops().rbegin(); it != block->ops().rend(); ++it) {
+      Operation *op = it->get();
+      if (isPureDeadOp(op)) {
+        op->markErased();
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+static int hoistPureCallsFromWhile(Module &module, Operation &loop,
+                                   const std::set<std::string> &pureNames) {
+  if (loop.name() != "scf.while" || loop.getRegions().size() < 2)
+    return 0;
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return 0;
+  int loopIndex = opIndex(*parent, &loop);
+  if (loopIndex < 0)
+    return 0;
+
+  std::set<std::string> definedInside;
+  std::set<std::string> storedBases;
+  collectDefinedValues(loop, definedInside);
+  collectStoredBases(loop, storedBases);
+
+  std::vector<Operation*> calls;
+  std::function<void(Operation&)> collectCalls = [&](Operation &op) {
+    if (op.name() == "sysy.call" && op.resultCount() == 1 &&
+        pureNames.count(symAttr(op.attr("callee"))) != 0)
+      calls.push_back(&op);
+    for (auto &region : op.getRegions())
+      for (auto &block : region->getBlocks())
+        for (auto &child : block->ops())
+          if (child && !child->isErased())
+            collectCalls(*child);
+  };
+  collectCalls(loop);
+
+  int hoisted = 0;
+  std::size_t insertIndex = (std::size_t) loopIndex;
+  for (Operation *call : calls) {
+    if (!call || call->isErased())
+      continue;
+    std::map<std::string, Value> cloned;
+    std::vector<Value> operands;
+    bool ok = true;
+    for (auto operand : call->getOperands()) {
+      Value remapped = cloneInvariantValue(operand, *parent, insertIndex,
+                                           definedInside, storedBases, pureNames,
+                                           cloned);
+      if (!remapped.valid()) {
+        ok = false;
+        break;
+      }
+      operands.push_back(remapped);
+    }
+    if (!ok)
+      continue;
+    auto clonedCall = std::make_unique<Operation>(
+        call->name(), operands, resultTypes(*call), call->attrs(), call->loc());
+    Operation &inserted = parent->insertOperation(insertIndex++, std::move(clonedCall));
+    replaceAllUses(module, call->result(), inserted.result());
+    call->markErased();
+    hoisted++;
+  }
+  return hoisted;
+}
+
 static bool isPureInlinePrefixOp(Operation *op) {
   return op && !op->isErased() && op->getRegions().empty() &&
          !op->isTerminator() && op->name() != "sysy.call" &&
@@ -415,9 +697,31 @@ void runInlining(Module &module, int threshold, SelfOptStats *stats) {
     stats->inlineFunctions += (int) inlinedFunctions.size();
 }
 
-void runIPCP(Module &module) {
-  (void) module;
-  // Propagate constants across function boundaries.
+void runIPCP(Module &module, SelfOptStats *stats) {
+  // Propagate constants across function boundaries and run a conservative
+  // pure-call LICM/CSE slice for scalar helper calls.  The LICM path only
+  // clones loop-invariant operands and pure i32 helper calls; memref-argument
+  // functions and calls behind uncertain stores are left untouched.
+  const std::set<std::string> pureNames = deducePureIntegerFunctions(module);
+  if (pureNames.empty())
+    return;
+
+  int hoisted = 0;
+  for (auto *op : walk(module)) {
+    if (op && !op->isErased() && op->name() == "scf.while")
+      hoisted += hoistPureCallsFromWhile(module, *op, pureNames);
+  }
+  if (hoisted > 0) {
+    for (auto *op : walk(module)) {
+      if (!op || op->isErased())
+        continue;
+      for (auto &region : op->getRegions())
+        eraseDeadPureOpsInRegion(*region);
+    }
+    eraseMarked(module);
+    if (stats)
+      stats->pureCallHoists += hoisted;
+  }
 }
 
 void runPureFunctionDeduction(Module &module) {

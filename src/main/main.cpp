@@ -343,6 +343,7 @@ int main(int argc, char **argv) {
               << " raised-selects=" << selfMLIRStats.opt.raisedSelects
               << " rot-helper-folds=" << selfMLIRStats.opt.rotHelperFolds
               << " pow2-strength-reductions=" << selfMLIRStats.opt.pow2StrengthReductions
+              << " pure-call-hoists=" << selfMLIRStats.opt.pureCallHoists
               << " lsra2-spills=" << selfMLIRStats.opt.lsra2Spills
               << " affine-summary-loops=" << selfMLIRStats.opt.affineSummaryLoops
               << " affine-summary-memory-ops=" << selfMLIRStats.opt.affineSummaryMemoryOps
@@ -412,6 +413,9 @@ int main(int argc, char **argv) {
               << " global-scalar-inits=" << asmStats.globalScalarInits
               << " pow2-strength-reductions=" << asmStats.pow2StrengthReductions
               << " lsra2-spills=" << asmStats.lsra2Spills
+              << " lsra-stable-values=" << asmStats.lsraStableValues
+              << " lsra-reg-hits=" << asmStats.lsraRegHits
+              << " lsra-spills-avoided=" << asmStats.lsraSpillsAvoided
               << " tail-calls=" << asmStats.tailCalls
               << " callee-save-slots=" << asmStats.calleeSaveSlots
               << " memo-functions=" << asmStats.memoFunctions

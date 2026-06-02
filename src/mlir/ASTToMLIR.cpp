@@ -901,7 +901,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runPureFunctionDeduction(*module);
     int inlineCallsBefore = stats.opt.inlineCalls;
     runInlining(*module, effective.inlineThreshold, &stats.opt);
-    runIPCP(*module);
+    runIPCP(*module, &stats.opt);
     if (effective.enableMemoryOpt && stats.opt.inlineCalls > inlineCallsBefore)
       runMemoryOpt(*module, &stats.opt, true);
     if (effective.enableStencilPeel && stats.opt.inlineCalls > inlineCallsBefore) {

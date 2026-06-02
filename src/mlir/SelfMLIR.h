@@ -293,6 +293,7 @@ struct SelfOptStats {
   int raisedSelects = 0;
   int rotHelperFolds = 0;
   int pow2StrengthReductions = 0;
+  int pureCallHoists = 0;
   int lsra2Spills = 0;
   int affineSummaryLoops = 0;
   int affineSummaryMemoryOps = 0;
@@ -444,6 +445,9 @@ struct NativeAsmStats {
   int globalScalarInits = 0;
   int pow2StrengthReductions = 0;
   int lsra2Spills = 0;
+  int lsraStableValues = 0;
+  int lsraRegHits = 0;
+  int lsraSpillsAvoided = 0;
   int tailCalls = 0;
   int calleeSaveSlots = 0;
   int memoFunctions = 0;

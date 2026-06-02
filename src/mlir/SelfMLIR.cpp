@@ -1894,10 +1894,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   int64_t calleeSaveBase = frameBytes;
   int maxCalleeSaveCount = isArm ? 10 : 12;
   int affineLoopCount = 0;
+  int whileLoopCount = 0;
+  int liveFuncOpCount = 0;
   for (auto *op : funcOps)
     if (op && !op->isErased()) {
+      liveFuncOpCount++;
       if (op->name() == "affine.for")
         affineLoopCount++;
+      else if (op->name() == "scf.while")
+        whileLoopCount++;
     }
   bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
                           affineLoopCount >= 2;
@@ -1907,6 +1912,153 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   stats.calleeSaveSlots += calleeSaveCount;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
+
+  // ------------------------------------------------------------------
+  // Linear-scan stable register assignment (LSRA).
+  //
+  // The streaming emitter below assigns op results to a small round-robin
+  // register pool and writes every defined value back to a stack home
+  // immediately (spill-everything model). That keeps hot-loop values such as
+  // accumulators and loop-invariant addresses out of registers, producing one
+  // load+store per use.
+  //
+  // This pre-pass computes per-value live intervals over the already
+  // linearized `funcOps` order and assigns a *stable* physical register to
+  // values whose live range fits. A value with a stable assignment:
+  //   * is materialized directly into its assigned register,
+  //   * is never eagerly spilled to its stack home, and
+  //   * is read back from the register on each use (no reload).
+  //
+  // Correctness is guaranteed by construction:
+  //   * The assigned registers (s4-s7) form a dedicated pool that is excluded
+  //     from the round-robin result pool, the scratch registers, and the
+  //     loop-IV registers, so nothing else can clobber them.
+  //   * s4-s7 are callee-saved and are covered by calleeSaveCount (see below),
+  //     so they are preserved across calls and restored on return.
+  //   * Any value that does not receive a stable register falls back to the
+  //     existing spill-everything path unchanged.
+  // The pass is RISC-V only and gated by SISY_ENABLE_SELF_LSRA. It requires the
+  // regAlloc2 frame (all of s0-s11 saved) so the reserved s4-s7 are safe.
+  static const char *kLsraPool[] = {"s4", "s5", "s6", "s7"};
+  std::map<std::string, std::string> lsraAssignment; // valueKey -> phys reg
+  std::set<std::string> lsraReserved;
+  int lsraMinOps = 180;
+  if (const char *value = std::getenv("SISY_SELF_LSRA_MIN_OPS")) {
+    try {
+      lsraMinOps = std::max(0, std::stoi(value));
+    } catch (...) {
+      lsraMinOps = 180;
+    }
+  }
+  bool lsraEnabled = !isArm && livenessEnabled && regAlloc2Enabled &&
+                     calleeSaveCount >= 12 &&
+                     (liveFuncOpCount >= lsraMinOps || whileLoopCount >= 2) &&
+                     envEnabled("SISY_ENABLE_SELF_LSRA", true);
+  if (lsraEnabled) {
+    // Linear index per op in funcOps (the same order the emitter walks).
+    std::map<Operation *, int> opIndex;
+    {
+      int idx = 0;
+      for (auto *op : funcOps) {
+        if (op && !op->isErased())
+          opIndex[op] = idx;
+        idx++;
+      }
+    }
+
+    struct LsraInterval {
+      Value value;
+      int start = 0;
+      int end = 0;
+    };
+    std::vector<LsraInterval> intervals;
+
+    // Build def/use positions for integer scalar SSA results only. To stay
+    // correct under the emitter's linearized control flow, a candidate value's
+    // definition and *all* of its uses must live in the same Block: that makes
+    // the live range straight-line, so a register assignment cannot be skipped
+    // by a not-taken branch or an un-entered loop body. s4-s7 are callee-saved,
+    // so values whose range happens to span a call are still safe.
+    for (auto *op : funcOps) {
+      if (!op || op->isErased())
+        continue;
+      auto defIt = opIndex.find(op);
+      if (defIt == opIndex.end())
+        continue;
+      int defPos = defIt->second;
+      Block *defBlock = op->getBlock();
+      for (int r = 0; r < op->resultCount(); r++) {
+        Value value = op->result(r);
+        Type ty = value.type();
+        if (!(ty.kind() == TypeKind::Integer || ty.kind() == TypeKind::Index ||
+              ty.str() == "i32"))
+          continue;
+        if (isMemrefType(ty) || isFloatType(ty))
+          continue;
+        std::string key = valueKey(value);
+        if (valueSlots.find(key) == valueSlots.end())
+          continue; // only values that have a scalar home are candidates
+        int lastUse = -1;
+        bool sameBlock = true;
+        for (auto *user : funcOps) {
+          if (!user || user->isErased())
+            continue;
+          auto uIt = opIndex.find(user);
+          if (uIt == opIndex.end())
+            continue;
+          bool uses = false;
+          for (auto operand : user->getOperands()) {
+            if (operand.valid() && valueKey(operand) == key) {
+              uses = true;
+              break;
+            }
+          }
+          if (!uses)
+            continue;
+          if (user->getBlock() != defBlock) {
+            sameBlock = false;
+            break;
+          }
+          lastUse = std::max(lastUse, uIt->second);
+        }
+        if (!sameBlock || lastUse <= defPos)
+          continue; // cross-block, dead, or single-point: use fallback path
+        intervals.push_back({value, defPos, lastUse});
+      }
+    }
+
+    if (!intervals.empty()) {
+      std::sort(intervals.begin(), intervals.end(),
+                [](const LsraInterval &a, const LsraInterval &b) {
+                  return a.start < b.start;
+                });
+      std::vector<std::string> freeRegs;
+      for (const char *reg : kLsraPool)
+        freeRegs.push_back(reg);
+      std::vector<std::pair<int, std::string>> active; // (end, reg)
+      auto expireOldIntervals = [&](int start) {
+        for (auto it = active.begin(); it != active.end();) {
+          if (it->first < start) {
+            freeRegs.push_back(it->second);
+            it = active.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      };
+      for (auto &iv : intervals) {
+        expireOldIntervals(iv.start);
+        if (freeRegs.empty())
+          continue; // spill this interval -> fallback path
+        std::string reg = freeRegs.back();
+        freeRegs.pop_back();
+        lsraAssignment[valueKey(iv.value)] = reg;
+        lsraReserved.insert(reg);
+        stats.lsraStableValues++;
+        active.push_back({iv.end, reg});
+      }
+    }
+  }
 
   int nextReg = 0;
   int nextLoopReg = 0;
@@ -1999,17 +2151,40 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (isArm)
       return armResultReg(nextReg++);
     if (regAlloc2Enabled && calleeSaveCount >= 12) {
-      static const char *regs[] = {
+      // Round-robin pool for results without a stable LSRA assignment. s4-s7
+      // are reserved for LSRA when it is active, so they are excluded here to
+      // keep the two pools disjoint.
+      static const char *regsFull[] = {
         "t0", "t1", "t2", "t3", "t4",
         "a2", "a3", "a4", "a5", "a6", "a7",
         "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
       };
-      return regs[(nextReg++) % (int)(sizeof(regs) / sizeof(regs[0]))];
+      static const char *regsNoLsra[] = {
+        "t0", "t1", "t2", "t3", "t4",
+        "a2", "a3", "a4", "a5", "a6", "a7",
+        "s0", "s1", "s2", "s3",
+      };
+      if (lsraEnabled) {
+        int n = (int)(sizeof(regsNoLsra) / sizeof(regsNoLsra[0]));
+        return regsNoLsra[(nextReg++) % n];
+      }
+      int n = (int)(sizeof(regsFull) / sizeof(regsFull[0]));
+      return regsFull[(nextReg++) % n];
     }
     return rvResultReg(nextReg++);
   };
   auto floatReg = [&]() -> std::string {
     return isArm ? armFloatReg(nextFloatReg++) : rvFloatReg(nextFloatReg++);
+  };
+  // Result register for an integer-typed op result: use the stable LSRA
+  // assignment when present, otherwise fall back to the round-robin pool.
+  auto intResultReg = [&](Value value) -> std::string {
+    if (lsraEnabled) {
+      auto it = lsraAssignment.find(valueKey(value));
+      if (it != lsraAssignment.end())
+        return it->second;
+    }
+    return resultReg();
   };
   std::set<std::string> homeValid;
   auto homeIsUsable = [&](Value value) {
@@ -2114,6 +2289,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   auto shouldSpillDefinedValue = [&](Value value) {
     if (!livenessEnabled)
       return true;
+    // LSRA values live permanently in their stable register; never spill them
+    // to the stack home (all reads come from the register).
+    if (lsraEnabled && lsraAssignment.count(valueKey(value)) != 0) {
+      stats.lsraSpillsAvoided++;
+      return false;
+    }
     if (remainingUses[valueKey(value)] <= 0) {
       stats.deadSpillsAvoided++;
       return false;
@@ -2206,6 +2387,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     std::string actualTmp = scratchForValue(value, tmp);
     std::string loc = lookupReg(value, regs);
     if (!loc.empty()) {
+      if (lsraEnabled) {
+        auto assigned = lsraAssignment.find(valueKey(value));
+        if (assigned != lsraAssignment.end() && assigned->second == loc)
+          stats.lsraRegHits++;
+      }
       if (loc.rfind("stack:", 0) == 0 || loc.rfind("global:", 0) == 0)
         return materializeAddress(value, actualTmp);
       return loc;
@@ -2653,7 +2839,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       } else if (isFloatType(op.resultType())) {
         dst = floatReg();
       } else {
-        dst = isArm ? armResultReg(nextReg++) : rvResultReg(nextReg++);
+        dst = isArm ? armResultReg(nextReg++) : intResultReg(op.result());
       }
       bindResult(op.result(), dst);
       if (isFloatType(op.resultType())) {
@@ -2696,7 +2882,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       if (isVec)
         dst = "v" + std::to_string(nextVecReg++);
       else
-        dst = resultReg();
+        dst = intResultReg(op.result());
       bindResult(op.result(), dst);
       if (isArm) {
         if (isVec)
@@ -2749,7 +2935,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 	              lhs = scratchReg(0);
 	              os << "    li " << lhs << ", 0\n";
 	            }
-	            std::string dst = resultReg();
+	            std::string dst = intResultReg(op.result());
 	            bindResult(op.result(), dst);
 	            if (shift == 0)
 	              os << "    addiw " << dst << ", " << lhs << ", 0\n";
@@ -2770,7 +2956,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 	            lhs = scratchReg(0);
 	            os << "    li " << lhs << ", 0\n";
 	          }
-	          std::string dst = resultReg();
+	          std::string dst = intResultReg(op.result());
 	          bindResult(op.result(), dst);
 	          if (shift == 0) {
 	            if (opname == "rv_machine.divw")
@@ -2824,7 +3010,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         rhs = scratchReg(1);
         os << "    " << (isArm ? "mov " : "li ") << rhs << (isArm ? ", #0\n" : ", 0\n");
       }
-      std::string dst = resultReg();
+      std::string dst = isArm ? resultReg() : intResultReg(op.result());
       bindResult(op.result(), dst);
       if (isArm) {
         if (opname == "arm_machine.srem") {
@@ -2909,7 +3095,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (opname == "rv_machine.fcvt_w_s" || opname == "arm_machine.fcvtzs") {
       std::string src = ensureReg(op.operand(0), isArm ? "s30" : "ft10");
       if (src.empty()) src = isArm ? "s0" : "ft0";
-      std::string dst = resultReg();
+      std::string dst = isArm ? resultReg() : intResultReg(op.result());
       bindResult(op.result(), dst);
       if (isArm)
         os << "    fcvtzs " << dst << ", " << src << "\n";
@@ -2929,7 +3115,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "unary machine op operand has no assigned register";
         return false;
       }
-      std::string dst = resultReg();
+      std::string dst = isArm ? resultReg() : intResultReg(op.result());
       bindResult(op.result(), dst);
       if (isArm) {
         if (opname == "arm_machine.not")
@@ -2984,6 +3170,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string dst = resultReg();
       if (isFloatType(op.resultType()))
         dst = floatReg();
+      else if (!isArm)
+        dst = intResultReg(op.result());
       bindResult(op.result(), dst);
       if (!loadFromAddress(dst, op.operand(0), indices))
         return false;
@@ -3480,7 +3668,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         opname == "rv_machine.fcmp" || opname == "arm_machine.fcmp") {
       std::string lhs = ensureReg(op.operand(0), isFloatType(op.operand(0).type()) ? (isArm ? "s30" : "ft10") : scratchReg(0));
       std::string rhs = ensureReg(op.operand(1), isFloatType(op.operand(1).type()) ? (isArm ? "s31" : "ft11") : scratchReg(1));
-      std::string dst = resultReg();
+      std::string dst = isArm ? resultReg() : intResultReg(op.result());
       bindResult(op.result(), dst);
 
       std::string pred = symbolAttr(op.attr("predicate"));
@@ -4170,6 +4358,60 @@ void runReadonlyGlobalScalarPropagation(Module &module, SelfOptStats *stats) {
   }
 }
 
+static std::string memoryLocationKey(Operation &op);
+
+static std::string memoryExprKey(Value value, int depth = 0) {
+  if (!value.valid())
+    return "";
+  if (depth > 8)
+    return "v:" + valueKey(value);
+  int64_t imm = 0;
+  if (constantIntegerValue(value, imm))
+    return "c:" + std::to_string(imm);
+
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return "v:" + valueKey(value);
+
+  if ((def->name() == "sysy.load" || def->name() == "memref.load") &&
+      def->resultCount() == 1) {
+    std::string loc = memoryLocationKey(*def);
+    if (!loc.empty())
+      return "load(" + loc + ")";
+  }
+
+  auto binaryExpr = [&](const char *kind, bool commutative) -> std::string {
+    if (def->operandCount() != 2)
+      return "";
+    std::string lhs = memoryExprKey(def->operand(0), depth + 1);
+    std::string rhs = memoryExprKey(def->operand(1), depth + 1);
+    if (lhs.empty() || rhs.empty())
+      return "";
+    if (commutative && rhs < lhs)
+      std::swap(lhs, rhs);
+    return std::string(kind) + "(" + lhs + "," + rhs + ")";
+  };
+
+  if (def->name() == "arith.addi" || def->name() == "rv_machine.addw" ||
+      def->name() == "arm_machine.add")
+    return binaryExpr("add", true);
+  if (def->name() == "arith.muli" || def->name() == "rv_machine.mulw" ||
+      def->name() == "arm_machine.mul")
+    return binaryExpr("mul", true);
+  if (def->name() == "arith.subi" || def->name() == "rv_machine.subw" ||
+      def->name() == "arm_machine.sub")
+    return binaryExpr("sub", false);
+
+  return "v:" + valueKey(value);
+}
+
+static bool memoryKeyDependsOnLocation(const std::string &key,
+                                       const std::string &location) {
+  if (key.empty() || location.empty())
+    return false;
+  return key.find("load(" + location + ")") != std::string::npos;
+}
+
 static std::string memoryLocationKey(Operation &op) {
   auto baseKey = [&]() -> std::string {
     int baseIndex = -1;
@@ -4190,10 +4432,10 @@ static std::string memoryLocationKey(Operation &op) {
     return "";
   if (op.name() == "memref.load") {
     for (int i = 1; i < op.operandCount(); i++)
-      key += "," + valueKey(op.operand(i));
+      key += "," + memoryExprKey(op.operand(i));
   } else if (op.name() == "memref.store") {
     for (int i = 2; i < op.operandCount(); i++)
-      key += "," + valueKey(op.operand(i));
+      key += "," + memoryExprKey(op.operand(i));
   }
   return key;
 }
@@ -4210,6 +4452,13 @@ static std::string memoryBaseKey(Operation &op) {
   if (sym.empty())
     sym = symbolAttr(op.attr("sym_name"));
   return sym.empty() ? "" : "s:" + sym;
+}
+
+static bool memoryKeyMayShareBase(const std::string &locationKey,
+                                  const std::string &baseKey) {
+  if (locationKey.empty() || baseKey.empty())
+    return false;
+  return locationKey == baseKey || locationKey.rfind(baseKey + ",", 0) == 0;
 }
 
 static bool isLocalAllocaOp(Operation *op) {
@@ -4304,6 +4553,53 @@ static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats)
     stats->memoryBlocks++;
   std::map<std::string, Value> activeStores;
   std::map<std::string, Operation*> activeStoreOps;
+  std::map<std::string, std::string> loadOrigins;
+
+  auto loadOriginOf = [&](Value value) -> std::string {
+    auto it = loadOrigins.find(valueKey(value));
+    return it == loadOrigins.end() ? "" : it->second;
+  };
+  auto invalidateLoadOriginsAfterStore = [&](const std::string &storeKey,
+                                             const std::string &base,
+                                             Value storedValue) {
+    std::string storedOrigin = loadOriginOf(storedValue);
+    std::vector<std::string> toErase;
+    for (const auto &kv : loadOrigins) {
+      const std::string &origin = kv.second;
+      if (origin == storeKey ||
+          (!base.empty() && memoryKeyMayShareBase(origin, base))) {
+        // If a potentially aliasing store writes back the exact value that was
+        // originally loaded from this location, the old loaded value remains a
+        // valid representation even when the two expressions alias. Otherwise
+        // the load-origin fact is no longer safe.
+        if (storedOrigin != origin)
+          toErase.push_back(kv.first);
+      }
+    }
+    for (const auto &key : toErase)
+      loadOrigins.erase(key);
+  };
+  auto invalidateFactsDependingOnLocation = [&](const std::string &locationKey) {
+    if (locationKey.empty())
+      return;
+    std::vector<std::string> activeToErase;
+    for (const auto &kv : activeStores) {
+      if (memoryKeyDependsOnLocation(kv.first, locationKey))
+        activeToErase.push_back(kv.first);
+    }
+    for (const auto &key : activeToErase) {
+      activeStores.erase(key);
+      activeStoreOps.erase(key);
+    }
+
+    std::vector<std::string> originsToErase;
+    for (const auto &kv : loadOrigins) {
+      if (memoryKeyDependsOnLocation(kv.second, locationKey))
+        originsToErase.push_back(kv.first);
+    }
+    for (const auto &key : originsToErase)
+      loadOrigins.erase(key);
+  };
 
   for (auto &owned : block.ops()) {
     auto &op = *owned;
@@ -4313,6 +4609,7 @@ static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats)
     if (!op.getRegions().empty()) {
       activeStores.clear();
       activeStoreOps.clear();
+      loadOrigins.clear();
       continue;
     }
 
@@ -4325,6 +4622,7 @@ static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats)
         activeStores.erase(k);
         activeStoreOps.erase(k);
       }
+      loadOrigins.clear();
       continue;
     }
 
@@ -4334,6 +4632,19 @@ static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats)
         continue;
 
       std::string base = memoryBaseKey(op);
+      if (op.operandCount() >= 1 && loadOriginOf(op.operand(0)) == key) {
+        op.markErased();
+        if (stats)
+          stats->memoryRemovedStores++;
+        continue;
+      }
+      bool scalarLocationStore =
+          op.operandCount() == 2 && isScalarWordMemref(op.operand(1).type());
+      if (scalarLocationStore)
+        invalidateFactsDependingOnLocation(key);
+      if (op.operandCount() >= 1)
+        invalidateLoadOriginsAfterStore(key, base, op.operand(0));
+
       std::vector<std::string> keysToInvalidate;
       for (const auto &kv : activeStores) {
         if (kv.first != key && !base.empty() &&
@@ -4371,6 +4682,8 @@ static void runBlockMemoryOpt(Module &module, Block &block, SelfOptStats *stats)
         op.markErased();
         if (stats)
           stats->memoryForwardedLoads++;
+      } else {
+        loadOrigins[valueKey(op.result())] = key;
       }
     }
   }
