@@ -293,6 +293,7 @@ struct SelfOptStats {
   int raisedSelects = 0;
   int rotHelperFolds = 0;
   int pow2StrengthReductions = 0;
+  int lsra2Spills = 0;
   int affineSummaryLoops = 0;
   int affineSummaryMemoryOps = 0;
   int affineSummarySideEffects = 0;
@@ -310,6 +311,7 @@ struct SelfOptStats {
   int imperfectInterchanges = 0;
   int loopTiles = 0;
   int addrIvRewrites = 0;
+  int sliderLoadsSaved = 0;
 };
 
 struct OptimizationConfig {
@@ -437,6 +439,7 @@ struct NativeAsmStats {
   int linearScanSpills = 0;
   int globalScalarInits = 0;
   int pow2StrengthReductions = 0;
+  int lsra2Spills = 0;
   int tailCalls = 0;
   int calleeSaveSlots = 0;
   int memoFunctions = 0;
@@ -470,6 +473,7 @@ struct ProductionStats {
   int conversionConverted = 0;
   int conversionFailed = 0;
   int conversionRollbacks = 0;
+  std::string adaptiveLevel = "default";
   SelfOptStats opt;
   bool verifyBefore = false;
   bool verifyAfter = false;

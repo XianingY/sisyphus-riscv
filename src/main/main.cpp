@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <unordered_set>
@@ -40,6 +41,17 @@ static std::vector<std::string> splitPathList(const std::string &raw) {
   if (!cur.empty())
     out.push_back(cur);
   return out;
+}
+
+static std::string stableHash64(const std::string &text) {
+  uint64_t hash = 1469598103934665603ull;
+  for (unsigned char c : text) {
+    hash ^= c;
+    hash *= 1099511628211ull;
+  }
+  std::ostringstream os;
+  os << std::hex << std::setfill('0') << std::setw(16) << hash;
+  return os.str();
 }
 
 static int thinLinkOnly(const sys::Options &opts) {
@@ -302,6 +314,7 @@ int main(int argc, char **argv) {
   if (opts.stats) {
     std::cerr << "[self-mlir] target=" << target
               << " source=ast frontend_path=self-mlir failed=0"
+              << " adaptive-level=" << selfMLIRStats.adaptiveLevel
               << " ast-nodes=" << selfMLIRStats.hirOps
               << " ops-before=" << selfMLIRStats.mlirOpsBefore
               << " ops-after=" << selfMLIRStats.mlirOpsAfter
@@ -330,6 +343,7 @@ int main(int argc, char **argv) {
               << " raised-selects=" << selfMLIRStats.opt.raisedSelects
               << " rot-helper-folds=" << selfMLIRStats.opt.rotHelperFolds
               << " pow2-strength-reductions=" << selfMLIRStats.opt.pow2StrengthReductions
+              << " lsra2-spills=" << selfMLIRStats.opt.lsra2Spills
               << " affine-summary-loops=" << selfMLIRStats.opt.affineSummaryLoops
               << " affine-summary-memory-ops=" << selfMLIRStats.opt.affineSummaryMemoryOps
               << " affine-summary-side-effects=" << selfMLIRStats.opt.affineSummarySideEffects
@@ -343,6 +357,8 @@ int main(int argc, char **argv) {
               << " kernel-unrolls=" << selfMLIRStats.opt.kernelUnrolls
               << " imperfect-interchanges=" << selfMLIRStats.opt.imperfectInterchanges
               << " loop-tiles=" << selfMLIRStats.opt.loopTiles
+              << " tile-loops=" << selfMLIRStats.opt.loopTiles
+              << " slider-loads-saved=" << selfMLIRStats.opt.sliderLoadsSaved
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed
@@ -373,9 +389,11 @@ int main(int argc, char **argv) {
     delete node;
     return 1;
   }
+  const std::string asmHash = stableHash64(asmBuffer.str());
 
   if (opts.stats) {
     std::cerr << "[native-asm] target=" << target
+              << " asm-hash=" << asmHash
               << " emitted=" << (asmStats.emitted ? 1 : 0)
               << " functions=" << asmStats.functions
               << " machine-ops=" << asmStats.machineOps
@@ -389,6 +407,7 @@ int main(int argc, char **argv) {
               << " linear-scan-spills=" << asmStats.linearScanSpills
               << " global-scalar-inits=" << asmStats.globalScalarInits
               << " pow2-strength-reductions=" << asmStats.pow2StrengthReductions
+              << " lsra2-spills=" << asmStats.lsra2Spills
               << " tail-calls=" << asmStats.tailCalls
               << " callee-save-slots=" << asmStats.calleeSaveSlots
               << " memo-functions=" << asmStats.memoFunctions

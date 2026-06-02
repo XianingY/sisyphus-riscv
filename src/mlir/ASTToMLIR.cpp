@@ -803,11 +803,14 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     effective.enableStencilPeel = false;
   if (envDisabled("SISY_ENABLE_SELF_ADDR_IV"))
     effective.enableLoopAddressIV = false;
+  if (envEnabled("SISY_ENABLE_SELF_TILE", effective.enableLoopTiling))
+    effective.enableLoopTiling = true;
   if (envDisabled("SISY_ENABLE_SELF_TILE"))
     effective.enableLoopTiling = false;
 
   if (!envDisabled("SISY_ENABLE_SELF_ADAPTIVE_GATE") &&
       effective.level == OptimizationConfig::Level::O1) {
+    stats.adaptiveLevel = "o1-default";
     int initialOps = 0;
     int loopOps = 0;
     int callOps = 0;
@@ -830,6 +833,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
 
     bool giantUnit = stats.hirOps > 25000 || initialOps > 90000 || funcs > 300;
     if (giantUnit) {
+      stats.adaptiveLevel = "o1-fast-giant";
       effective.enableAffine = false;
       effective.enableLoopTiling = false;
       effective.enableLoopFusion = false;
@@ -841,6 +845,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
       stats.opt.walksEliminated++;
     } else if (target == "riscv" && loopOps >= 6 && memOps >= 12 &&
                initialOps < 6000) {
+      stats.adaptiveLevel = "o1-compute-hot";
       effective.enableScheduler = true;
       effective.enableStencilPeel = true;
       effective.enableLoopAddressIV = true;

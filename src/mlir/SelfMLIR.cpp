@@ -1899,7 +1899,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       if (op->name() == "affine.for")
         affineLoopCount++;
     }
-  bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", false) &&
+  bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
                           affineLoopCount >= 2;
   int calleeSaveCount = regAlloc2Enabled
                             ? maxCalleeSaveCount
@@ -2038,7 +2038,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
          << "\n    fmv.w.x " << dst << ", " << intScratchForFloatBits() << "\n";
   };
   auto isDeferredHomeReg = [&](const std::string &reg) {
-    if (!regAlloc2Enabled || reg.size() < 2 || reg[0] != 's')
+    if (!regAlloc2Enabled ||
+        !envEnabled("SISY_ENABLE_SELF_REGALLOC2_LAZY", false) ||
+        reg.size() < 2 || reg[0] != 's')
       return false;
     if (reg == "s8" || reg == "s9" || reg == "s10" || reg == "s11")
       return false;
@@ -2058,6 +2060,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     emitStackStore(reg, off, ptr ? "sd" : (fp ? "fsw" : "sw"));
     homeValid.insert(valueKey(value));
     stats.liveSpills++;
+    if (regAlloc2Enabled)
+      stats.lsra2Spills++;
   };
   auto maybeSpillBeforeClobber = [&](const std::string &key, const std::string &reg,
                                      bool callBoundary) {
