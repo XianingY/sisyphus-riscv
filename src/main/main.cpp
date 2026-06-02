@@ -421,6 +421,14 @@ int main(int argc, char **argv) {
               << " lsra-stable-values=" << asmStats.lsraStableValues
               << " lsra-reg-hits=" << asmStats.lsraRegHits
               << " lsra-spills-avoided=" << asmStats.lsraSpillsAvoided
+              << " scalar-promoted-slots=" << asmStats.scalarPromotedSlots
+              << " scalar-loop-carried=" << asmStats.scalarLoopCarried
+              << " reduction-regs=" << asmStats.reductionRegs
+              << " scalar-promote-skipped-escape=" << asmStats.scalarPromoteSkippedEscape
+              << " scalar-reg-loads=" << asmStats.scalarRegLoads
+              << " scalar-reg-stores=" << asmStats.scalarRegStores
+              << " global-base-hoists=" << asmStats.globalBaseHoists
+              << " global-base-hits=" << asmStats.globalBaseHits
               << " tail-calls=" << asmStats.tailCalls
               << " callee-save-slots=" << asmStats.calleeSaveSlots
               << " memo-functions=" << asmStats.memoFunctions

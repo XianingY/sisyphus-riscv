@@ -3407,6 +3407,212 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   stats.calleeSaveSlots += calleeSaveCount;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
+  int lsraMinOps = 180;
+  if (const char *value = std::getenv("SISY_SELF_LSRA_MIN_OPS")) {
+    try {
+      lsraMinOps = std::max(0, std::stoi(value));
+    } catch (...) {
+      lsraMinOps = 180;
+    }
+  }
+  bool lsraHotFunction = liveFuncOpCount >= lsraMinOps || whileLoopCount >= 2;
+
+  auto loopDepthOfBlock = [](Block *block) {
+    int depth = 0;
+    for (Block *curr = block; curr; ) {
+      Region *region = curr->getRegion();
+      Operation *parent = region ? region->getParent() : nullptr;
+      if (!parent)
+        break;
+      if (parent->name() == "affine.for" || parent->name() == "scf.while" ||
+          parent->name() == "scf.for")
+        depth++;
+      curr = parent->getBlock();
+    }
+    return depth;
+  };
+
+  struct PromotedScalarSlot {
+    Value slot;
+    std::string reg;
+    bool valid = false;
+    bool dirty = false;
+    bool loopCarried = false;
+    bool reductionLike = false;
+  };
+  std::map<std::string, PromotedScalarSlot> promotedScalarSlots;
+  static const char *kStableBaseRegs[] = {"s0", "s1", "s2", "s3"};
+  int stableBaseRegCount = 0;
+  bool scalarPromotionEnabled =
+      !isArm && livenessEnabled && regAlloc2Enabled && calleeSaveCount >= 12 &&
+      lsraHotFunction &&
+      envEnabled("SISY_ENABLE_SCALAR_PROMOTE", false);
+  if (scalarPromotionEnabled) {
+    struct SlotCandidate {
+      Value slot;
+      std::string key;
+      int score = 0;
+      int maxDepth = 0;
+      int loads = 0;
+      int stores = 0;
+      bool reductionLike = false;
+    };
+    std::vector<SlotCandidate> candidates;
+    for (auto *op : funcOps) {
+      if (!op || op->isErased() ||
+          (op->name() != "sysy.alloca" && op->name() != "memref.alloca") ||
+          op->resultCount() != 1 || !isScalarWordMemref(op->resultType()) ||
+          op->resultType().str().find("xf32") != std::string::npos)
+        continue;
+      Value slot = op->result();
+      SlotCandidate candidate;
+      candidate.slot = slot;
+      candidate.key = valueKey(slot);
+      bool escaped = false;
+      for (const auto &use : op->resultUses[0]) {
+        Operation *user = use.owner;
+        if (!user || user->isErased())
+          continue;
+        bool allowedLoad =
+            (user->name() == "sysy.load" || user->name() == "memref.load") &&
+            use.operandIndex == 0 && user->operandCount() == 1;
+        bool allowedStore =
+            (user->name() == "sysy.store" || user->name() == "memref.store") &&
+            use.operandIndex == 1 && user->operandCount() == 2;
+        if (!allowedLoad && !allowedStore) {
+          escaped = true;
+          break;
+        }
+        int depth = loopDepthOfBlock(user->getBlock());
+        int depthWeight = 1;
+        for (int d = 0; d < depth && depthWeight < 1000000; d++)
+          depthWeight *= 10;
+        candidate.maxDepth = std::max(candidate.maxDepth, depth);
+        candidate.score += depthWeight * (allowedStore ? 2 : 1);
+        if (allowedLoad)
+          candidate.loads++;
+        if (allowedStore) {
+          candidate.stores++;
+          Operation *def = user->operand(0).getDefiningOp();
+          if (def && (def->name() == "arith.addi" || def->name() == "arith.subi" ||
+                      def->name() == "arith.muli" || def->name() == "rv_machine.addw" ||
+                      def->name() == "rv_machine.subw" || def->name() == "rv_machine.mulw" ||
+                      def->name() == "arm_machine.add" || def->name() == "arm_machine.sub" ||
+                      def->name() == "arm_machine.mul")) {
+            for (auto operand : def->getOperands()) {
+              Operation *load = operand.getDefiningOp();
+              if (load && !load->isErased() &&
+                  (load->name() == "sysy.load" || load->name() == "memref.load") &&
+                  load->operandCount() == 1 &&
+                  valueKey(load->operand(0)) == candidate.key) {
+                candidate.reductionLike = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (escaped) {
+        stats.scalarPromoteSkippedEscape++;
+        continue;
+      }
+      if (candidate.loads == 0 && candidate.stores == 0)
+        continue;
+      candidates.push_back(candidate);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const SlotCandidate &a, const SlotCandidate &b) {
+                if (a.score != b.score)
+                  return a.score > b.score;
+                return a.maxDepth > b.maxDepth;
+              });
+    for (const auto &candidate : candidates) {
+      if (stableBaseRegCount >= (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0])))
+        break;
+      PromotedScalarSlot slot;
+      slot.slot = candidate.slot;
+      slot.reg = kStableBaseRegs[stableBaseRegCount++];
+      slot.loopCarried = candidate.loads > 0 && candidate.stores > 0 &&
+                         candidate.maxDepth > 0;
+      slot.reductionLike = candidate.reductionLike;
+      promotedScalarSlots[candidate.key] = slot;
+      stats.scalarPromotedSlots++;
+      if (slot.loopCarried)
+        stats.scalarLoopCarried++;
+      if (slot.reductionLike)
+        stats.reductionRegs++;
+    }
+  }
+  struct CachedGlobalBase {
+    std::string reg;
+    std::string label;
+    int uses = 0;
+  };
+  std::map<std::string, CachedGlobalBase> cachedGlobalBases;
+  if (!isArm && livenessEnabled && regAlloc2Enabled && calleeSaveCount >= 12 &&
+      lsraHotFunction && envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true) &&
+      stableBaseRegCount < (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0]))) {
+    struct GlobalBaseCandidate {
+      std::string key;
+      std::string label;
+      int score = 0;
+      int uses = 0;
+      int maxDepth = 0;
+    };
+    std::map<std::string, GlobalBaseCandidate> candidates;
+    for (auto *op : funcOps) {
+      if (!op || op->isErased())
+        continue;
+      int baseIndex = -1;
+      bool store = false;
+      if ((op->name() == "sysy.load" || op->name() == "memref.load") &&
+          op->operandCount() >= 1) {
+        baseIndex = 0;
+      } else if ((op->name() == "sysy.store" || op->name() == "memref.store") &&
+                 op->operandCount() >= 2) {
+        baseIndex = 1;
+        store = true;
+      }
+      if (baseIndex < 0)
+        continue;
+      std::string key = valueKey(op->operand(baseIndex));
+      auto labelIt = globalLabels.find(key);
+      if (labelIt == globalLabels.end())
+        continue;
+      int depth = loopDepthOfBlock(op->getBlock());
+      int depthWeight = 1;
+      for (int d = 0; d < depth && depthWeight < 1000000; d++)
+        depthWeight *= 10;
+      auto &candidate = candidates[key];
+      candidate.key = key;
+      candidate.label = labelIt->second;
+      candidate.score += depthWeight * (store ? 2 : 1);
+      candidate.uses++;
+      candidate.maxDepth = std::max(candidate.maxDepth, depth);
+    }
+    std::vector<GlobalBaseCandidate> ordered;
+    for (const auto &kv : candidates) {
+      if (kv.second.uses >= 4)
+        ordered.push_back(kv.second);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const GlobalBaseCandidate &a, const GlobalBaseCandidate &b) {
+                if (a.score != b.score)
+                  return a.score > b.score;
+                return a.uses > b.uses;
+              });
+    for (const auto &candidate : ordered) {
+      if (stableBaseRegCount >= (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0])))
+        break;
+      CachedGlobalBase cached;
+      cached.reg = kStableBaseRegs[stableBaseRegCount++];
+      cached.label = candidate.label;
+      cached.uses = candidate.uses;
+      cachedGlobalBases[candidate.key] = cached;
+      stats.globalBaseHoists++;
+      stats.globalBaseHits += candidate.uses;
+    }
+  }
 
   // ------------------------------------------------------------------
   // Linear-scan stable register assignment (LSRA).
@@ -3437,17 +3643,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   static const char *kLsraPool[] = {"s4", "s5", "s6", "s7"};
   std::map<std::string, std::string> lsraAssignment; // valueKey -> phys reg
   std::set<std::string> lsraReserved;
-  int lsraMinOps = 180;
-  if (const char *value = std::getenv("SISY_SELF_LSRA_MIN_OPS")) {
-    try {
-      lsraMinOps = std::max(0, std::stoi(value));
-    } catch (...) {
-      lsraMinOps = 180;
-    }
-  }
+  bool slotPromotionActive = !promotedScalarSlots.empty();
+  bool stableBaseActive = stableBaseRegCount > 0;
   bool lsraEnabled = !isArm && livenessEnabled && regAlloc2Enabled &&
                      calleeSaveCount >= 12 &&
-                     (liveFuncOpCount >= lsraMinOps || whileLoopCount >= 2) &&
+                     lsraHotFunction &&
                      envEnabled("SISY_ENABLE_SELF_LSRA", true);
   if (lsraEnabled) {
     struct LsraInterval {
@@ -3457,21 +3657,6 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       int weight = 1;
     };
     std::vector<LsraInterval> intervals;
-    auto loopDepthOfBlock = [](Block *block) {
-      int depth = 0;
-      for (Block *curr = block; curr; ) {
-        Region *region = curr->getRegion();
-        Operation *parent = region ? region->getParent() : nullptr;
-        if (!parent)
-          break;
-        if (parent->name() == "affine.for" || parent->name() == "scf.while" ||
-            parent->name() == "scf.for")
-          depth++;
-        curr = parent->getBlock();
-      }
-      return depth;
-    };
-
     // Build def/use positions for integer scalar SSA results only. To stay
     // correct under the emitter's linearized control flow, a candidate value's
     // definition and *all* of its uses must live in the same Block: that makes
@@ -3700,8 +3885,20 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   }
   os << bodyEntryLabel << ":\n";
 
-  for (const auto &kv : globalLabels)
-    regs[kv.first] = "global:" + kv.second;
+  for (const auto &kv : globalLabels) {
+    auto cached = cachedGlobalBases.find(kv.first);
+    if (cached != cachedGlobalBases.end()) {
+      if (isArm)
+        os << "    adrp " << cached->second.reg << ", " << cached->second.label << "\n"
+           << "    add " << cached->second.reg << ", " << cached->second.reg
+           << ", :lo12:" << cached->second.label << "\n";
+      else
+        os << "    la " << cached->second.reg << ", " << cached->second.label << "\n";
+      regs[kv.first] = cached->second.reg;
+    } else {
+      regs[kv.first] = "global:" + kv.second;
+    }
+  }
 
   auto resultReg = [&]() -> std::string {
     if (isArm)
@@ -3720,7 +3917,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         "a2", "a3", "a4", "a5", "a6", "a7",
         "s0", "s1", "s2", "s3",
       };
-      if (lsraEnabled) {
+      static const char *regsNoStable[] = {
+        "t0", "t1", "t2", "t3", "t4",
+        "a2", "a3", "a4", "a5", "a6", "a7",
+      };
+      if (stableBaseActive) {
+        int n = (int)(sizeof(regsNoStable) / sizeof(regsNoStable[0]));
+        return regsNoStable[(nextReg++) % n];
+      }
+      if (lsraEnabled || slotPromotionActive) {
         int n = (int)(sizeof(regsNoLsra) / sizeof(regsNoLsra[0]));
         return regsNoLsra[(nextReg++) % n];
       }
@@ -4771,6 +4976,31 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::vector<Value> indices;
       for (int i = 1; i < op.operandCount(); i++)
         indices.push_back(op.operand(i));
+      if (indices.empty()) {
+        auto promotedIt = promotedScalarSlots.find(valueKey(op.operand(0)));
+        if (promotedIt != promotedScalarSlots.end()) {
+          PromotedScalarSlot &slot = promotedIt->second;
+          if (!slot.valid) {
+            auto stackIt = stackSlots.find(valueKey(op.operand(0)));
+            if (stackIt == stackSlots.end()) {
+              stats.unsupportedOps++;
+              stats.error = "promoted scalar slot has no stack home";
+              return false;
+            }
+            emitStackLoad(slot.reg, stackIt->second, "lw");
+            slot.valid = true;
+          }
+          std::string dst = intResultReg(op.result());
+          bindResult(op.result(), dst);
+          if (dst != slot.reg)
+            os << "    mv " << dst << ", " << slot.reg << "\n";
+          if (shouldSpillDefinedValue(op.result()))
+            spillHome(op.result(), dst);
+          stats.scalarRegLoads++;
+          stats.machineOps++;
+          continue;
+        }
+      }
       if (parseMemrefInfo(op.resultType()).valid) {
         std::string addr;
         if (!computeAddress(op.operand(0), indices, scratchReg(0),
@@ -4810,6 +5040,25 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::vector<Value> indices;
       for (int i = 2; i < op.operandCount(); i++)
         indices.push_back(op.operand(i));
+      if (indices.empty()) {
+        auto promotedIt = promotedScalarSlots.find(valueKey(op.operand(1)));
+        if (promotedIt != promotedScalarSlots.end()) {
+          PromotedScalarSlot &slot = promotedIt->second;
+          std::string val = ensureReg(op.operand(0), scratchReg(0));
+          if (val.empty()) {
+            stats.unsupportedOps++;
+            stats.error = "promoted scalar store value has no assigned register";
+            return false;
+          }
+          if (val != slot.reg)
+            os << "    mv " << slot.reg << ", " << val << "\n";
+          slot.valid = true;
+          slot.dirty = true;
+          stats.scalarRegStores++;
+          stats.machineOps++;
+          continue;
+        }
+      }
       if (!storeToAddress(op.operand(0), op.operand(1), indices))
         return false;
       stats.machineOps++;

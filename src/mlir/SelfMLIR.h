@@ -456,6 +456,14 @@ struct NativeAsmStats {
   int lsraStableValues = 0;
   int lsraRegHits = 0;
   int lsraSpillsAvoided = 0;
+  int scalarPromotedSlots = 0;
+  int scalarLoopCarried = 0;
+  int reductionRegs = 0;
+  int scalarPromoteSkippedEscape = 0;
+  int scalarRegLoads = 0;
+  int scalarRegStores = 0;
+  int globalBaseHoists = 0;
+  int globalBaseHits = 0;
   int tailCalls = 0;
   int calleeSaveSlots = 0;
   int memoFunctions = 0;
