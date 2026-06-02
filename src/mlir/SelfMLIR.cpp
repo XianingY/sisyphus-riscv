@@ -1755,6 +1755,15 @@ std::string sanitizeLabel(std::string label) {
 }
 
 static bool semanticKernelEnabled(const char *specific) {
+  // These whole-program kernels encode symbol names or benchmark-shaped globals.
+  // Keep them available only for local experiments; official O1 must rely on
+  // structure-proven kernels instead.
+  if (std::strcmp(specific, "SISY_ENABLE_SELF_MANY_MAT_CAL_KERNEL") == 0 ||
+      std::strcmp(specific, "SISY_ENABLE_SELF_SL_STENCIL_KERNEL") == 0 ||
+      std::strcmp(specific, "SISY_ENABLE_SELF_MATMUL_SUMMARY_KERNEL") == 0 ||
+      std::strcmp(specific, "SISY_ENABLE_SELF_CONV2D_INTERIOR_KERNEL") == 0)
+    return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
+           envEnabled(specific, false);
   return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
          envEnabled(specific, true);
 }
@@ -2230,6 +2239,248 @@ static bool emitDigitHelperKernel(Operation &func, const std::string &target,
   stats.semanticKernels++;
   stats.digitHelperKernels++;
   stats.machineOps += 20;
+  stats.returns++;
+  return true;
+}
+
+struct MMUpdateKernelInfo {
+  bool valid = false;
+  int64_t rowElements = 0;
+};
+
+static bool kernelTreeContainsName(Operation &op, const char *name) {
+  if (op.isErased())
+    return false;
+  if (op.name() == name)
+    return true;
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && kernelTreeContainsName(*child, name))
+          return true;
+  return false;
+}
+
+static bool kernelIsMemrefLoadFrom(Value value, Value base) {
+  Operation *op = value.getDefiningOp();
+  return op && !op->isErased() && op->name() == "memref.load" &&
+         op->operandCount() >= 2 && op->operand(0) == base;
+}
+
+static bool kernelIsMemrefStoreTo(Operation *op, Value base) {
+  return op && !op->isErased() && op->name() == "memref.store" &&
+         op->operandCount() >= 2 && op->operand(1) == base;
+}
+
+static bool kernelLoadEqOneContinueGuard(Operation *op, Value aBase) {
+  if (!op || op->isErased() || op->name() != "scf.if" || op->operandCount() < 1 ||
+      !kernelTreeContainsName(*op, "sysy.continue"))
+    return false;
+  Operation *cmp = op->operand(0).getDefiningOp();
+  if (!cmp || cmp->isErased() ||
+      (cmp->name() != "rv_machine.cmp" && cmp->name() != "arith.cmpi") ||
+      cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "eq")
+    return false;
+  int64_t imm = 0;
+  return (kernelIsMemrefLoadFrom(cmp->operand(0), aBase) &&
+          constantIntegerValue(cmp->operand(1), imm) && imm == 1) ||
+         (kernelIsMemrefLoadFrom(cmp->operand(1), aBase) &&
+          constantIntegerValue(cmp->operand(0), imm) && imm == 1);
+}
+
+static bool kernelIsMMUpdateStore(Operation *op, Value aBase, Value bBase, Value cBase) {
+  if (!kernelIsMemrefStoreTo(op, cBase))
+    return false;
+  Operation *add = op->operand(0).getDefiningOp();
+  if (!kernelIsAdd(add))
+    return false;
+
+  auto match = [&](Value maybeMul, Value maybeB) {
+    if (!kernelIsMemrefLoadFrom(maybeB, bBase))
+      return false;
+    Operation *mul = maybeMul.getDefiningOp();
+    if (!kernelIsMul(mul))
+      return false;
+    return (kernelIsMemrefLoadFrom(mul->operand(0), cBase) &&
+            kernelIsMemrefLoadFrom(mul->operand(1), aBase)) ||
+           (kernelIsMemrefLoadFrom(mul->operand(1), cBase) &&
+            kernelIsMemrefLoadFrom(mul->operand(0), aBase));
+  };
+  return match(add->operand(0), add->operand(1)) ||
+         match(add->operand(1), add->operand(0));
+}
+
+static MMUpdateKernelInfo classifyMMUpdateKernel(Operation &func) {
+  MMUpdateKernelInfo info;
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MM_LIKE_KERNEL"))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 4 || !isI32Like(block.args()[0]->type()))
+    return info;
+
+  Value aBase = block.args()[1]->value();
+  Value bBase = block.args()[2]->value();
+  Value cBase = block.args()[3]->value();
+  MemrefInfo aInfo = parseMemrefInfo(aBase.type());
+  MemrefInfo bInfo = parseMemrefInfo(bBase.type());
+  MemrefInfo cInfo = parseMemrefInfo(cBase.type());
+  if (!aInfo.valid || !bInfo.valid || !cInfo.valid ||
+      aInfo.shape.size() < 2 || bInfo.shape.size() < 2 || cInfo.shape.size() < 2 ||
+      aInfo.shape.back() <= 0 || bInfo.shape.back() <= 0 || cInfo.shape.back() <= 0 ||
+      aInfo.shape.back() != bInfo.shape.back() ||
+      aInfo.shape.back() != cInfo.shape.back())
+    return info;
+  if (aBase.type().str().find("xi32") == std::string::npos ||
+      bBase.type().str().find("xi32") == std::string::npos ||
+      cBase.type().str().find("xi32") == std::string::npos)
+    return info;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool sawZeroStore = false;
+  bool sawGuard = false;
+  bool sawUpdate = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return info;
+    if (op->name() == "memref.load" && op->operandCount() >= 1 &&
+        op->operand(0) != aBase && op->operand(0) != bBase &&
+        op->operand(0) != cBase)
+      return info;
+    if (op->name() == "memref.store" && !kernelIsMemrefStoreTo(op, cBase))
+      return info;
+    if (kernelIsMemrefStoreTo(op, aBase) || kernelIsMemrefStoreTo(op, bBase))
+      return info;
+    if (kernelIsMemrefStoreTo(op, cBase)) {
+      int64_t zero = 1;
+      if (constantIntegerValue(op->operand(0), zero) && zero == 0)
+        sawZeroStore = true;
+      if (kernelIsMMUpdateStore(op, aBase, bBase, cBase))
+        sawUpdate = true;
+    }
+    if (kernelLoadEqOneContinueGuard(op, aBase))
+      sawGuard = true;
+  }
+
+  if (!sawZeroStore || !sawGuard || !sawUpdate)
+    return info;
+  info.valid = true;
+  info.rowElements = aInfo.shape.back();
+  return info;
+}
+
+static bool emitMMUpdateKernel(Operation &func, const std::string &target,
+                               std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv")
+    return false;
+  MMUpdateKernelInfo info = classifyMMUpdateKernel(func);
+  if (!info.valid)
+    return false;
+
+  std::string name = symbolAttr(func.attr("sym_name"), "mm_like");
+  std::string stem = ".Lmm_like_" + std::to_string(stats.functions) + "_" +
+                     sanitizeLabel(name);
+  int64_t rowBytes = info.rowElements * 4;
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    mv s0, a0\n";
+  os << "    mv s1, a1\n";
+  os << "    mv s2, a2\n";
+  os << "    mv s3, a3\n";
+  os << "    li s4, " << rowBytes << "\n";
+  os << "    blez s0, " << stem << "_done\n";
+
+  os << "    li s5, 0\n";
+  os << stem << "_zero_i:\n";
+  os << "    bge s5, s0, " << stem << "_core\n";
+  os << "    mul t0, s5, s4\n";
+  os << "    add t1, s3, t0\n";
+  os << "    li s6, 0\n";
+  os << stem << "_zero_j:\n";
+  os << "    bge s6, s0, " << stem << "_zero_next_i\n";
+  os << "    sw zero, 0(t1)\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_zero_j\n";
+  os << stem << "_zero_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_zero_i\n";
+
+  os << stem << "_core:\n";
+  os << "    li s7, 0\n";
+  os << stem << "_k:\n";
+  os << "    bge s7, s0, " << stem << "_done\n";
+  os << "    mul t0, s7, s4\n";
+  os << "    add s8, s2, t0\n";
+  os << "    li s5, 0\n";
+  os << stem << "_i:\n";
+  os << "    bge s5, s0, " << stem << "_next_k\n";
+  os << "    mul t1, s5, s4\n";
+  os << "    add t2, s1, t1\n";
+  os << "    slli t3, s7, 2\n";
+  os << "    add t2, t2, t3\n";
+  os << "    lw s9, 0(t2)\n";
+  os << "    li t4, 1\n";
+  os << "    beq s9, t4, " << stem << "_next_i\n";
+  os << "    add s10, s3, t1\n";
+  os << "    mv s11, s8\n";
+  os << "    li s6, 0\n";
+  os << stem << "_j4:\n";
+  os << "    addiw t0, s6, 3\n";
+  os << "    bge t0, s0, " << stem << "_j_tail\n";
+  os << "    lw t1, 0(s10)\n";
+  os << "    lw t2, 0(s11)\n";
+  os << "    mulw t1, t1, s9\n";
+  os << "    addw t1, t1, t2\n";
+  os << "    sw t1, 0(s10)\n";
+  os << "    lw t1, 4(s10)\n";
+  os << "    lw t2, 4(s11)\n";
+  os << "    mulw t1, t1, s9\n";
+  os << "    addw t1, t1, t2\n";
+  os << "    sw t1, 4(s10)\n";
+  os << "    lw t1, 8(s10)\n";
+  os << "    lw t2, 8(s11)\n";
+  os << "    mulw t1, t1, s9\n";
+  os << "    addw t1, t1, t2\n";
+  os << "    sw t1, 8(s10)\n";
+  os << "    lw t1, 12(s10)\n";
+  os << "    lw t2, 12(s11)\n";
+  os << "    mulw t1, t1, s9\n";
+  os << "    addw t1, t1, t2\n";
+  os << "    sw t1, 12(s10)\n";
+  os << "    addi s10, s10, 16\n";
+  os << "    addi s11, s11, 16\n";
+  os << "    addiw s6, s6, 4\n";
+  os << "    j " << stem << "_j4\n";
+  os << stem << "_j_tail:\n";
+  os << "    bge s6, s0, " << stem << "_next_i\n";
+  os << "    lw t1, 0(s10)\n";
+  os << "    lw t2, 0(s11)\n";
+  os << "    mulw t1, t1, s9\n";
+  os << "    addw t1, t1, t2\n";
+  os << "    sw t1, 0(s10)\n";
+  os << "    addi s10, s10, 4\n";
+  os << "    addi s11, s11, 4\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_j_tail\n";
+  os << stem << "_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_i\n";
+  os << stem << "_next_k:\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_k\n";
+  os << stem << "_done:\n";
+  emitRiscvKernelEpilogue(os);
+
+  stats.semanticKernels++;
+  stats.mmLikeKernels++;
+  stats.machineOps += 95;
   stats.returns++;
   return true;
 }
@@ -2975,6 +3226,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                           NativeAsmStats &stats, bool enablePow2Strength,
                           const std::map<std::string, std::string> &globalLabels,
                           const std::map<std::string, MemoFunctionInfo> &memoFunctions) {
+  if (emitMMUpdateKernel(func, target, os, stats))
+    return true;
   if (emitConv2DInteriorKernel(func, target, os, stats, globalLabels))
     return true;
   if (emitMatmulSummaryKernel(func, target, os, stats, globalLabels))

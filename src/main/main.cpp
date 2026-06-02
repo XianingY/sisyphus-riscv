@@ -428,10 +428,11 @@ int main(int argc, char **argv) {
               << " triangular-transpose-kernels=" << asmStats.triangularTransposeKernels
               << " modular-multiply-kernels=" << asmStats.modularMultiplyKernels
               << " digit-helper-kernels=" << asmStats.digitHelperKernels
-              << " many-mat-cal-kernels=" << asmStats.manyMatCalKernels
-              << " sl-stencil-kernels=" << asmStats.slStencilKernels
-              << " matmul-summary-kernels=" << asmStats.matmulSummaryKernels
-              << " conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
+              << " mm-like-kernels=" << asmStats.mmLikeKernels
+              << " experimental-many-mat-cal-kernels=" << asmStats.manyMatCalKernels
+              << " experimental-sl-stencil-kernels=" << asmStats.slStencilKernels
+              << " experimental-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
+              << " experimental-conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
               << "\n";
   }
 
