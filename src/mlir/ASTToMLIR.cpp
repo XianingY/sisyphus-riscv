@@ -965,6 +965,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   stats.conversionRollbacks = convStats.rollbacks;
   if (effective.enablePow2Strength)
     runParityProductCompareStrength(*module, &stats.opt);
+  runMachineDeadCodeElim(*module, &stats.opt);
   summarizeModule(*module, stats);
   if (dump) {
     *dump << "===== self-MLIR production =====\n";

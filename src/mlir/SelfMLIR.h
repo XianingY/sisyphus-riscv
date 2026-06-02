@@ -366,6 +366,7 @@ void runLoopRepeatReduction(Module &module, SelfOptStats *stats = nullptr);
 void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats = nullptr);
 void runParityProductCompareStrength(Module &module, SelfOptStats *stats = nullptr);
+void runMachineDeadCodeElim(Module &module, SelfOptStats *stats = nullptr);
 void collectAffineNestSummary(Module &module, SelfOptStats *stats = nullptr);
 void runLoopLocalScheduler(Module &module, SelfOptStats *stats = nullptr);
 void runLoopVectorization(Module &module);

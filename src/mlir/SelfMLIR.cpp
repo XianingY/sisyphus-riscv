@@ -3582,6 +3582,45 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   int nextVecReg = 0;
   int nextFloatReg = 0;
   int returnsBefore = stats.returns;
+  std::set<std::string> skipMaterializedConstants;
+  if (!isArm) {
+    for (auto *op : funcOps) {
+      if (!op || op->isErased() || op->name() != "rv_machine.li" ||
+          op->resultCount() != 1 || isFloatType(op->resultType()))
+        continue;
+      int64_t imm = 0;
+      if (!constantIntegerValue(op->result(), imm))
+        continue;
+      bool hasUse = false;
+      bool allImmediateFriendly = true;
+      for (const auto &use : op->resultUses[0]) {
+        Operation *user = use.owner;
+        if (!user || user->isErased())
+          continue;
+        hasUse = true;
+        bool ok = false;
+        if ((user->name() == "rv_machine.and" ||
+             user->name() == "rv_machine.or" ||
+             user->name() == "rv_machine.xor") &&
+            user->operandCount() == 2 && fitsSigned12(imm)) {
+          Value other = valueKey(user->operand(0)) == valueKey(op->result()) ? user->operand(1)
+                                                                             : user->operand(0);
+          int64_t otherImm = 0;
+          ok = !constantIntegerValue(other, otherImm);
+        } else if (user->name() == "rv_machine.cmp" &&
+                   user->operandCount() == 2 && imm == 0) {
+          std::string pred = symbolAttr(user->attr("predicate"));
+          ok = pred == "eq" || pred == "ne";
+        }
+        if (!ok) {
+          allImmediateFriendly = false;
+          break;
+        }
+      }
+      if (hasUse && allImmediateFriendly)
+        skipMaterializedConstants.insert(valueKey(op->result()));
+    }
+  }
 
   auto scratchReg = [&](int n) -> std::string {
     if (isArm)
@@ -4372,6 +4411,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     } consumeGuard{consumeAtEnd};
 
     if (opname == "rv_machine.li" || opname == "arm_machine.mov") {
+      if (!isArm && op.resultCount() == 1 &&
+          skipMaterializedConstants.count(valueKey(op.result())) != 0) {
+        stats.deadSpillsAvoided++;
+        stats.machineOps++;
+        continue;
+      }
       std::string dst;
       if (op.resultType().str().find("vector") != std::string::npos) {
         dst = "v" + std::to_string(nextVecReg++);
@@ -4532,6 +4577,42 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 	              os << "    sraiw " << dst << ", " << tmp << ", " << shift << "\n";
 	            }
 	          }
+	          if (shouldSpillDefinedValue(op.result()))
+	            spillHome(op.result(), dst);
+	          stats.machineOps++;
+	          stats.pow2StrengthReductions++;
+	          continue;
+	        }
+	      }
+	      if (!isArm && (opname == "rv_machine.and" ||
+	                     opname == "rv_machine.or" ||
+	                     opname == "rv_machine.xor")) {
+	        int64_t imm = 0;
+	        Value valueOperand;
+	        bool hasImm = false;
+	        int64_t otherImm = 0;
+	        bool rhsConst = constantIntegerValue(op.operand(1), imm) && fitsSigned12(imm);
+	        bool lhsConst = constantIntegerValue(op.operand(0), otherImm) && fitsSigned12(otherImm);
+	        if (rhsConst && !lhsConst) {
+	          valueOperand = op.operand(0);
+	          hasImm = true;
+	        } else if (lhsConst && !rhsConst) {
+	          imm = otherImm;
+	          valueOperand = op.operand(1);
+	          hasImm = true;
+	        }
+	        if (hasImm) {
+	          std::string lhs = ensureReg(valueOperand, scratchReg(0));
+	          if (lhs.empty()) {
+	            lhs = scratchReg(0);
+	            os << "    li " << lhs << ", 0\n";
+	          }
+	          std::string dst = intResultReg(op.result());
+	          bindResult(op.result(), dst);
+	          const char *inst = opname == "rv_machine.and" ? "andi"
+	                            : (opname == "rv_machine.or" ? "ori" : "xori");
+	          os << "    " << inst << " " << dst << ", " << lhs << ", " << imm << "\n";
+	          os << "    addiw " << dst << ", " << dst << ", 0\n";
 	          if (shouldSpillDefinedValue(op.result()))
 	            spillHome(op.result(), dst);
 	          stats.machineOps++;
@@ -5205,6 +5286,34 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "rv_machine.cmp" || opname == "arm_machine.cmp" ||
         opname == "rv_machine.fcmp" || opname == "arm_machine.fcmp") {
+      if (opname == "rv_machine.cmp" && op.operandCount() == 2 &&
+          op.resultCount() == 1) {
+        std::string pred = symbolAttr(op.attr("predicate"));
+        if (pred == "eq" || pred == "ne") {
+          int64_t zero = 0;
+          Value testValue;
+          if (constantIntegerValue(op.operand(1), zero) && zero == 0)
+            testValue = op.operand(0);
+          else if (constantIntegerValue(op.operand(0), zero) && zero == 0)
+            testValue = op.operand(1);
+          if (testValue.valid()) {
+            std::string src = ensureReg(testValue, scratchReg(0));
+            if (src.empty()) {
+              stats.unsupportedOps++;
+              stats.error = "cmp zero operand has no assigned register";
+              return false;
+            }
+            std::string dst = intResultReg(op.result());
+            bindResult(op.result(), dst);
+            os << "    " << (pred == "eq" ? "seqz " : "snez ")
+               << dst << ", " << src << "\n";
+            if (shouldSpillDefinedValue(op.result()))
+              spillHome(op.result(), dst);
+            stats.machineOps++;
+            continue;
+          }
+        }
+      }
       std::string lhs = ensureReg(op.operand(0), isFloatType(op.operand(0).type()) ? (isArm ? "s30" : "ft10") : scratchReg(0));
       std::string rhs = ensureReg(op.operand(1), isFloatType(op.operand(1).type()) ? (isArm ? "s31" : "ft11") : scratchReg(1));
       std::string dst = isArm ? resultReg() : intResultReg(op.result());
@@ -7909,6 +8018,25 @@ static std::string parityAndOpForCmp(const std::string &cmpName) {
   return "arith.andi";
 }
 
+static std::string parityNotOpForCmp(const std::string &cmpName) {
+  if (cmpName == "rv_machine.cmp")
+    return "rv_machine.seqz";
+  if (cmpName == "arm_machine.cmp")
+    return "arm_machine.not";
+  return "arith.noti";
+}
+
+static bool parityPureDeadOp(Operation *op) {
+  if (!op || op->isErased() || op->resultCount() == 0)
+    return false;
+  for (int i = 0; i < op->resultCount(); i++) {
+    if (!op->resultUses[i].empty())
+      return false;
+  }
+  return parityOpHasName(op, {"arith.constant", "rv_machine.li", "arm_machine.mov",
+                              "arith.andi", "rv_machine.and", "arm_machine.and"});
+}
+
 void runParityProductCompareStrength(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_POW2_STRENGTH", true))
     return;
@@ -7981,21 +8109,80 @@ void runParityProductCompareStrength(Module &module, SelfOptStats *stats) {
         std::vector<Value>{andPair.result(), one.result()}, std::vector<Type>{i32},
         std::map<std::string, Attribute>{}, cmp->loc());
     Operation &lowBit = block->insertOperation(insertIndex++, std::move(lowBitOp));
-    auto newCmpOp = std::make_unique<Operation>(
-        cmp->name(), std::vector<Value>{lowBit.result(), zeroValue}, std::vector<Type>{i32},
-        std::map<std::string, Attribute>{{"predicate", cmp->attr("predicate")}}, cmp->loc());
-    Operation &newCmp = block->insertOperation(insertIndex++, std::move(newCmpOp));
+    Value replacement = lowBit.result();
+    if (pred == "eq") {
+      auto notOp = std::make_unique<Operation>(
+          parityNotOpForCmp(cmp->name()), std::vector<Value>{lowBit.result()},
+          std::vector<Type>{i32}, std::map<std::string, Attribute>{}, cmp->loc());
+      Operation &inserted = block->insertOperation(insertIndex++, std::move(notOp));
+      replacement = inserted.result();
+    }
 
-    replaceAllUses(module, cmp->result(), newCmp.result());
+    Operation *zeroDef = zeroValue.getDefiningOp();
+    Operation *divisorDef = rem->operand(1).getDefiningOp();
+    replaceAllUses(module, cmp->result(), replacement);
     cmp->markErased();
     rem->markErased();
     mul->markErased();
+    if (parityPureDeadOp(zeroDef))
+      zeroDef->markErased();
+    if (parityPureDeadOp(divisorDef))
+      divisorDef->markErased();
     changed = true;
     if (stats)
       stats->pow2StrengthReductions++;
   }
   if (changed)
     eraseMarked(module);
+}
+
+static bool machineDcePureOp(Operation *op) {
+  if (!op || op->isErased() || op->resultCount() == 0 || !op->getRegions().empty())
+    return false;
+  for (int i = 0; i < op->resultCount(); i++) {
+    if (!op->resultUses[i].empty())
+      return false;
+  }
+  const std::string &name = op->name();
+  return name == "arith.constant" || name == "arith.addi" ||
+         name == "arith.subi" || name == "arith.muli" ||
+         name == "arith.divi" || name == "arith.remi" ||
+         name == "arith.andi" || name == "arith.ori" ||
+         name == "arith.xori" || name == "arith.noti" ||
+         name == "arith.cmpi" || name == "rv_machine.li" ||
+         name == "rv_machine.addw" || name == "rv_machine.subw" ||
+         name == "rv_machine.mulw" || name == "rv_machine.divw" ||
+         name == "rv_machine.remw" || name == "rv_machine.and" ||
+         name == "rv_machine.or" || name == "rv_machine.xor" ||
+         name == "rv_machine.seqz" || name == "rv_machine.neg" ||
+         name == "rv_machine.cmp" || name == "arm_machine.mov" ||
+         name == "arm_machine.add" || name == "arm_machine.sub" ||
+         name == "arm_machine.mul" || name == "arm_machine.sdiv" ||
+         name == "arm_machine.srem" || name == "arm_machine.and" ||
+         name == "arm_machine.orr" || name == "arm_machine.eor" ||
+         name == "arm_machine.not" || name == "arm_machine.neg" ||
+         name == "arm_machine.cmp";
+}
+
+void runMachineDeadCodeElim(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_MACHINE_DCE", true))
+    return;
+  bool changed = true;
+  int removed = 0;
+  while (changed) {
+    changed = false;
+    for (auto *op : walk(module)) {
+      if (!machineDcePureOp(op))
+        continue;
+      op->markErased();
+      changed = true;
+      removed++;
+    }
+    if (changed)
+      eraseMarked(module);
+  }
+  if (stats && removed > 0)
+    stats->worklistRewrites += removed;
 }
 
 static bool classifyRowBufferedReduction(Operation &outer, RowReductionInfo &info) {
