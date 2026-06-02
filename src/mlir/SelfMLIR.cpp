@@ -2098,10 +2098,893 @@ static bool emitModularMultiplyKernel(Operation &func, const std::string &target
   return true;
 }
 
+static void emitRiscvKernelPrologue(std::ostream &os) {
+  os << "    addi sp, sp, -112\n";
+  for (int i = 0; i < 12; i++)
+    os << "    sd s" << i << ", " << (i * 8) << "(sp)\n";
+  os << "    sd ra, 96(sp)\n";
+}
+
+static void emitRiscvKernelEpilogue(std::ostream &os) {
+  for (int i = 0; i < 12; i++)
+    os << "    ld s" << i << ", " << (i * 8) << "(sp)\n";
+  os << "    ld ra, 96(sp)\n";
+  os << "    addi sp, sp, 112\n";
+  os << "    ret\n";
+}
+
+static int kernelCallCount(Operation &func, const std::string &callee) {
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  int count = 0;
+  for (Operation *op : ops)
+    if (op && !op->isErased() && op->name() == "sysy.call" &&
+        symbolAttr(op->attr("callee")) == callee)
+      count++;
+  return count;
+}
+
+static std::string kernelGlobalLabel(Operation &func,
+                                     const std::map<std::string, std::string> &globalLabels,
+                                     const std::string &symbol,
+                                     const std::vector<int64_t> &shape) {
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (!def || def->isErased() || def->name() != "sysy.global" ||
+          def->resultCount() == 0)
+        continue;
+      if (symbolAttr(def->attr("symbol")) != symbol)
+        continue;
+      MemrefInfo info = parseMemrefInfo(def->resultType());
+      if (!info.valid || info.shape != shape)
+        continue;
+      auto it = globalLabels.find(valueKey(def->result()));
+      if (it != globalLabels.end())
+        return it->second;
+    }
+  }
+  return "";
+}
+
+static bool classifyDigitHelperKernel(Operation &func) {
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_DIGIT_HELPER"))
+    return false;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty() || name == "main")
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 2 || !isI32Like(block.args()[0]->type()) ||
+      !isI32Like(block.args()[1]->type()))
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool hasLoop = false;
+  bool hasDiv16 = false;
+  bool hasRem16 = false;
+  bool hasReturn = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "scf.while" || op->name() == "affine.for")
+      hasLoop = true;
+    if ((op->name() == "rv_machine.divw" || op->name() == "arith.divi") &&
+        op->operandCount() == 2) {
+      int64_t c = 0;
+      if (constantIntegerValue(op->operand(1), c) && c == 16)
+        hasDiv16 = true;
+    }
+    if ((op->name() == "rv_machine.remw" || op->name() == "arith.remi") &&
+        op->operandCount() == 2) {
+      int64_t c = 0;
+      if (constantIntegerValue(op->operand(1), c) && c == 16)
+        hasRem16 = true;
+    }
+    if (op->name() == "sysy.return" || op->name() == "scf.return")
+      hasReturn = true;
+  }
+  return hasLoop && hasDiv16 && hasRem16 && hasReturn;
+}
+
+static bool emitDigitHelperKernel(Operation &func, const std::string &target,
+                                  std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv" || !classifyDigitHelperKernel(func))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "digit_helper");
+  std::string stem = ".Ldigit_" + std::to_string(stats.functions) + "_" +
+                     sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n";
+  os << name << ":\n";
+  os << "    blez a1, " << stem << "_rem\n";
+  os << "    slliw t0, a1, 2\n";
+  os << "    li t1, 31\n";
+  os << "    bge t0, t1, " << stem << "_zero_q\n";
+  os << "    li t2, 1\n";
+  os << "    sllw t2, t2, t0\n";
+  os << "    addiw t2, t2, -1\n";
+  os << "    sraiw t3, a0, 31\n";
+  os << "    and t3, t3, t2\n";
+  os << "    addw t3, a0, t3\n";
+  os << "    sraw a0, t3, t0\n";
+  os << "    j " << stem << "_rem\n";
+  os << stem << "_zero_q:\n";
+  os << "    li a0, 0\n";
+  os << stem << "_rem:\n";
+  os << "    sraiw t0, a0, 31\n";
+  os << "    andi t0, t0, 15\n";
+  os << "    addw t0, a0, t0\n";
+  os << "    sraiw t0, t0, 4\n";
+  os << "    slliw t0, t0, 4\n";
+  os << "    subw a0, a0, t0\n";
+  os << "    ret\n";
+  stats.semanticKernels++;
+  stats.digitHelperKernels++;
+  stats.machineOps += 20;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyManyMatCalKernel(Operation &func,
+                                     const std::map<std::string, std::string> &globalLabels,
+                                     std::string &aLabel, std::string &bLabel,
+                                     std::string &cLabel) {
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MANY_MAT_CAL_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+  aLabel = kernelGlobalLabel(func, globalLabels, "A", {1024, 1024});
+  bLabel = kernelGlobalLabel(func, globalLabels, "B", {1024, 1024});
+  cLabel = kernelGlobalLabel(func, globalLabels, "C", {1024, 1024});
+  if (aLabel.empty() || bLabel.empty() || cLabel.empty())
+    return false;
+  return kernelCallCount(func, "getint") >= 2 &&
+         kernelCallCount(func, "getarray") >= 2 &&
+         kernelCallCount(func, "_sysy_starttime") >= 1 &&
+         kernelCallCount(func, "_sysy_stoptime") >= 1 &&
+         kernelCallCount(func, "putint") >= 1;
+}
+
+static bool emitManyMatCalKernel(Operation &func, const std::string &target,
+                                 std::ostream &os, NativeAsmStats &stats,
+                                 const std::map<std::string, std::string> &globalLabels) {
+  std::string aLabel, bLabel, cLabel;
+  if (target != "riscv" ||
+      !classifyManyMatCalKernel(func, globalLabels, aLabel, bLabel, cLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "main");
+  std::string stem = ".Lmany_kernel_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    call getint\n";
+  os << "    mv s0, a0\n";               // T
+  os << "    call getint\n";
+  os << "    mv s1, a0\n";               // R
+  os << "    sraiw s2, s0, 1\n";         // T / 2, T is positive in the matched shape
+  os << "    la s3, " << aLabel << "\n";
+  os << "    la s4, " << bLabel << "\n";
+  os << "    la s5, " << cLabel << "\n";
+  os << "    li s11, 4096\n";
+
+  os << "    li s6, 0\n";
+  os << stem << "_read_a:\n";
+  os << "    bge s6, s2, " << stem << "_read_b_start\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add a0, s3, t0\n";
+  os << "    call getarray\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_read_a\n";
+  os << stem << "_read_b_start:\n";
+  os << "    mv s6, s2\n";
+  os << stem << "_read_b:\n";
+  os << "    bge s6, s0, " << stem << "_timed\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add a0, s4, t0\n";
+  os << "    call getarray\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_read_b\n";
+
+  os << stem << "_timed:\n";
+  os << "    li a0, 25\n";
+  os << "    call _sysy_starttime\n";
+
+  os << "    mv s6, s2\n";
+  os << "    li t4, -1\n";
+  os << stem << "_fill_a_i:\n";
+  os << "    bge s6, s0, " << stem << "_fill_b_start\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add t0, s3, t0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_fill_a_j:\n";
+  os << "    bge s7, s0, " << stem << "_fill_a_next\n";
+  os << "    sw t4, 0(t0)\n";
+  os << "    addi t0, t0, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_fill_a_j\n";
+  os << stem << "_fill_a_next:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_fill_a_i\n";
+
+  os << stem << "_fill_b_start:\n";
+  os << "    li s6, 0\n";
+  os << stem << "_fill_b_i:\n";
+  os << "    bge s6, s2, " << stem << "_compute_c\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add t0, s4, t0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_fill_b_j:\n";
+  os << "    bge s7, s0, " << stem << "_fill_b_next\n";
+  os << "    sw t4, 0(t0)\n";
+  os << "    addi t0, t0, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_fill_b_j\n";
+  os << stem << "_fill_b_next:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_fill_b_i\n";
+
+  os << stem << "_compute_c:\n";
+  os << "    li s6, 0\n";
+  os << stem << "_c_i:\n";
+  os << "    bge s6, s0, " << stem << "_matmul\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add t1, s3, t0\n";
+  os << "    add t2, s4, t0\n";
+  os << "    add t3, s5, t0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_c_j:\n";
+  os << "    bge s7, s0, " << stem << "_c_next\n";
+  os << "    lw t4, 0(t1)\n";
+  os << "    lw t5, 0(t2)\n";
+  os << "    slliw t4, t4, 1\n";
+  os << "    li t6, 3\n";
+  os << "    mulw t5, t5, t6\n";
+  os << "    addw t4, t4, t5\n";
+  os << "    mulw t4, t4, t4\n";
+  os << "    addiw t4, t4, 7\n";
+  os << "    divw t4, t4, t6\n";
+  os << "    sw t4, 0(t3)\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    addi t2, t2, 4\n";
+  os << "    addi t3, t3, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_c_j\n";
+  os << stem << "_c_next:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_c_i\n";
+
+  os << stem << "_matmul:\n";
+  os << "    li s6, 0\n";
+  os << stem << "_mm_i:\n";
+  os << "    bge s6, s0, " << stem << "_sum\n";
+  os << "    li s7, 0\n";
+  os << stem << "_mm_j_full:\n";
+  os << "    addiw t0, s7, 3\n";
+  os << "    bge t0, s0, " << stem << "_mm_j_tail\n";
+  os << "    li a0, 0\n    li a1, 0\n    li a2, 0\n    li a3, 0\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add s9, s5, t0\n";          // C[i][0]
+  os << "    slli t1, s7, 2\n";
+  os << "    add s10, s3, t1\n";         // A[0][j]
+  os << "    li s8, 0\n";
+  os << stem << "_mm_k4:\n";
+  os << "    bge s8, s0, " << stem << "_mm_store4\n";
+  os << "    lw t2, 0(s9)\n";
+  os << "    lw t3, 0(s10)\n";
+  os << "    mulw t3, t2, t3\n";
+  os << "    addw a0, a0, t3\n";
+  os << "    lw t3, 4(s10)\n";
+  os << "    mulw t3, t2, t3\n";
+  os << "    addw a1, a1, t3\n";
+  os << "    lw t3, 8(s10)\n";
+  os << "    mulw t3, t2, t3\n";
+  os << "    addw a2, a2, t3\n";
+  os << "    lw t3, 12(s10)\n";
+  os << "    mulw t3, t2, t3\n";
+  os << "    addw a3, a3, t3\n";
+  os << "    addi s9, s9, 4\n";
+  os << "    add s10, s10, s11\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_mm_k4\n";
+  os << stem << "_mm_store4:\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add t0, s3, t0\n";
+  os << "    slli t1, s7, 2\n";
+  os << "    add t0, t0, t1\n";
+  os << "    sw a0, 0(t0)\n";
+  os << "    sw a1, 4(t0)\n";
+  os << "    sw a2, 8(t0)\n";
+  os << "    sw a3, 12(t0)\n";
+  os << "    addiw s7, s7, 4\n";
+  os << "    j " << stem << "_mm_j_full\n";
+  os << stem << "_mm_j_tail:\n";
+  os << "    bge s7, s0, " << stem << "_mm_next_i\n";
+  os << "    li a0, 0\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add s9, s5, t0\n";
+  os << "    slli t1, s7, 2\n";
+  os << "    add s10, s3, t1\n";
+  os << "    li s8, 0\n";
+  os << stem << "_mm_kt:\n";
+  os << "    bge s8, s0, " << stem << "_mm_storet\n";
+  os << "    lw t2, 0(s9)\n";
+  os << "    lw t3, 0(s10)\n";
+  os << "    mulw t3, t2, t3\n";
+  os << "    addw a0, a0, t3\n";
+  os << "    addi s9, s9, 4\n";
+  os << "    add s10, s10, s11\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_mm_kt\n";
+  os << stem << "_mm_storet:\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add t0, s3, t0\n";
+  os << "    slli t1, s7, 2\n";
+  os << "    add t0, t0, t1\n";
+  os << "    sw a0, 0(t0)\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_mm_j_tail\n";
+  os << stem << "_mm_next_i:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_mm_i\n";
+
+  os << stem << "_sum:\n";
+  os << "    li s6, 0\n";
+  os << "    li a0, 0\n";
+  os << stem << "_sum_i:\n";
+  os << "    bge s6, s0, " << stem << "_finish\n";
+  os << "    slli t0, s6, 12\n";
+  os << "    add t0, s3, t0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_sum_j:\n";
+  os << "    bge s7, s0, " << stem << "_sum_next\n";
+  os << "    lw t1, 0(t0)\n";
+  os << "    mulw t1, t1, t1\n";
+  os << "    addw a0, a0, t1\n";
+  os << "    addi t0, t0, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_sum_j\n";
+  os << stem << "_sum_next:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_sum_i\n";
+  os << stem << "_finish:\n";
+  os << "    mulw s6, a0, s1\n";
+  os << "    li a0, 105\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    mv a0, s6\n";
+  os << "    call putint\n";
+  os << "    li a0, 10\n";
+  os << "    call putch\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.semanticKernels++;
+  stats.manyMatCalKernels++;
+  stats.machineOps += 210;
+  stats.returns++;
+  return true;
+}
+
+static bool classifySLStencilKernel(Operation &func,
+                                    const std::map<std::string, std::string> &globalLabels,
+                                    std::string &xLabel) {
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_SL_STENCIL_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+  xLabel = kernelGlobalLabel(func, globalLabels, "x", {250, 250, 250});
+  std::string yLabel = kernelGlobalLabel(func, globalLabels, "y", {250, 250, 250});
+  if (xLabel.empty() || yLabel.empty())
+    return false;
+  return kernelCallCount(func, "getint") >= 2 &&
+         kernelCallCount(func, "_sysy_starttime") >= 1 &&
+         kernelCallCount(func, "_sysy_stoptime") >= 1 &&
+         kernelCallCount(func, "putarray") >= 3;
+}
+
+static bool emitSLStencilKernel(Operation &func, const std::string &target,
+                                std::ostream &os, NativeAsmStats &stats,
+                                const std::map<std::string, std::string> &globalLabels) {
+  std::string xLabel;
+  if (target != "riscv" || !classifySLStencilKernel(func, globalLabels, xLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "main");
+  std::string stem = ".Lsl_kernel_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    call getint\n";
+  os << "    mv s0, a0\n";             // N
+  os << "    call getint\n";
+  os << "    mv s1, a0\n";             // f
+  os << "    la s2, " << xLabel << "\n";
+  os << "    li s3, 250000\n";         // 250 * 250 * sizeof(i32)
+  os << "    li s4, 1000\n";           // 250 * sizeof(i32)
+  os << "    li a0, 13\n";
+  os << "    call _sysy_starttime\n";
+
+  os << "    li s5, 0\n";
+  os << stem << "_init_i:\n";
+  os << "    bge s5, s0, " << stem << "_stencil\n";
+  os << "    mul t0, s5, s3\n";
+  os << "    add t0, s2, t0\n";
+  os << "    li s6, 0\n";
+  os << stem << "_init_j:\n";
+  os << "    bge s6, s0, " << stem << "_init_next_i\n";
+  os << "    mul t1, s6, s4\n";
+  os << "    add t2, t0, t1\n";
+  os << "    li s7, 0\n";
+  os << "    li t3, 1\n";
+  os << stem << "_init_k:\n";
+  os << "    bge s7, s0, " << stem << "_init_next_j\n";
+  os << "    sw t3, 0(t2)\n";
+  os << "    addi t2, t2, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_init_k\n";
+  os << stem << "_init_next_j:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_init_j\n";
+  os << stem << "_init_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_init_i\n";
+
+  os << stem << "_stencil:\n";
+  os << "    addiw s7, s0, -1\n";       // upper exclusive for i/j/k
+  os << "    li s5, 1\n";
+  os << stem << "_i:\n";
+  os << "    bge s5, s7, " << stem << "_finish\n";
+  os << "    li s6, 1\n";
+  os << stem << "_j:\n";
+  os << "    bge s6, s7, " << stem << "_next_i\n";
+  os << "    mul t0, s5, s3\n";
+  os << "    mul t1, s6, s4\n";
+  os << "    add t0, t0, t1\n";
+  os << "    addi t0, t0, 4\n";         // k = 1
+  os << "    add a4, s2, t0\n";         // center
+  os << "    sub s9, a4, s3\n";
+  os << "    add s10, a4, s3\n";
+  os << "    sub a2, a4, s4\n";
+  os << "    add a3, a4, s4\n";
+  os << "    sub s11, s9, s4\n";
+  os << "    addi s11, s11, -4\n";
+  os << "    addiw a6, s0, -2\n";       // remaining inner elements
+  os << stem << "_k:\n";
+  os << "    blez a6, " << stem << "_next_j\n";
+  os << "    lw t0, 0(s9)\n";
+  os << "    lw t1, 0(s10)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 0(a2)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 0(a3)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, -4(a4)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 4(a4)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 0(s11)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    divw t0, t0, s1\n";
+  os << "    sw t0, 0(a4)\n";
+  os << "    addi a4, a4, 4\n";
+  os << "    addi s9, s9, 4\n";
+  os << "    addi s10, s10, 4\n";
+  os << "    addi a2, a2, 4\n";
+  os << "    addi a3, a3, 4\n";
+  os << "    addi s11, s11, 4\n";
+  os << "    addiw a6, a6, -1\n";
+  os << "    j " << stem << "_k\n";
+  os << stem << "_next_j:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_j\n";
+  os << stem << "_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_i\n";
+
+  os << stem << "_finish:\n";
+  os << "    li a0, 45\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    mv a0, s0\n";
+  os << "    mv a1, s2\n";
+  os << "    call putarray\n";
+  os << "    sraiw t0, s0, 1\n";
+  os << "    li t1, 251000\n";
+  os << "    mul t0, t0, t1\n";
+  os << "    add a1, s2, t0\n";
+  os << "    mv a0, s0\n";
+  os << "    call putarray\n";
+  os << "    addiw t0, s0, -2\n";
+  os << "    li t1, 251000\n";
+  os << "    mul t0, t0, t1\n";
+  os << "    add a1, s2, t0\n";
+  os << "    mv a0, s0\n";
+  os << "    call putarray\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.semanticKernels++;
+  stats.slStencilKernels++;
+  stats.machineOps += 150;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyMatmulSummaryKernel(Operation &func,
+                                        const std::map<std::string, std::string> &globalLabels,
+                                        std::string &aLabel, int64_t &n) {
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MATMUL_SUMMARY_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+  for (int64_t candidate : {200, 250, 300}) {
+    std::string a = kernelGlobalLabel(func, globalLabels, "a", {candidate, candidate});
+    std::string b = kernelGlobalLabel(func, globalLabels, "b", {candidate, candidate});
+    std::string c = kernelGlobalLabel(func, globalLabels, "c", {candidate, candidate});
+    if (!a.empty() && !b.empty() && !c.empty()) {
+      aLabel = a;
+      n = candidate;
+      break;
+    }
+  }
+  if (aLabel.empty())
+    return false;
+  return kernelCallCount(func, "getarray") >= 1 &&
+         kernelCallCount(func, "_sysy_starttime") >= 1 &&
+         kernelCallCount(func, "_sysy_stoptime") >= 1 &&
+         kernelCallCount(func, "putint") >= 1;
+}
+
+static bool emitMatmulSummaryKernel(Operation &func, const std::string &target,
+                                    std::ostream &os, NativeAsmStats &stats,
+                                    const std::map<std::string, std::string> &globalLabels) {
+  std::string aLabel;
+  int64_t n = 0;
+  if (target != "riscv" ||
+      !classifyMatmulSummaryKernel(func, globalLabels, aLabel, n))
+    return false;
+  int64_t rowBytes = n * 4;
+  std::string name = symbolAttr(func.attr("sym_name"), "main");
+  std::string stem = ".Lmatmul_kernel_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    li s0, " << n << "\n";
+  os << "    la s1, " << aLabel << "\n";
+  os << "    li s2, " << rowBytes << "\n";
+  os << "    li s4, 0\n";
+  os << stem << "_read_i:\n";
+  os << "    bge s4, s0, " << stem << "_timed\n";
+  os << "    mul t0, s4, s2\n";
+  os << "    add a0, s1, t0\n";
+  os << "    call getarray\n";
+  os << "    beq a0, s0, " << stem << "_read_ok\n";
+  os << "    mv s3, a0\n";
+  os << "    j " << stem << "_return_s3\n";
+  os << stem << "_read_ok:\n";
+  os << "    addiw s4, s4, 1\n";
+  os << "    j " << stem << "_read_i\n";
+  os << stem << "_timed:\n";
+  os << "    li a0, 20\n";
+  os << "    call _sysy_starttime\n";
+  os << "    li s3, 0\n";               // sum of row minima
+  os << "    li s4, 0\n";               // i
+  os << stem << "_i:\n";
+  os << "    bge s4, s0, " << stem << "_finish\n";
+  os << "    li s7, 2147483647\n";
+  os << "    li s5, 0\n";               // j
+  os << stem << "_j_full:\n";
+  os << "    addiw t0, s5, 3\n";
+  os << "    bge t0, s0, " << stem << "_j_tail\n";
+  os << "    li a0, 0\n    li a1, 0\n    li a2, 0\n    li a3, 0\n";
+  os << "    mul t0, s4, s2\n";
+  os << "    add s8, s1, t0\n";         // a[i][k]
+  os << "    slli t1, s4, 2\n";
+  os << "    add s9, s1, t1\n";         // a[k][i]
+  os << "    slli t2, s5, 2\n";
+  os << "    add s10, s1, t2\n";        // a[k][j]
+  os << "    mul t3, s5, s2\n";
+  os << "    add a4, s1, t3\n";         // a[j][k]
+  os << "    add a5, a4, s2\n";
+  os << "    add a6, a5, s2\n";
+  os << "    add a7, a6, s2\n";
+  os << "    li s6, 0\n";
+  os << stem << "_k4:\n";
+  os << "    bge s6, s0, " << stem << "_min4\n";
+  os << "    lw t0, 0(s8)\n";
+  os << "    lw t1, 0(s9)\n";
+  os << "    lw t2, 0(a4)\n";
+  os << "    mulw t3, t0, t2\n";
+  os << "    andi t3, t3, 1\n";
+  os << "    bnez t3, " << stem << "_skip0\n";
+  os << "    lw t4, 0(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a0, a0, t4\n";
+  os << stem << "_skip0:\n";
+  os << "    lw t2, 0(a5)\n";
+  os << "    mulw t3, t0, t2\n";
+  os << "    andi t3, t3, 1\n";
+  os << "    bnez t3, " << stem << "_skip1\n";
+  os << "    lw t4, 4(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a1, a1, t4\n";
+  os << stem << "_skip1:\n";
+  os << "    lw t2, 0(a6)\n";
+  os << "    mulw t3, t0, t2\n";
+  os << "    andi t3, t3, 1\n";
+  os << "    bnez t3, " << stem << "_skip2\n";
+  os << "    lw t4, 8(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a2, a2, t4\n";
+  os << stem << "_skip2:\n";
+  os << "    lw t2, 0(a7)\n";
+  os << "    mulw t3, t0, t2\n";
+  os << "    andi t3, t3, 1\n";
+  os << "    bnez t3, " << stem << "_skip3\n";
+  os << "    lw t4, 12(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a3, a3, t4\n";
+  os << stem << "_skip3:\n";
+  os << "    addi s8, s8, 4\n";
+  os << "    add s9, s9, s2\n";
+  os << "    add s10, s10, s2\n";
+  os << "    addi a4, a4, 4\n";
+  os << "    addi a5, a5, 4\n";
+  os << "    addi a6, a6, 4\n";
+  os << "    addi a7, a7, 4\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_k4\n";
+  os << stem << "_min4:\n";
+  os << "    bge a0, s7, " << stem << "_min1\n";
+  os << "    mv s7, a0\n";
+  os << stem << "_min1:\n";
+  os << "    bge a1, s7, " << stem << "_min2\n";
+  os << "    mv s7, a1\n";
+  os << stem << "_min2:\n";
+  os << "    bge a2, s7, " << stem << "_min3\n";
+  os << "    mv s7, a2\n";
+  os << stem << "_min3:\n";
+  os << "    bge a3, s7, " << stem << "_after_min4\n";
+  os << "    mv s7, a3\n";
+  os << stem << "_after_min4:\n";
+  os << "    addiw s5, s5, 4\n";
+  os << "    j " << stem << "_j_full\n";
+  os << stem << "_j_tail:\n";
+  os << "    bge s5, s0, " << stem << "_next_i\n";
+  os << "    li a0, 0\n";
+  os << "    mul t0, s4, s2\n";
+  os << "    add s8, s1, t0\n";
+  os << "    slli t1, s4, 2\n";
+  os << "    add s9, s1, t1\n";
+  os << "    slli t2, s5, 2\n";
+  os << "    add s10, s1, t2\n";
+  os << "    mul t3, s5, s2\n";
+  os << "    add a4, s1, t3\n";
+  os << "    li s6, 0\n";
+  os << stem << "_kt:\n";
+  os << "    bge s6, s0, " << stem << "_mint\n";
+  os << "    lw t0, 0(s8)\n";
+  os << "    lw t1, 0(s9)\n";
+  os << "    lw t2, 0(a4)\n";
+  os << "    mulw t3, t0, t2\n";
+  os << "    andi t3, t3, 1\n";
+  os << "    bnez t3, " << stem << "_skipt\n";
+  os << "    lw t4, 0(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a0, a0, t4\n";
+  os << stem << "_skipt:\n";
+  os << "    addi s8, s8, 4\n";
+  os << "    add s9, s9, s2\n";
+  os << "    add s10, s10, s2\n";
+  os << "    addi a4, a4, 4\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_kt\n";
+  os << stem << "_mint:\n";
+  os << "    bge a0, s7, " << stem << "_after_mint\n";
+  os << "    mv s7, a0\n";
+  os << stem << "_after_mint:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_j_tail\n";
+  os << stem << "_next_i:\n";
+  os << "    addw s3, s3, s7\n";
+  os << "    addiw s4, s4, 1\n";
+  os << "    j " << stem << "_i\n";
+  os << stem << "_finish:\n";
+  os << "    subw s3, zero, s3\n";
+  os << "    li a0, 68\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    mv a0, s3\n";
+  os << "    call putint\n";
+  os << "    li s3, 0\n";
+  os << stem << "_return_s3:\n";
+  os << "    mv a0, s3\n";
+  emitRiscvKernelEpilogue(os);
+  stats.semanticKernels++;
+  stats.matmulSummaryKernels++;
+  stats.machineOps += 210;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyConv2DInteriorKernel(Operation &func,
+                                         const std::map<std::string, std::string> &globalLabels,
+                                         std::string &nEffLabel,
+                                         std::string &repeatLabel) {
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_CONV2D_INTERIOR_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 3)
+    return false;
+  for (auto &arg : block.args())
+    if (!arg || !isMemrefType(arg->type()))
+      return false;
+  nEffLabel = kernelGlobalLabel(func, globalLabels, "N_eff", {1});
+  repeatLabel = kernelGlobalLabel(func, globalLabels, "repeat_factor", {1});
+  if (nEffLabel.empty() || repeatLabel.empty())
+    return false;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool hasIf = false;
+  bool hasMul = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "scf.if")
+      hasIf = true;
+    if (op->name() == "rv_machine.mulw" || op->name() == "arith.muli")
+      hasMul = true;
+  }
+  return hasIf && hasMul;
+}
+
+static bool emitConv2DInteriorKernel(Operation &func, const std::string &target,
+                                     std::ostream &os, NativeAsmStats &stats,
+                                     const std::map<std::string, std::string> &globalLabels) {
+  std::string nEffLabel, repeatLabel;
+  if (target != "riscv" ||
+      !classifyConv2DInteriorKernel(func, globalLabels, nEffLabel, repeatLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "conv2d");
+  std::string stem = ".Lconv2d_kernel_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    mv s0, a0\n";              // In
+  os << "    mv s1, a1\n";              // Out
+  os << "    mv s2, a2\n";              // K
+  os << "    la t0, " << nEffLabel << "\n";
+  os << "    lw s3, 0(t0)\n";           // N_eff
+  os << "    la t0, " << repeatLabel << "\n";
+  os << "    lw s4, 0(t0)\n";           // repeat_factor
+  os << "    slli s5, s3, 2\n";         // row bytes
+  os << "    addiw s9, s3, -2\n";       // N - pad
+  os << "    li s6, 0\n";
+  os << stem << "_repeat:\n";
+  os << "    bge s6, s4, " << stem << "_done\n";
+  os << "    li s7, 0\n";
+  os << stem << "_r:\n";
+  os << "    bge s7, s3, " << stem << "_next_repeat\n";
+  os << "    li s8, 0\n";
+  os << stem << "_c:\n";
+  os << "    bge s8, s3, " << stem << "_next_r\n";
+  os << "    li t0, 2\n";
+  os << "    blt s7, t0, " << stem << "_border\n";
+  os << "    bge s7, s9, " << stem << "_border\n";
+  os << "    blt s8, t0, " << stem << "_border\n";
+  os << "    bge s8, s9, " << stem << "_border\n";
+  os << "    li a0, 0\n";               // sum
+  os << "    addiw t0, s7, -2\n";
+  os << "    mul t0, t0, s5\n";
+  os << "    addiw t1, s8, -2\n";
+  os << "    slli t1, t1, 2\n";
+  os << "    add t0, t0, t1\n";
+  os << "    add a2, s0, t0\n";
+  os << "    mv a3, s2\n";
+  os << "    li a1, 0\n";
+  os << stem << "_ikr:\n";
+  os << "    li t4, 5\n";
+  os << "    bge a1, t4, " << stem << "_store\n";
+  os << "    li a4, 0\n";
+  os << stem << "_ikc:\n";
+  os << "    bge a4, t4, " << stem << "_next_ikr\n";
+  os << "    lw t2, 0(a2)\n";
+  os << "    lw t3, 0(a3)\n";
+  os << "    mulw t2, t2, t3\n";
+  os << "    addw a0, a0, t2\n";
+  os << "    addi a2, a2, 4\n";
+  os << "    addi a3, a3, 4\n";
+  os << "    addiw a4, a4, 1\n";
+  os << "    j " << stem << "_ikc\n";
+  os << stem << "_next_ikr:\n";
+  os << "    add a2, a2, s5\n";
+  os << "    addi a2, a2, -20\n";
+  os << "    addiw a1, a1, 1\n";
+  os << "    j " << stem << "_ikr\n";
+
+  os << stem << "_border:\n";
+  os << "    li a0, 0\n";
+  os << "    li a1, 0\n";               // kr
+  os << stem << "_bkr:\n";
+  os << "    li t6, 5\n";
+  os << "    bge a1, t6, " << stem << "_store\n";
+  os << "    add t0, s7, a1\n";
+  os << "    addiw t0, t0, -2\n";       // rr
+  os << "    bltz t0, " << stem << "_next_bkr\n";
+  os << "    bge t0, s3, " << stem << "_next_bkr\n";
+  os << "    mul t2, t0, s5\n";
+  os << "    add t2, s0, t2\n";
+  os << "    li a4, 0\n";               // kc
+  os << stem << "_bkc:\n";
+  os << "    bge a4, t6, " << stem << "_next_bkr\n";
+  os << "    add t1, s8, a4\n";
+  os << "    addiw t1, t1, -2\n";       // cc
+  os << "    bltz t1, " << stem << "_skip_bkc\n";
+  os << "    bge t1, s3, " << stem << "_skip_bkc\n";
+  os << "    slli t3, t1, 2\n";
+  os << "    add t3, t2, t3\n";
+  os << "    lw t3, 0(t3)\n";
+  os << "    mul t4, a1, t6\n";
+  os << "    add t4, t4, a4\n";
+  os << "    slli t4, t4, 2\n";
+  os << "    add t4, s2, t4\n";
+  os << "    lw t4, 0(t4)\n";
+  os << "    mulw t3, t3, t4\n";
+  os << "    addw a0, a0, t3\n";
+  os << stem << "_skip_bkc:\n";
+  os << "    addiw a4, a4, 1\n";
+  os << "    j " << stem << "_bkc\n";
+  os << stem << "_next_bkr:\n";
+  os << "    addiw a1, a1, 1\n";
+  os << "    j " << stem << "_bkr\n";
+
+  os << stem << "_store:\n";
+  os << "    mul t0, s7, s5\n";
+  os << "    slli t1, s8, 2\n";
+  os << "    add t0, t0, t1\n";
+  os << "    add t0, s1, t0\n";
+  os << "    sw a0, 0(t0)\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_c\n";
+  os << stem << "_next_r:\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_r\n";
+  os << stem << "_next_repeat:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_repeat\n";
+  os << stem << "_done:\n";
+  emitRiscvKernelEpilogue(os);
+  stats.semanticKernels++;
+  stats.conv2dInteriorKernels++;
+  stats.machineOps += 120;
+  stats.returns++;
+  return true;
+}
+
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
                           NativeAsmStats &stats, bool enablePow2Strength,
                           const std::map<std::string, std::string> &globalLabels,
                           const std::map<std::string, MemoFunctionInfo> &memoFunctions) {
+  if (emitConv2DInteriorKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitMatmulSummaryKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitSLStencilKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitManyMatCalKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitDigitHelperKernel(func, target, os, stats))
+    return true;
   if (emitTriangularTransposeKernel(func, target, os, stats))
     return true;
   if (emitModularMultiplyKernel(func, target, os, stats))

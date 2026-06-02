@@ -427,6 +427,11 @@ int main(int argc, char **argv) {
               << " semantic-kernels=" << asmStats.semanticKernels
               << " triangular-transpose-kernels=" << asmStats.triangularTransposeKernels
               << " modular-multiply-kernels=" << asmStats.modularMultiplyKernels
+              << " digit-helper-kernels=" << asmStats.digitHelperKernels
+              << " many-mat-cal-kernels=" << asmStats.manyMatCalKernels
+              << " sl-stencil-kernels=" << asmStats.slStencilKernels
+              << " matmul-summary-kernels=" << asmStats.matmulSummaryKernels
+              << " conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
               << "\n";
   }
 

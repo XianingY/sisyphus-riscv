@@ -109,14 +109,18 @@ static InlineCandidate classifyInlineCandidate(Operation &func, int threshold) {
   Operation *ret = nullptr;
   int returns = 0;
   int ops = 0;
+  bool sawCall = false;
   std::function<void(Operation&)> countNested = [&](Operation &op) {
     ops++;
-    if (op.name() == "sysy.call" || op.name() == "scf.while" ||
-        op.name() == "scf.for" || op.name() == "affine.for")
+    if (op.name() == "sysy.call") {
+      sawCall = true;
       ops = threshold + 1;
+    }
     // A direct single-return inline clones loads at the original call site, so
     // read-only helper bodies remain semantically equivalent even when they
-    // read mutable globals. Stores, calls, and loops are still rejected below.
+    // read mutable globals. Stores and calls are still rejected below. Small
+    // structured loops are allowed; cloneOperationTree remaps nested regions
+    // and block arguments, which lets hot digit helpers inline cleanly.
     if (op.name() == "sysy.store" || op.name() == "memref.store") {
       if (op.operandCount() < 2 ||
           localAllocas.count(op.operand(1).getDefiningOp()) == 0)
@@ -136,7 +140,7 @@ static InlineCandidate classifyInlineCandidate(Operation &func, int threshold) {
     if (owned && !owned->isErased())
       countNested(*owned);
   }
-  if (ops > threshold || returns != 1 || !ret || ret->getBlock() != &entry)
+  if (sawCall || ops > threshold || returns != 1 || !ret || ret->getBlock() != &entry)
     return candidate;
   if (entry.ops().empty() || entry.ops().back().get() != ret)
     return candidate;

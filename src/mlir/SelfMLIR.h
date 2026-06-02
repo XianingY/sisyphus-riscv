@@ -460,6 +460,11 @@ struct NativeAsmStats {
   int semanticKernels = 0;
   int triangularTransposeKernels = 0;
   int modularMultiplyKernels = 0;
+  int digitHelperKernels = 0;
+  int manyMatCalKernels = 0;
+  int slStencilKernels = 0;
+  int matmulSummaryKernels = 0;
+  int conv2dInteriorKernels = 0;
   std::string error;
 };
 
