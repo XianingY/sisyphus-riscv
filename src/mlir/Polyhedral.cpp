@@ -1,7 +1,11 @@
 #include "Polyhedral.h"
+#include <algorithm>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace sys::mlir {
 
@@ -842,6 +846,106 @@ void runAffineLoopTiling(Module &module) {
 }
 
 void runAffineLoopFusion(Module &module) {
+  struct FusionAccess {
+    std::string baseKey;
+    bool store = false;
+  };
+  auto singleBlock = [](Operation *op) -> Block* {
+    if (!op || op->getRegions().size() != 1 ||
+        op->getRegions()[0]->getBlocks().size() != 1)
+      return nullptr;
+    return op->getRegions()[0]->getBlocks()[0].get();
+  };
+  std::function<bool(Operation*)> unsafeTree = [&](Operation *op) -> bool {
+    if (!op || op->isErased())
+      return false;
+    const std::string &name = op->name();
+    if (name == "sysy.call" || name == "sysy.return" ||
+        name == "sysy.break" || name == "sysy.continue" ||
+        name == "scf.if" || name == "scf.while" || name == "scf.for" ||
+        name == "sysy.alloca" || name == "memref.alloca")
+      return true;
+    for (auto &region : op->getRegions())
+      for (auto &block : region->getBlocks())
+        for (auto &child : block->ops())
+          if (unsafeTree(child.get()))
+            return true;
+    return false;
+  };
+  std::function<void(Operation*, std::vector<FusionAccess>&)> collectAccesses =
+      [&](Operation *op, std::vector<FusionAccess> &out) {
+        if (!op || op->isErased())
+          return;
+        if ((op->name() == "memref.load" || op->name() == "sysy.load") &&
+            op->operandCount() >= 1) {
+          out.push_back({op->operand(0).identityKey(), false});
+        } else if ((op->name() == "memref.store" || op->name() == "sysy.store") &&
+                   op->operandCount() >= 2) {
+          out.push_back({op->operand(1).identityKey(), true});
+        }
+        for (auto &region : op->getRegions())
+          for (auto &block : region->getBlocks())
+            for (auto &child : block->ops())
+              collectAccesses(child.get(), out);
+      };
+  auto fusionSafe = [&](Operation *prevFor, Operation *childFor) -> bool {
+    if (!prevFor || !childFor || prevFor->operandCount() < 3 ||
+        childFor->operandCount() < 3)
+      return false;
+    Block *prevBody = singleBlock(prevFor);
+    Block *childBody = singleBlock(childFor);
+    if (!prevBody || !childBody || prevBody->args().empty() ||
+        childBody->args().empty())
+      return false;
+    for (auto &owned : prevBody->ops()) {
+      if (!owned || owned->isErased() || owned->name() == "affine.yield")
+        continue;
+      if (unsafeTree(owned.get()))
+        return false;
+    }
+    for (auto &owned : childBody->ops()) {
+      if (!owned || owned->isErased() || owned->name() == "affine.yield")
+        continue;
+      if (unsafeTree(owned.get()))
+        return false;
+    }
+
+    std::vector<FusionAccess> prevAccesses;
+    std::vector<FusionAccess> childAccesses;
+    for (auto &owned : prevBody->ops())
+      collectAccesses(owned.get(), prevAccesses);
+    for (auto &owned : childBody->ops())
+      collectAccesses(owned.get(), childAccesses);
+
+    // Fusion changes execution from all prev iterations followed by all child
+    // iterations to prev(i); child(i).  Keep only cases where writes in one
+    // loop cannot alias any access in the other loop.  Read/read sharing is
+    // harmless; producer-consumer fusion can be added later with exact
+    // distance-vector checks.
+    for (const auto &a : prevAccesses) {
+      for (const auto &b : childAccesses) {
+        if (a.baseKey != b.baseKey)
+          continue;
+        if (a.store || b.store)
+          return false;
+      }
+    }
+    return true;
+  };
+  std::function<void(Operation*, Value, Value)> replaceValueInTree =
+      [&](Operation *op, Value oldValue, Value newValue) {
+        if (!op || op->isErased())
+          return;
+        for (int i = 0; i < op->operandCount(); i++) {
+          if (op->operand(i) == oldValue)
+            op->setOperand(i, newValue);
+        }
+        for (auto &region : op->getRegions())
+          for (auto &block : region->getBlocks())
+            for (auto &child : block->ops())
+              replaceValueInTree(child.get(), oldValue, newValue);
+      };
+
   for (auto *op : walk(module)) {
     if (!op || op->isErased()) continue;
     // Iterate over blocks to find adjacent affine.for operations
@@ -869,6 +973,10 @@ void runAffineLoopFusion(Module &module) {
                 }
               }
               if (match) {
+                if (!fusionSafe(prevFor, child)) {
+                  prevFor = child;
+                  continue;
+                }
                 // Fuse child into prevFor
                 Block *prevBody = prevFor->getRegions()[0]->getBlocks()[0].get();
                 Block *childBody = child->getRegions()[0]->getBlocks()[0].get();
@@ -881,7 +989,6 @@ void runAffineLoopFusion(Module &module) {
                 // Replace child's IV with prevFor's IV
                 Value prevIV = prevBody->args()[0]->value();
                 Value childIV = childBody->args()[0]->value();
-                replaceAllUses(module, childIV, prevIV);
 
                 // Move all ops from childBody to prevBody
                 std::vector<Operation*> toMove;
@@ -890,6 +997,7 @@ void runAffineLoopFusion(Module &module) {
                 }
 
                 for (Operation *mOp : toMove) {
+                  replaceValueInTree(mOp, childIV, prevIV);
                   auto moved = childBody->takeOperation(mOp);
                   moved->setBlock(prevBody);
                   prevBody->insertOperation(prevBody->ops().size(), std::move(moved));
