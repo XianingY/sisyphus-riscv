@@ -3295,6 +3295,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       valueByKey[valueKey(operand)] = operand;
     }
   }
+  std::map<Operation *, int> opIndex;
+  {
+    int idx = 0;
+    for (auto *op : funcOps) {
+      if (op && !op->isErased())
+        opIndex[op] = idx;
+      idx++;
+    }
+  }
 
   auto overflowArgBytes = [&](Operation *call) -> int64_t {
     if (!call || call->name() != "sysy.call")
@@ -3441,17 +3450,6 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                      (liveFuncOpCount >= lsraMinOps || whileLoopCount >= 2) &&
                      envEnabled("SISY_ENABLE_SELF_LSRA", true);
   if (lsraEnabled) {
-    // Linear index per op in funcOps (the same order the emitter walks).
-    std::map<Operation *, int> opIndex;
-    {
-      int idx = 0;
-      for (auto *op : funcOps) {
-        if (op && !op->isErased())
-          opIndex[op] = idx;
-        idx++;
-      }
-    }
-
     struct LsraInterval {
       Value value;
       int start = 0;
@@ -3817,6 +3815,28 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (remainingUses[valueKey(value)] <= 0) {
       stats.deadSpillsAvoided++;
       return false;
+    }
+    Operation *def = value.getDefiningOp();
+    if (def && !def->isErased()) {
+      Operation *onlyUser = nullptr;
+      int liveUses = 0;
+      unsigned resultIndex = value.getResultIndex();
+      if (resultIndex < def->resultUses.size()) {
+        for (const auto &use : def->resultUses[resultIndex]) {
+          if (!use.owner || use.owner->isErased())
+            continue;
+          liveUses++;
+          onlyUser = use.owner;
+        }
+      }
+      auto defIt = opIndex.find(def);
+      auto useIt = onlyUser ? opIndex.find(onlyUser) : opIndex.end();
+      if (liveUses == 1 && onlyUser && def->getBlock() == onlyUser->getBlock() &&
+          defIt != opIndex.end() && useIt != opIndex.end() &&
+          useIt->second == defIt->second + 1) {
+        stats.deadSpillsAvoided++;
+        return false;
+      }
     }
     return true;
   };
