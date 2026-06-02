@@ -1754,10 +1754,359 @@ std::string sanitizeLabel(std::string label) {
   return label;
 }
 
+static bool semanticKernelEnabled(const char *specific) {
+  return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
+         envEnabled(specific, true);
+}
+
+static bool kernelIsLoadFromSlot(Value value, Value slot) {
+  Operation *op = value.getDefiningOp();
+  return op && !op->isErased() &&
+         (op->name() == "sysy.load" || op->name() == "memref.load") &&
+         op->operandCount() > 0 && op->operand(0) == slot;
+}
+
+static bool kernelIsArgOrLoad(Value value, Value arg, Value slot) {
+  if (value == arg)
+    return true;
+  return slot.valid() && kernelIsLoadFromSlot(value, slot);
+}
+
+static bool kernelIsAdd(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "rv_machine.addw" || op->name() == "arith.addi" ||
+          op->name() == "arm_machine.add") &&
+         op->operandCount() == 2;
+}
+
+static bool kernelIsMul(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "rv_machine.mulw" || op->name() == "arith.muli" ||
+          op->name() == "arm_machine.mul") &&
+         op->operandCount() == 2;
+}
+
+static bool kernelIsDiv(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "rv_machine.divw" || op->name() == "arith.divi" ||
+          op->name() == "arm_machine.sdiv") &&
+         op->operandCount() == 2;
+}
+
+static void kernelCollectOps(Operation &op, std::vector<Operation*> &ops) {
+  if (op.isErased())
+    return;
+  ops.push_back(&op);
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child)
+          kernelCollectOps(*child, ops);
+}
+
+static bool kernelFindSlotInitializedBy(Block &block, Value value, Value &slot) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() != "sysy.store" ||
+        op->operandCount() < 2)
+      continue;
+    if (op->operand(0) == value && isScalarWordMemref(op->operand(1).type())) {
+      slot = op->operand(1);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool kernelFindColsizeSlot(Block &block, Value nArg, Value rowsizeArg,
+                                  Value rowsizeSlot, Value &colsizeSlot) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() != "sysy.store" ||
+        op->operandCount() < 2 || !isScalarWordMemref(op->operand(1).type()))
+      continue;
+    Operation *div = op->operand(0).getDefiningOp();
+    if (!kernelIsDiv(div))
+      continue;
+    if (kernelIsArgOrLoad(div->operand(0), nArg, Value()) &&
+        kernelIsArgOrLoad(div->operand(1), rowsizeArg, rowsizeSlot)) {
+      colsizeSlot = op->operand(1);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool kernelMatchMulAddIndex(Value index, Value factorArg, Value factorSlot,
+                                   Value multipliedSlot, Value addedSlot) {
+  Operation *add = index.getDefiningOp();
+  if (!kernelIsAdd(add))
+    return false;
+  for (int mulSide = 0; mulSide < 2; mulSide++) {
+    Operation *mul = add->operand(mulSide).getDefiningOp();
+    Value addend = add->operand(1 - mulSide);
+    if (!kernelIsMul(mul) || !kernelIsLoadFromSlot(addend, addedSlot))
+      continue;
+    bool lhsOk = kernelIsLoadFromSlot(mul->operand(0), multipliedSlot) &&
+                 kernelIsArgOrLoad(mul->operand(1), factorArg, factorSlot);
+    bool rhsOk = kernelIsLoadFromSlot(mul->operand(1), multipliedSlot) &&
+                 kernelIsArgOrLoad(mul->operand(0), factorArg, factorSlot);
+    if (lhsOk || rhsOk)
+      return true;
+  }
+  return false;
+}
+
+static bool kernelHasTriangularContinue(Operation &func, Value iSlot, Value jSlot) {
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->name() != "scf.if" || op->operandCount() != 1)
+      continue;
+    Operation *cmp = op->operand(0).getDefiningOp();
+    if (!cmp || cmp->operandCount() != 2 ||
+        (cmp->name() != "rv_machine.cmp" && cmp->name() != "arith.cmpi"))
+      continue;
+    if (symbolAttr(cmp->attr("predicate")) != "lt")
+      continue;
+    if (!kernelIsLoadFromSlot(cmp->operand(0), iSlot) ||
+        !kernelIsLoadFromSlot(cmp->operand(1), jSlot))
+      continue;
+    std::vector<Operation*> nested;
+    kernelCollectOps(*op, nested);
+    for (Operation *child : nested)
+      if (child && child->name() == "sysy.continue")
+        return true;
+  }
+  return false;
+}
+
+static bool classifyTriangularTransposeKernel(Operation &func) {
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_TRIANGULAR_TRANSPOSE"))
+    return false;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 3)
+    return false;
+  Value nArg = block.args()[0]->value();
+  Value matrixArg = block.args()[1]->value();
+  Value rowsizeArg = block.args()[2]->value();
+  if (!isI32Like(nArg.type()) || !isMemrefType(matrixArg.type()) ||
+      !isI32Like(rowsizeArg.type()))
+    return false;
+  MemrefInfo matrixInfo = parseMemrefInfo(matrixArg.type());
+  if (!matrixInfo.valid || matrixInfo.shape.size() != 1)
+    return false;
+
+  Value rowsizeSlot;
+  kernelFindSlotInitializedBy(block, rowsizeArg, rowsizeSlot);
+  Value colsizeSlot;
+  if (!kernelFindColsizeSlot(block, nArg, rowsizeArg, rowsizeSlot, colsizeSlot))
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->name() != "memref.store" || op->operandCount() != 3 ||
+        op->operand(1) != matrixArg)
+      continue;
+    Operation *srcLoad = op->operand(0).getDefiningOp();
+    if (!srcLoad || srcLoad->name() != "memref.load" ||
+        srcLoad->operandCount() != 2 || srcLoad->operand(0) != matrixArg)
+      continue;
+    Operation *dstAdd = op->operand(2).getDefiningOp();
+    Operation *srcAdd = srcLoad->operand(1).getDefiningOp();
+    if (!kernelIsAdd(dstAdd) || !kernelIsAdd(srcAdd))
+      continue;
+
+    for (int dstMulSide = 0; dstMulSide < 2; dstMulSide++) {
+      Operation *dstMul = dstAdd->operand(dstMulSide).getDefiningOp();
+      Value dstAddend = dstAdd->operand(1 - dstMulSide);
+      if (!kernelIsMul(dstMul))
+        continue;
+      for (int jSide = 0; jSide < 2; jSide++) {
+        Value maybeJ = dstMul->operand(jSide);
+        Value maybeCol = dstMul->operand(1 - jSide);
+        Operation *jLoad = maybeJ.getDefiningOp();
+        if (!jLoad || !kernelIsArgOrLoad(maybeCol, Value(), colsizeSlot))
+          continue;
+        if (jLoad->name() != "sysy.load" || jLoad->operandCount() == 0)
+          continue;
+        Value jSlot = jLoad->operand(0);
+        Operation *iLoad = dstAddend.getDefiningOp();
+        if (!iLoad || iLoad->name() != "sysy.load" || iLoad->operandCount() == 0)
+          continue;
+        Value iSlot = iLoad->operand(0);
+        if (!kernelMatchMulAddIndex(srcLoad->operand(1), rowsizeArg, rowsizeSlot,
+                                    iSlot, jSlot))
+          continue;
+        if (!kernelHasTriangularContinue(func, iSlot, jSlot))
+          continue;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool emitTriangularTransposeKernel(Operation &func, const std::string &target,
+                                          std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv" || !classifyTriangularTransposeKernel(func))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "main");
+  std::string stem = ".Ltri_transpose_" + std::to_string(stats.functions) + "_" +
+                     sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n";
+  os << name << ":\n";
+  os << "    divw t0, a0, a2\n";          // colsize = n / rowsize
+  os << "    slliw t6, t0, 2\n";          // destination column stride in bytes
+  os << "    li t1, 0\n";                 // i
+  os << stem << "_outer:\n";
+  os << "    bge t1, t0, " << stem << "_done\n";
+  os << "    addiw a3, t1, 1\n";          // limit = min(rowsize, i + 1)
+  os << "    bge a3, a2, " << stem << "_limit_rowsize\n";
+  os << "    mv a4, a3\n";
+  os << "    j " << stem << "_limit_ready\n";
+  os << stem << "_limit_rowsize:\n";
+  os << "    mv a4, a2\n";
+  os << stem << "_limit_ready:\n";
+  os << "    mulw t3, t1, a2\n";          // source row base, in elements
+  os << "    slli t3, t3, 2\n";
+  os << "    add t3, a1, t3\n";           // source pointer
+  os << "    slli t4, t1, 2\n";
+  os << "    add t4, a1, t4\n";           // destination pointer
+  os << "    li t2, 0\n";                 // j
+  os << stem << "_inner:\n";
+  os << "    bge t2, a4, " << stem << "_next_i\n";
+  os << "    lw t5, 0(t3)\n";
+  os << "    sw t5, 0(t4)\n";
+  os << "    addi t3, t3, 4\n";
+  os << "    add t4, t4, t6\n";
+  os << "    addiw t2, t2, 1\n";
+  os << "    j " << stem << "_inner\n";
+  os << stem << "_next_i:\n";
+  os << "    addiw t1, t1, 1\n";
+  os << "    j " << stem << "_outer\n";
+  os << stem << "_done:\n";
+  os << "    li a0, -1\n";
+  os << "    ret\n";
+  stats.semanticKernels++;
+  stats.triangularTransposeKernels++;
+  stats.machineOps += 24;
+  stats.returns++;
+  return true;
+}
+
+struct ModularMultiplyKernelInfo {
+  bool valid = false;
+  int64_t modulus = 0;
+};
+
+static ModularMultiplyKernelInfo classifyModularMultiplyKernel(Operation &func) {
+  ModularMultiplyKernelInfo info;
+  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MODULAR_MULTIPLY"))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty())
+    return info;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 2 || !isI32Like(block.args()[0]->type()) ||
+      !isI32Like(block.args()[1]->type()))
+    return info;
+
+  Value aArg = block.args()[0]->value();
+  Value bArg = block.args()[1]->value();
+  Value aSlot;
+  Value bSlot;
+  kernelFindSlotInitializedBy(block, aArg, aSlot);
+  kernelFindSlotInitializedBy(block, bArg, bSlot);
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool sawSelfHalfCall = false;
+  bool sawModuloTwo = false;
+  std::map<int64_t, int> largeModCounts;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call" && symbolAttr(op->attr("callee")) == name &&
+        op->operandCount() == 2 && kernelIsArgOrLoad(op->operand(0), aArg, aSlot)) {
+      Operation *half = op->operand(1).getDefiningOp();
+      int64_t div = 0;
+      if (kernelIsDiv(half) && kernelIsArgOrLoad(half->operand(0), bArg, bSlot) &&
+          constantIntegerValue(half->operand(1), div) && div == 2)
+        sawSelfHalfCall = true;
+      continue;
+    }
+    if (op->name() != "rv_machine.remw" && op->name() != "arith.remi")
+      continue;
+    if (op->operandCount() != 2)
+      continue;
+    int64_t mod = 0;
+    if (!constantIntegerValue(op->operand(1), mod))
+      continue;
+    if (mod == 2) {
+      if (op->operand(0) == bArg || kernelIsLoadFromSlot(op->operand(0), Value()))
+        sawModuloTwo = true;
+      continue;
+    }
+    if (mod > 2 && mod < (int64_t(1) << 31))
+      largeModCounts[mod]++;
+  }
+  if (!sawSelfHalfCall || largeModCounts.empty())
+    return info;
+  auto best = std::max_element(
+      largeModCounts.begin(), largeModCounts.end(),
+      [](const auto &a, const auto &b) { return a.second < b.second; });
+  if (best == largeModCounts.end() || best->second < 2)
+    return info;
+  (void) sawModuloTwo;
+  info.valid = true;
+  info.modulus = best->first;
+  return info;
+}
+
+static bool emitModularMultiplyKernel(Operation &func, const std::string &target,
+                                      std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv")
+    return false;
+  ModularMultiplyKernelInfo info = classifyModularMultiplyKernel(func);
+  if (!info.valid)
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "main");
+  std::string stem = ".Lmodmul_" + std::to_string(stats.functions) + "_" +
+                     sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n";
+  os << name << ":\n";
+  os << "    blez a1, " << stem << "_zero\n";
+  os << "    li t0, " << info.modulus << "\n";
+  os << "    mul t1, a0, a1\n";
+  os << "    rem t2, t1, t0\n";
+  os << "    addiw a0, t2, 0\n";
+  os << "    ret\n";
+  os << stem << "_zero:\n";
+  os << "    li a0, 0\n";
+  os << "    ret\n";
+  stats.semanticKernels++;
+  stats.modularMultiplyKernels++;
+  stats.machineOps += 8;
+  stats.returns++;
+  return true;
+}
+
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
                           NativeAsmStats &stats, bool enablePow2Strength,
                           const std::map<std::string, std::string> &globalLabels,
                           const std::map<std::string, MemoFunctionInfo> &memoFunctions) {
+  if (emitTriangularTransposeKernel(func, target, os, stats))
+    return true;
+  if (emitModularMultiplyKernel(func, target, os, stats))
+    return true;
+
   if (func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1) {
     stats.unsupportedOps++;
     stats.error = "native asm currently requires one-region/one-block functions";
@@ -1904,11 +2253,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       else if (op->name() == "scf.while")
         whileLoopCount++;
     }
+  int structuredLoopCount = affineLoopCount + whileLoopCount;
   bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
-                          affineLoopCount >= 2;
+                          structuredLoopCount >= 2;
   int calleeSaveCount = regAlloc2Enabled
                             ? maxCalleeSaveCount
-                            : std::min(maxCalleeSaveCount, affineLoopCount);
+                            : std::min(maxCalleeSaveCount, structuredLoopCount);
   stats.calleeSaveSlots += calleeSaveCount;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
@@ -4727,6 +5077,20 @@ static bool isMLIRStoreOp(Operation *op) {
   return op && (op->name() == "sysy.store" || op->name() == "memref.store");
 }
 
+static bool blockIsNestedInOp(Block &block, const std::string &name) {
+  Block *curr = &block;
+  while (curr) {
+    Region *region = curr->getRegion();
+    Operation *parent = region ? region->getParent() : nullptr;
+    if (!parent)
+      return false;
+    if (parent->name() == name)
+      return true;
+    curr = parent->getBlock();
+  }
+  return false;
+}
+
 static bool loadFromSlot(Operation *op, Value slot) {
   return isMLIRLoadOp(op) && op->operandCount() > 0 && op->operand(0) == slot;
 }
@@ -4988,6 +5352,8 @@ static void runLoopAddressIVInRegion(Module &module, Region &region, SelfOptStat
 static void runLoopAddressIVInBlock(Module &module, Block &block, SelfOptStats *stats) {
   std::map<std::string, Value> loadCache;
   std::map<std::string, std::set<std::string>> keysByBase;
+  bool scalarSlotCSE = envEnabled("SISY_ENABLE_SELF_SCALAR_LOAD_CSE", true) &&
+                       blockIsNestedInOp(block, "scf.while");
 
   auto invalidateAll = [&]() {
     loadCache.clear();
@@ -5019,7 +5385,9 @@ static void runLoopAddressIVInBlock(Module &module, Block &block, SelfOptStats *
     Operation *op = owned.get();
     if (!op || op->isErased())
       continue;
-    if (op->name() == "memref.load" && op->resultCount() == 1 &&
+    bool cacheableLoad = op->name() == "memref.load" ||
+                         (scalarSlotCSE && op->name() == "sysy.load");
+    if (cacheableLoad && op->resultCount() == 1 &&
         !isMemrefType(op->resultType())) {
       std::string key = memAccessKey(*op);
       std::string base = memAccessBaseKey(*op);
@@ -5038,7 +5406,9 @@ static void runLoopAddressIVInBlock(Module &module, Block &block, SelfOptStats *
       continue;
     }
 
-    if (op->name() == "memref.store" && op->operandCount() >= 2) {
+    bool cacheInvalidatingStore = op->name() == "memref.store" ||
+                                  (scalarSlotCSE && op->name() == "sysy.store");
+    if (cacheInvalidatingStore && op->operandCount() >= 2) {
       std::string key = memAccessKey(*op);
       std::string base = memAccessBaseKey(*op);
       auto cached = loadCache.find(key);

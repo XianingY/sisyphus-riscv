@@ -424,6 +424,9 @@ int main(int argc, char **argv) {
               << " memo-fallbacks=" << asmStats.memoFallbacks
               << " loop-address-cse=" << asmStats.loopAddressCSE
               << " scheduler-moves=" << asmStats.schedulerMoves
+              << " semantic-kernels=" << asmStats.semanticKernels
+              << " triangular-transpose-kernels=" << asmStats.triangularTransposeKernels
+              << " modular-multiply-kernels=" << asmStats.modularMultiplyKernels
               << "\n";
   }
 

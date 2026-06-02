@@ -457,6 +457,9 @@ struct NativeAsmStats {
   int loopAddressCSE = 0;
   int schedulerMoves = 0;
   bool emitted = false;
+  int semanticKernels = 0;
+  int triangularTransposeKernels = 0;
+  int modularMultiplyKernels = 0;
   std::string error;
 };
 
