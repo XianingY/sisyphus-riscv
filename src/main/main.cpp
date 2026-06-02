@@ -359,6 +359,7 @@ int main(int argc, char **argv) {
               << " poly-permutations=" << selfMLIRStats.opt.polyPermutations
               << " poly-tiles=" << selfMLIRStats.opt.polyTiles
               << " reduction-blocks=" << selfMLIRStats.opt.reductionBlocks
+              << " reduction-regs=" << selfMLIRStats.opt.reductionRegs
               << " interior-peels=" << selfMLIRStats.opt.interiorPeels
               << " kernel-unrolls=" << selfMLIRStats.opt.kernelUnrolls
               << " imperfect-interchanges=" << selfMLIRStats.opt.imperfectInterchanges

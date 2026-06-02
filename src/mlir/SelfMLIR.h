@@ -312,6 +312,7 @@ struct SelfOptStats {
   int polyPermutations = 0;
   int polyTiles = 0;
   int reductionBlocks = 0;
+  int reductionRegs = 0;
   int interiorPeels = 0;
   int kernelUnrolls = 0;
   int imperfectInterchanges = 0;

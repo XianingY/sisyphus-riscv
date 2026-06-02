@@ -3446,7 +3446,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   bool scalarPromotionEnabled =
       !isArm && livenessEnabled && regAlloc2Enabled && calleeSaveCount >= 12 &&
       lsraHotFunction &&
-      envEnabled("SISY_ENABLE_SCALAR_PROMOTE", false);
+      envEnabled("SISY_ENABLE_SCALAR_PROMOTE", true);
+  bool scalarPromotionAll = false;
+  if (const char *value = std::getenv("SISY_ENABLE_SCALAR_PROMOTE")) {
+    std::string text(value);
+    scalarPromotionAll = text != "0" && text != "false" && text != "FALSE";
+  }
   if (scalarPromotionEnabled) {
     struct SlotCandidate {
       Value slot;
@@ -3456,6 +3461,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       int loads = 0;
       int stores = 0;
       bool reductionLike = false;
+      bool forced = false;
     };
     std::vector<SlotCandidate> candidates;
     for (auto *op : funcOps) {
@@ -3468,6 +3474,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       SlotCandidate candidate;
       candidate.slot = slot;
       candidate.key = valueKey(slot);
+      std::string promoteAttr = symbolAttr(op->attr("scalar_promote"));
+      candidate.forced = promoteAttr == "1" || promoteAttr == "true" ||
+                         promoteAttr == "forced";
+      if (!candidate.forced && !scalarPromotionAll)
+        continue;
       bool escaped = false;
       for (const auto &use : op->resultUses[0]) {
         Operation *user = use.owner;
@@ -3551,6 +3562,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   std::map<std::string, CachedGlobalBase> cachedGlobalBases;
   if (!isArm && livenessEnabled && regAlloc2Enabled && calleeSaveCount >= 12 &&
       lsraHotFunction && envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true) &&
+      promotedScalarSlots.empty() &&
       stableBaseRegCount < (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0]))) {
     struct GlobalBaseCandidate {
       std::string key;
@@ -3647,7 +3659,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   bool stableBaseActive = stableBaseRegCount > 0;
   bool lsraEnabled = !isArm && livenessEnabled && regAlloc2Enabled &&
                      calleeSaveCount >= 12 &&
-                     lsraHotFunction &&
+                     lsraHotFunction && !slotPromotionActive &&
                      envEnabled("SISY_ENABLE_SELF_LSRA", true);
   if (lsraEnabled) {
     struct LsraInterval {
@@ -8652,6 +8664,183 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
   return true;
 }
 
+static Value tileAppendAddI32(Module &module, Block &block, Value lhs, Value rhs,
+                              Location loc) {
+  Operation &op = appendOp(block, "rv_machine.addw", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value tileAppendSubI32(Module &module, Block &block, Value lhs, Value rhs,
+                              Location loc) {
+  Operation &op = appendOp(block, "rv_machine.subw", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value tileAppendRemI32(Module &module, Block &block, Value lhs, Value rhs,
+                              Location loc) {
+  Operation &op = appendOp(block, "rv_machine.remw", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value tileAppendLaneIndex(Module &module, Block &block, Value base,
+                                 int lane, Location loc) {
+  if (lane == 0)
+    return base;
+  Value laneConst = tileAppendIntConstant(module, block, lane, loc);
+  return tileAppendAddI32(module, block, base, laneConst, loc);
+}
+
+static void appendScalarZeroStore(Module &module, Block &block, Value slot,
+                                  Location loc) {
+  Value zero = tileAppendIntConstant(module, block, 0, loc);
+  appendOp(block, "sysy.store", {zero, slot}, {}, {}, loc);
+}
+
+static Value appendScalarLoad(Module &module, Block &block, Value slot,
+                              Location loc) {
+  Operation &op = appendOp(block, "sysy.load", {slot}, {module.context().i(32)},
+                           {}, loc);
+  return op.result();
+}
+
+static void appendScalarStore(Block &block, Value value, Value slot,
+                              Location loc) {
+  appendOp(block, "sysy.store", {value, slot}, {}, {}, loc);
+}
+
+static bool applyRegisterBlockedReduction(Module &module,
+                                          const RowReductionInfo &info,
+                                          SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_REDUCTION_REG", true))
+    return false;
+  Operation &outer = *info.outer;
+  Block *parent = outer.getBlock();
+  if (!parent)
+    return false;
+  int outerIndex = operationIndexInBlock(*parent, &outer);
+  if (outerIndex < 0)
+    return false;
+
+  Context &ctx = module.context();
+  Location loc = outer.loc();
+  Type i32 = ctx.i(32);
+  constexpr int kBlock = 4;
+  std::size_t insertIndex = (std::size_t) outerIndex;
+
+  std::vector<Value> accSlots;
+  accSlots.reserve(kBlock);
+  for (int lane = 0; lane < kBlock; lane++) {
+    Operation &slot = insertOp(
+        *parent, insertIndex, "sysy.alloca", {}, {ctx.memref({1}, i32)},
+        {{"symbol", ctx.stringAttr(".tile_acc" + std::to_string(lane))},
+         {"scalar_promote", ctx.stringAttr("forced")}},
+        loc);
+    accSlots.push_back(slot.result());
+  }
+
+  Operation &newOuter = tileInsertAffineLoop(module, *parent, insertIndex,
+                                             outer.operand(0), outer.operand(1),
+                                             outer.operand(2), loc, "i");
+  Block &outerBody = *newOuter.getRegions()[0]->getBlocks()[0];
+  Value iIv = outerBody.args()[0]->value();
+  Value jLower = tileMaterializeValue(module, outerBody, info.jLoop->operand(0), loc);
+  Value jUpper = tileMaterializeValue(module, outerBody, info.jLoop->operand(1), loc);
+  Value kLower = tileMaterializeValue(module, outerBody, info.kLoop->operand(0), loc);
+  Value kUpper = tileMaterializeValue(module, outerBody, info.kLoop->operand(1), loc);
+  Value kStep = tileMaterializeValue(module, outerBody, info.kLoop->operand(2), loc);
+  Value four = tileAppendIntConstant(module, outerBody, kBlock, loc);
+  Value delta = tileAppendSubI32(module, outerBody, jUpper, jLower, loc);
+  Value rem = tileAppendRemI32(module, outerBody, delta, four, loc);
+  Value mainUpper = tileAppendSubI32(module, outerBody, jUpper, rem, loc);
+
+  Operation &jBlockLoop = tileAppendAffineLoop(module, outerBody, jLower,
+                                               mainUpper, four, loc, "jb");
+  {
+    Block &jbBody = *jBlockLoop.getRegions()[0]->getBlocks()[0];
+    Value jbIv = jbBody.args()[0]->value();
+    std::vector<Value> lanes;
+    lanes.reserve(kBlock);
+    for (int lane = 0; lane < kBlock; lane++) {
+      appendScalarZeroStore(module, jbBody, accSlots[lane], loc);
+      lanes.push_back(tileAppendLaneIndex(module, jbBody, jbIv, lane, loc));
+    }
+
+    Operation &kLoop = tileAppendAffineLoop(module, jbBody, kLower, kUpper,
+                                            kStep, loc, "k");
+    Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
+    Value kIv = kBody.args()[0]->value();
+    Operation &lhs = appendOp(kBody, "memref.load",
+                              {info.lhsLoad->operand(0), iIv, kIv}, {i32},
+                              info.lhsLoad->attrs(), loc);
+    for (int lane = 0; lane < kBlock; lane++) {
+      Value old = appendScalarLoad(module, kBody, accSlots[lane], loc);
+      Operation &rhs = appendOp(kBody, "memref.load",
+                                {info.rhsLoad->operand(0), kIv, lanes[lane]},
+                                {i32}, info.rhsLoad->attrs(), loc);
+      Operation &prod = appendOp(kBody, "rv_machine.mulw",
+                                 {lhs.result(), rhs.result()}, {i32}, {}, loc);
+      Operation &sum = appendOp(kBody, "rv_machine.addw",
+                                {old, prod.result()}, {i32}, {}, loc);
+      appendScalarStore(kBody, sum.result(), accSlots[lane], loc);
+    }
+    appendOp(kBody, "affine.yield", {}, {}, {}, loc);
+
+    for (int lane = 0; lane < kBlock; lane++) {
+      Value val = appendScalarLoad(module, jbBody, accSlots[lane], loc);
+      appendOp(jbBody, "memref.store",
+               {val, info.finalStore->operand(1), iIv, lanes[lane]},
+               {}, info.finalStore->attrs(), loc);
+    }
+    appendOp(jbBody, "affine.yield", {}, {}, {}, loc);
+  }
+
+  Operation &tailLoop = tileAppendAffineLoop(module, outerBody, mainUpper, jUpper,
+                                             tileMaterializeValue(module, outerBody,
+                                                                  info.jLoop->operand(2), loc),
+                                             loc, "j");
+  {
+    Block &tailBody = *tailLoop.getRegions()[0]->getBlocks()[0];
+    Value jIv = tailBody.args()[0]->value();
+    appendScalarZeroStore(module, tailBody, accSlots[0], loc);
+    Operation &kLoop = tileAppendAffineLoop(module, tailBody, kLower, kUpper,
+                                            kStep, loc, "k");
+    Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
+    Value kIv = kBody.args()[0]->value();
+    Operation &lhs = appendOp(kBody, "memref.load",
+                              {info.lhsLoad->operand(0), iIv, kIv}, {i32},
+                              info.lhsLoad->attrs(), loc);
+    Value old = appendScalarLoad(module, kBody, accSlots[0], loc);
+    Operation &rhs = appendOp(kBody, "memref.load",
+                              {info.rhsLoad->operand(0), kIv, jIv}, {i32},
+                              info.rhsLoad->attrs(), loc);
+    Operation &prod = appendOp(kBody, "rv_machine.mulw",
+                               {lhs.result(), rhs.result()}, {i32}, {}, loc);
+    Operation &sum = appendOp(kBody, "rv_machine.addw",
+                              {old, prod.result()}, {i32}, {}, loc);
+    appendScalarStore(kBody, sum.result(), accSlots[0], loc);
+    appendOp(kBody, "affine.yield", {}, {}, {}, loc);
+    Value val = appendScalarLoad(module, tailBody, accSlots[0], loc);
+    appendOp(tailBody, "memref.store",
+             {val, info.finalStore->operand(1), iIv, jIv},
+             {}, info.finalStore->attrs(), loc);
+    appendOp(tailBody, "affine.yield", {}, {}, {}, loc);
+  }
+
+  appendOp(outerBody, "affine.yield", {}, {}, {}, loc);
+  outer.markErased();
+  if (stats) {
+    stats->reductionBlocks++;
+    stats->loopTiles++;
+    stats->polyTiles++;
+    stats->reductionRegs += kBlock;
+    stats->imperfectInterchanges++;
+  }
+  return true;
+}
+
 static bool stripMineInnermostAffineLoop(Module &module, Operation &loop,
                                          int64_t tileSize, SelfOptStats *stats) {
   (void) stats;
@@ -8767,7 +8956,8 @@ static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
         continue;
       RowReductionInfo info;
       if (classifyRowBufferedReduction(*loop, info)) {
-        applyRowBufferedReduction(module, info, stats);
+        if (!applyRegisterBlockedReduction(module, info, stats))
+          applyRowBufferedReduction(module, info, stats);
       } else if (stats) {
         stats->tileSkippedShape++;
       }
