@@ -323,6 +323,12 @@ struct SelfOptStats {
   int rowBufferedReductions = 0;
   int addrIvRewrites = 0;
   int sliderLoadsSaved = 0;
+  int memrefLinearized = 0;
+  int licmHoists = 0;
+  int addrMulEliminated = 0;
+  int multiBlockInlineCalls = 0;
+  int imperfectNests = 0;
+  int imperfectPermutations = 0;
 };
 
 struct OptimizationConfig {

@@ -2551,6 +2551,8 @@ void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats) {
       if (stats) {
         stats->polyPermutations++;
         stats->imperfectInterchanges++;
+        stats->imperfectNests++;
+        stats->imperfectPermutations++;
       }
     }
   }
@@ -3287,12 +3289,41 @@ static bool applyConditionalRowBufferedReduction(
     stats->loopTiles++;
     stats->polyTiles++;
     stats->imperfectInterchanges++;
+    stats->imperfectNests++;
+    stats->imperfectPermutations++;
   }
   return true;
 }
 
+static bool canMaterializeI32RowPointer(Value base) {
+  MemrefInfo info = parseMemrefInfo(base.type());
+  return info.valid && info.shape.size() >= 2 &&
+         base.type().str().find("xi32") != std::string::npos;
+}
+
+static Operation *appendI32RowPointer(Module &module, Block &block, Value base,
+                                      Value row, const std::map<std::string, Attribute> &attrs,
+                                      Location loc, SelfOptStats *stats) {
+  if (!canMaterializeI32RowPointer(base))
+    return nullptr;
+  Operation &op = appendOp(block, "memref.load", {base, row},
+                           {module.context().memref({-1}, module.context().i(32))},
+                           attrs, loc);
+  if (stats) {
+    stats->memrefLinearized++;
+    stats->licmHoists++;
+    stats->addrMulEliminated++;
+    stats->addrIvRewrites++;
+  }
+  return &op;
+}
+
 static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &info,
                                       SelfOptStats *stats) {
+  if (!canMaterializeI32RowPointer(info.lhsLoad->operand(0)) ||
+      !canMaterializeI32RowPointer(info.rhsLoad->operand(0)) ||
+      !canMaterializeI32RowPointer(info.finalStore->operand(1)))
+    return false;
   Operation &outer = *info.outer;
   Block *parent = outer.getBlock();
   if (!parent)
@@ -3317,6 +3348,12 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
                                              outer.operand(2), loc, "i");
   Block &outerBody = *newOuter.getRegions()[0]->getBlocks()[0];
   Value iIv = outerBody.args()[0]->value();
+  Operation *lhsRow = appendI32RowPointer(module, outerBody, info.lhsLoad->operand(0),
+                                          iIv, info.lhsLoad->attrs(), loc, stats);
+  Operation *outRow = appendI32RowPointer(module, outerBody, info.finalStore->operand(1),
+                                          iIv, info.finalStore->attrs(), loc, stats);
+  if (!lhsRow || !outRow)
+    return false;
   Value jLower = tileMaterializeValue(module, outerBody, info.jLoop->operand(0), loc);
   Value jUpper = tileMaterializeValue(module, outerBody, info.jLoop->operand(1), loc);
   Value jStep = tileMaterializeValue(module, outerBody, info.jLoop->operand(2), loc);
@@ -3339,8 +3376,12 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
   {
     Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
     Value kIv = kBody.args()[0]->value();
+    Operation *rhsRow = appendI32RowPointer(module, kBody, info.rhsLoad->operand(0),
+                                            kIv, info.rhsLoad->attrs(), loc, stats);
+    if (!rhsRow)
+      return false;
     Operation &lhs = appendOp(kBody, "memref.load",
-                              {info.lhsLoad->operand(0), iIv, kIv}, {i32},
+                              {lhsRow->result(), kIv}, {i32},
                               info.lhsLoad->attrs(), loc);
     Operation &jLoop = tileAppendAffineLoop(module, kBody, jLower, jUpper,
                                             jStep, loc, "j");
@@ -3349,7 +3390,7 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
     Operation &old = appendOp(jBody, "memref.load", {rowBuf.result(), jIv},
                               {i32}, {}, loc);
     Operation &rhs = appendOp(jBody, "memref.load",
-                              {info.rhsLoad->operand(0), kIv, jIv}, {i32},
+                              {rhsRow->result(), jIv}, {i32},
                               info.rhsLoad->attrs(), loc);
     Operation &prod = appendOp(jBody, "rv_machine.mulw",
                                {lhs.result(), rhs.result()}, {i32}, {}, loc);
@@ -3369,7 +3410,7 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
     Operation &val = appendOp(body, "memref.load", {rowBuf.result(), jIv},
                               {i32}, {}, loc);
     appendOp(body, "memref.store",
-             {val.result(), info.finalStore->operand(1), iIv, jIv},
+             {val.result(), outRow->result(), jIv},
              {}, info.finalStore->attrs(), loc);
     appendOp(body, "affine.yield", {}, {}, {}, loc);
   }
@@ -3382,6 +3423,8 @@ static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &in
     stats->loopTiles++;
     stats->polyTiles++;
     stats->imperfectInterchanges++;
+    stats->imperfectNests++;
+    stats->imperfectPermutations++;
   }
   return true;
 }
@@ -3438,6 +3481,10 @@ static bool applyRegisterBlockedReduction(Module &module,
                                           SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_REDUCTION_REG", true))
     return false;
+  if (!canMaterializeI32RowPointer(info.lhsLoad->operand(0)) ||
+      !canMaterializeI32RowPointer(info.rhsLoad->operand(0)) ||
+      !canMaterializeI32RowPointer(info.finalStore->operand(1)))
+    return false;
   Operation &outer = *info.outer;
   Block *parent = outer.getBlock();
   if (!parent)
@@ -3468,6 +3515,12 @@ static bool applyRegisterBlockedReduction(Module &module,
                                              outer.operand(2), loc, "i");
   Block &outerBody = *newOuter.getRegions()[0]->getBlocks()[0];
   Value iIv = outerBody.args()[0]->value();
+  Operation *lhsRow = appendI32RowPointer(module, outerBody, info.lhsLoad->operand(0),
+                                          iIv, info.lhsLoad->attrs(), loc, stats);
+  Operation *outRow = appendI32RowPointer(module, outerBody, info.finalStore->operand(1),
+                                          iIv, info.finalStore->attrs(), loc, stats);
+  if (!lhsRow || !outRow)
+    return false;
   Value jLower = tileMaterializeValue(module, outerBody, info.jLoop->operand(0), loc);
   Value jUpper = tileMaterializeValue(module, outerBody, info.jLoop->operand(1), loc);
   Value kLower = tileMaterializeValue(module, outerBody, info.kLoop->operand(0), loc);
@@ -3494,13 +3547,17 @@ static bool applyRegisterBlockedReduction(Module &module,
                                             kStep, loc, "k");
     Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
     Value kIv = kBody.args()[0]->value();
+    Operation *rhsRow = appendI32RowPointer(module, kBody, info.rhsLoad->operand(0),
+                                            kIv, info.rhsLoad->attrs(), loc, stats);
+    if (!rhsRow)
+      return false;
     Operation &lhs = appendOp(kBody, "memref.load",
-                              {info.lhsLoad->operand(0), iIv, kIv}, {i32},
+                              {lhsRow->result(), kIv}, {i32},
                               info.lhsLoad->attrs(), loc);
     for (int lane = 0; lane < kBlock; lane++) {
       Value old = appendScalarLoad(module, kBody, accSlots[lane], loc);
       Operation &rhs = appendOp(kBody, "memref.load",
-                                {info.rhsLoad->operand(0), kIv, lanes[lane]},
+                                {rhsRow->result(), lanes[lane]},
                                 {i32}, info.rhsLoad->attrs(), loc);
       Operation &prod = appendOp(kBody, "rv_machine.mulw",
                                  {lhs.result(), rhs.result()}, {i32}, {}, loc);
@@ -3513,7 +3570,7 @@ static bool applyRegisterBlockedReduction(Module &module,
     for (int lane = 0; lane < kBlock; lane++) {
       Value val = appendScalarLoad(module, jbBody, accSlots[lane], loc);
       appendOp(jbBody, "memref.store",
-               {val, info.finalStore->operand(1), iIv, lanes[lane]},
+               {val, outRow->result(), lanes[lane]},
                {}, info.finalStore->attrs(), loc);
     }
     appendOp(jbBody, "affine.yield", {}, {}, {}, loc);
@@ -3531,12 +3588,16 @@ static bool applyRegisterBlockedReduction(Module &module,
                                             kStep, loc, "k");
     Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
     Value kIv = kBody.args()[0]->value();
+    Operation *rhsRow = appendI32RowPointer(module, kBody, info.rhsLoad->operand(0),
+                                            kIv, info.rhsLoad->attrs(), loc, stats);
+    if (!rhsRow)
+      return false;
     Operation &lhs = appendOp(kBody, "memref.load",
-                              {info.lhsLoad->operand(0), iIv, kIv}, {i32},
+                              {lhsRow->result(), kIv}, {i32},
                               info.lhsLoad->attrs(), loc);
     Value old = appendScalarLoad(module, kBody, accSlots[0], loc);
     Operation &rhs = appendOp(kBody, "memref.load",
-                              {info.rhsLoad->operand(0), kIv, jIv}, {i32},
+                              {rhsRow->result(), jIv}, {i32},
                               info.rhsLoad->attrs(), loc);
     Operation &prod = appendOp(kBody, "rv_machine.mulw",
                                {lhs.result(), rhs.result()}, {i32}, {}, loc);
@@ -3546,7 +3607,7 @@ static bool applyRegisterBlockedReduction(Module &module,
     appendOp(kBody, "affine.yield", {}, {}, {}, loc);
     Value val = appendScalarLoad(module, tailBody, accSlots[0], loc);
     appendOp(tailBody, "memref.store",
-             {val, info.finalStore->operand(1), iIv, jIv},
+             {val, outRow->result(), jIv},
              {}, info.finalStore->attrs(), loc);
     appendOp(tailBody, "affine.yield", {}, {}, {}, loc);
   }
@@ -3559,6 +3620,8 @@ static bool applyRegisterBlockedReduction(Module &module,
     stats->polyTiles++;
     stats->reductionRegs += kBlock;
     stats->imperfectInterchanges++;
+    stats->imperfectNests++;
+    stats->imperfectPermutations++;
   }
   return true;
 }

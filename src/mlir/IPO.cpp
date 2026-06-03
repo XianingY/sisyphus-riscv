@@ -71,26 +71,56 @@ static std::unique_ptr<Operation> cloneOperationTree(
 
 struct InlineCandidate {
   Operation *func = nullptr;
+  Block *entry = nullptr;
   Operation *ret = nullptr;
   int opCount = 0;
+  bool multiBlock = false;
 };
 
 struct SelectInlineCandidate {
   Operation *func = nullptr;
+  Block *entry = nullptr;
   Operation *ifOp = nullptr;
   Value condition;
   Value trueValue;
   Value falseValue;
   std::vector<Operation*> prefixOps;
   int opCount = 0;
+  bool multiBlock = false;
 };
+
+static bool blockHasLiveNonYieldOps(Block &block) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "scf.yield")
+      continue;
+    return true;
+  }
+  return false;
+}
+
+static Block *inlineEntryBlock(Operation &func, bool &multiBlock) {
+  multiBlock = false;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().empty())
+    return nullptr;
+  Region &region = *func.getRegions()[0];
+  multiBlock = region.getBlocks().size() > 1;
+  Block *entry = region.getBlocks()[0].get();
+  for (size_t i = 1; i < region.getBlocks().size(); i++) {
+    if (blockHasLiveNonYieldOps(*region.getBlocks()[i]))
+      return nullptr;
+  }
+  return entry;
+}
 
 static InlineCandidate classifyInlineCandidate(Operation &func, int threshold) {
   InlineCandidate candidate;
-  if (threshold <= 0 || func.name() != "sysy.func" ||
-      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+  bool multiBlock = false;
+  Block *entryBlock = inlineEntryBlock(func, multiBlock);
+  if (threshold <= 0 || !entryBlock)
     return candidate;
-  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  Block &entry = *entryBlock;
   std::set<Operation*> localAllocas;
   std::function<void(Operation&)> collectAllocas = [&](Operation &op) {
     if (op.name() == "sysy.alloca" || op.name() == "memref.alloca")
@@ -145,8 +175,10 @@ static InlineCandidate classifyInlineCandidate(Operation &func, int threshold) {
   if (entry.ops().empty() || entry.ops().back().get() != ret)
     return candidate;
   candidate.func = &func;
+  candidate.entry = &entry;
   candidate.ret = ret;
   candidate.opCount = ops;
+  candidate.multiBlock = multiBlock;
   return candidate;
 }
 
@@ -495,10 +527,11 @@ static bool branchReturnsLocalOrPureValue(Region &region,
 static SelectInlineCandidate classifySelectInlineCandidate(Operation &func,
                                                            int threshold) {
   SelectInlineCandidate candidate;
-  if (threshold <= 0 || func.name() != "sysy.func" ||
-      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+  bool multiBlock = false;
+  Block *entryBlock = inlineEntryBlock(func, multiBlock);
+  if (threshold <= 0 || !entryBlock)
     return candidate;
-  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  Block &entry = *entryBlock;
 
   std::set<std::string> localAllocas;
   std::map<std::string, Value> localStoreValues;
@@ -549,12 +582,16 @@ static SelectInlineCandidate classifySelectInlineCandidate(Operation &func,
   candidate.trueValue = trueValue;
   candidate.falseValue = falseValue;
   candidate.opCount = ops;
+  candidate.entry = &entry;
+  candidate.multiBlock = multiBlock;
   return candidate;
 }
 
 static bool inlineDirectCall(Module &module, Operation &call,
                              const InlineCandidate &candidate) {
-  Block &entry = *candidate.func->getRegions()[0]->getBlocks()[0];
+  if (!candidate.entry)
+    return false;
+  Block &entry = *candidate.entry;
   if ((int) entry.args().size() != call.operandCount())
     return false;
   if (candidate.ret->operandCount() != call.resultCount())
@@ -595,7 +632,9 @@ static bool inlineSelectCall(Module &module, Operation &call,
                              const SelectInlineCandidate &candidate) {
   if (call.resultCount() != 1 || !candidate.func || !candidate.ifOp)
     return false;
-  Block &entry = *candidate.func->getRegions()[0]->getBlocks()[0];
+  if (!candidate.entry)
+    return false;
+  Block &entry = *candidate.entry;
   if ((int) entry.args().size() != call.operandCount())
     return false;
   Block *block = call.getBlock();
@@ -680,8 +719,11 @@ void runInlining(Module &module, int threshold, SelfOptStats *stats) {
           inlineSelectCall(module, *call, selectIt->second)) {
         inlinedFunctions.insert(callee);
         changed = true;
-        if (stats)
+        if (stats) {
           stats->inlineCalls++;
+          if (selectIt->second.multiBlock)
+            stats->multiBlockInlineCalls++;
+        }
         continue;
       }
       auto directIt = directCandidates.find(callee);
@@ -689,8 +731,11 @@ void runInlining(Module &module, int threshold, SelfOptStats *stats) {
           inlineDirectCall(module, *call, directIt->second)) {
         inlinedFunctions.insert(callee);
         changed = true;
-        if (stats)
+        if (stats) {
           stats->inlineCalls++;
+          if (directIt->second.multiBlock)
+            stats->multiBlockInlineCalls++;
+        }
       }
     }
     eraseMarked(module);

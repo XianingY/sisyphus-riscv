@@ -370,6 +370,12 @@ int main(int argc, char **argv) {
               << " stencil-tiles=" << selfMLIRStats.opt.stencilTiles
               << " row-buffered-reductions=" << selfMLIRStats.opt.rowBufferedReductions
               << " slider-loads-saved=" << selfMLIRStats.opt.sliderLoadsSaved
+              << " memref-linearized=" << selfMLIRStats.opt.memrefLinearized
+              << " licm-hoists=" << selfMLIRStats.opt.licmHoists
+              << " addr-mul-eliminated=" << selfMLIRStats.opt.addrMulEliminated
+              << " multi-block-inline-calls=" << selfMLIRStats.opt.multiBlockInlineCalls
+              << " imperfect-nests=" << selfMLIRStats.opt.imperfectNests
+              << " imperfect-permutations=" << selfMLIRStats.opt.imperfectPermutations
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed
