@@ -1946,6 +1946,18 @@ struct RowReductionInfo {
   bool valid = false;
 };
 
+struct ConditionalRowReductionInfo {
+  Operation *outer = nullptr;
+  Operation *jLoop = nullptr;
+  Operation *kLoop = nullptr;
+  Operation *ifOp = nullptr;
+  Operation *finalStore = nullptr;
+  Operation *product = nullptr;
+  Value accumulatorSlot;
+  std::vector<Operation*> conditionPrefixOps;
+  bool valid = false;
+};
+
 struct PolyAccessInfo {
   Value base;
   bool store = false;
@@ -1964,6 +1976,10 @@ static bool tileIsLoadFromSlot(Value value, Value slot) {
 static bool tileIsStoreToSlot(Operation *op, Value slot) {
   return tileOpHasName(op, {"sysy.store", "memref.store"}) &&
          op->operandCount() >= 2 && op->operand(1) == slot;
+}
+
+static bool tileIsLoadOfSlot(Value value, Value slot) {
+  return tileIsLoadFromSlot(value, slot);
 }
 
 static bool tileOpTreeStoresSlot(Operation &op, Value slot) {
@@ -1991,6 +2007,42 @@ static bool tileValueIsSlotPlusConst(Value value, Value slot) {
          (isLoad(op->operand(1)) && constantIntegerValue(op->operand(0), imm));
 }
 
+static bool tileValueIsSlotPlusProduct(Value value, Value slot, Operation *&product) {
+  product = nullptr;
+  Operation *op = value.getDefiningOp();
+  if (!tileOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) ||
+      op->operandCount() != 2)
+    return false;
+  auto isProduct = [](Value v) {
+    Operation *def = v.getDefiningOp();
+    return tileOpHasName(def, {"arith.muli", "rv_machine.mulw", "arm_machine.mul"}) &&
+           def->operandCount() == 2 && def->resultCount() == 1;
+  };
+  if (tileIsLoadOfSlot(op->operand(0), slot) && isProduct(op->operand(1))) {
+    product = op->operand(1).getDefiningOp();
+    return true;
+  }
+  if (tileIsLoadOfSlot(op->operand(1), slot) && isProduct(op->operand(0))) {
+    product = op->operand(0).getDefiningOp();
+    return true;
+  }
+  return false;
+}
+
+static bool tileValueTreeUsesValue(Value value, Value needle, int depth = 0) {
+  if (!value.valid() || !needle.valid() || depth > 12)
+    return false;
+  if (value == needle)
+    return true;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return false;
+  for (auto operand : def->getOperands())
+    if (tileValueTreeUsesValue(operand, needle, depth + 1))
+      return true;
+  return false;
+}
+
 static void tileReplaceLoadsFromSlot(Module &module, Operation &op, Value slot,
                                      Value replacement, int &count) {
   if (tileOpHasName(&op, {"sysy.load", "memref.load"}) &&
@@ -2008,6 +2060,38 @@ static void tileReplaceLoadsFromSlot(Module &module, Operation &op, Value slot,
       }
     }
   }
+}
+
+static void tileCollectMemrefLoadBases(Operation &op, std::set<std::string> &bases) {
+  if (tileOpHasName(&op, {"memref.load"}) && op.operandCount() > 0)
+    bases.insert(valueKey(op.operand(0)));
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && !child->isErased())
+          tileCollectMemrefLoadBases(*child, bases);
+}
+
+static void tileCollectMemrefLoadBases(Block &block, std::set<std::string> &bases) {
+  for (auto &owned : block.ops())
+    if (owned && !owned->isErased())
+      tileCollectMemrefLoadBases(*owned, bases);
+}
+
+static bool tileBlockHasStoreOutsideSlot(Block &block, Value slot) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (tileOpHasName(op, {"sysy.store", "memref.store"}) &&
+        !tileIsStoreToSlot(op, slot))
+      return true;
+    for (auto &region : op->getRegions())
+      for (auto &childBlock : region->getBlocks())
+        if (tileBlockHasStoreOutsideSlot(*childBlock, slot))
+          return true;
+  }
+  return false;
 }
 
 static bool cacheWhileLoopIvLoads(Module &module, Operation &loop,
@@ -2596,6 +2680,384 @@ static bool classifyRowBufferedReduction(Operation &outer, RowReductionInfo &inf
   return true;
 }
 
+static bool classifyConditionalRowReduction(Operation &outer,
+                                            ConditionalRowReductionInfo &info) {
+  if (outer.name() != "affine.for" || outer.operandCount() < 3)
+    return false;
+
+  struct LoopTriple {
+    Operation *iLoop = nullptr;
+    Operation *jLoop = nullptr;
+    Operation *kLoop = nullptr;
+  };
+  auto parentAffineLoop = [](Operation *op) -> Operation* {
+    if (!op || !op->getBlock() || !op->getBlock()->getRegion())
+      return nullptr;
+    Operation *parent = op->getBlock()->getRegion()->getParent();
+    return parent && parent->name() == "affine.for" ? parent : nullptr;
+  };
+  auto directAffineChild = [](Operation *loop) -> Operation* {
+    Block *body = loop ? tileSingleBlock(*loop) : nullptr;
+    return body ? tileSingleDirectAffineChild(*body) : nullptr;
+  };
+  auto singleChildIs = [&](Operation *parent, Operation *child) {
+    return parent && child && directAffineChild(parent) == child;
+  };
+  auto stepOne = [](Operation *loop) {
+    int64_t step = 0;
+    return loop && loop->operandCount() >= 3 &&
+           constantIntegerValue(loop->operand(2), step) && step == 1;
+  };
+  auto purePostIfOp = [](Operation *op) {
+    return op && op->getRegions().empty() &&
+           !tileOpHasName(op, {"sysy.load", "sysy.store", "memref.load",
+                               "memref.store", "sysy.call", "sysy.return",
+                               "sysy.break", "sysy.continue", "scf.if",
+                               "scf.while", "scf.for", "affine.for",
+                               "scf.condition"});
+  };
+
+  std::vector<LoopTriple> triples;
+  auto addTriple = [&](Operation *iLoop, Operation *jLoop, Operation *kLoop) {
+    if (!iLoop || !jLoop || !kLoop)
+      return;
+    for (const auto &existing : triples)
+      if (existing.iLoop == iLoop && existing.jLoop == jLoop &&
+          existing.kLoop == kLoop)
+        return;
+    triples.push_back({iLoop, jLoop, kLoop});
+  };
+
+  Operation *child = directAffineChild(&outer);
+  addTriple(&outer, child, directAffineChild(child));
+  Operation *parent = parentAffineLoop(&outer);
+  if (singleChildIs(parent, &outer))
+    addTriple(parent, &outer, directAffineChild(&outer));
+  Operation *grandparent = parentAffineLoop(parent);
+  if (singleChildIs(parent, &outer) && singleChildIs(grandparent, parent))
+    addTriple(grandparent, parent, &outer);
+
+  for (const auto &triple : triples) {
+    Operation *outerLoop = triple.iLoop;
+    Operation *jLoop = triple.jLoop;
+    Operation *kLoop = triple.kLoop;
+    if (!stepOne(outerLoop) || !stepOne(jLoop) || !stepOne(kLoop))
+      continue;
+    Block *outerBody = tileSingleBlock(*outerLoop);
+    Block *jBody = tileSingleBlock(*jLoop);
+    Block *kBody = tileSingleBlock(*kLoop);
+    if (!outerBody || outerBody->args().empty() || !jBody ||
+        jBody->args().empty() || !kBody || kBody->args().empty() ||
+        tileBlockHasNestedLoop(*kBody))
+      continue;
+
+    Value iIv = tileFirstBlockArg(*outerLoop);
+    Value jIv = tileFirstBlockArg(*jLoop);
+    Value kIv = tileFirstBlockArg(*kLoop);
+
+    std::vector<Value> accumulatorCandidates;
+    for (auto &owned : jBody->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+      if (tileOpHasName(op, {"sysy.alloca", "memref.alloca"}) &&
+          op->resultCount() == 1 && isScalarWordMemref(op->resultType()))
+        accumulatorCandidates.push_back(op->result());
+    }
+    if (accumulatorCandidates.empty())
+      continue;
+
+    for (Value sumSlot : accumulatorCandidates) {
+      bool zeroInitialized = false;
+      Operation *finalStore = nullptr;
+      for (auto &owned : jBody->ops()) {
+        Operation *op = owned.get();
+        if (!op || op->isErased())
+          continue;
+        if (tileIsStoreToSlot(op, sumSlot)) {
+          int64_t init = 0;
+          if (constantIntegerValue(op->operand(0), init) && init == 0)
+            zeroInitialized = true;
+        }
+        if (op->name() == "memref.store" && op->operandCount() >= 4 &&
+            tileIsLoadFromSlot(op->operand(0), sumSlot) &&
+            tileSame2DIndices(op, iIv, jIv, 2))
+          finalStore = op;
+      }
+      if (!zeroInitialized || !finalStore)
+        continue;
+
+      Operation *ifOp = nullptr;
+      std::vector<Operation*> conditionPrefixOps;
+      bool prefixValid = true;
+      bool seenIf = false;
+      for (auto &owned : kBody->ops()) {
+        Operation *op = owned.get();
+        if (!op || op->isErased() || op->name() == "affine.yield")
+          continue;
+        if (op->name() == "scf.if") {
+          if (ifOp) {
+            prefixValid = false;
+            break;
+          }
+          ifOp = op;
+          seenIf = true;
+        } else {
+          if (seenIf) {
+            if (!purePostIfOp(op)) {
+              prefixValid = false;
+              break;
+            }
+            continue;
+          }
+          if (!op->getRegions().empty()) {
+            prefixValid = false;
+            break;
+          }
+          conditionPrefixOps.push_back(op);
+        }
+      }
+      if (!prefixValid || !ifOp || ifOp->operandCount() != 1 ||
+          ifOp->getRegions().size() != 1 ||
+          ifOp->getRegions()[0]->getBlocks().size() != 1)
+        continue;
+      Block &thenBlock = *ifOp->getRegions()[0]->getBlocks()[0];
+      if (tileBlockHasNestedLoop(thenBlock) ||
+          tileBlockHasStoreOutsideSlot(thenBlock, sumSlot))
+        continue;
+
+      Operation *product = nullptr;
+      Operation *sumStore = nullptr;
+      for (auto &owned : thenBlock.ops()) {
+        Operation *op = owned.get();
+        if (!op || op->isErased() || op->name() == "scf.yield")
+          continue;
+        if (!tileIsStoreToSlot(op, sumSlot))
+          continue;
+        Operation *candidateProduct = nullptr;
+        if (!tileValueIsSlotPlusProduct(op->operand(0), sumSlot, candidateProduct))
+          continue;
+        product = candidateProduct;
+        sumStore = op;
+        break;
+      }
+      if (!sumStore || !product)
+        continue;
+
+      std::set<std::string> loadBases;
+      for (Operation *op : conditionPrefixOps)
+        tileCollectMemrefLoadBases(*op, loadBases);
+      tileCollectMemrefLoadBases(thenBlock, loadBases);
+      std::string outputBase = valueKey(finalStore->operand(1));
+      if (loadBases.count(outputBase) != 0)
+        continue;
+
+      bool productUsesI = tileValueTreeUsesValue(product->result(), iIv);
+      bool productUsesJ = tileValueTreeUsesValue(product->result(), jIv);
+      bool productUsesK = tileValueTreeUsesValue(product->result(), kIv);
+      if (!productUsesJ || !productUsesK)
+        continue;
+
+      info.outer = outerLoop;
+      info.jLoop = jLoop;
+      info.kLoop = kLoop;
+      info.ifOp = ifOp;
+      info.finalStore = finalStore;
+      info.product = product;
+      info.accumulatorSlot = sumSlot;
+      info.conditionPrefixOps = conditionPrefixOps;
+      info.valid = true;
+      (void) productUsesI;
+      return true;
+    }
+  }
+  return false;
+}
+
+static Operation *cloneSimpleIntoBlock(Module &module, Block &block, Operation &op,
+                                       std::map<std::string, Value> &valueMap) {
+  std::set<Operation*> skipOps;
+  auto cloned = cloneForUnrolledIteration(module, op, valueMap, skipOps,
+                                          Value(), 0);
+  if (!cloned)
+    return nullptr;
+  Operation &inserted = block.addOperation(std::move(cloned));
+  for (int i = 0; i < op.resultCount(); i++)
+    valueMap[valueKey(op.result(i))] = inserted.result(i);
+  return &inserted;
+}
+
+static bool ensureClonedValue(Module &module, Block &block, Value value,
+                              std::map<std::string, Value> &valueMap,
+                              Block *allowedSourceBlock) {
+  if (!value.valid())
+    return false;
+  if (valueMap.count(valueKey(value)) != 0)
+    return true;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased() || def->getBlock() != allowedSourceBlock ||
+      def->getRegions().size() != 0)
+    return true;
+  for (auto operand : def->getOperands()) {
+    if (!ensureClonedValue(module, block, operand, valueMap, allowedSourceBlock))
+      return false;
+  }
+  return cloneSimpleIntoBlock(module, block, *def, valueMap) != nullptr;
+}
+
+static bool applyConditionalRowBufferedReduction(
+    Module &module, const ConditionalRowReductionInfo &info, SelfOptStats *stats) {
+  Operation &outer = *info.outer;
+  Block *parent = outer.getBlock();
+  if (!parent)
+    return false;
+  int outerIndex = operationIndexInBlock(*parent, &outer);
+  if (outerIndex < 0)
+    return false;
+
+  Context &ctx = module.context();
+  Location loc = outer.loc();
+  Type i32 = ctx.i(32);
+  MemrefInfo outInfo = parseMemrefInfo(info.finalStore->operand(1).type());
+  if (!outInfo.valid || outInfo.shape.size() < 2 || outInfo.shape[1] <= 0)
+    return false;
+  int64_t rowElements = outInfo.shape[1];
+
+  std::size_t insertIndex = (std::size_t) outerIndex;
+  Operation &rowBuf = insertOp(
+      *parent, insertIndex, "sysy.alloca", {}, {ctx.memref({rowElements}, i32)},
+      {{"symbol", ctx.stringAttr(".tile_cond_rowbuf")}}, loc);
+  Operation &newOuter = tileInsertAffineLoop(module, *parent, insertIndex,
+                                             outer.operand(0), outer.operand(1),
+                                             outer.operand(2), loc, "i");
+  Block &outerBody = *newOuter.getRegions()[0]->getBlocks()[0];
+  Value newI = outerBody.args()[0]->value();
+  Value zeroJLower = tileMaterializeValue(module, outerBody,
+                                          info.jLoop->operand(0), loc);
+  Value zeroJUpper = tileMaterializeValue(module, outerBody,
+                                          info.jLoop->operand(1), loc);
+  Value zeroJStep = tileMaterializeValue(module, outerBody,
+                                         info.jLoop->operand(2), loc);
+
+  Operation &zeroLoop = tileAppendAffineLoop(module, outerBody, zeroJLower,
+                                             zeroJUpper, zeroJStep, loc, "j");
+  {
+    Block &body = *zeroLoop.getRegions()[0]->getBlocks()[0];
+    Value newJ = body.args()[0]->value();
+    Value zero = tileAppendIntConstant(module, body, 0, loc);
+    appendOp(body, "memref.store", {zero, rowBuf.result(), newJ}, {}, {}, loc);
+    appendOp(body, "affine.yield", {}, {}, {}, loc);
+  }
+
+  Block *oldOuterBody = tileSingleBlock(*info.outer);
+  Block *oldJBody = tileSingleBlock(*info.jLoop);
+  Block *oldKBody = tileSingleBlock(*info.kLoop);
+  if (!oldOuterBody || !oldJBody || !oldKBody || oldOuterBody->args().empty() ||
+      oldJBody->args().empty() || oldKBody->args().empty())
+    return false;
+  Value oldI = oldOuterBody->args()[0]->value();
+  Value oldJ = oldJBody->args()[0]->value();
+  Value oldK = oldKBody->args()[0]->value();
+
+  Value kLower = tileMaterializeValue(module, outerBody, info.kLoop->operand(0), loc);
+  Value kUpper = tileMaterializeValue(module, outerBody, info.kLoop->operand(1), loc);
+  Value kStep = tileMaterializeValue(module, outerBody, info.kLoop->operand(2), loc);
+  Operation &kLoop = tileAppendAffineLoop(module, outerBody, kLower, kUpper,
+                                          kStep, loc, "k");
+  {
+    Block &kBody = *kLoop.getRegions()[0]->getBlocks()[0];
+    Value newK = kBody.args()[0]->value();
+    std::map<std::string, Value> kValueMap;
+    kValueMap[valueKey(oldI)] = newI;
+    kValueMap[valueKey(oldK)] = newK;
+
+    Block &oldThen = *info.ifOp->getRegions()[0]->getBlocks()[0];
+    for (int operandIdx = 0; operandIdx < info.product->operandCount(); operandIdx++) {
+      Value operand = info.product->operand(operandIdx);
+      Operation *def = operand.getDefiningOp();
+      if (!def || def->isErased() || def->getBlock() != &oldThen ||
+          opTreeUsesValue(*def, oldJ))
+        continue;
+      if (!ensureClonedValue(module, kBody, operand, kValueMap, &oldThen))
+        return false;
+    }
+
+    Value innerJLower = tileMaterializeValue(module, kBody,
+                                             info.jLoop->operand(0), loc);
+    Value innerJUpper = tileMaterializeValue(module, kBody,
+                                             info.jLoop->operand(1), loc);
+    Value innerJStep = tileMaterializeValue(module, kBody,
+                                            info.jLoop->operand(2), loc);
+    Operation &jLoop = tileAppendAffineLoop(module, kBody, innerJLower,
+                                            innerJUpper, innerJStep, loc, "j");
+    Block &jBody = *jLoop.getRegions()[0]->getBlocks()[0];
+    Value newJ = jBody.args()[0]->value();
+    std::map<std::string, Value> valueMap = kValueMap;
+    valueMap[valueKey(oldJ)] = newJ;
+    for (Operation *op : info.conditionPrefixOps) {
+      if (!cloneSimpleIntoBlock(module, jBody, *op, valueMap))
+        return false;
+    }
+    auto condIt = valueMap.find(valueKey(info.ifOp->operand(0)));
+    if (condIt == valueMap.end() || !condIt->second.valid())
+      return false;
+
+    Operation &newIf = appendOp(jBody, "scf.if", {condIt->second}, {}, {},
+                                info.ifOp->loc(), 1);
+    Block &thenBody = newIf.getRegions()[0]->addBlock();
+    Operation &oldAcc = appendOp(thenBody, "memref.load",
+                                 {rowBuf.result(), newJ}, {i32}, {}, loc);
+    Value productValue;
+    for (auto operand : info.product->getOperands()) {
+      if (!ensureClonedValue(module, thenBody, operand, valueMap, &oldThen))
+        return false;
+    }
+    if (!cloneSimpleIntoBlock(module, thenBody, *info.product, valueMap))
+      return false;
+    auto productIt = valueMap.find(valueKey(info.product->result()));
+    if (productIt == valueMap.end() || !productIt->second.valid())
+      return false;
+    productValue = productIt->second;
+    Operation &sum = appendOp(thenBody, "rv_machine.addw",
+                              {oldAcc.result(), productValue}, {i32}, {}, loc);
+    appendOp(thenBody, "memref.store", {sum.result(), rowBuf.result(), newJ},
+             {}, {}, loc);
+    appendOp(thenBody, "scf.yield", {}, {}, {}, loc);
+    appendOp(jBody, "affine.yield", {}, {}, {}, loc);
+    appendOp(kBody, "affine.yield", {}, {}, {}, loc);
+  }
+
+  Value writeJLower = tileMaterializeValue(module, outerBody,
+                                           info.jLoop->operand(0), loc);
+  Value writeJUpper = tileMaterializeValue(module, outerBody,
+                                           info.jLoop->operand(1), loc);
+  Value writeJStep = tileMaterializeValue(module, outerBody,
+                                          info.jLoop->operand(2), loc);
+  Operation &writeLoop = tileAppendAffineLoop(module, outerBody, writeJLower,
+                                              writeJUpper, writeJStep, loc, "j");
+  {
+    Block &body = *writeLoop.getRegions()[0]->getBlocks()[0];
+    Value newJ = body.args()[0]->value();
+    Operation &val = appendOp(body, "memref.load", {rowBuf.result(), newJ},
+                              {i32}, {}, loc);
+    appendOp(body, "memref.store",
+             {val.result(), info.finalStore->operand(1), newI, newJ},
+             {}, info.finalStore->attrs(), loc);
+    appendOp(body, "affine.yield", {}, {}, {}, loc);
+  }
+  appendOp(outerBody, "affine.yield", {}, {}, {}, loc);
+
+  outer.markErased();
+  if (stats) {
+    stats->rowBufferedReductions++;
+    stats->reductionBlocks++;
+    stats->loopTiles++;
+    stats->polyTiles++;
+    stats->imperfectInterchanges++;
+  }
+  return true;
+}
+
 static bool applyRowBufferedReduction(Module &module, const RowReductionInfo &info,
                                       SelfOptStats *stats) {
   Operation &outer = *info.outer;
@@ -2985,8 +3447,13 @@ static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
       if (classifyRowBufferedReduction(*loop, info)) {
         if (!applyRegisterBlockedReduction(module, info, stats))
           applyRowBufferedReduction(module, info, stats);
-      } else if (stats) {
-        stats->tileSkippedShape++;
+      } else {
+        ConditionalRowReductionInfo conditionalInfo;
+        if (classifyConditionalRowReduction(*loop, conditionalInfo)) {
+          applyConditionalRowBufferedReduction(module, conditionalInfo, stats);
+        } else if (stats) {
+          stats->tileSkippedShape++;
+        }
       }
     }
     eraseMarked(module);
