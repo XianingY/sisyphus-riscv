@@ -933,6 +933,94 @@ static bool unrollSmallConstantWhile(Module &module, Operation &loop,
   return true;
 }
 
+struct ConstantAffineInfo {
+  bool valid = false;
+  int64_t lower = 0;
+  int64_t upper = 0;
+  int64_t step = 1;
+  int64_t tripCount = 0;
+};
+
+static ConstantAffineInfo classifySmallConstantAffineFor(Operation &loop) {
+  ConstantAffineInfo info;
+  if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
+      loop.getRegions().size() != 1 ||
+      loop.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  if (!constantIntegerValue(loop.operand(0), info.lower) ||
+      !constantIntegerValue(loop.operand(1), info.upper) ||
+      !constantIntegerValue(loop.operand(2), info.step) ||
+      info.step <= 0)
+    return info;
+  int64_t span = info.upper - info.lower;
+  if (span < 0)
+    return info;
+  info.tripCount = (span + info.step - 1) / info.step;
+  if (info.tripCount <= 0 || info.tripCount > 7)
+    return info;
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  for (auto &owned : body.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "affine.yield")
+      continue;
+    if (op->name() == "sysy.return" || op->name() == "scf.return" ||
+        op->name() == "sysy.break" || op->name() == "sysy.continue" ||
+        op->name() == "sysy.call")
+      return ConstantAffineInfo();
+  }
+  info.valid = true;
+  return info;
+}
+
+static bool unrollSmallConstantAffineFor(Module &module, Operation &loop,
+                                         const ConstantAffineInfo &info) {
+  Block *parent = loop.getBlock();
+  if (!parent || loop.getRegions().empty() ||
+      loop.getRegions()[0]->getBlocks().empty())
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  if (body.args().empty())
+    return false;
+
+  std::vector<Operation*> bodyOps;
+  for (auto &owned : body.ops())
+    if (owned && !owned->isErased() && owned->name() != "affine.yield")
+      bodyOps.push_back(owned.get());
+
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  std::size_t insertIndex = (std::size_t) loopIndex;
+  for (int64_t iter = 0; iter < info.tripCount; iter++) {
+    int64_t ivValue = info.lower + iter * info.step;
+    Operation &ivConst = parent->insertOperation(
+        insertIndex++,
+        std::make_unique<Operation>(
+            "arith.constant", std::vector<Value>{}, std::vector<Type>{i32},
+            std::map<std::string, Attribute>{
+                {"value", ctx.integerAttr(ivValue, i32)}},
+            loop.loc()));
+    std::map<std::string, Value> valueMap;
+    valueMap[valueKey(body.args()[0]->value())] = ivConst.result();
+    std::set<Operation*> skipOps;
+    for (Operation *op : bodyOps) {
+      if (!op)
+        continue;
+      auto cloned = cloneForUnrolledIteration(module, *op, valueMap, skipOps,
+                                              Value(), 0);
+      if (!cloned)
+        continue;
+      Operation &inserted = parent->insertOperation(insertIndex++, std::move(cloned));
+      for (int i = 0; i < op->resultCount(); i++)
+        valueMap[valueKey(op->result(i))] = inserted.result(i);
+    }
+  }
+  loop.markErased();
+  return true;
+}
+
 static void runLoopAddressIVInRegion(Module &module, Region &region, SelfOptStats *stats);
 
 static void runLoopAddressIVInBlock(Module &module, Block &block, SelfOptStats *stats) {
@@ -1768,20 +1856,33 @@ void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
   for (int round = 0; round < 4; round++) {
     std::vector<Operation*> loops;
     for (auto *op : walk(module))
-      if (op && !op->isErased() && op->name() == "scf.while")
+      if (op && !op->isErased() &&
+          (op->name() == "scf.while" || op->name() == "affine.for"))
         loops.push_back(op);
     bool changed = false;
     for (Operation *loop : loops) {
       if (!loop || loop->isErased())
         continue;
-      ConstantWhileInfo info = classifySmallConstantWhile(*loop);
-      if (!info.valid)
-        continue;
-      if (unrollSmallConstantWhile(module, *loop, info)) {
+      bool unrolled = false;
+      int64_t tripCount = 0;
+      if (loop->name() == "scf.while") {
+        ConstantWhileInfo info = classifySmallConstantWhile(*loop);
+        if (info.valid) {
+          unrolled = unrollSmallConstantWhile(module, *loop, info);
+          tripCount = info.tripCount;
+        }
+      } else if (loop->name() == "affine.for") {
+        ConstantAffineInfo info = classifySmallConstantAffineFor(*loop);
+        if (info.valid) {
+          unrolled = unrollSmallConstantAffineFor(module, *loop, info);
+          tripCount = info.tripCount;
+        }
+      }
+      if (unrolled) {
         changed = true;
         if (stats) {
           stats->kernelUnrolls++;
-          stats->interiorPeels += info.tripCount > 0 ? 1 : 0;
+          stats->interiorPeels += tripCount > 0 ? 1 : 0;
         }
       }
     }
@@ -4140,6 +4241,96 @@ void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats) {
   int iterations = 0;
   while (changed && iterations++ < 8)
     changed = runLICMInRegion(module, module.body(), stats);
+}
+
+static bool localCSEPureOp(Operation *op) {
+  if (!op || op->isErased() || op->isTerminator() ||
+      !op->getRegions().empty() || op->resultCount() != 1)
+    return false;
+  if (isMemrefType(op->resultType()))
+    return false;
+  return tileOpHasName(op, {"arith.constant", "rv_machine.li",
+                            "arith.addi", "arith.subi", "arith.muli",
+                            "arith.divi", "arith.remi", "arith.andi",
+                            "arith.ori", "arith.xori", "arith.cmpi",
+                            "arith.select", "rv_machine.addw",
+                            "rv_machine.subw", "rv_machine.mulw",
+                            "rv_machine.divw", "rv_machine.remw",
+                            "rv_machine.and", "rv_machine.or",
+                            "rv_machine.xor", "rv_machine.sllw",
+                            "rv_machine.sraw", "rv_machine.seqz",
+                            "rv_machine.snez", "rv_machine.neg",
+                            "rv_machine.cmp"});
+}
+
+static bool localCSECommutative(Operation *op) {
+  return tileOpHasName(op, {"arith.addi", "arith.muli", "arith.andi",
+                            "arith.ori", "arith.xori", "rv_machine.addw",
+                            "rv_machine.mulw", "rv_machine.and",
+                            "rv_machine.or", "rv_machine.xor"});
+}
+
+static std::string localCSEKey(Operation &op) {
+  std::vector<std::string> operands;
+  operands.reserve(op.getOperands().size());
+  for (Value value : op.getOperands())
+    operands.push_back(valueKey(value));
+  if (localCSECommutative(&op))
+    std::sort(operands.begin(), operands.end());
+
+  std::ostringstream os;
+  os << op.name() << ':' << op.resultType().str();
+  for (const auto &attr : op.attrs())
+    os << ":@" << attr.first << '=' << attr.second.str();
+  for (const std::string &operand : operands)
+    os << ":%" << operand;
+  return os.str();
+}
+
+static bool runLocalCSEInRegion(Module &module, Region &region,
+                                SelfOptStats *stats) {
+  bool changed = false;
+  for (auto &blockPtr : region.getBlocks()) {
+    Block &block = *blockPtr;
+    std::map<std::string, Value> available;
+    std::vector<Operation*> ops;
+    for (auto &owned : block.ops())
+      if (owned && !owned->isErased())
+        ops.push_back(owned.get());
+
+    for (Operation *op : ops) {
+      if (!op || op->isErased())
+        continue;
+      for (auto &nested : op->getRegions())
+        changed |= runLocalCSEInRegion(module, *nested, stats);
+      if (!localCSEPureOp(op))
+        continue;
+      std::string key = localCSEKey(*op);
+      auto it = available.find(key);
+      if (it != available.end()) {
+        replaceAllUses(module, op->result(), it->second);
+        op->markErased();
+        changed = true;
+        if (stats) {
+          stats->localCSERewrites++;
+          stats->worklistRewrites++;
+        }
+        continue;
+      }
+      available[key] = op->result();
+    }
+  }
+  return changed;
+}
+
+void runLocalCSE(Module &module, SelfOptStats *stats) {
+  bool changed = true;
+  int iterations = 0;
+  while (changed && iterations++ < 4) {
+    changed = runLocalCSEInRegion(module, module.body(), stats);
+    if (changed)
+      eraseMarked(module);
+  }
 }
 
 struct DivChainReductionInfo {

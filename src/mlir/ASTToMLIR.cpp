@@ -872,12 +872,6 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
       stats.opt.affineWorklistItems += runRaiseToAffine(*module);
     if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", false))
       runImperfectLoopPromotion(*module);
-    if (effective.enableLoopTiling)
-      runLoopTiling(*module, &stats.opt);
-    if (effective.enableLoopFusion && !envDisabled("SISY_ENABLE_SELF_LOOP_FUSION"))
-      runAffineLoopFusion(*module);
-    if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))
-      runPolyhedralLoopPermutation(*module, &stats.opt);
   }
   if (effective.enableStencilPeel)
     runStencilPeelingAndUnroll(*module, &stats.opt);
@@ -885,6 +879,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   if (effective.level != OptimizationConfig::Level::O0) {
     runMemrefLinearization(*module, &stats.opt);
     runLoopInvariantCodeMotion(*module, &stats.opt);
+    runLocalCSE(*module, &stats.opt);
   }
 
   // 3. Global straight-line optimizations.
@@ -900,6 +895,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runLoopAddressIV(*module, &stats.opt);
   if (effective.level != OptimizationConfig::Level::O0)
     runClosedFormDivReduction(*module, &stats.opt);
+  if (effective.level != OptimizationConfig::Level::O0)
+    runLocalCSE(*module, &stats.opt);
   if (effective.enableProvenBitwise)
     runProvenBitwiseHelper(*module, &stats.opt);
   if (effective.enableRotateHelper)
@@ -923,9 +920,53 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
       runLoopRepeatReduction(*module, &stats.opt);
     runClosedFormDivReduction(*module, &stats.opt);
     runLoopInvariantCodeMotion(*module, &stats.opt);
+    runLocalCSE(*module, &stats.opt);
     if (effective.enableLoopAddressIV && stats.opt.inlineCalls > inlineCallsBefore)
       runLoopAddressIV(*module, &stats.opt);
   }
+
+  // 5. Re-run structural recovery after IPO.  Helper calls such as idx() and
+  // digit extraction routines often block the first affine raise; once they
+  // are inlined, the surrounding hot loops can finally enter the affine and
+  // polyhedral pipeline.
+  if (effective.level != OptimizationConfig::Level::O0) {
+    if (effective.enableStencilPeel)
+      runStencilPeelingAndUnroll(*module, &stats.opt);
+    if (effective.enableAffine && !envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
+      if (!envDisabled("SISY_ENABLE_SELF_RAISE_AFFINE")) {
+        int phase2 = runRaiseToAffine(*module);
+        stats.opt.affineWorklistItems += phase2;
+        stats.opt.phase2AffineRaises += phase2;
+      }
+      if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", false))
+        runImperfectLoopPromotion(*module);
+      if (effective.enableLoopTiling)
+        runLoopTiling(*module, &stats.opt);
+      if (effective.enableLoopFusion && !envDisabled("SISY_ENABLE_SELF_LOOP_FUSION"))
+        runAffineLoopFusion(*module);
+      if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))
+        runPolyhedralLoopPermutation(*module, &stats.opt);
+    }
+    if (effective.enableStencilPeel)
+      runStencilPeelingAndUnroll(*module, &stats.opt);
+    runIfStoreSelectPromotion(*module, &stats.opt);
+    runMemrefLinearization(*module, &stats.opt);
+    runLoopInvariantCodeMotion(*module, &stats.opt);
+    runClosedFormDivReduction(*module, &stats.opt);
+    runLocalCSE(*module, &stats.opt);
+    runLoopInvariantCodeMotion(*module, &stats.opt);
+    if (effective.enableMemoryOpt)
+      runMemoryOpt(*module, &stats.opt, true);
+    if (effective.enableLoopAddressIV) {
+      runLoopRepeatReduction(*module, &stats.opt);
+      runLoopAddressIV(*module, &stats.opt);
+    }
+    if (effective.enableProvenBitwise)
+      runProvenBitwiseHelper(*module, &stats.opt);
+    if (effective.enableRotateHelper)
+      runRotateHelperFold(*module, &stats.opt);
+  }
+
   if (effective.enableScheduler)
     runLoopLocalScheduler(*module, &stats.opt);
   if (effective.enableAffine)

@@ -374,6 +374,9 @@ int main(int argc, char **argv) {
               << " licm-hoists=" << selfMLIRStats.opt.licmHoists
               << " addr-mul-eliminated=" << selfMLIRStats.opt.addrMulEliminated
               << " multi-block-inline-calls=" << selfMLIRStats.opt.multiBlockInlineCalls
+              << " multi-stage-inline-calls=" << selfMLIRStats.opt.inlineCalls
+              << " phase2-affine-raises=" << selfMLIRStats.opt.phase2AffineRaises
+              << " local-cse-rewrites=" << selfMLIRStats.opt.localCSERewrites
               << " imperfect-nests=" << selfMLIRStats.opt.imperfectNests
               << " imperfect-permutations=" << selfMLIRStats.opt.imperfectPermutations
               << " closed-form-div-reductions=" << selfMLIRStats.opt.closedFormDivReductions

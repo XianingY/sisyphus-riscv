@@ -327,6 +327,8 @@ struct SelfOptStats {
   int licmHoists = 0;
   int addrMulEliminated = 0;
   int multiBlockInlineCalls = 0;
+  int phase2AffineRaises = 0;
+  int localCSERewrites = 0;
   int imperfectNests = 0;
   int imperfectPermutations = 0;
   int closedFormDivReductions = 0;
@@ -375,6 +377,7 @@ void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void runMemrefLinearization(Module &module, SelfOptStats *stats = nullptr);
 void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats = nullptr);
 void runClosedFormDivReduction(Module &module, SelfOptStats *stats = nullptr);
+void runLocalCSE(Module &module, SelfOptStats *stats = nullptr);
 void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats = nullptr);
 void runParityProductCompareStrength(Module &module, SelfOptStats *stats = nullptr);
 void runMachineDeadCodeElim(Module &module, SelfOptStats *stats = nullptr);
