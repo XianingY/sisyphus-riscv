@@ -329,6 +329,7 @@ struct SelfOptStats {
   int multiBlockInlineCalls = 0;
   int imperfectNests = 0;
   int imperfectPermutations = 0;
+  int closedFormDivReductions = 0;
 };
 
 struct OptimizationConfig {
@@ -371,6 +372,9 @@ void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats = nullptr);
 void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats = nullptr);
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats = nullptr);
 void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
+void runMemrefLinearization(Module &module, SelfOptStats *stats = nullptr);
+void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats = nullptr);
+void runClosedFormDivReduction(Module &module, SelfOptStats *stats = nullptr);
 void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats = nullptr);
 void runParityProductCompareStrength(Module &module, SelfOptStats *stats = nullptr);
 void runMachineDeadCodeElim(Module &module, SelfOptStats *stats = nullptr);

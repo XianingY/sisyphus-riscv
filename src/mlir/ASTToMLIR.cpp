@@ -882,6 +882,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
   if (effective.enableStencilPeel)
     runStencilPeelingAndUnroll(*module, &stats.opt);
   runIfStoreSelectPromotion(*module, &stats.opt);
+  if (effective.level != OptimizationConfig::Level::O0) {
+    runMemrefLinearization(*module, &stats.opt);
+    runLoopInvariantCodeMotion(*module, &stats.opt);
+  }
 
   // 3. Global straight-line optimizations.
   if (effective.enableGlobalOpt) {
@@ -894,6 +898,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runLoopRepeatReduction(*module, &stats.opt);
   if (effective.enableLoopAddressIV)
     runLoopAddressIV(*module, &stats.opt);
+  if (effective.level != OptimizationConfig::Level::O0)
+    runClosedFormDivReduction(*module, &stats.opt);
   if (effective.enableProvenBitwise)
     runProvenBitwiseHelper(*module, &stats.opt);
   if (effective.enableRotateHelper)
@@ -915,6 +921,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     }
     if (effective.enableLoopAddressIV && stats.opt.inlineCalls > inlineCallsBefore)
       runLoopRepeatReduction(*module, &stats.opt);
+    runClosedFormDivReduction(*module, &stats.opt);
+    runLoopInvariantCodeMotion(*module, &stats.opt);
     if (effective.enableLoopAddressIV && stats.opt.inlineCalls > inlineCallsBefore)
       runLoopAddressIV(*module, &stats.opt);
   }

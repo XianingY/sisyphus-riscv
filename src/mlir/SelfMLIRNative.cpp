@@ -2553,6 +2553,20 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
     }
   };
+  auto invalidateLoopHeaderRegs = [&](Value ivValue) {
+    std::string ivKey = valueKey(ivValue);
+    for (auto it = regs.begin(); it != regs.end(); ) {
+      const std::string &key = it->first;
+      const std::string &reg = it->second;
+      if (key == ivKey || reg.rfind("stack:", 0) == 0 ||
+          reg.rfind("global:", 0) == 0 || globalLabels.count(key) != 0 ||
+          (lsraEnabled && lsraAssignment.count(key) != 0)) {
+        ++it;
+        continue;
+      }
+      it = regs.erase(it);
+    }
+  };
   auto consumeOperands = [&](Operation &op) {
     for (auto operand : op.getOperands()) {
       std::string key = valueKey(operand);
@@ -2575,6 +2589,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return false;
     }
     Operation *def = value.getDefiningOp();
+    if (def && !def->isErased() && def->attr("licm_hoisted"))
+      return true;
     if (def && !def->isErased()) {
       Operation *onlyUser = nullptr;
       int liveUses = 0;
@@ -2597,6 +2613,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
     }
     return true;
+  };
+  auto forgetHoistedResultReg = [&](Operation &def) {
+    if (def.attr("licm_hoisted") && def.resultCount() == 1)
+      regs.erase(valueKey(def.result()));
   };
   auto invalidateCallerSavedForCall = [&]() {
     for (auto it = regs.begin(); it != regs.end(); ) {
@@ -2662,10 +2682,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       loc = "stack:" + std::to_string(slotIt->second);
     if (loc.rfind("stack:", 0) == 0) {
       int64_t off = std::stoll(loc.substr(6));
+      clobberPhysicalReg(tmp);
       return materializeStackAddressRaw(tmp, off);
     }
     if (loc.rfind("global:", 0) == 0) {
       std::string label = loc.substr(7);
+      clobberPhysicalReg(tmp);
       if (isArm)
         os << "    adrp " << tmp << ", " << label << "\n"
            << "    add " << tmp << ", " << tmp << ", :lo12:" << label << "\n";
@@ -2675,6 +2697,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
     auto home = valueSlots.find(valueKey(value));
     if (home != valueSlots.end() && isMemrefType(value.type()) && homeIsUsable(value)) {
+      clobberPhysicalReg(tmp);
       emitStackLoad(tmp, home->second, "ld");
       return tmp;
     }
@@ -2695,6 +2718,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
     int64_t imm = 0;
     if (constantIntegerValue(value, imm)) {
+      clobberPhysicalReg(actualTmp);
       if (isArm)
         os << "    mov " << actualTmp << ", #" << imm << "\n";
       else
@@ -2707,12 +2731,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           (op->name() == "arith.constant" || op->name() == "rv_machine.li" ||
            op->name() == "arm_machine.mov") &&
           op->attr("value")) {
+        clobberPhysicalReg(actualTmp);
         emitFloatBitsToReg(actualTmp, parseFloatAttrBits(op->attr("value")));
         return actualTmp;
       }
     }
     auto home = valueSlots.find(valueKey(value));
     if (home != valueSlots.end() && homeIsUsable(value)) {
+      clobberPhysicalReg(actualTmp);
       bool fp = isFloatType(value.type()) || looksFloatReg(actualTmp);
       bool ptr = isMemrefType(value.type());
       emitStackLoad(actualTmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
@@ -2869,6 +2895,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return false;
     }
     if (first != result) {
+      clobberPhysicalReg(result);
       if (isArm)
         os << "    mov " << result << ", " << first << "\n";
       else
@@ -2877,10 +2904,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     for (std::size_t i = 1; i < indices.size(); i++) {
       if (isArm) {
+        clobberPhysicalReg(tmp);
         os << "    mov " << tmp << ", #" << info.shape[i] << "\n";
+        clobberPhysicalReg(result);
         os << "    mul " << result << ", " << result << ", " << tmp << "\n";
       } else {
+        clobberPhysicalReg(tmp);
         os << "    li " << tmp << ", " << info.shape[i] << "\n";
+        clobberPhysicalReg(result);
         os << "    mulw " << result << ", " << result << ", " << tmp << "\n";
       }
       std::string idx = ensureReg(indices[i], tmp);
@@ -2906,10 +2937,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
       if (trailingElems != 1) {
         if (isArm) {
+          clobberPhysicalReg(tmp);
           os << "    mov " << tmp << ", #" << trailingElems << "\n";
+          clobberPhysicalReg(result);
           os << "    mul " << result << ", " << result << ", " << tmp << "\n";
         } else {
+          clobberPhysicalReg(tmp);
           os << "    li " << tmp << ", " << trailingElems << "\n";
+          clobberPhysicalReg(result);
           os << "    mulw " << result << ", " << result << ", " << tmp << "\n";
         }
       }
@@ -2930,13 +2965,47 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return false;
     std::string baseAddr = materializeAddress(base, tmpReg);
     if (isArm) {
+      clobberPhysicalReg(indexReg);
       os << "    add " << indexReg << ", " << baseAddr << ", "
          << indexReg << ", lsl #2\n";
     } else {
+      clobberPhysicalReg(indexReg);
       os << "    slli " << indexReg << ", " << indexReg << ", 2\n";
       os << "    add " << indexReg << ", " << baseAddr << ", " << indexReg << "\n";
     }
     addrOut = indexReg;
+    return true;
+  };
+  auto computeLinearizedElementAddress = [&](Value base, Value index,
+                                             const std::string &addrReg,
+                                             const std::string &indexReg,
+                                             const std::string &tmpReg,
+                                             std::string &addrOut) -> bool {
+    std::string idx = ensureReg(index, indexReg);
+    if (idx.empty()) {
+      stats.unsupportedOps++;
+      stats.error = "linearized memref index has no assigned register";
+      return false;
+    }
+    if (idx != indexReg) {
+      clobberPhysicalReg(indexReg);
+      if (isArm)
+        os << "    mov " << indexReg << ", " << idx << "\n";
+      else
+        os << "    mv " << indexReg << ", " << idx << "\n";
+    }
+    std::string baseAddr = materializeAddress(base, tmpReg);
+    if (isArm) {
+      clobberPhysicalReg(indexReg);
+      os << "    add " << indexReg << ", " << baseAddr << ", "
+         << indexReg << ", lsl #2\n";
+    } else {
+      clobberPhysicalReg(indexReg);
+      os << "    slli " << indexReg << ", " << indexReg << ", 2\n";
+      os << "    add " << indexReg << ", " << baseAddr << ", " << indexReg << "\n";
+    }
+    addrOut = indexReg;
+    (void) addrReg;
     return true;
   };
   auto loadFromAddress = [&](const std::string &dst, Value base,
@@ -3123,6 +3192,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         consumeOperands(op);
         operandsConsumed = true;
       }
+      forgetHoistedResultReg(op);
     };
     struct ConsumeGuard {
       std::function<void()> fn;
@@ -3210,7 +3280,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 	        opname == "rv_machine.remw" || opname == "arm_machine.srem" ||
 	        opname == "rv_machine.and" || opname == "arm_machine.and" ||
 	        opname == "rv_machine.or" || opname == "arm_machine.orr" ||
-	        opname == "rv_machine.xor" || opname == "arm_machine.eor") {
+	        opname == "rv_machine.xor" || opname == "arm_machine.eor" ||
+	        opname == "rv_machine.sllw" || opname == "rv_machine.sraw") {
 	      if (op.operandCount() != 2 || op.resultCount() != 1) {
 	        stats.unsupportedOps++;
 	        stats.error = "bad binary machine op shape";
@@ -3368,6 +3439,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         else if (opname == "rv_machine.and") inst = "and";
         else if (opname == "rv_machine.or") inst = "or";
         else if (opname == "rv_machine.xor") inst = "xor";
+        else if (opname == "rv_machine.sllw") inst = "sllw";
+        else if (opname == "rv_machine.sraw") inst = "sraw";
         os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
         if (inst == "and" || inst == "or" || inst == "xor")
           os << "    addiw " << dst << ", " << dst << ", 0\n";
@@ -3537,6 +3610,22 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       else if (!isArm)
         dst = intResultReg(op.result());
       bindResult(op.result(), dst);
+      if (op.attr("linearized_index") && indices.size() == 1) {
+        std::string addr;
+        if (!computeLinearizedElementAddress(op.operand(0), indices[0],
+                                             scratchReg(0), scratchReg(1),
+                                             scratchReg(0), addr))
+          return false;
+        if (isArm)
+          os << "    ldr " << dst << ", [" << addr << "]\n";
+        else
+          os << "    " << (isFloatType(op.resultType()) ? "flw " : "lw ")
+             << dst << ", 0(" << addr << ")\n";
+        if (shouldSpillDefinedValue(op.result()))
+          spillHome(op.result(), dst);
+        stats.machineOps++;
+        continue;
+      }
       if (!loadFromAddress(dst, op.operand(0), indices))
         return false;
       if (shouldSpillDefinedValue(op.result()))
@@ -3572,6 +3661,25 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
           stats.machineOps++;
           continue;
         }
+      }
+      if (op.attr("linearized_index") && indices.size() == 1) {
+        bool fpStore = isFloatType(op.operand(0).type());
+        std::string addr;
+        if (!computeLinearizedElementAddress(op.operand(1), indices[0],
+                                             scratchReg(0), scratchReg(1),
+                                             scratchReg(0), addr))
+          return false;
+        if (isArm) {
+          std::string val = ensureReg(op.operand(0), fpStore ? "s30" : scratchReg(0));
+          fpStore = fpStore || looksFloatReg(val);
+          os << "    str " << val << ", [" << addr << "]\n";
+        } else {
+          std::string val = ensureReg(op.operand(0), fpStore ? "ft10" : scratchReg(0));
+          fpStore = fpStore || looksFloatReg(val);
+          os << "    " << (fpStore ? "fsw " : "sw ") << val << ", 0(" << addr << ")\n";
+        }
+        stats.machineOps++;
+        continue;
       }
       if (!storeToAddress(op.operand(0), op.operand(1), indices))
         return false;
@@ -3944,6 +4052,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         std::string bound = reloadValue(op.operand(1), boundScratch);
         os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
       }
+      invalidateLoopHeaderRegs(ivValue);
+      regs[valueKey(ivValue)] = iv;
       continue;
     }
 

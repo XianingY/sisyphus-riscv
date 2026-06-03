@@ -376,6 +376,7 @@ int main(int argc, char **argv) {
               << " multi-block-inline-calls=" << selfMLIRStats.opt.multiBlockInlineCalls
               << " imperfect-nests=" << selfMLIRStats.opt.imperfectNests
               << " imperfect-permutations=" << selfMLIRStats.opt.imperfectPermutations
+              << " closed-form-div-reductions=" << selfMLIRStats.opt.closedFormDivReductions
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed

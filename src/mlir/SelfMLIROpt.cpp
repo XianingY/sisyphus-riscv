@@ -1978,6 +1978,8 @@ struct PolyNestInfo {
   Operation *inner = nullptr;
   Block *outerBody = nullptr;
   Block *innerBody = nullptr;
+  std::vector<Operation*> preOps;
+  std::vector<Operation*> postOps;
 };
 
 static bool tileIsLoadFromSlot(Value value, Value slot) {
@@ -2360,7 +2362,44 @@ static bool polyScalarSlotHasLoad(Module &module, Value slot) {
   return false;
 }
 
-static bool polyTransparentOuterOp(Module &module, Operation *op) {
+static bool polyScalarSlotReferencedInBlock(Operation &op, Value slot) {
+  if (!slot.valid() || op.isErased())
+    return false;
+  if ((tileOpHasName(&op, {"sysy.load", "memref.load", "sysy.store", "memref.store"})) &&
+      op.operandCount() > 0) {
+    int baseOperand = tileOpHasName(&op, {"sysy.store", "memref.store"}) ? 1 : 0;
+    if (op.operandCount() > baseOperand && op.operand(baseOperand) == slot)
+      return true;
+  }
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && polyScalarSlotReferencedInBlock(*child, slot))
+          return true;
+  return false;
+}
+
+static bool polyScalarSlotReferencedInBlock(Block *block, Value slot) {
+  if (!block || !slot.valid())
+    return true;
+  for (auto &owned : block->ops())
+    if (owned && polyScalarSlotReferencedInBlock(*owned, slot))
+      return true;
+  return false;
+}
+
+static bool polyTransparentPureOp(Operation *op) {
+  if (!op || op->isErased() || !op->getRegions().empty())
+    return false;
+  return tileOpHasName(op, {"arith.constant", "rv_machine.li",
+                            "arith.addi", "arith.subi", "arith.muli",
+                            "arith.andi", "arith.ori", "arith.xori",
+                            "rv_machine.addw", "rv_machine.subw",
+                            "rv_machine.mulw", "rv_machine.and",
+                            "rv_machine.or", "rv_machine.xor"});
+}
+
+static bool polyTransparentOuterOp(Module &module, Operation *op, Block *innerBody) {
   if (!op || op->isErased() || op->name() == "affine.yield")
     return true;
   if (op->name() == "affine.for")
@@ -2369,20 +2408,20 @@ static bool polyTransparentOuterOp(Module &module, Operation *op) {
     return false;
   if (tileOpHasName(op, {"sysy.call", "sysy.return", "sysy.break",
                          "sysy.continue", "scf.if", "scf.while",
-                         "scf.for", "scf.condition", "memref.load",
-                         "sysy.load"}))
+                         "scf.for", "scf.condition"}))
     return false;
+  if (tileOpHasName(op, {"sysy.load", "memref.load"})) {
+    if (op->operandCount() < 1 || !isScalarWordMemref(op->operand(0).type()))
+      return false;
+    return !polyScalarSlotReferencedInBlock(innerBody, op->operand(0));
+  }
   if (tileOpHasName(op, {"sysy.store", "memref.store"})) {
     if (op->operandCount() < 2 || !isScalarWordMemref(op->operand(1).type()))
       return false;
-    return !polyScalarSlotHasLoad(module, op->operand(1));
+    return !polyScalarSlotReferencedInBlock(innerBody, op->operand(1)) &&
+           !polyScalarSlotHasLoad(module, op->operand(1));
   }
-  for (int i = 0; i < op->resultCount(); i++) {
-    int64_t imm = 0;
-    if (!constantIntegerValue(op->result(i), imm))
-      return false;
-  }
-  return true;
+  return polyTransparentPureOp(op);
 }
 
 static bool polyClassify2DNest(Module &module, Operation &outer,
@@ -2391,6 +2430,7 @@ static bool polyClassify2DNest(Module &module, Operation &outer,
   info.outerBody = tileSingleBlock(outer);
   if (!info.outerBody || info.outerBody->args().empty())
     return false;
+  bool afterInner = false;
   for (auto &owned : info.outerBody->ops()) {
     Operation *op = owned.get();
     if (!op || op->isErased() || op->name() == "affine.yield")
@@ -2399,16 +2439,33 @@ static bool polyClassify2DNest(Module &module, Operation &outer,
       if (info.inner)
         return false;
       info.inner = op;
+      afterInner = true;
       continue;
     }
-    if (!polyTransparentOuterOp(module, op))
-      return false;
   }
   if (!info.inner)
     return false;
   info.innerBody = tileSingleBlock(*info.inner);
-  return info.innerBody && !info.innerBody->args().empty() &&
-         !tileBlockUnsafeForStripMining(*info.innerBody);
+  if (!info.innerBody || info.innerBody->args().empty() ||
+      tileBlockUnsafeForStripMining(*info.innerBody))
+    return false;
+  afterInner = false;
+  for (auto &owned : info.outerBody->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "affine.yield")
+      continue;
+    if (op == info.inner) {
+      afterInner = true;
+      continue;
+    }
+    if (!polyTransparentOuterOp(module, op, info.innerBody))
+      return false;
+    if (afterInner)
+      info.postOps.push_back(op);
+    else
+      info.preOps.push_back(op);
+  }
+  return true;
 }
 
 static Value polyMaterializeLoopOperand(Module &module, Block &block,
@@ -2466,9 +2523,23 @@ static bool applyPolyLoopInterchange(Module &module, Operation &outer,
   std::map<std::string, Value> valueMap;
   valueMap[valueKey(oldOuterBody->args()[0]->value())] = newInnerIv;
   valueMap[valueKey(oldInnerBody->args()[0]->value())] = newOuterIv;
-  for (auto &owned : oldOuterBody->ops()) {
-    Operation *op = owned.get();
-    if (!op || op->isErased() || op == &inner)
+  auto cloneTransparentOps = [&](const std::vector<Operation*> &ops) -> bool {
+    for (Operation *op : ops) {
+      if (!op || op->isErased())
+        continue;
+      std::set<Operation*> skipOps;
+      auto cloned = cloneForUnrolledIteration(module, *op, valueMap, skipOps,
+                                              Value(), 0);
+      if (!cloned)
+        return false;
+      Operation &inserted = newInnerBody.addOperation(std::move(cloned));
+      for (int i = 0; i < op->resultCount(); i++)
+        valueMap[valueKey(op->result(i))] = inserted.result(i);
+    }
+    return true;
+  };
+  for (Operation *op : nest.preOps) {
+    if (!op || op->isErased())
       continue;
     for (int i = 0; i < op->resultCount(); i++) {
       int64_t imm = 0;
@@ -2477,6 +2548,8 @@ static bool applyPolyLoopInterchange(Module &module, Operation &outer,
             tileAppendIntConstant(module, newInnerBody, imm, loc);
     }
   }
+  if (!cloneTransparentOps(nest.preOps))
+    return false;
   std::set<Operation*> skipOps;
   for (auto &owned : oldInnerBody->ops()) {
     if (!owned || owned->isErased() || owned->isTerminator())
@@ -2489,6 +2562,8 @@ static bool applyPolyLoopInterchange(Module &module, Operation &outer,
     for (int i = 0; i < owned->resultCount(); i++)
       valueMap[valueKey(owned->result(i))] = inserted.result(i);
   }
+  if (!cloneTransparentOps(nest.postOps))
+    return false;
   appendOp(newInnerBody, "affine.yield", {}, {}, {}, loc);
   appendOp(newOuterBody, "affine.yield", {}, {}, {}, loc);
   outer.markErased();
@@ -3786,6 +3861,454 @@ void runLoopTiling(Module &module, SelfOptStats *stats) {
     return;
   }
   runSafeLoopTiling(module, stats);
+}
+
+static bool isLinearizedAccess(Operation *op) {
+  return op && op->attr("linearized_index");
+}
+
+static Operation &appendI32Constant(Module &module, Block &block, int64_t value,
+                                    Location loc) {
+  Context &ctx = module.context();
+  return appendOp(block, "rv_machine.li", {}, {ctx.i(32)},
+                  {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc);
+}
+
+static Operation &insertI32Constant(Module &module, Block &block, std::size_t &index,
+                                    int64_t value, Location loc) {
+  Context &ctx = module.context();
+  return insertOp(block, index, "rv_machine.li", {}, {ctx.i(32)},
+                  {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc);
+}
+
+static bool fullRankI32MemrefAccess(Operation *op, Value &base,
+                                    std::vector<Value> &indices,
+                                    bool &store) {
+  if (!op || op->isErased() || isLinearizedAccess(op))
+    return false;
+  store = op->name() == "memref.store";
+  if (op->name() != "memref.load" && !store)
+    return false;
+  if (op->name() == "memref.load" && op->resultCount() == 1 &&
+      isMemrefType(op->resultType()))
+    return false;
+  int start = store ? 2 : 1;
+  if (op->operandCount() <= start)
+    return false;
+  base = op->operand(store ? 1 : 0);
+  MemrefInfo info = parseMemrefInfo(base.type());
+  if (!info.valid || info.shape.size() < 2 ||
+      info.shape.size() != (std::size_t) (op->operandCount() - start) ||
+      base.type().str().find("xi32") == std::string::npos)
+    return false;
+  for (std::size_t i = 1; i < info.shape.size(); i++)
+    if (info.shape[i] <= 0)
+      return false;
+  indices.clear();
+  for (int i = start; i < op->operandCount(); i++)
+    indices.push_back(op->operand(i));
+  return true;
+}
+
+static Value insertLinearizedIndex(Module &module, Block &block,
+                                   std::size_t &index, Value base,
+                                   const std::vector<Value> &indices,
+                                   Location loc, SelfOptStats *stats) {
+  MemrefInfo info = parseMemrefInfo(base.type());
+  if (!info.valid || indices.empty() || info.shape.size() != indices.size())
+    return Value();
+  Value linear = indices[0];
+  Type i32 = module.context().i(32);
+  for (std::size_t dim = 1; dim < indices.size(); dim++) {
+    Operation &stride = insertI32Constant(module, block, index, info.shape[dim], loc);
+    Operation &mul = insertOp(block, index, "rv_machine.mulw",
+                              {linear, stride.result()}, {i32}, {}, loc);
+    Operation &add = insertOp(block, index, "rv_machine.addw",
+                              {mul.result(), indices[dim]}, {i32}, {}, loc);
+    linear = add.result();
+    if (stats)
+      stats->addrMulEliminated++;
+  }
+  return linear;
+}
+
+void runMemrefLinearization(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_MEMREF_LINEARIZATION", true))
+    return;
+  std::vector<Operation*> accesses;
+  for (Operation *op : walk(module)) {
+    Value base;
+    std::vector<Value> indices;
+    bool store = false;
+    if (fullRankI32MemrefAccess(op, base, indices, store))
+      accesses.push_back(op);
+  }
+  bool changed = false;
+  for (Operation *op : accesses) {
+    if (!op || op->isErased())
+      continue;
+    Value base;
+    std::vector<Value> indices;
+    bool store = false;
+    if (!fullRankI32MemrefAccess(op, base, indices, store))
+      continue;
+    Block *block = op->getBlock();
+    if (!block)
+      continue;
+    int rawIndex = operationIndexInBlock(*block, op);
+    if (rawIndex < 0)
+      continue;
+    std::size_t insertIndex = (std::size_t) rawIndex;
+    Value linear = insertLinearizedIndex(module, *block, insertIndex, base,
+                                         indices, op->loc(), stats);
+    if (!linear.valid())
+      continue;
+    std::map<std::string, Attribute> attrs = op->attrs();
+    attrs["linearized_index"] = module.context().boolAttr(true);
+    if (store) {
+      insertOp(*block, insertIndex, op->name(), {op->operand(0), base, linear},
+               {}, attrs, op->loc());
+    } else {
+      Operation &load = insertOp(*block, insertIndex, op->name(), {base, linear},
+                                 resultTypesOf(*op), attrs, op->loc());
+      replaceAllUses(module, op->result(), load.result());
+    }
+    op->markErased();
+    changed = true;
+    if (stats)
+      stats->memrefLinearized++;
+  }
+  if (changed)
+    eraseMarked(module);
+}
+
+static bool licmPureHoistable(Operation *op) {
+  if (!op || op->isErased() || op->isTerminator() || !op->getRegions().empty() ||
+      op->resultCount() == 0)
+    return false;
+  if (op->resultCount() == 1 && isMemrefType(op->resultType()))
+    return false;
+  return tileOpHasName(op, {"arith.constant", "rv_machine.li",
+                            "arith.addi", "arith.subi", "arith.muli",
+                            "arith.andi", "arith.ori", "arith.xori",
+                            "rv_machine.addw", "rv_machine.subw",
+                            "rv_machine.mulw", "rv_machine.and",
+                            "rv_machine.or", "rv_machine.xor",
+                            "rv_machine.sllw", "rv_machine.sraw"});
+}
+
+static bool licmAddressHoistable(Operation *op) {
+  if (!licmPureHoistable(op))
+    return false;
+  if (tileOpHasName(op, {"arith.constant", "rv_machine.li"}))
+    return true;
+  if (!tileOpHasName(op, {"arith.muli", "rv_machine.mulw"}))
+    return false;
+  if (op->operandCount() != 2)
+    return false;
+  int64_t imm = 0;
+  return constantIntegerValue(op->operand(0), imm) ||
+         constantIntegerValue(op->operand(1), imm);
+}
+
+static void collectDefinedValuesInBlockTree(Block &block,
+                                            std::set<std::string> &defined) {
+  for (auto &arg : block.args())
+    if (arg)
+      defined.insert(valueKey(arg->value()));
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    for (int i = 0; i < op->resultCount(); i++)
+      defined.insert(valueKey(op->result(i)));
+    for (auto &region : op->getRegions())
+      for (auto &nested : region->getBlocks())
+        collectDefinedValuesInBlockTree(*nested, defined);
+  }
+}
+
+static bool opOperandsLoopInvariant(Operation &op,
+                                    const std::set<std::string> &definedInLoop) {
+  for (Value operand : op.getOperands())
+    if (operand.valid() && definedInLoop.count(valueKey(operand)) != 0)
+      return false;
+  return true;
+}
+
+static bool blockNestedIn(Block *block, Block *root) {
+  for (Block *curr = block; curr; ) {
+    if (curr == root)
+      return true;
+    Region *region = curr->getRegion();
+    Operation *parent = region ? region->getParent() : nullptr;
+    curr = parent ? parent->getBlock() : nullptr;
+  }
+  return false;
+}
+
+static bool opResultUsesStayInLoop(Operation &op, Block &loopBody) {
+  for (int i = 0; i < op.resultCount(); i++) {
+    if ((std::size_t) i >= op.resultUses.size())
+      continue;
+    for (const Use &use : op.resultUses[i]) {
+      if (!use.owner || use.owner->isErased())
+        continue;
+      if (!blockNestedIn(use.owner->getBlock(), &loopBody))
+        return false;
+    }
+  }
+  return true;
+}
+
+static bool hoistInvariantsFromAffineLoop(Module &module, Operation &loop,
+                                          SelfOptStats *stats) {
+  if (loop.name() != "affine.for" || loop.getRegions().size() != 1 ||
+      loop.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block *parent = loop.getBlock();
+  Block *body = loop.getRegions()[0]->getBlocks()[0].get();
+  if (!parent || !body)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+
+  bool changed = false;
+  bool localChanged = true;
+  while (localChanged) {
+    localChanged = false;
+    std::set<std::string> definedInLoop;
+    collectDefinedValuesInBlockTree(*body, definedInLoop);
+    loopIndex = operationIndexInBlock(*parent, &loop);
+    if (loopIndex < 0)
+      return changed;
+    std::size_t insertIndex = (std::size_t) loopIndex;
+    std::vector<Operation*> bodyOps;
+    for (auto &owned : body->ops())
+      if (owned && !owned->isErased())
+        bodyOps.push_back(owned.get());
+    for (Operation *op : bodyOps) {
+      if (!licmAddressHoistable(op) || !opOperandsLoopInvariant(*op, definedInLoop))
+        continue;
+      if (!opResultUsesStayInLoop(*op, *body))
+        continue;
+      auto clone = std::make_unique<Operation>(op->name(), op->getOperands(),
+                                               resultTypesOf(*op), op->attrs(),
+                                               op->loc());
+      clone->setAttr("licm_hoisted", module.context().boolAttr(true));
+      Operation &inserted = parent->insertOperation(insertIndex++, std::move(clone));
+      for (int i = 0; i < op->resultCount(); i++)
+        replaceAllUses(module, op->result(i), inserted.result(i));
+      op->markErased();
+      changed = true;
+      localChanged = true;
+      if (stats) {
+        stats->licmHoists++;
+        if (op->name() == "rv_machine.mulw" || op->name() == "arith.muli")
+          stats->addrMulEliminated++;
+      }
+      break;
+    }
+    if (localChanged)
+      eraseMarked(module);
+  }
+  return changed;
+}
+
+static bool runLICMInRegion(Module &module, Region &region, SelfOptStats *stats) {
+  bool changed = false;
+  for (auto &block : region.getBlocks()) {
+    std::vector<Operation*> ops;
+    for (auto &owned : block->ops())
+      if (owned && !owned->isErased())
+        ops.push_back(owned.get());
+    for (Operation *op : ops) {
+      for (auto &nested : op->getRegions())
+        changed |= runLICMInRegion(module, *nested, stats);
+      if (op->name() == "affine.for")
+        changed |= hoistInvariantsFromAffineLoop(module, *op, stats);
+    }
+  }
+  return changed;
+}
+
+void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_LICM", true))
+    return;
+  bool changed = true;
+  int iterations = 0;
+  while (changed && iterations++ < 8)
+    changed = runLICMInRegion(module, module.body(), stats);
+}
+
+struct DivChainReductionInfo {
+  bool valid = false;
+  Value slot;
+  Value upper;
+  int64_t divisor = 0;
+  int shift = 0;
+};
+
+static DivChainReductionInfo classifyDivChainReductionLoop(Operation &loop) {
+  DivChainReductionInfo info;
+  if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
+      loop.getRegions().size() != 1 || loop.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  int64_t lower = 0;
+  int64_t step = 0;
+  if (!constantIntegerValue(loop.operand(0), lower) || lower != 0 ||
+      !constantIntegerValue(loop.operand(2), step) || step != 1)
+    return info;
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  Operation *store = nullptr;
+  for (auto &owned : body.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "affine.yield")
+      continue;
+    if (tileOpHasName(op, {"sysy.call", "sysy.return", "scf.return",
+                           "sysy.break", "sysy.continue", "scf.if",
+                           "scf.while", "scf.for", "affine.for"}))
+      return info;
+    if (isMLIRStoreOp(op)) {
+      if (store)
+        return info;
+      store = op;
+      continue;
+    }
+    if (isMLIRLoadOp(op))
+      continue;
+    if (tileOpHasName(op, {"arith.constant", "rv_machine.li",
+                           "arith.divi", "rv_machine.divw",
+                           "arm_machine.sdiv"}))
+      continue;
+    if (licmPureHoistable(op))
+      continue;
+    return info;
+  }
+  if (!store || store->operandCount() < 2 ||
+      !isScalarWordMemref(store->operand(1).type()))
+    return info;
+  Operation *div = store->operand(0).getDefiningOp();
+  if (!tileOpHasName(div, {"arith.divi", "rv_machine.divw", "arm_machine.sdiv"}) ||
+      div->operandCount() != 2)
+    return info;
+  if (!loadFromSlot(div->operand(0).getDefiningOp(), store->operand(1)))
+    return info;
+  int64_t divisor = 0;
+  int shift = 0;
+  if (!constantIntegerValue(div->operand(1), divisor) ||
+      !positivePowerOfTwoShift(divisor, shift) || shift <= 1)
+    return info;
+  info.valid = true;
+  info.slot = store->operand(1);
+  info.upper = loop.operand(1);
+  info.divisor = divisor;
+  info.shift = shift;
+  return info;
+}
+
+static Value appendSignedDivPow2Dynamic(Module &module, Block &block, Value value,
+                                        Value shift, Location loc) {
+  Type i32 = module.context().i(32);
+  Operation &one = appendI32Constant(module, block, 1, loc);
+  Operation &maskBase = appendOp(block, "rv_machine.sllw",
+                                 {one.result(), shift}, {i32}, {}, loc);
+  Operation &mask = appendOp(block, "rv_machine.subw",
+                             {maskBase.result(), one.result()}, {i32}, {}, loc);
+  Operation &thirtyOne = appendI32Constant(module, block, 31, loc);
+  Operation &sign = appendOp(block, "rv_machine.sraw",
+                             {value, thirtyOne.result()}, {i32}, {}, loc);
+  Operation &bias = appendOp(block, "rv_machine.and",
+                             {sign.result(), mask.result()}, {i32}, {}, loc);
+  Operation &adjusted = appendOp(block, "rv_machine.addw",
+                                 {value, bias.result()}, {i32}, {}, loc);
+  Operation &quot = appendOp(block, "rv_machine.sraw",
+                             {adjusted.result(), shift}, {i32}, {}, loc);
+  return quot.result();
+}
+
+static bool applyDivChainReductionLoop(Module &module, Operation &loop,
+                                       const DivChainReductionInfo &info,
+                                       SelfOptStats *stats) {
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  Location loc = loop.loc();
+  std::size_t insertIndex = (std::size_t) loopIndex;
+  Operation &start = insertOp(*parent, insertIndex, "sysy.load",
+                              {info.slot}, {i32}, {}, loc);
+  Operation &zero = insertI32Constant(module, *parent, insertIndex, 0, loc);
+  Operation &condPositive = insertOp(
+      *parent, insertIndex, "arith.cmpi", {zero.result(), info.upper}, {i32},
+      {{"predicate", ctx.stringAttr("lt")}}, loc);
+
+  auto outerIf = std::make_unique<Operation>("scf.if",
+                                             std::vector<Value>{condPositive.result()},
+                                             std::vector<Type>{},
+                                             std::map<std::string, Attribute>{}, loc);
+  Region &positiveRegion = outerIf->addRegion();
+  Block &positive = positiveRegion.addBlock();
+  Operation &shiftStep = appendI32Constant(module, positive, info.shift, loc);
+  Operation &totalShift = appendOp(positive, "rv_machine.mulw",
+                                   {info.upper, shiftStep.result()}, {i32}, {}, loc);
+  Operation &limit = appendI32Constant(module, positive, 31, loc);
+  Operation &smallShift = appendOp(
+      positive, "arith.cmpi", {totalShift.result(), limit.result()}, {i32},
+      {{"predicate", ctx.stringAttr("lt")}}, loc);
+  auto smallIf = std::make_unique<Operation>("scf.if",
+                                             std::vector<Value>{smallShift.result()},
+                                             std::vector<Type>{},
+                                             std::map<std::string, Attribute>{}, loc);
+  Region &smallRegion = smallIf->addRegion();
+  Block &small = smallRegion.addBlock();
+  Value quotient = appendSignedDivPow2Dynamic(module, small, start.result(),
+                                              totalShift.result(), loc);
+  appendOp(small, "sysy.store", {quotient, info.slot}, {}, {}, loc);
+  appendOp(small, "scf.yield", {}, {}, {}, loc);
+  Region &largeRegion = smallIf->addRegion();
+  Block &large = largeRegion.addBlock();
+  Operation &largeZero = appendI32Constant(module, large, 0, loc);
+  appendOp(large, "sysy.store", {largeZero.result(), info.slot}, {}, {}, loc);
+  appendOp(large, "scf.yield", {}, {}, {}, loc);
+  positive.addOperation(std::move(smallIf));
+  appendOp(positive, "scf.yield", {}, {}, {}, loc);
+
+  Region &nonPositiveRegion = outerIf->addRegion();
+  Block &nonPositive = nonPositiveRegion.addBlock();
+  appendOp(nonPositive, "sysy.store", {start.result(), info.slot}, {}, {}, loc);
+  appendOp(nonPositive, "scf.yield", {}, {}, {}, loc);
+  parent->insertOperation(insertIndex, std::move(outerIf));
+  loop.markErased();
+  if (stats) {
+    stats->closedFormDivReductions++;
+    stats->pow2StrengthReductions++;
+  }
+  return true;
+}
+
+void runClosedFormDivReduction(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_CLOSED_FORM_DIV", true))
+    return;
+  std::vector<Operation*> loops;
+  for (Operation *op : walk(module))
+    if (op && !op->isErased() && op->name() == "affine.for")
+      loops.push_back(op);
+  bool changed = false;
+  for (Operation *loop : loops) {
+    if (!loop || loop->isErased())
+      continue;
+    DivChainReductionInfo info = classifyDivChainReductionLoop(*loop);
+    if (info.valid && applyDivChainReductionLoop(module, *loop, info, stats))
+      changed = true;
+  }
+  if (changed)
+    eraseMarked(module);
 }
 
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats) {
