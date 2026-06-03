@@ -31,6 +31,7 @@ int64_t memrefAllocationBytes(Type type);
 bool isScalarWordMemref(Type type);
 bool isI32Like(Type type);
 std::string sanitizeLabel(std::string label);
+int operationIndexInBlock(Block &block, Operation *needle);
 
 } // namespace sys::mlir
 

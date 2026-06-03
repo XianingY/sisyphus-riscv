@@ -158,4 +158,12 @@ std::string sanitizeLabel(std::string label) {
   return label;
 }
 
+int operationIndexInBlock(Block &block, Operation *needle) {
+  for (size_t i = 0; i < block.ops().size(); i++)
+    if (block.ops()[i].get() == needle)
+      return (int) i;
+  return -1;
+}
+
+
 } // namespace sys::mlir
