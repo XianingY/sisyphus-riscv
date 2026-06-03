@@ -1866,8 +1866,43 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         whileLoopCount++;
     }
   int structuredLoopCount = affineLoopCount + whileLoopCount;
+  auto regionContainsStructuredLoop = [](Region &region) {
+    std::function<bool(Block&)> blockHasLoop = [&](Block &b) -> bool {
+      for (auto &owned : b.ops()) {
+        Operation *op = owned.get();
+        if (!op || op->isErased())
+          continue;
+        if (op->name() == "affine.for" || op->name() == "scf.while" ||
+            op->name() == "scf.for")
+          return true;
+        for (auto &childRegion : op->getRegions())
+          for (auto &childBlock : childRegion->getBlocks())
+            if (blockHasLoop(*childBlock))
+              return true;
+      }
+      return false;
+    };
+    for (auto &childBlock : region.getBlocks())
+      if (blockHasLoop(*childBlock))
+        return true;
+    return false;
+  };
+  bool hasLoopInBothIfBranches = false;
+  for (auto *op : funcOps) {
+    if (!op || op->isErased() || op->name() != "scf.if")
+      continue;
+    int loopRegions = 0;
+    for (auto &region : op->getRegions()) {
+      if (regionContainsStructuredLoop(*region))
+        loopRegions++;
+    }
+    if (loopRegions >= 2) {
+      hasLoopInBothIfBranches = true;
+      break;
+    }
+  }
   bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
-                          structuredLoopCount >= 2;
+                          structuredLoopCount >= 2 && !hasLoopInBothIfBranches;
   int calleeSaveCount = regAlloc2Enabled
                             ? maxCalleeSaveCount
                             : std::min(maxCalleeSaveCount, structuredLoopCount);

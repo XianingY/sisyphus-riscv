@@ -1954,8 +1954,15 @@ struct ConditionalRowReductionInfo {
   Operation *finalStore = nullptr;
   Operation *product = nullptr;
   Value accumulatorSlot;
+  Value parityInvariant;
+  bool parityFastPath = false;
   std::vector<Operation*> conditionPrefixOps;
   bool valid = false;
+};
+
+struct TileAccumulatorStoreInfo {
+  Operation *finalStore = nullptr;
+  Value slot;
 };
 
 struct PolyAccessInfo {
@@ -1967,10 +1974,24 @@ struct PolyAccessInfo {
   bool lastIndexInner = false;
 };
 
+struct PolyNestInfo {
+  Operation *inner = nullptr;
+  Block *outerBody = nullptr;
+  Block *innerBody = nullptr;
+};
+
 static bool tileIsLoadFromSlot(Value value, Value slot) {
   Operation *op = value.getDefiningOp();
   return tileOpHasName(op, {"sysy.load", "memref.load"}) &&
          op->operandCount() > 0 && op->operand(0) == slot;
+}
+
+static Value tileLoadedScalarSlot(Value value) {
+  Operation *op = value.getDefiningOp();
+  if (!tileOpHasName(op, {"sysy.load", "memref.load"}) ||
+      op->operandCount() == 0 || !isScalarWordMemref(op->operand(0).type()))
+    return Value();
+  return op->operand(0);
 }
 
 static bool tileIsStoreToSlot(Operation *op, Value slot) {
@@ -2041,6 +2062,114 @@ static bool tileValueTreeUsesValue(Value value, Value needle, int depth = 0) {
     if (tileValueTreeUsesValue(operand, needle, depth + 1))
       return true;
   return false;
+}
+
+static bool tileBlockHasZeroStoreToSlot(Block &block, Value slot) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || !tileIsStoreToSlot(op, slot))
+      continue;
+    int64_t init = 0;
+    if (constantIntegerValue(op->operand(0), init) && init == 0)
+      return true;
+  }
+  return false;
+}
+
+static std::vector<TileAccumulatorStoreInfo>
+tileFindFinalStoresLoadedFromScalarSlot(Block &block, Value iIv, Value jIv) {
+  std::vector<TileAccumulatorStoreInfo> result;
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() != "memref.store" ||
+        op->operandCount() < 4 || !tileSame2DIndices(op, iIv, jIv, 2))
+      continue;
+    Value slot = tileLoadedScalarSlot(op->operand(0));
+    if (!slot.valid())
+      continue;
+    bool duplicate = false;
+    for (const auto &existing : result) {
+      if (existing.finalStore == op && existing.slot == slot) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate)
+      result.push_back({op, slot});
+  }
+  return result;
+}
+
+static bool tileStripAndOne(Value value, Value &inner) {
+  Operation *op = value.getDefiningOp();
+  if (!tileOpHasName(op, {"arith.andi", "rv_machine.and", "arm_machine.and"}) ||
+      op->operandCount() != 2)
+    return false;
+  int64_t imm = 0;
+  if (constantIntegerValue(op->operand(0), imm) && imm == 1) {
+    inner = op->operand(1);
+    return true;
+  }
+  if (constantIntegerValue(op->operand(1), imm) && imm == 1) {
+    inner = op->operand(0);
+    return true;
+  }
+  return false;
+}
+
+static bool tileParityOperandsFromOddExpr(Value value, Value &lhs, Value &rhs) {
+  Value stripped;
+  if (tileStripAndOne(value, stripped))
+    value = stripped;
+  Operation *op = value.getDefiningOp();
+  if (tileOpHasName(op, {"arith.remi", "rv_machine.remw", "arm_machine.srem"}) &&
+      op->operandCount() == 2) {
+    int64_t divisor = 0;
+    if (!constantIntegerValue(op->operand(1), divisor) || divisor != 2)
+      return false;
+    Operation *mul = op->operand(0).getDefiningOp();
+    if (!tileOpHasName(mul, {"arith.muli", "rv_machine.mulw", "arm_machine.mul"}) ||
+        mul->operandCount() != 2)
+      return false;
+    lhs = mul->operand(0);
+    rhs = mul->operand(1);
+    return true;
+  }
+  if (tileOpHasName(op, {"arith.andi", "rv_machine.and", "arm_machine.and"}) &&
+      op->operandCount() == 2) {
+    lhs = op->operand(0);
+    rhs = op->operand(1);
+    return true;
+  }
+  return false;
+}
+
+static bool tileMatchParityEvenCondition(Value condition, Value jIv,
+                                         Value &invariantOperand) {
+  invariantOperand = Value();
+  Operation *condOp = condition.getDefiningOp();
+  Value oddExpr;
+  if (tileOpHasName(condOp, {"rv_machine.seqz"}) && condOp->operandCount() == 1) {
+    oddExpr = condOp->operand(0);
+  } else if (tileOpHasName(condOp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) &&
+             condOp->operandCount() >= 2 && symbolAttr(condOp->attr("predicate")) == "eq") {
+    int64_t imm = 0;
+    if (constantIntegerValue(condOp->operand(0), imm) && imm == 0)
+      oddExpr = condOp->operand(1);
+    else if (constantIntegerValue(condOp->operand(1), imm) && imm == 0)
+      oddExpr = condOp->operand(0);
+  }
+  if (!oddExpr.valid())
+    return false;
+  Value lhs, rhs;
+  if (!tileParityOperandsFromOddExpr(oddExpr, lhs, rhs))
+    return false;
+  bool lhsUsesJ = tileValueTreeUsesValue(lhs, jIv);
+  bool rhsUsesJ = tileValueTreeUsesValue(rhs, jIv);
+  if (lhsUsesJ == rhsUsesJ)
+    return false;
+  invariantOperand = lhsUsesJ ? rhs : lhs;
+  return invariantOperand.valid();
 }
 
 static void tileReplaceLoadsFromSlot(Module &module, Operation &op, Value slot,
@@ -2217,47 +2346,115 @@ static bool polyNoStoreAliasHazard(const std::vector<PolyAccessInfo> &accesses) 
   return true;
 }
 
-static bool polyPerfect2DNest(Operation &outer, Operation *&inner,
-                              Block *&outerBody, Block *&innerBody) {
-  inner = nullptr;
-  outerBody = tileSingleBlock(outer);
-  if (!outerBody || outerBody->args().empty())
+static bool polyScalarSlotHasLoad(Module &module, Value slot) {
+  if (!slot.valid())
+    return true;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() ||
+        !tileOpHasName(op, {"sysy.load", "memref.load"}) ||
+        op->operandCount() == 0)
+      continue;
+    if (op->operand(0) == slot)
+      return true;
+  }
+  return false;
+}
+
+static bool polyTransparentOuterOp(Module &module, Operation *op) {
+  if (!op || op->isErased() || op->name() == "affine.yield")
+    return true;
+  if (op->name() == "affine.for")
+    return true;
+  if (!op->getRegions().empty())
     return false;
-  int liveOps = 0;
-  for (auto &owned : outerBody->ops()) {
+  if (tileOpHasName(op, {"sysy.call", "sysy.return", "sysy.break",
+                         "sysy.continue", "scf.if", "scf.while",
+                         "scf.for", "scf.condition", "memref.load",
+                         "sysy.load"}))
+    return false;
+  if (tileOpHasName(op, {"sysy.store", "memref.store"})) {
+    if (op->operandCount() < 2 || !isScalarWordMemref(op->operand(1).type()))
+      return false;
+    return !polyScalarSlotHasLoad(module, op->operand(1));
+  }
+  for (int i = 0; i < op->resultCount(); i++) {
+    int64_t imm = 0;
+    if (!constantIntegerValue(op->result(i), imm))
+      return false;
+  }
+  return true;
+}
+
+static bool polyClassify2DNest(Module &module, Operation &outer,
+                               PolyNestInfo &info) {
+  info = PolyNestInfo();
+  info.outerBody = tileSingleBlock(outer);
+  if (!info.outerBody || info.outerBody->args().empty())
+    return false;
+  for (auto &owned : info.outerBody->ops()) {
     Operation *op = owned.get();
     if (!op || op->isErased() || op->name() == "affine.yield")
       continue;
-    liveOps++;
-    if (op->name() == "affine.for")
-      inner = op;
+    if (op->name() == "affine.for") {
+      if (info.inner)
+        return false;
+      info.inner = op;
+      continue;
+    }
+    if (!polyTransparentOuterOp(module, op))
+      return false;
   }
-  if (liveOps != 1 || !inner)
+  if (!info.inner)
     return false;
-  innerBody = tileSingleBlock(*inner);
-  return innerBody && !innerBody->args().empty() &&
-         !tileBlockUnsafeForStripMining(*innerBody);
+  info.innerBody = tileSingleBlock(*info.inner);
+  return info.innerBody && !info.innerBody->args().empty() &&
+         !tileBlockUnsafeForStripMining(*info.innerBody);
+}
+
+static Value polyMaterializeLoopOperand(Module &module, Block &block,
+                                        std::size_t &index, Value value,
+                                        Block *oldOuterBody, Location loc) {
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getBlock() != oldOuterBody)
+    return value;
+  int64_t imm = 0;
+  if (!constantIntegerValue(value, imm))
+    return Value();
+  Operation &constant = insertOp(
+      block, index, "rv_machine.li", {}, {module.context().i(32)},
+      {{"value", module.context().integerAttr(imm, module.context().i(32))}},
+      loc);
+  return constant.result();
 }
 
 static bool applyPolyLoopInterchange(Module &module, Operation &outer,
-                                     Operation &inner) {
+                                     const PolyNestInfo &nest) {
+  Operation &inner = *nest.inner;
   Block *parent = outer.getBlock();
   if (!parent)
     return false;
   int outerIndex = operationIndexInBlock(*parent, &outer);
   if (outerIndex < 0)
     return false;
-  Block *oldOuterBody = tileSingleBlock(outer);
-  Block *oldInnerBody = tileSingleBlock(inner);
+  Block *oldOuterBody = nest.outerBody;
+  Block *oldInnerBody = nest.innerBody;
   if (!oldOuterBody || !oldInnerBody || oldOuterBody->args().empty() ||
       oldInnerBody->args().empty())
     return false;
 
   Location loc = outer.loc();
   std::size_t insertIndex = (std::size_t) outerIndex;
+  Value innerLower = polyMaterializeLoopOperand(module, *parent, insertIndex,
+                                                inner.operand(0), oldOuterBody, loc);
+  Value innerUpper = polyMaterializeLoopOperand(module, *parent, insertIndex,
+                                                inner.operand(1), oldOuterBody, loc);
+  Value innerStep = polyMaterializeLoopOperand(module, *parent, insertIndex,
+                                               inner.operand(2), oldOuterBody, loc);
+  if (!innerLower.valid() || !innerUpper.valid() || !innerStep.valid())
+    return false;
   Operation &newOuter = tileInsertAffineLoop(module, *parent, insertIndex,
-                                             inner.operand(0), inner.operand(1),
-                                             inner.operand(2), loc, "poly_j");
+                                             innerLower, innerUpper, innerStep,
+                                             loc, "poly_j");
   Block &newOuterBody = *newOuter.getRegions()[0]->getBlocks()[0];
   Value newOuterIv = newOuterBody.args()[0]->value();
   Operation &newInner = tileAppendAffineLoop(module, newOuterBody,
@@ -2269,6 +2466,17 @@ static bool applyPolyLoopInterchange(Module &module, Operation &outer,
   std::map<std::string, Value> valueMap;
   valueMap[valueKey(oldOuterBody->args()[0]->value())] = newInnerIv;
   valueMap[valueKey(oldInnerBody->args()[0]->value())] = newOuterIv;
+  for (auto &owned : oldOuterBody->ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op == &inner)
+      continue;
+    for (int i = 0; i < op->resultCount(); i++) {
+      int64_t imm = 0;
+      if (constantIntegerValue(op->result(i), imm))
+        valueMap[valueKey(op->result(i))] =
+            tileAppendIntConstant(module, newInnerBody, imm, loc);
+    }
+  }
   std::set<Operation*> skipOps;
   for (auto &owned : oldInnerBody->ops()) {
     if (!owned || owned->isErased() || owned->isTerminator())
@@ -2299,11 +2507,10 @@ void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats) {
   for (Operation *outer : loops) {
     if (!outer || outer->isErased() || outer->operandCount() < 3)
       continue;
-    Operation *inner = nullptr;
-    Block *outerBody = nullptr;
-    Block *innerBody = nullptr;
-    if (!polyPerfect2DNest(*outer, inner, outerBody, innerBody))
+    PolyNestInfo nest;
+    if (!polyClassify2DNest(module, *outer, nest))
       continue;
+    Operation *inner = nest.inner;
     if (!inner || inner->operandCount() < 3)
       continue;
     int64_t outerStep = 0;
@@ -2315,9 +2522,9 @@ void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats) {
     if (stats)
       stats->polyNests++;
     std::vector<PolyAccessInfo> accesses;
-    Value outerIv = outerBody->args()[0]->value();
-    Value innerIv = innerBody->args()[0]->value();
-    for (auto &owned : innerBody->ops())
+    Value outerIv = nest.outerBody->args()[0]->value();
+    Value innerIv = nest.innerBody->args()[0]->value();
+    for (auto &owned : nest.innerBody->ops())
       if (owned && !owned->isErased())
         polyCollectAccesses(*owned, outerIv, innerIv, accesses);
     if (accesses.empty())
@@ -2339,7 +2546,7 @@ void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats) {
     }
     if (outerStrideScore <= innerStrideScore)
       continue;
-    if (applyPolyLoopInterchange(module, *outer, *inner)) {
+    if (applyPolyLoopInterchange(module, *outer, nest)) {
       changed = true;
       if (stats) {
         stats->polyPermutations++;
@@ -2592,15 +2799,8 @@ static bool classifyRowBufferedReduction(Operation &outer, RowReductionInfo &inf
   Value jIv = tileFirstBlockArg(*jLoop);
   Value kIv = tileFirstBlockArg(*kLoop);
 
-  std::vector<Value> accumulatorCandidates;
-  for (auto &owned : jBody->ops()) {
-    Operation *op = owned.get();
-    if (!op || op->isErased())
-      continue;
-    if (tileOpHasName(op, {"sysy.alloca", "memref.alloca"}) &&
-        op->resultCount() == 1 && isScalarWordMemref(op->resultType()))
-      accumulatorCandidates.push_back(op->result());
-  }
+  std::vector<TileAccumulatorStoreInfo> accumulatorCandidates =
+      tileFindFinalStoresLoadedFromScalarSlot(*jBody, iIv, jIv);
   if (accumulatorCandidates.empty())
     return false;
 
@@ -2608,24 +2808,14 @@ static bool classifyRowBufferedReduction(Operation &outer, RowReductionInfo &inf
   Operation *sumStore = nullptr;
   Operation *lhsLoad = nullptr;
   Operation *rhsLoad = nullptr;
-  for (Value sumSlot : accumulatorCandidates) {
-    finalStore = nullptr;
+  for (const auto &candidate : accumulatorCandidates) {
+    finalStore = candidate.finalStore;
+    Value sumSlot = candidate.slot;
     sumStore = nullptr;
     lhsLoad = nullptr;
     rhsLoad = nullptr;
 
-    for (auto &owned : jBody->ops()) {
-      Operation *op = owned.get();
-      if (!op || op->isErased() || op->name() != "memref.store" ||
-          op->operandCount() < 4)
-        continue;
-      if (!tileIsLoadFromSlot(op->operand(0), sumSlot))
-        continue;
-      if (!tileSame2DIndices(op, iIv, jIv, 2))
-        continue;
-      finalStore = op;
-    }
-    if (!finalStore)
+    if (!finalStore || !tileBlockHasZeroStoreToSlot(*jBody, sumSlot))
       continue;
 
     for (auto &owned : kBody->ops()) {
@@ -2755,36 +2945,15 @@ static bool classifyConditionalRowReduction(Operation &outer,
     Value jIv = tileFirstBlockArg(*jLoop);
     Value kIv = tileFirstBlockArg(*kLoop);
 
-    std::vector<Value> accumulatorCandidates;
-    for (auto &owned : jBody->ops()) {
-      Operation *op = owned.get();
-      if (!op || op->isErased())
-        continue;
-      if (tileOpHasName(op, {"sysy.alloca", "memref.alloca"}) &&
-          op->resultCount() == 1 && isScalarWordMemref(op->resultType()))
-        accumulatorCandidates.push_back(op->result());
-    }
+    std::vector<TileAccumulatorStoreInfo> accumulatorCandidates =
+        tileFindFinalStoresLoadedFromScalarSlot(*jBody, iIv, jIv);
     if (accumulatorCandidates.empty())
       continue;
 
-    for (Value sumSlot : accumulatorCandidates) {
-      bool zeroInitialized = false;
-      Operation *finalStore = nullptr;
-      for (auto &owned : jBody->ops()) {
-        Operation *op = owned.get();
-        if (!op || op->isErased())
-          continue;
-        if (tileIsStoreToSlot(op, sumSlot)) {
-          int64_t init = 0;
-          if (constantIntegerValue(op->operand(0), init) && init == 0)
-            zeroInitialized = true;
-        }
-        if (op->name() == "memref.store" && op->operandCount() >= 4 &&
-            tileIsLoadFromSlot(op->operand(0), sumSlot) &&
-            tileSame2DIndices(op, iIv, jIv, 2))
-          finalStore = op;
-      }
-      if (!zeroInitialized || !finalStore)
+    for (const auto &candidate : accumulatorCandidates) {
+      Operation *finalStore = candidate.finalStore;
+      Value sumSlot = candidate.slot;
+      if (!finalStore || !tileBlockHasZeroStoreToSlot(*jBody, sumSlot))
         continue;
 
       Operation *ifOp = nullptr;
@@ -2865,6 +3034,15 @@ static bool classifyConditionalRowReduction(Operation &outer,
       info.finalStore = finalStore;
       info.product = product;
       info.accumulatorSlot = sumSlot;
+      Value parityInvariant;
+      if (envEnabled("SISY_ENABLE_SELF_PARITY_BIFURCATION", true) &&
+          tileMatchParityEvenCondition(info.ifOp->operand(0), jIv, parityInvariant)) {
+        info.parityFastPath = true;
+        info.parityInvariant = parityInvariant;
+      } else {
+        info.parityFastPath = false;
+        info.parityInvariant = Value();
+      }
       info.conditionPrefixOps = conditionPrefixOps;
       info.valid = true;
       (void) productUsesI;
@@ -2982,48 +3160,103 @@ static bool applyConditionalRowBufferedReduction(
         return false;
     }
 
-    Value innerJLower = tileMaterializeValue(module, kBody,
-                                             info.jLoop->operand(0), loc);
-    Value innerJUpper = tileMaterializeValue(module, kBody,
-                                             info.jLoop->operand(1), loc);
-    Value innerJStep = tileMaterializeValue(module, kBody,
-                                            info.jLoop->operand(2), loc);
-    Operation &jLoop = tileAppendAffineLoop(module, kBody, innerJLower,
-                                            innerJUpper, innerJStep, loc, "j");
-    Block &jBody = *jLoop.getRegions()[0]->getBlocks()[0];
-    Value newJ = jBody.args()[0]->value();
-    std::map<std::string, Value> valueMap = kValueMap;
-    valueMap[valueKey(oldJ)] = newJ;
-    for (Operation *op : info.conditionPrefixOps) {
-      if (!cloneSimpleIntoBlock(module, jBody, *op, valueMap))
+    auto appendAccumulate = [&](Block &target, Value newJ,
+                                std::map<std::string, Value> valueMap) -> bool {
+      Operation &oldAcc = appendOp(target, "memref.load",
+                                   {rowBuf.result(), newJ}, {i32}, {}, loc);
+      for (auto operand : info.product->getOperands()) {
+        if (!ensureClonedValue(module, target, operand, valueMap, &oldThen))
+          return false;
+      }
+      if (!cloneSimpleIntoBlock(module, target, *info.product, valueMap))
         return false;
-    }
-    auto condIt = valueMap.find(valueKey(info.ifOp->operand(0)));
-    if (condIt == valueMap.end() || !condIt->second.valid())
-      return false;
+      auto productIt = valueMap.find(valueKey(info.product->result()));
+      if (productIt == valueMap.end() || !productIt->second.valid())
+        return false;
+      Operation &sum = appendOp(target, "rv_machine.addw",
+                                {oldAcc.result(), productIt->second}, {i32},
+                                {}, loc);
+      appendOp(target, "memref.store", {sum.result(), rowBuf.result(), newJ},
+               {}, {}, loc);
+      return true;
+    };
 
-    Operation &newIf = appendOp(jBody, "scf.if", {condIt->second}, {}, {},
-                                info.ifOp->loc(), 1);
-    Block &thenBody = newIf.getRegions()[0]->addBlock();
-    Operation &oldAcc = appendOp(thenBody, "memref.load",
-                                 {rowBuf.result(), newJ}, {i32}, {}, loc);
-    Value productValue;
-    for (auto operand : info.product->getOperands()) {
-      if (!ensureClonedValue(module, thenBody, operand, valueMap, &oldThen))
+    auto appendReductionJLoop =
+        [&](Block &container, bool guarded,
+            const std::map<std::string, Value> &incomingMap) -> bool {
+      Value innerJLower = tileMaterializeValue(module, container,
+                                               info.jLoop->operand(0), loc);
+      Value innerJUpper = tileMaterializeValue(module, container,
+                                               info.jLoop->operand(1), loc);
+      Value innerJStep = tileMaterializeValue(module, container,
+                                              info.jLoop->operand(2), loc);
+      Operation &jLoop = tileAppendAffineLoop(module, container, innerJLower,
+                                              innerJUpper, innerJStep, loc, "j");
+      Block &jBody = *jLoop.getRegions()[0]->getBlocks()[0];
+      Value newJ = jBody.args()[0]->value();
+      std::map<std::string, Value> valueMap = incomingMap;
+      valueMap[valueKey(oldJ)] = newJ;
+      if (!guarded) {
+        if (!appendAccumulate(jBody, newJ, valueMap))
+          return false;
+        appendOp(jBody, "affine.yield", {}, {}, {}, loc);
+        return true;
+      }
+
+      for (Operation *op : info.conditionPrefixOps) {
+        if (!cloneSimpleIntoBlock(module, jBody, *op, valueMap))
+          return false;
+      }
+      auto condIt = valueMap.find(valueKey(info.ifOp->operand(0)));
+      if (condIt == valueMap.end() || !condIt->second.valid())
+        return false;
+
+      Operation &newIf = appendOp(jBody, "scf.if", {condIt->second}, {}, {},
+                                  info.ifOp->loc(), 1);
+      Block &thenBody = newIf.getRegions()[0]->addBlock();
+      if (!appendAccumulate(thenBody, newJ, valueMap))
+        return false;
+      appendOp(thenBody, "scf.yield", {}, {}, {}, loc);
+      appendOp(jBody, "affine.yield", {}, {}, {}, loc);
+      return true;
+    };
+
+    bool useParityFastPath = info.parityFastPath;
+    Value parityInvariantValue;
+    if (useParityFastPath) {
+      if (!ensureClonedValue(module, kBody, info.parityInvariant, kValueMap,
+                             oldKBody)) {
+        useParityFastPath = false;
+      } else {
+        auto invariantIt = kValueMap.find(valueKey(info.parityInvariant));
+        if (invariantIt == kValueMap.end() || !invariantIt->second.valid())
+          useParityFastPath = false;
+        else
+          parityInvariantValue = invariantIt->second;
+      }
+    }
+
+    if (useParityFastPath) {
+      Value one = tileAppendIntConstant(module, kBody, 1, loc);
+      Operation &odd = appendOp(kBody, "rv_machine.and",
+                                {parityInvariantValue, one}, {i32}, {}, loc);
+      Operation &even = appendOp(kBody, "rv_machine.seqz",
+                                 {odd.result()}, {i32}, {}, loc);
+      Operation &fastIf = appendOp(kBody, "scf.if", {even.result()}, {}, {},
+                                   info.ifOp->loc(), 2);
+      Block &fastThen = fastIf.getRegions()[0]->addBlock();
+      if (!appendReductionJLoop(fastThen, false, kValueMap))
+        return false;
+      appendOp(fastThen, "scf.yield", {}, {}, {}, loc);
+
+      Block &fastElse = fastIf.getRegions()[1]->addBlock();
+      if (!appendReductionJLoop(fastElse, true, kValueMap))
+        return false;
+      appendOp(fastElse, "scf.yield", {}, {}, {}, loc);
+    } else {
+      if (!appendReductionJLoop(kBody, true, kValueMap))
         return false;
     }
-    if (!cloneSimpleIntoBlock(module, thenBody, *info.product, valueMap))
-      return false;
-    auto productIt = valueMap.find(valueKey(info.product->result()));
-    if (productIt == valueMap.end() || !productIt->second.valid())
-      return false;
-    productValue = productIt->second;
-    Operation &sum = appendOp(thenBody, "rv_machine.addw",
-                              {oldAcc.result(), productValue}, {i32}, {}, loc);
-    appendOp(thenBody, "memref.store", {sum.result(), rowBuf.result(), newJ},
-             {}, {}, loc);
-    appendOp(thenBody, "scf.yield", {}, {}, {}, loc);
-    appendOp(jBody, "affine.yield", {}, {}, {}, loc);
     appendOp(kBody, "affine.yield", {}, {}, {}, loc);
   }
 
