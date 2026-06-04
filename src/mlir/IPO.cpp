@@ -140,22 +140,26 @@ static InlineCandidate classifyInlineCandidate(Operation &func, int threshold) {
   int returns = 0;
   int ops = 0;
   bool sawCall = false;
+  bool sawLoop = false;
+  bool sawExternalStore = false;
   std::function<void(Operation&)> countNested = [&](Operation &op) {
     ops++;
     if (op.name() == "sysy.call") {
       sawCall = true;
       ops = threshold + 1;
     }
-    // A direct single-return inline clones loads at the original call site, so
-    // read-only helper bodies remain semantically equivalent even when they
-    // read mutable globals. Stores and calls are still rejected below. Small
-    // structured loops are allowed; cloneOperationTree remaps nested regions
-    // and block arguments, which lets hot digit helpers inline cleanly.
+    if (op.name() == "scf.while" || op.name() == "scf.for" ||
+        op.name() == "affine.for")
+      sawLoop = true;
     if (op.name() == "sysy.store" || op.name() == "memref.store") {
       if (op.operandCount() < 2 ||
           localAllocas.count(op.operand(1).getDefiningOp()) == 0)
-        ops = threshold + 1;
+        sawExternalStore = true;
     }
+    // Direct inlining preserves the order of loads and stores at the call site.
+    // Calls are still rejected to avoid recursive expansion and hidden runtime
+    // effects, but small helpers that update globals or memref parameters can
+    // be inlined just like ordinary C inliners do.
     if (op.name() == "sysy.return" || op.name() == "scf.return") {
       returns++;
       ret = &op;
@@ -170,7 +174,8 @@ static InlineCandidate classifyInlineCandidate(Operation &func, int threshold) {
     if (owned && !owned->isErased())
       countNested(*owned);
   }
-  if (sawCall || ops > threshold || returns != 1 || !ret || ret->getBlock() != &entry)
+  if (sawCall || (sawLoop && sawExternalStore) || ops > threshold ||
+      returns != 1 || !ret || ret->getBlock() != &entry)
     return candidate;
   if (entry.ops().empty() || entry.ops().back().get() != ret)
     return candidate;

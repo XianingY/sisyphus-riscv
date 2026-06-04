@@ -3022,6 +3022,42 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.deadSpillsAvoided++;
         return false;
       }
+      if (isFloatType(value.type()) && defIt != opIndex.end()) {
+        bool allLocalUses = liveUses > 0;
+        int lastUseIndex = defIt->second;
+        for (const auto &use : def->resultUses[value.getResultIndex()]) {
+          if (!use.owner || use.owner->isErased())
+            continue;
+          if (use.owner->getBlock() != def->getBlock()) {
+            allLocalUses = false;
+            break;
+          }
+          auto localUseIt = opIndex.find(use.owner);
+          if (localUseIt == opIndex.end() || localUseIt->second <= defIt->second) {
+            allLocalUses = false;
+            break;
+          }
+          lastUseIndex = std::max(lastUseIndex, localUseIt->second);
+        }
+        if (allLocalUses) {
+          bool crossesCall = false;
+          for (const auto &kv : opIndex) {
+            Operation *between = kv.first;
+            if (!between || between->isErased() || between->getBlock() != def->getBlock())
+              continue;
+            if (kv.second <= defIt->second || kv.second >= lastUseIndex)
+              continue;
+            if (between->name() == "sysy.call") {
+              crossesCall = true;
+              break;
+            }
+          }
+          if (!crossesCall) {
+            stats.deadSpillsAvoided++;
+            return false;
+          }
+        }
+      }
     }
     return true;
   };

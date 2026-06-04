@@ -1945,11 +1945,212 @@ static bool peelOpHasName(Operation *op, std::initializer_list<const char*> name
   return false;
 }
 
+struct PeelExpr {
+  bool valid = false;
+  int coeff = 0;
+  int64_t min = 0;
+  int64_t max = 0;
+};
+
+static PeelExpr peelConstExpr(int64_t value) {
+  PeelExpr expr;
+  expr.valid = true;
+  expr.min = value;
+  expr.max = value;
+  return expr;
+}
+
+static PeelExpr peelTargetIvExpr() {
+  PeelExpr expr;
+  expr.valid = true;
+  expr.coeff = 1;
+  return expr;
+}
+
+static PeelExpr peelAddExpr(PeelExpr a, PeelExpr b) {
+  PeelExpr expr;
+  if (!a.valid || !b.valid)
+    return expr;
+  expr.valid = true;
+  expr.coeff = a.coeff + b.coeff;
+  expr.min = a.min + b.min;
+  expr.max = a.max + b.max;
+  if (expr.coeff < 0 || expr.coeff > 1)
+    expr.valid = false;
+  return expr;
+}
+
+static PeelExpr peelSubExpr(PeelExpr a, PeelExpr b) {
+  PeelExpr expr;
+  if (!a.valid || !b.valid)
+    return expr;
+  expr.valid = true;
+  expr.coeff = a.coeff - b.coeff;
+  expr.min = a.min - b.max;
+  expr.max = a.max - b.min;
+  if (expr.coeff < 0 || expr.coeff > 1)
+    expr.valid = false;
+  return expr;
+}
+
+static bool peelEvaluateConstant(Value value, int64_t &out, int depth = 0) {
+  if (depth > 8)
+    return false;
+  if (constantIntegerValue(value, out))
+    return true;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return false;
+  if ((def->name() == "sysy.load" || def->name() == "memref.load") &&
+      def->operandCount() == 1 && isScalarWordMemref(def->operand(0).type())) {
+    Value slot = def->operand(0);
+    Operation *slotDef = slot.getDefiningOp();
+    if (!slotDef || slot.getResultIndex() >= slotDef->resultUses.size())
+      return false;
+    bool found = false;
+    int64_t stored = 0;
+    for (const Use &use : slotDef->resultUses[slot.getResultIndex()]) {
+      Operation *user = use.owner;
+      if (!user || user->isErased())
+        continue;
+      if (user->name() != "sysy.store" && user->name() != "memref.store")
+        continue;
+      if (user->operandCount() < 2 || user->operand(1) != slot)
+        continue;
+      int64_t candidate = 0;
+      if (!peelEvaluateConstant(user->operand(0), candidate, depth + 1))
+        return false;
+      if (found && candidate != stored)
+        return false;
+      found = true;
+      stored = candidate;
+    }
+    if (!found)
+      return false;
+    out = stored;
+    return true;
+  }
+  if (def->operandCount() != 2)
+    return false;
+  int64_t lhs = 0, rhs = 0;
+  if (!peelEvaluateConstant(def->operand(0), lhs, depth + 1) ||
+      !peelEvaluateConstant(def->operand(1), rhs, depth + 1))
+    return false;
+  if (def->name() == "arith.addi" || def->name() == "rv_machine.addw" ||
+      def->name() == "arm_machine.add") {
+    out = lhs + rhs;
+    return true;
+  }
+  if (def->name() == "arith.subi" || def->name() == "rv_machine.subw" ||
+      def->name() == "arm_machine.sub") {
+    out = lhs - rhs;
+    return true;
+  }
+  if (def->name() == "arith.muli" || def->name() == "rv_machine.mulw" ||
+      def->name() == "arm_machine.mul") {
+    out = lhs * rhs;
+    return true;
+  }
+  if ((def->name() == "arith.divi" || def->name() == "rv_machine.divw" ||
+       def->name() == "arm_machine.sdiv") && rhs != 0) {
+    out = lhs / rhs;
+    return true;
+  }
+  if ((def->name() == "arith.remi" || def->name() == "rv_machine.remw" ||
+       def->name() == "arm_machine.srem") && rhs != 0) {
+    out = lhs % rhs;
+    return true;
+  }
+  return false;
+}
+
+static PeelExpr peelExprForValue(Value value,
+                                 const std::map<std::string, PeelExpr> &exprMap) {
+  auto it = exprMap.find(valueKey(value));
+  if (it != exprMap.end())
+    return it->second;
+  int64_t c = 0;
+  if (peelEvaluateConstant(value, c))
+    return peelConstExpr(c);
+  return {};
+}
+
+static bool peelConstantAffineIv(Operation *op, PeelExpr &expr) {
+  if (!op || op->name() != "affine.for" || op->operandCount() < 3 ||
+      op->getRegions().size() != 1 || op->getRegions()[0]->getBlocks().empty())
+    return false;
+  int64_t lower = 0, upper = 0, step = 0;
+  if (!constantIntegerValue(op->operand(0), lower) ||
+      !constantIntegerValue(op->operand(1), upper) ||
+      !constantIntegerValue(op->operand(2), step) || step <= 0 || upper <= lower)
+    return false;
+  expr.valid = true;
+  expr.coeff = 0;
+  expr.min = lower;
+  expr.max = lower + ((upper - lower - 1) / step) * step;
+  return true;
+}
+
 static Operation &peelInsertI32Constant(Module &module, Block &block, std::size_t &index,
                                         int64_t value, Location loc) {
   Context &ctx = module.context();
   return insertOp(block, index, "rv_machine.li", {}, {ctx.i(32)},
                   {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc);
+}
+
+static bool evaluateIntegerPredicate(const std::string &pred, int64_t lhs,
+                                     int64_t rhs, int64_t &out) {
+  if (pred == "eq") {
+    out = lhs == rhs;
+  } else if (pred == "ne") {
+    out = lhs != rhs;
+  } else if (pred == "lt" || pred == "slt") {
+    out = lhs < rhs;
+  } else if (pred == "le" || pred == "sle") {
+    out = lhs <= rhs;
+  } else if (pred == "gt" || pred == "sgt") {
+    out = lhs > rhs;
+  } else if (pred == "ge" || pred == "sge") {
+    out = lhs >= rhs;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+static bool foldConstantComparisons(Module &module) {
+  std::vector<Operation*> cmps;
+  for (auto *op : walk(module)) {
+    if (op && !op->isErased() &&
+        peelOpHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}))
+      cmps.push_back(op);
+  }
+
+  bool changed = false;
+  for (Operation *op : cmps) {
+    if (!op || op->isErased() || op->operandCount() != 2 || op->resultCount() != 1)
+      continue;
+    int64_t lhs = 0, rhs = 0, result = 0;
+    if (!constantIntegerValue(op->operand(0), lhs) ||
+        !constantIntegerValue(op->operand(1), rhs) ||
+        !evaluateIntegerPredicate(symbolAttr(op->attr("predicate")), lhs, rhs, result))
+      continue;
+    Block *block = op->getBlock();
+    if (!block)
+      continue;
+    int rawIndex = operationIndexInBlock(*block, op);
+    if (rawIndex < 0)
+      continue;
+    std::size_t insertIndex = (std::size_t) rawIndex;
+    Operation &constant = peelInsertI32Constant(module, *block, insertIndex, result,
+                                               op->loc());
+    replaceAllUses(module, op->result(0), constant.result(0));
+    op->markErased();
+    changed = true;
+  }
+  if (changed)
+    eraseMarked(module);
+  return changed;
 }
 
 static bool foldConstantIf(Module &module, Operation &ifOp) {
@@ -2040,7 +2241,11 @@ static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &m
   hasPeeling = false;
 
   std::map<std::string, int64_t> linearMap;
+  std::map<std::string, int64_t> slotLinearMap;
+  std::map<std::string, PeelExpr> exprMap;
+  std::map<std::string, PeelExpr> slotExprMap;
   linearMap[valueKey(iv)] = 0;
+  exprMap[valueKey(iv)] = peelTargetIvExpr();
 
   std::set<int64_t> offsets;
 
@@ -2055,6 +2260,24 @@ static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &m
       if (!op || op->isErased())
         continue;
 
+      if (peelOpHasName(op, {"sysy.store", "memref.store"}) &&
+          op->operandCount() >= 2 && isScalarWordMemref(op->operand(1).type())) {
+        auto linearIt = linearMap.find(valueKey(op->operand(0)));
+        if (linearIt != linearMap.end())
+          slotLinearMap[valueKey(op->operand(1))] = linearIt->second;
+        PeelExpr stored = peelExprForValue(op->operand(0), exprMap);
+        if (stored.valid)
+          slotExprMap[valueKey(op->operand(1))] = stored;
+      } else if (peelOpHasName(op, {"sysy.load", "memref.load"}) &&
+                 op->operandCount() == 1 && op->resultCount() == 1) {
+        auto it = slotLinearMap.find(valueKey(op->operand(0)));
+        if (it != slotLinearMap.end())
+          linearMap[valueKey(op->result(0))] = it->second;
+        auto exprIt = slotExprMap.find(valueKey(op->operand(0)));
+        if (exprIt != slotExprMap.end())
+          exprMap[valueKey(op->result(0))] = exprIt->second;
+      }
+
       if (peelOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) &&
           op->operandCount() == 2) {
         int64_t c = 0;
@@ -2063,29 +2286,62 @@ static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &m
         } else if (linearMap.count(valueKey(op->operand(1))) && constantIntegerValue(op->operand(0), c)) {
           linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(1))] + c;
         }
+        PeelExpr lhsExpr = peelExprForValue(op->operand(0), exprMap);
+        PeelExpr rhsExpr = peelExprForValue(op->operand(1), exprMap);
+        PeelExpr result = peelAddExpr(lhsExpr, rhsExpr);
+        if (result.valid)
+          exprMap[valueKey(op->result(0))] = result;
       } else if (peelOpHasName(op, {"arith.subi", "rv_machine.subw", "arm_machine.sub"}) &&
                  op->operandCount() == 2) {
         int64_t c = 0;
         if (linearMap.count(valueKey(op->operand(0))) && constantIntegerValue(op->operand(1), c)) {
           linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(0))] - c;
         }
+        PeelExpr lhsExpr = peelExprForValue(op->operand(0), exprMap);
+        PeelExpr rhsExpr = peelExprForValue(op->operand(1), exprMap);
+        PeelExpr result = peelSubExpr(lhsExpr, rhsExpr);
+        if (result.valid)
+          exprMap[valueKey(op->result(0))] = result;
       }
 
       if (peelOpHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) &&
           op->operandCount() == 2) {
         std::string pred = symbolAttr(op->attr("predicate"));
+        bool isLt = pred == "lt" || pred == "slt";
+        bool isLe = pred == "le" || pred == "sle";
+        bool isGt = pred == "gt" || pred == "sgt";
+        bool isGe = pred == "ge" || pred == "sge";
         Value lhs = op->operand(0);
         Value rhs = op->operand(1);
+
+        PeelExpr lhsExpr = peelExprForValue(lhs, exprMap);
+        PeelExpr rhsExpr = peelExprForValue(rhs, exprMap);
+        if (lhsExpr.valid && lhsExpr.coeff == 1) {
+          int64_t c = 0;
+          if ((constantIntegerValue(rhs, c) && c == 0) ||
+              valueKey(rhs) == valueKey(upper)) {
+            offsets.insert(lhsExpr.min);
+            offsets.insert(lhsExpr.max);
+          }
+        }
+        if (rhsExpr.valid && rhsExpr.coeff == 1) {
+          int64_t c = 0;
+          if ((constantIntegerValue(lhs, c) && c == 0) ||
+              valueKey(lhs) == valueKey(upper)) {
+            offsets.insert(rhsExpr.min);
+            offsets.insert(rhsExpr.max);
+          }
+        }
 
         if (linearMap.count(valueKey(lhs))) {
           int64_t offset = linearMap[valueKey(lhs)];
           int64_t c = 0;
           if (constantIntegerValue(rhs, c) && c == 0) {
-            if (pred == "sge" || pred == "sgt" || pred == "slt" || pred == "sle") {
+            if (isGe || isGt || isLt || isLe) {
               offsets.insert(offset);
             }
           } else if (valueKey(rhs) == valueKey(upper)) {
-            if (pred == "slt" || pred == "sle" || pred == "sgt" || pred == "sge") {
+            if (isLt || isLe || isGt || isGe) {
               offsets.insert(offset);
             }
           }
@@ -2094,11 +2350,11 @@ static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &m
           int64_t offset = linearMap[valueKey(rhs)];
           int64_t c = 0;
           if (constantIntegerValue(lhs, c) && c == 0) {
-            if (pred == "sle" || pred == "slt" || pred == "sge" || pred == "sgt") {
+            if (isLe || isLt || isGe || isGt) {
               offsets.insert(offset);
             }
           } else if (valueKey(lhs) == valueKey(upper)) {
-            if (pred == "sgt" || pred == "sge" || pred == "slt" || pred == "sle") {
+            if (isGt || isGe || isLt || isLe) {
               offsets.insert(offset);
             }
           }
@@ -2106,6 +2362,10 @@ static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &m
       }
 
       for (auto &region : op->getRegions()) {
+        PeelExpr nestedIvExpr;
+        if (peelConstantAffineIv(op, nestedIvExpr) &&
+            !region->getBlocks().empty() && !region->getBlocks()[0]->args().empty())
+          exprMap[valueKey(region->getBlocks()[0]->args()[0]->value())] = nestedIvExpr;
         for (auto &block : region->getBlocks()) {
           worklist.push_back(block.get());
         }
@@ -2122,7 +2382,11 @@ static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &m
 
 static bool rewritePeeledInteriorComparisons(Module &module, Block &body, Value iv, Value upper, int64_t peelStart, int64_t peelEnd) {
   std::map<std::string, int64_t> linearMap;
+  std::map<std::string, int64_t> slotLinearMap;
+  std::map<std::string, PeelExpr> exprMap;
+  std::map<std::string, PeelExpr> slotExprMap;
   linearMap[valueKey(iv)] = 0;
+  exprMap[valueKey(iv)] = peelTargetIvExpr();
 
   bool changed = false;
   std::vector<Block*> worklist{&body};
@@ -2138,6 +2402,24 @@ static bool rewritePeeledInteriorComparisons(Module &module, Block &body, Value 
       if (!op || op->isErased())
         continue;
 
+      if (peelOpHasName(op, {"sysy.store", "memref.store"}) &&
+          op->operandCount() >= 2 && isScalarWordMemref(op->operand(1).type())) {
+        auto linearIt = linearMap.find(valueKey(op->operand(0)));
+        if (linearIt != linearMap.end())
+          slotLinearMap[valueKey(op->operand(1))] = linearIt->second;
+        PeelExpr stored = peelExprForValue(op->operand(0), exprMap);
+        if (stored.valid)
+          slotExprMap[valueKey(op->operand(1))] = stored;
+      } else if (peelOpHasName(op, {"sysy.load", "memref.load"}) &&
+                 op->operandCount() == 1 && op->resultCount() == 1) {
+        auto it = slotLinearMap.find(valueKey(op->operand(0)));
+        if (it != slotLinearMap.end())
+          linearMap[valueKey(op->result(0))] = it->second;
+        auto exprIt = slotExprMap.find(valueKey(op->operand(0)));
+        if (exprIt != slotExprMap.end())
+          exprMap[valueKey(op->result(0))] = exprIt->second;
+      }
+
       if (peelOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) &&
           op->operandCount() == 2) {
         int64_t c = 0;
@@ -2146,35 +2428,80 @@ static bool rewritePeeledInteriorComparisons(Module &module, Block &body, Value 
         } else if (linearMap.count(valueKey(op->operand(1))) && constantIntegerValue(op->operand(0), c)) {
           linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(1))] + c;
         }
+        PeelExpr lhsExpr = peelExprForValue(op->operand(0), exprMap);
+        PeelExpr rhsExpr = peelExprForValue(op->operand(1), exprMap);
+        PeelExpr result = peelAddExpr(lhsExpr, rhsExpr);
+        if (result.valid)
+          exprMap[valueKey(op->result(0))] = result;
       } else if (peelOpHasName(op, {"arith.subi", "rv_machine.subw", "arm_machine.sub"}) &&
                  op->operandCount() == 2) {
         int64_t c = 0;
         if (linearMap.count(valueKey(op->operand(0))) && constantIntegerValue(op->operand(1), c)) {
           linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(0))] - c;
         }
+        PeelExpr lhsExpr = peelExprForValue(op->operand(0), exprMap);
+        PeelExpr rhsExpr = peelExprForValue(op->operand(1), exprMap);
+        PeelExpr result = peelSubExpr(lhsExpr, rhsExpr);
+        if (result.valid)
+          exprMap[valueKey(op->result(0))] = result;
       }
 
       if (peelOpHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) &&
           op->operandCount() == 2) {
         std::string pred = symbolAttr(op->attr("predicate"));
+        bool isLt = pred == "lt" || pred == "slt";
+        bool isLe = pred == "le" || pred == "sle";
+        bool isGt = pred == "gt" || pred == "sgt";
+        bool isGe = pred == "ge" || pred == "sge";
         Value lhs = op->operand(0);
         Value rhs = op->operand(1);
 
         bool isTrue = false;
+        PeelExpr lhsExpr = peelExprForValue(lhs, exprMap);
+        PeelExpr rhsExpr = peelExprForValue(rhs, exprMap);
+
+        if (lhsExpr.valid && lhsExpr.coeff == 1) {
+          int64_t c = 0;
+          if (constantIntegerValue(rhs, c) && c == 0) {
+            if (isGe && peelStart + lhsExpr.min >= 0)
+              isTrue = true;
+            else if (isGt && peelStart + lhsExpr.min > 0)
+              isTrue = true;
+          } else if (valueKey(rhs) == valueKey(upper)) {
+            if (isLt && lhsExpr.max <= peelEnd)
+              isTrue = true;
+            else if (isLe && lhsExpr.max <= peelEnd + 1)
+              isTrue = true;
+          }
+        }
+        if (rhsExpr.valid && rhsExpr.coeff == 1) {
+          int64_t c = 0;
+          if (constantIntegerValue(lhs, c) && c == 0) {
+            if (isLe && peelStart + rhsExpr.min >= 0)
+              isTrue = true;
+            else if (isLt && peelStart + rhsExpr.min > 0)
+              isTrue = true;
+          } else if (valueKey(lhs) == valueKey(upper)) {
+            if (isGt && rhsExpr.max <= peelEnd)
+              isTrue = true;
+            else if (isGe && rhsExpr.max <= peelEnd + 1)
+              isTrue = true;
+          }
+        }
 
         if (linearMap.count(valueKey(lhs))) {
           int64_t offset = linearMap[valueKey(lhs)];
           int64_t c = 0;
           if (constantIntegerValue(rhs, c) && c == 0) {
-            if (pred == "sge" && (peelStart + offset >= 0)) {
+            if (isGe && (peelStart + offset >= 0)) {
               isTrue = true;
-            } else if (pred == "sgt" && (peelStart + offset > 0)) {
+            } else if (isGt && (peelStart + offset > 0)) {
               isTrue = true;
             }
           } else if (valueKey(rhs) == valueKey(upper)) {
-            if (pred == "slt" && (offset <= peelEnd)) {
+            if (isLt && (offset <= peelEnd)) {
               isTrue = true;
-            } else if (pred == "sle" && (offset <= peelEnd + 1)) {
+            } else if (isLe && (offset <= peelEnd + 1)) {
               isTrue = true;
             }
           }
@@ -2183,15 +2510,15 @@ static bool rewritePeeledInteriorComparisons(Module &module, Block &body, Value 
           int64_t offset = linearMap[valueKey(rhs)];
           int64_t c = 0;
           if (constantIntegerValue(lhs, c) && c == 0) {
-            if (pred == "sle" && (peelStart + offset >= 0)) {
+            if (isLe && (peelStart + offset >= 0)) {
               isTrue = true;
-            } else if (pred == "slt" && (peelStart + offset > 0)) {
+            } else if (isLt && (peelStart + offset > 0)) {
               isTrue = true;
             }
           } else if (valueKey(lhs) == valueKey(upper)) {
-            if (pred == "sgt" && (offset <= peelEnd)) {
+            if (isGt && (offset <= peelEnd)) {
               isTrue = true;
-            } else if (pred == "sge" && (offset <= peelEnd + 1)) {
+            } else if (isGe && (offset <= peelEnd + 1)) {
               isTrue = true;
             }
           }
@@ -2203,6 +2530,10 @@ static bool rewritePeeledInteriorComparisons(Module &module, Block &body, Value 
       }
 
       for (auto &region : op->getRegions()) {
+        PeelExpr nestedIvExpr;
+        if (peelConstantAffineIv(op, nestedIvExpr) &&
+            !region->getBlocks().empty() && !region->getBlocks()[0]->args().empty())
+          exprMap[valueKey(region->getBlocks()[0]->args()[0]->value())] = nestedIvExpr;
         for (auto &block : region->getBlocks()) {
           worklist.push_back(block.get());
         }
@@ -2356,6 +2687,23 @@ void runLoopRangePeeling(Module &module, SelfOptStats *stats) {
     return;
   eraseMarked(module);
   runLocalCSE(module, stats);
+  for (int i = 0; i < 4; i++) {
+    bool foldedCmp = foldConstantComparisons(module);
+    bool foldedIf = false;
+    std::vector<Operation*> ifs;
+    for (auto *op : walk(module)) {
+      if (op && !op->isErased() && op->name() == "scf.if")
+        ifs.push_back(op);
+    }
+    for (Operation *op : ifs) {
+      if (op && !op->isErased())
+        foldedIf |= foldConstantIf(module, *op);
+    }
+    if (foldedIf)
+      eraseMarked(module);
+    if (!foldedCmp && !foldedIf)
+      break;
+  }
   runConstantIfFolding(module);
   if (stats) {
     stats->rangePeels += peeled;
@@ -5114,6 +5462,178 @@ static std::string localCSEKey(Operation &op) {
   return os.str();
 }
 
+struct SelectRange {
+  bool hasLower = false;
+  bool hasUpper = false;
+  int64_t lower = 0;
+  int64_t upper = 0;
+};
+
+static SelectRange exactRange(int64_t value) {
+  SelectRange range;
+  range.hasLower = true;
+  range.hasUpper = true;
+  range.lower = value;
+  range.upper = value;
+  return range;
+}
+
+static SelectRange rangeForValue(Value value,
+                                 const std::map<std::string, SelectRange> &ranges) {
+  auto it = ranges.find(valueKey(value));
+  if (it != ranges.end())
+    return it->second;
+  int64_t c = 0;
+  if (constantIntegerValue(value, c))
+    return exactRange(c);
+  return {};
+}
+
+static bool matchConstMinusValue(Value value, int64_t &constant, Value &operand) {
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased() || def->operandCount() != 2 || def->resultCount() != 1)
+    return false;
+  if (!peelOpHasName(def, {"arith.subi", "rv_machine.subw", "arm_machine.sub"}))
+    return false;
+  if (!constantIntegerValue(def->operand(0), constant))
+    return false;
+  operand = def->operand(1);
+  return true;
+}
+
+static bool matchMaxSelect(Operation &op, Value &lhs, Value &rhs) {
+  if (!peelOpHasName(&op, {"arith.select", "rv_machine.select"}) ||
+      op.operandCount() != 3 || op.resultCount() != 1)
+    return false;
+  Operation *cmp = op.operand(0).getDefiningOp();
+  if (!cmp || cmp->isErased() || cmp->operandCount() != 2 ||
+      !peelOpHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}))
+    return false;
+  std::string pred = symbolAttr(cmp->attr("predicate"));
+  Value trueValue = op.operand(1);
+  Value falseValue = op.operand(2);
+  if ((pred == "lt" || pred == "slt") &&
+      cmp->operand(0) == falseValue && cmp->operand(1) == trueValue) {
+    lhs = falseValue;
+    rhs = trueValue;
+    return true;
+  }
+  if ((pred == "gt" || pred == "sgt") &&
+      cmp->operand(0) == trueValue && cmp->operand(1) == falseValue) {
+    lhs = trueValue;
+    rhs = falseValue;
+    return true;
+  }
+  return false;
+}
+
+static bool isComplementPair(Value a, Value b, int64_t &constant) {
+  Value base;
+  int64_t c = 0;
+  if (matchConstMinusValue(a, c, base) && base == b) {
+    constant = c;
+    return c >= 0;
+  }
+  if (matchConstMinusValue(b, c, base) && base == a) {
+    constant = c;
+    return c >= 0;
+  }
+  return false;
+}
+
+static bool simplifyRangeSelectsInBlock(Module &module, Block &block,
+                                        SelfOptStats *stats) {
+  bool changed = false;
+  std::map<std::string, SelectRange> ranges;
+  std::vector<Operation*> ops;
+  for (auto &owned : block.ops())
+    if (owned && !owned->isErased())
+      ops.push_back(owned.get());
+
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (auto &nested : op->getRegions())
+      for (auto &nestedBlock : nested->getBlocks())
+        changed |= simplifyRangeSelectsInBlock(module, *nestedBlock, stats);
+
+    if (op->resultCount() == 1) {
+      int64_t constant = 0;
+      if (constantIntegerValue(op->result(0), constant)) {
+        ranges[valueKey(op->result(0))] = exactRange(constant);
+      } else if (peelOpHasName(op, {"arith.subi", "rv_machine.subw", "arm_machine.sub"}) &&
+                 op->operandCount() == 2) {
+        int64_t lhsConst = 0;
+        if (constantIntegerValue(op->operand(0), lhsConst)) {
+          SelectRange rhsRange = rangeForValue(op->operand(1), ranges);
+          SelectRange result;
+          if (rhsRange.hasUpper) {
+            result.hasLower = true;
+            result.lower = lhsConst - rhsRange.upper;
+          }
+          if (rhsRange.hasLower) {
+            result.hasUpper = true;
+            result.upper = lhsConst - rhsRange.lower;
+          }
+          if (result.hasLower || result.hasUpper)
+            ranges[valueKey(op->result(0))] = result;
+        }
+      }
+    }
+
+    Value lhs, rhs;
+    if (!matchMaxSelect(*op, lhs, rhs))
+      continue;
+
+    SelectRange lhsRange = rangeForValue(lhs, ranges);
+    SelectRange rhsRange = rangeForValue(rhs, ranges);
+    int64_t complementConstant = 0;
+    if (isComplementPair(lhs, rhs, complementConstant)) {
+      SelectRange maxRange;
+      maxRange.hasLower = true;
+      maxRange.lower = (complementConstant + 1) / 2;
+      ranges[valueKey(op->result(0))] = maxRange;
+    } else {
+      SelectRange maxRange;
+      if (lhsRange.hasLower && rhsRange.hasLower) {
+        maxRange.hasLower = true;
+        maxRange.lower = std::max(lhsRange.lower, rhsRange.lower);
+      }
+      if (lhsRange.hasUpper && rhsRange.hasUpper) {
+        maxRange.hasUpper = true;
+        maxRange.upper = std::max(lhsRange.upper, rhsRange.upper);
+      }
+      if (maxRange.hasLower || maxRange.hasUpper)
+        ranges[valueKey(op->result(0))] = maxRange;
+    }
+
+    Value replacement;
+    if (lhsRange.hasLower && rhsRange.hasUpper && lhsRange.lower >= rhsRange.upper) {
+      replacement = lhs;
+    } else if (rhsRange.hasLower && lhsRange.hasUpper && rhsRange.lower >= lhsRange.upper) {
+      replacement = rhs;
+    } else {
+      continue;
+    }
+
+    replaceAllUses(module, op->result(0), replacement);
+    op->markErased();
+    changed = true;
+    if (stats) {
+      stats->worklistRewrites++;
+      stats->localCSERewrites++;
+    }
+  }
+  return changed;
+}
+
+static bool simplifyRangeSelects(Module &module, SelfOptStats *stats) {
+  bool changed = false;
+  for (auto &block : module.body().getBlocks())
+    changed |= simplifyRangeSelectsInBlock(module, *block, stats);
+  return changed;
+}
+
 static bool runLocalCSEInRegion(Module &module, Region &region,
                                 SelfOptStats *stats) {
   bool changed = false;
@@ -5154,7 +5674,8 @@ void runLocalCSE(Module &module, SelfOptStats *stats) {
   bool changed = true;
   int iterations = 0;
   while (changed && iterations++ < 4) {
-    changed = runLocalCSEInRegion(module, module.body(), stats);
+    changed = simplifyRangeSelects(module, stats);
+    changed |= runLocalCSEInRegion(module, module.body(), stats);
     if (changed)
       eraseMarked(module);
   }
