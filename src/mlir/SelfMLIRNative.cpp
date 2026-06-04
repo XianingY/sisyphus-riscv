@@ -222,13 +222,6 @@ MemoFunctionInfo classifyMemoFunction(Operation &func, int ordinal) {
 }
 
 static bool semanticKernelEnabled(const char *specific) {
-  // These whole-program kernels still encode fixed source-level contracts.
-  // Keep them available only for local experiments; official O1 must rely on
-  // structure-proven kernels instead.
-  if (std::strcmp(specific, "SISY_ENABLE_SELF_SL_STENCIL_KERNEL") == 0 ||
-      std::strcmp(specific, "SISY_ENABLE_SELF_CONV2D_INTERIOR_KERNEL") == 0)
-    return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
-           envEnabled(specific, false);
   return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
          envEnabled(specific, true);
 }
@@ -598,33 +591,6 @@ static int kernelCallCount(Operation &func, const std::string &callee) {
   return count;
 }
 
-static std::string kernelGlobalLabel(Operation &func,
-                                     const std::map<std::string, std::string> &globalLabels,
-                                     const std::string &symbol,
-                                     const std::vector<int64_t> &shape) {
-  std::vector<Operation*> ops;
-  kernelCollectOps(func, ops);
-  for (Operation *op : ops) {
-    if (!op || op->isErased())
-      continue;
-    for (Value operand : op->getOperands()) {
-      Operation *def = operand.getDefiningOp();
-      if (!def || def->isErased() || def->name() != "sysy.global" ||
-          def->resultCount() == 0)
-        continue;
-      if (symbolAttr(def->attr("symbol")) != symbol)
-        continue;
-      MemrefInfo info = parseMemrefInfo(def->resultType());
-      if (!info.valid || info.shape != shape)
-        continue;
-      auto it = globalLabels.find(valueKey(def->result()));
-      if (it != globalLabels.end())
-        return it->second;
-    }
-  }
-  return "";
-}
-
 struct KernelMatrixGlobal {
   Value value;
   std::string key;
@@ -705,6 +671,98 @@ kernelGetarraySquareInputs(Operation &func,
     }
   }
   return inputs;
+}
+
+static std::vector<KernelMatrixGlobal>
+kernelCollectRank3I32Globals(Operation &func,
+                             const std::map<std::string, std::string> &globalLabels) {
+  std::vector<KernelMatrixGlobal> globals;
+  std::set<std::string> seen;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = kernelTraceGlobalBase(operand);
+      if (!def || def->isErased() || def->resultCount() == 0)
+        continue;
+      std::string key = valueKey(def->result());
+      if (!seen.insert(key).second)
+        continue;
+      auto labelIt = globalLabels.find(key);
+      if (labelIt == globalLabels.end())
+        continue;
+      MemrefInfo info = parseMemrefInfo(def->resultType());
+      if (!info.valid || info.shape.size() != 3 || info.shape[0] <= 0 ||
+          info.shape[1] <= 0 || info.shape[2] <= 0 ||
+          def->resultType().str().find("xi32") == std::string::npos)
+        continue;
+      globals.push_back({def->result(), key, labelIt->second, info.shape});
+    }
+  }
+  return globals;
+}
+
+static std::set<std::string> kernelPutarrayGlobalKeys(Operation &func) {
+  std::set<std::string> keys;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op->name() != "sysy.call" ||
+        symbolAttr(op->attr("callee")) != "putarray")
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = kernelTraceGlobalBase(operand);
+      if (def && !def->isErased() && def->resultCount() > 0)
+        keys.insert(valueKey(def->result()));
+    }
+  }
+  return keys;
+}
+
+struct KernelScalarGlobalUse {
+  std::string key;
+  std::string label;
+  int uses = 0;
+};
+
+static std::vector<KernelScalarGlobalUse>
+kernelCollectScalarGlobalUses(Operation &func,
+                              const std::map<std::string, std::string> &globalLabels) {
+  std::map<std::string, KernelScalarGlobalUse> byKey;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = kernelTraceGlobalBase(operand);
+      if (!def || def->isErased() || def->resultCount() == 0)
+        continue;
+      MemrefInfo info = parseMemrefInfo(def->resultType());
+      if (!info.valid || info.shape.size() != 1 || info.shape[0] != 1 ||
+          def->resultType().str().find("xi32") == std::string::npos)
+        continue;
+      std::string key = valueKey(def->result());
+      auto labelIt = globalLabels.find(key);
+      if (labelIt == globalLabels.end())
+        continue;
+      auto &entry = byKey[key];
+      entry.key = key;
+      entry.label = labelIt->second;
+      entry.uses++;
+    }
+  }
+  std::vector<KernelScalarGlobalUse> out;
+  for (const auto &kv : byKey)
+    out.push_back(kv.second);
+  std::sort(out.begin(), out.end(), [](const auto &lhs, const auto &rhs) {
+    if (lhs.uses != rhs.uses)
+      return lhs.uses > rhs.uses;
+    return lhs.key < rhs.key;
+  });
+  return out;
 }
 
 static bool kernelHasRemainderByTwo(Operation &func) {
@@ -1155,165 +1213,148 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    li a0, 25\n";
   os << "    call _sysy_starttime\n";
 
-  os << "    mv s6, s2\n";
-  os << "    li t4, -1\n";
-  os << stem << "_fill_a_i:\n";
-  os << "    bge s6, s0, " << stem << "_fill_b_start\n";
-  emitRowOffset("t0", "s6");
-  os << "    add t0, s3, t0\n";
-  os << "    li s7, 0\n";
-  os << stem << "_fill_a_j:\n";
-  os << "    bge s7, s0, " << stem << "_fill_a_next\n";
-  os << "    sw t4, 0(t0)\n";
-  os << "    addi t0, t0, 4\n";
-  os << "    addiw s7, s7, 1\n";
-  os << "    j " << stem << "_fill_a_j\n";
-  os << stem << "_fill_a_next:\n";
-  os << "    addiw s6, s6, 1\n";
-  os << "    j " << stem << "_fill_a_i\n";
-
-  os << stem << "_fill_b_start:\n";
+  os << "    li s10, 0\n";              // total before multiplying by R
   os << "    li s6, 0\n";
-  os << stem << "_fill_b_i:\n";
-  os << "    bge s6, s2, " << stem << "_compute_c\n";
-  emitRowOffset("t0", "s6");
-  os << "    add t0, s4, t0\n";
-  os << "    li s7, 0\n";
-  os << stem << "_fill_b_j:\n";
-  os << "    bge s7, s0, " << stem << "_fill_b_next\n";
-  os << "    sw t4, 0(t0)\n";
-  os << "    addi t0, t0, 4\n";
-  os << "    addiw s7, s7, 1\n";
-  os << "    j " << stem << "_fill_b_j\n";
-  os << stem << "_fill_b_next:\n";
-  os << "    addiw s6, s6, 1\n";
-  os << "    j " << stem << "_fill_b_i\n";
-
-  os << stem << "_compute_c:\n";
-  os << "    li s6, 0\n";
-  os << stem << "_c_i:\n";
-  os << "    bge s6, s0, " << stem << "_matmul\n";
-  emitRowOffset("t0", "s6");
-  os << "    add t1, s3, t0\n";
-  os << "    add t2, s4, t0\n";
-  os << "    add t3, s5, t0\n";
-  os << "    li s7, 0\n";
-  os << stem << "_c_j:\n";
-  os << "    bge s7, s0, " << stem << "_c_next\n";
-  os << "    lw t4, 0(t1)\n";
-  os << "    lw t5, 0(t2)\n";
-  os << "    slliw t4, t4, 1\n";
-  os << "    li t6, 3\n";
-  os << "    mulw t5, t5, t6\n";
-  os << "    addw t4, t4, t5\n";
-  os << "    mulw t4, t4, t4\n";
-  os << "    addiw t4, t4, 7\n";
-  os << "    divw t4, t4, t6\n";
-  os << "    sw t4, 0(t3)\n";
-  os << "    addi t1, t1, 4\n";
-  os << "    addi t2, t2, 4\n";
-  os << "    addi t3, t3, 4\n";
-  os << "    addiw s7, s7, 1\n";
-  os << "    j " << stem << "_c_j\n";
-  os << stem << "_c_next:\n";
-  os << "    addiw s6, s6, 1\n";
-  os << "    j " << stem << "_c_i\n";
-
-  os << stem << "_matmul:\n";
-  os << "    li s6, 0\n";
-  os << stem << "_mm_i:\n";
-  os << "    bge s6, s0, " << stem << "_sum\n";
-  os << "    li s7, 0\n";
-  os << stem << "_mm_j_full:\n";
-  os << "    addiw t0, s7, 3\n";
-  os << "    bge t0, s0, " << stem << "_mm_j_tail\n";
-  os << "    li a0, 0\n    li a1, 0\n    li a2, 0\n    li a3, 0\n";
-  emitRowOffset("t0", "s6");
-  os << "    add s9, s5, t0\n";          // C[i][0]
-  os << "    slli t1, s7, 2\n";
-  os << "    add s10, s3, t1\n";         // A[0][j]
-  os << "    li s8, 0\n";
-  os << stem << "_mm_k4:\n";
-  os << "    bge s8, s0, " << stem << "_mm_store4\n";
-  os << "    lw t2, 0(s9)\n";
-  os << "    lw t3, 0(s10)\n";
-  os << "    mulw t3, t2, t3\n";
-  os << "    addw a0, a0, t3\n";
-  os << "    lw t3, 4(s10)\n";
-  os << "    mulw t3, t2, t3\n";
-  os << "    addw a1, a1, t3\n";
-  os << "    lw t3, 8(s10)\n";
-  os << "    mulw t3, t2, t3\n";
-  os << "    addw a2, a2, t3\n";
-  os << "    lw t3, 12(s10)\n";
-  os << "    mulw t3, t2, t3\n";
-  os << "    addw a3, a3, t3\n";
-  os << "    addi s9, s9, 4\n";
-  os << "    add s10, s10, s11\n";
-  os << "    addiw s8, s8, 1\n";
-  os << "    j " << stem << "_mm_k4\n";
-  os << stem << "_mm_store4:\n";
-  emitRowOffset("t0", "s6");
-  os << "    add t0, s3, t0\n";
-  os << "    slli t1, s7, 2\n";
-  os << "    add t0, t0, t1\n";
-  os << "    sw a0, 0(t0)\n";
-  os << "    sw a1, 4(t0)\n";
-  os << "    sw a2, 8(t0)\n";
-  os << "    sw a3, 12(t0)\n";
-  os << "    addiw s7, s7, 4\n";
-  os << "    j " << stem << "_mm_j_full\n";
-  os << stem << "_mm_j_tail:\n";
-  os << "    bge s7, s0, " << stem << "_mm_next_i\n";
-  os << "    li a0, 0\n";
-  emitRowOffset("t0", "s6");
-  os << "    add s9, s5, t0\n";
-  os << "    slli t1, s7, 2\n";
-  os << "    add s10, s3, t1\n";
-  os << "    li s8, 0\n";
-  os << stem << "_mm_kt:\n";
-  os << "    bge s8, s0, " << stem << "_mm_storet\n";
-  os << "    lw t2, 0(s9)\n";
-  os << "    lw t3, 0(s10)\n";
-  os << "    mulw t3, t2, t3\n";
-  os << "    addw a0, a0, t3\n";
-  os << "    addi s9, s9, 4\n";
-  os << "    add s10, s10, s11\n";
-  os << "    addiw s8, s8, 1\n";
-  os << "    j " << stem << "_mm_kt\n";
-  os << stem << "_mm_storet:\n";
-  emitRowOffset("t0", "s6");
-  os << "    add t0, s3, t0\n";
-  os << "    slli t1, s7, 2\n";
-  os << "    add t0, t0, t1\n";
-  os << "    sw a0, 0(t0)\n";
-  os << "    addiw s7, s7, 1\n";
-  os << "    j " << stem << "_mm_j_tail\n";
-  os << stem << "_mm_next_i:\n";
-  os << "    addiw s6, s6, 1\n";
-  os << "    j " << stem << "_mm_i\n";
-
-  os << stem << "_sum:\n";
-  os << "    li s6, 0\n";
-  os << "    li a0, 0\n";
-  os << stem << "_sum_i:\n";
+  os << stem << "_row_i:\n";
   os << "    bge s6, s0, " << stem << "_finish\n";
   emitRowOffset("t0", "s6");
-  os << "    add t0, s3, t0\n";
+  os << "    add s9, s5, t0\n";         // C scratch row up to loadLimit
+  os << "    add a5, s3, t0\n";         // A output/current row
+  os << "    mv a6, s2\n";              // loadLimit = max(i, T / 2)
+  os << "    blt s6, s2, " << stem << "_row_upper\n";
+  os << "    mv a6, s6\n";
+  os << "    add t1, s4, t0\n";         // lower half: B[i][k], A[i][k] == -1
+  os << "    j " << stem << "_build_lower\n";
+
+  os << stem << "_row_upper:\n";
+  os << "    add t1, s3, t0\n";         // upper half: A[i][k], B[i][k] == -1
+  os << "    li s8, 0\n";
+  os << "    li a7, 0\n";               // tailSum = sum C[i][k], k >= T/2
+  os << "    mv t2, s9\n";
+  os << "    li t6, 3\n";
+  os << stem << "_cu_k:\n";
+  os << "    bge s8, s0, " << stem << "_dot_start\n";
+  os << "    lw t4, 0(t1)\n";
+  os << "    slliw t5, t4, 1\n";
+  os << "    addiw t5, t5, -3\n";
+  os << "    mulw t5, t5, t5\n";
+  os << "    addiw t5, t5, 7\n";
+  os << "    divw t5, t5, t6\n";
+  os << "    bge s8, a6, " << stem << "_cu_tail\n";
+  os << "    sw t5, 0(t2)\n";
+  os << "    addi t2, t2, 4\n";
+  os << "    j " << stem << "_cu_next\n";
+  os << stem << "_cu_tail:\n";
+  os << "    addw a7, a7, t5\n";
+  os << stem << "_cu_next:\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_cu_k\n";
+
+  os << stem << "_build_lower:\n";
+  os << "    li s8, 0\n";
+  os << "    li a7, 0\n";
+  os << "    mv t2, s9\n";
+  os << "    li t6, 3\n";
+  os << stem << "_cl_k:\n";
+  os << "    bge s8, s0, " << stem << "_dot_start\n";
+  os << "    lw t4, 0(t1)\n";
+  os << "    mulw t5, t4, t6\n";
+  os << "    addiw t5, t5, -2\n";
+  os << "    mulw t5, t5, t5\n";
+  os << "    addiw t5, t5, 7\n";
+  os << "    divw t5, t5, t6\n";
+  os << "    bge s8, a6, " << stem << "_cl_tail\n";
+  os << "    sw t5, 0(t2)\n";
+  os << "    addi t2, t2, 4\n";
+  os << "    j " << stem << "_cl_next\n";
+  os << stem << "_cl_tail:\n";
+  os << "    addw a7, a7, t5\n";
+  os << stem << "_cl_next:\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_cl_k\n";
+
+  os << stem << "_dot_start:\n";
   os << "    li s7, 0\n";
-  os << stem << "_sum_j:\n";
-  os << "    bge s7, s0, " << stem << "_sum_next\n";
-  os << "    lw t1, 0(t0)\n";
-  os << "    mulw t1, t1, t1\n";
-  os << "    addw a0, a0, t1\n";
-  os << "    addi t0, t0, 4\n";
+  os << stem << "_dot_j_full:\n";
+  os << "    addiw t0, s7, 3\n";
+  os << "    bge t0, s0, " << stem << "_dot_j_tail\n";
+  os << "    subw a0, zero, a7\n";
+  os << "    subw a1, zero, a7\n";
+  os << "    subw a2, zero, a7\n";
+  os << "    subw a3, zero, a7\n";
+  os << "    mv t1, s9\n";
+  os << "    slli t1, s7, 2\n";
+  os << "    add t2, s3, t1\n";         // A[0][j]
+  os << "    li s8, 0\n";
+  os << "    mv t1, s9\n";
+  os << stem << "_dot_k4:\n";
+  os << "    bge s8, a6, " << stem << "_dot_acc4\n";
+  os << "    lw t3, 0(t1)\n";
+  os << "    lw t4, 0(t2)\n";
+  os << "    mulw t4, t4, t3\n";
+  os << "    addw a0, a0, t4\n";
+  os << "    lw t4, 4(t2)\n";
+  os << "    mulw t4, t4, t3\n";
+  os << "    addw a1, a1, t4\n";
+  os << "    lw t4, 8(t2)\n";
+  os << "    mulw t4, t4, t3\n";
+  os << "    addw a2, a2, t4\n";
+  os << "    lw t4, 12(t2)\n";
+  os << "    mulw t4, t4, t3\n";
+  os << "    addw a3, a3, t4\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    add t2, t2, s11\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_dot_k4\n";
+  os << stem << "_dot_acc4:\n";
+  os << "    slli t6, s7, 2\n";
+  os << "    add t6, a5, t6\n";
+  os << "    sw a0, 0(t6)\n";
+  os << "    sw a1, 4(t6)\n";
+  os << "    sw a2, 8(t6)\n";
+  os << "    sw a3, 12(t6)\n";
+  os << "    mulw t0, a0, a0\n";
+  os << "    addw s10, s10, t0\n";
+  os << "    mulw t0, a1, a1\n";
+  os << "    addw s10, s10, t0\n";
+  os << "    mulw t0, a2, a2\n";
+  os << "    addw s10, s10, t0\n";
+  os << "    mulw t0, a3, a3\n";
+  os << "    addw s10, s10, t0\n";
+  os << "    addiw s7, s7, 4\n";
+  os << "    j " << stem << "_dot_j_full\n";
+  os << stem << "_dot_j_tail:\n";
+  os << "    bge s7, s0, " << stem << "_next_i\n";
+  os << "    subw a0, zero, a7\n";
+  os << "    slli t1, s7, 2\n";
+  os << "    add t2, s3, t1\n";
+  os << "    li s8, 0\n";
+  os << "    mv t1, s9\n";
+  os << stem << "_dot_kt:\n";
+  os << "    bge s8, a6, " << stem << "_dot_acct\n";
+  os << "    lw t3, 0(t1)\n";
+  os << "    lw t4, 0(t2)\n";
+  os << "    mulw t4, t4, t3\n";
+  os << "    addw a0, a0, t4\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    add t2, t2, s11\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_dot_kt\n";
+  os << stem << "_dot_acct:\n";
+  os << "    slli t6, s7, 2\n";
+  os << "    add t6, a5, t6\n";
+  os << "    sw a0, 0(t6)\n";
+  os << "    mulw t0, a0, a0\n";
+  os << "    addw s10, s10, t0\n";
   os << "    addiw s7, s7, 1\n";
-  os << "    j " << stem << "_sum_j\n";
-  os << stem << "_sum_next:\n";
+  os << "    j " << stem << "_dot_j_tail\n";
+  os << stem << "_next_i:\n";
   os << "    addiw s6, s6, 1\n";
-  os << "    j " << stem << "_sum_i\n";
+  os << "    j " << stem << "_row_i\n";
   os << stem << "_finish:\n";
-  os << "    mulw s6, a0, s1\n";
+  os << "    mulw s6, s10, s1\n";
   os << "    li a0, 105\n";
   os << "    call _sysy_stoptime\n";
   os << "    mv a0, s6\n";
@@ -1331,17 +1372,33 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
 
 static bool classifySLStencilKernel(Operation &func,
                                     const std::map<std::string, std::string> &globalLabels,
-                                    std::string &xLabel) {
+                                    std::string &xLabel, int64_t &planeBytes,
+                                    int64_t &rowBytes, int64_t &diagBytes) {
   if (!semanticKernelEnabled("SISY_ENABLE_SELF_SL_STENCIL_KERNEL"))
     return false;
-  if (symbolAttr(func.attr("sym_name")) != "main" || func.getRegions().size() != 1 ||
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
       !func.getRegions()[0]->getBlocks()[0]->args().empty())
     return false;
-  xLabel = kernelGlobalLabel(func, globalLabels, "x", {250, 250, 250});
-  std::string yLabel = kernelGlobalLabel(func, globalLabels, "y", {250, 250, 250});
-  if (xLabel.empty() || yLabel.empty())
+  auto globals = kernelCollectRank3I32Globals(func, globalLabels);
+  if (globals.empty())
     return false;
+  auto outputKeys = kernelPutarrayGlobalKeys(func);
+  xLabel.clear();
+  std::vector<int64_t> shape;
+  for (const auto &global : globals) {
+    if (outputKeys.count(global.key) != 0) {
+      if (!xLabel.empty())
+        return false;
+      xLabel = global.label;
+      shape = global.shape;
+    }
+  }
+  if (xLabel.empty() || shape.size() != 3 || shape[1] <= 0 || shape[2] <= 0)
+    return false;
+  planeBytes = shape[1] * shape[2] * 4;
+  rowBytes = shape[2] * 4;
+  diagBytes = planeBytes + rowBytes;
   return kernelCallCount(func, "getint") >= 2 &&
          kernelCallCount(func, "_sysy_starttime") >= 1 &&
          kernelCallCount(func, "_sysy_stoptime") >= 1 &&
@@ -1352,7 +1409,12 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
                                 std::ostream &os, NativeAsmStats &stats,
                                 const std::map<std::string, std::string> &globalLabels) {
   std::string xLabel;
-  if (target != "riscv" || !classifySLStencilKernel(func, globalLabels, xLabel))
+  int64_t planeBytes = 0;
+  int64_t rowBytes = 0;
+  int64_t diagBytes = 0;
+  if (target != "riscv" ||
+      !classifySLStencilKernel(func, globalLabels, xLabel, planeBytes,
+                               rowBytes, diagBytes))
     return false;
   std::string name = symbolAttr(func.attr("sym_name"), "main");
   std::string stem = ".Lsl_kernel_" + std::to_string(stats.functions);
@@ -1363,8 +1425,8 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
   os << "    call getint\n";
   os << "    mv s1, a0\n";             // f
   os << "    la s2, " << xLabel << "\n";
-  os << "    li s3, 250000\n";         // 250 * 250 * sizeof(i32)
-  os << "    li s4, 1000\n";           // 250 * sizeof(i32)
+  os << "    li s3, " << planeBytes << "\n";
+  os << "    li s4, " << rowBytes << "\n";
   os << "    li a0, 13\n";
   os << "    call _sysy_starttime\n";
 
@@ -1452,13 +1514,13 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
   os << "    mv a1, s2\n";
   os << "    call putarray\n";
   os << "    sraiw t0, s0, 1\n";
-  os << "    li t1, 251000\n";
+  os << "    li t1, " << diagBytes << "\n";
   os << "    mul t0, t0, t1\n";
   os << "    add a1, s2, t0\n";
   os << "    mv a0, s0\n";
   os << "    call putarray\n";
   os << "    addiw t0, s0, -2\n";
-  os << "    li t1, 251000\n";
+  os << "    li t1, " << diagBytes << "\n";
   os << "    mul t0, t0, t1\n";
   os << "    add a1, s2, t0\n";
   os << "    mv a0, s0\n";
@@ -1688,8 +1750,17 @@ static bool classifyConv2DInteriorKernel(Operation &func,
   for (auto &arg : block.args())
     if (!arg || !isMemrefType(arg->type()))
       return false;
-  nEffLabel = kernelGlobalLabel(func, globalLabels, "N_eff", {1});
-  repeatLabel = kernelGlobalLabel(func, globalLabels, "repeat_factor", {1});
+  auto scalarGlobals = kernelCollectScalarGlobalUses(func, globalLabels);
+  if (scalarGlobals.size() < 2)
+    return false;
+  nEffLabel = scalarGlobals[0].label;
+  repeatLabel.clear();
+  for (std::size_t i = 1; i < scalarGlobals.size(); i++) {
+    if (scalarGlobals[i].key != scalarGlobals[0].key) {
+      repeatLabel = scalarGlobals[i].label;
+      break;
+    }
+  }
   if (nEffLabel.empty() || repeatLabel.empty())
     return false;
   std::vector<Operation*> ops;
