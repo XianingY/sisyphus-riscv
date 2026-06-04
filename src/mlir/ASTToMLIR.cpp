@@ -866,7 +866,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
 
   // 2. High-level structure recovery and polyhedral preparation
   if (effective.enableAffine && !envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
-    if (envEnabled("SISY_ENABLE_SELF_CONTINUE_WRAP", false))
+    if (envEnabled("SISY_ENABLE_SELF_CONTINUE_WRAP", true))
       runContinueToIfWrap(*module);
     if (!envDisabled("SISY_ENABLE_SELF_RAISE_AFFINE"))
       stats.opt.affineWorklistItems += runRaiseToAffine(*module);

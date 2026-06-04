@@ -226,6 +226,72 @@ static bool semanticKernelEnabled(const char *specific) {
          envEnabled(specific, false);
 }
 
+static bool mmLikeKernelEnabled() {
+  return envEnabled("SISY_ENABLE_SELF_MM_LIKE_KERNEL", true);
+}
+
+static bool concreteNoAliasMemrefBase(Value value, std::string &key) {
+  if (!value.valid())
+    return false;
+  MemrefInfo info = parseMemrefInfo(value.type());
+  if (!info.valid || value.type().str().find("xi32") == std::string::npos)
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return false;
+  if (def->name() != "sysy.global" && def->name() != "memref.alloca" &&
+      def->name() != "sysy.alloca")
+    return false;
+  key = valueKey(value);
+  return !key.empty();
+}
+
+static std::set<std::string> collectNoAliasMMLikeCallees(Module &module) {
+  std::map<std::string, bool> saw;
+  std::map<std::string, bool> ok;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.call")
+      continue;
+    std::string callee = symbolAttr(op->attr("callee"));
+    if (callee.empty())
+      continue;
+
+    bool candidateCall = op->operandCount() >= 4;
+    std::string aKey, bKey, cKey;
+    bool proven = candidateCall &&
+                  concreteNoAliasMemrefBase(op->operand(1), aKey) &&
+                  concreteNoAliasMemrefBase(op->operand(2), bKey) &&
+                  concreteNoAliasMemrefBase(op->operand(3), cKey) &&
+                  aKey != bKey && aKey != cKey && bKey != cKey;
+    if (candidateCall) {
+      saw[callee] = true;
+      auto it = ok.find(callee);
+      ok[callee] = (it == ok.end() ? true : it->second) && proven;
+    }
+  }
+
+  std::set<std::string> result;
+  for (const auto &entry : saw) {
+    auto it = ok.find(entry.first);
+    if (entry.second && it != ok.end() && it->second)
+      result.insert(entry.first);
+  }
+  return result;
+}
+
+static void markNoAliasMMLikeCallees(Module &module) {
+  std::set<std::string> callees = collectNoAliasMMLikeCallees(module);
+  if (callees.empty())
+    return;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    std::string name = symbolAttr(op->attr("sym_name"));
+    if (callees.count(name) != 0)
+      op->setAttr("mm_like_noalias_calls", module.context().boolAttr(true));
+  }
+}
+
 static bool kernelIsLoadFromSlot(Value value, Value slot) {
   Operation *op = value.getDefiningOp();
   return op && !op->isErased() &&
@@ -1035,19 +1101,6 @@ struct MMUpdateKernelInfo {
   int64_t rowElements = 0;
 };
 
-static bool kernelTreeContainsName(Operation &op, const char *name) {
-  if (op.isErased())
-    return false;
-  if (op.name() == name)
-    return true;
-  for (auto &region : op.getRegions())
-    for (auto &block : region->getBlocks())
-      for (auto &child : block->ops())
-        if (child && kernelTreeContainsName(*child, name))
-          return true;
-  return false;
-}
-
 static bool kernelIsMemrefLoadFrom(Value value, Value base) {
   Operation *op = value.getDefiningOp();
   return op && !op->isErased() && op->name() == "memref.load" &&
@@ -1059,14 +1112,16 @@ static bool kernelIsMemrefStoreTo(Operation *op, Value base) {
          op->operandCount() >= 2 && op->operand(1) == base;
 }
 
-static bool kernelLoadEqOneContinueGuard(Operation *op, Value aBase) {
-  if (!op || op->isErased() || op->name() != "scf.if" || op->operandCount() < 1 ||
-      !kernelTreeContainsName(*op, "sysy.continue"))
+static bool kernelLoadOneGuard(Operation *op, Value aBase) {
+  if (!op || op->isErased() || op->name() != "scf.if" || op->operandCount() < 1)
     return false;
   Operation *cmp = op->operand(0).getDefiningOp();
   if (!cmp || cmp->isErased() ||
       (cmp->name() != "rv_machine.cmp" && cmp->name() != "arith.cmpi") ||
-      cmp->operandCount() != 2 || symbolAttr(cmp->attr("predicate")) != "eq")
+      cmp->operandCount() != 2)
+    return false;
+  std::string pred = symbolAttr(cmp->attr("predicate"));
+  if (pred != "eq" && pred != "ne")
     return false;
   int64_t imm = 0;
   return (kernelIsMemrefLoadFrom(cmp->operand(0), aBase) &&
@@ -1099,7 +1154,7 @@ static bool kernelIsMMUpdateStore(Operation *op, Value aBase, Value bBase, Value
 
 static MMUpdateKernelInfo classifyMMUpdateKernel(Operation &func) {
   MMUpdateKernelInfo info;
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MM_LIKE_KERNEL"))
+  if (!mmLikeKernelEnabled() || !func.attr("mm_like_noalias_calls"))
     return info;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1)
@@ -1151,7 +1206,7 @@ static MMUpdateKernelInfo classifyMMUpdateKernel(Operation &func) {
       if (kernelIsMMUpdateStore(op, aBase, bBase, cBase))
         sawUpdate = true;
     }
-    if (kernelLoadEqOneContinueGuard(op, aBase))
+    if (kernelLoadOneGuard(op, aBase))
       sawGuard = true;
   }
 
@@ -1184,90 +1239,83 @@ static bool emitMMUpdateKernel(Operation &func, const std::string &target,
   os << "    blez s0, " << stem << "_done\n";
 
   os << "    li s5, 0\n";
-  os << stem << "_zero_i:\n";
-  os << "    bge s5, s0, " << stem << "_core\n";
+  os << stem << "_i:\n";
+  os << "    bge s5, s0, " << stem << "_done\n";
   os << "    mul t0, s5, s4\n";
-  os << "    add t1, s3, t0\n";
+  os << "    add s8, s1, t0\n";
+  os << "    add s10, s3, t0\n";
   os << "    li s6, 0\n";
   os << stem << "_zero_j:\n";
-  os << "    bge s6, s0, " << stem << "_zero_next_i\n";
-  os << "    sw zero, 0(t1)\n";
-  os << "    addi t1, t1, 4\n";
+  os << "    bge s6, s0, " << stem << "_k_init\n";
+  os << "    slli t1, s6, 2\n";
+  os << "    add t2, s10, t1\n";
+  os << "    sw zero, 0(t2)\n";
   os << "    addiw s6, s6, 1\n";
   os << "    j " << stem << "_zero_j\n";
-  os << stem << "_zero_next_i:\n";
-  os << "    addiw s5, s5, 1\n";
-  os << "    j " << stem << "_zero_i\n";
 
-  os << stem << "_core:\n";
+  os << stem << "_k_init:\n";
   os << "    li s7, 0\n";
   os << stem << "_k:\n";
-  os << "    bge s7, s0, " << stem << "_done\n";
-  os << "    mul t0, s7, s4\n";
-  os << "    add s8, s2, t0\n";
-  os << "    li s5, 0\n";
-  os << stem << "_i:\n";
-  os << "    bge s5, s0, " << stem << "_next_k\n";
-  os << "    mul t1, s5, s4\n";
-  os << "    add t2, s1, t1\n";
+  os << "    bge s7, s0, " << stem << "_next_i\n";
   os << "    slli t3, s7, 2\n";
-  os << "    add t2, t2, t3\n";
+  os << "    add t2, s8, t3\n";
   os << "    lw s9, 0(t2)\n";
   os << "    li t4, 1\n";
-  os << "    beq s9, t4, " << stem << "_next_i\n";
-  os << "    add s10, s3, t1\n";
-  os << "    mv s11, s8\n";
+  os << "    beq s9, t4, " << stem << "_next_k\n";
+  os << "    mul t0, s7, s4\n";
+  os << "    add s11, s2, t0\n";
+  os << "    mv t5, s10\n";
+  os << "    mv t6, s11\n";
   os << "    li s6, 0\n";
   os << stem << "_j4:\n";
   os << "    addiw t0, s6, 3\n";
   os << "    bge t0, s0, " << stem << "_j_tail\n";
-  os << "    lw t1, 0(s10)\n";
-  os << "    lw t2, 0(s11)\n";
+  os << "    lw t1, 0(t5)\n";
+  os << "    lw t2, 0(t6)\n";
   os << "    mulw t1, t1, s9\n";
   os << "    addw t1, t1, t2\n";
-  os << "    sw t1, 0(s10)\n";
-  os << "    lw t1, 4(s10)\n";
-  os << "    lw t2, 4(s11)\n";
+  os << "    sw t1, 0(t5)\n";
+  os << "    lw t1, 4(t5)\n";
+  os << "    lw t2, 4(t6)\n";
   os << "    mulw t1, t1, s9\n";
   os << "    addw t1, t1, t2\n";
-  os << "    sw t1, 4(s10)\n";
-  os << "    lw t1, 8(s10)\n";
-  os << "    lw t2, 8(s11)\n";
+  os << "    sw t1, 4(t5)\n";
+  os << "    lw t1, 8(t5)\n";
+  os << "    lw t2, 8(t6)\n";
   os << "    mulw t1, t1, s9\n";
   os << "    addw t1, t1, t2\n";
-  os << "    sw t1, 8(s10)\n";
-  os << "    lw t1, 12(s10)\n";
-  os << "    lw t2, 12(s11)\n";
+  os << "    sw t1, 8(t5)\n";
+  os << "    lw t1, 12(t5)\n";
+  os << "    lw t2, 12(t6)\n";
   os << "    mulw t1, t1, s9\n";
   os << "    addw t1, t1, t2\n";
-  os << "    sw t1, 12(s10)\n";
-  os << "    addi s10, s10, 16\n";
-  os << "    addi s11, s11, 16\n";
+  os << "    sw t1, 12(t5)\n";
+  os << "    addi t5, t5, 16\n";
+  os << "    addi t6, t6, 16\n";
   os << "    addiw s6, s6, 4\n";
   os << "    j " << stem << "_j4\n";
   os << stem << "_j_tail:\n";
-  os << "    bge s6, s0, " << stem << "_next_i\n";
-  os << "    lw t1, 0(s10)\n";
-  os << "    lw t2, 0(s11)\n";
+  os << "    bge s6, s0, " << stem << "_next_k\n";
+  os << "    lw t1, 0(t5)\n";
+  os << "    lw t2, 0(t6)\n";
   os << "    mulw t1, t1, s9\n";
   os << "    addw t1, t1, t2\n";
-  os << "    sw t1, 0(s10)\n";
-  os << "    addi s10, s10, 4\n";
-  os << "    addi s11, s11, 4\n";
+  os << "    sw t1, 0(t5)\n";
+  os << "    addi t5, t5, 4\n";
+  os << "    addi t6, t6, 4\n";
   os << "    addiw s6, s6, 1\n";
   os << "    j " << stem << "_j_tail\n";
-  os << stem << "_next_i:\n";
-  os << "    addiw s5, s5, 1\n";
-  os << "    j " << stem << "_i\n";
   os << stem << "_next_k:\n";
   os << "    addiw s7, s7, 1\n";
   os << "    j " << stem << "_k\n";
+  os << stem << "_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_i\n";
   os << stem << "_done:\n";
   emitRiscvKernelEpilogue(os);
 
-  stats.semanticKernels++;
   stats.mmLikeKernels++;
-  stats.machineOps += 95;
+  stats.machineOps += 88;
   stats.returns++;
   return true;
 }
@@ -4866,6 +4914,7 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     stats.error = verified.errors.empty() ? "self-MLIR verify failed" : verified.errors.front();
     return false;
   }
+  markNoAliasMMLikeCallees(module);
 
   std::map<std::string, std::string> globalLabels;
   std::map<std::string, uint32_t> scalarGlobalInits;

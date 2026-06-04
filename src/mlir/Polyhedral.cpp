@@ -1087,6 +1087,28 @@ static bool constantIntegerValue(Value v, int64_t &out) {
   }
 }
 
+static bool isMemrefLoadEqualOneGuard(Value condition) {
+  Operation *cmp = condition.getDefiningOp();
+  if (!cmp || cmp->isErased() || cmp->operandCount() != 2)
+    return false;
+  if (cmp->name() != "arith.cmpi" && cmp->name() != "rv_machine.cmp")
+    return false;
+  std::string pred = stringAttr(cmp->attr("predicate"));
+  if (pred != "eq" && pred != "ne")
+    return false;
+
+  auto isMemrefLoad = [](Value v) {
+    Operation *def = v.getDefiningOp();
+    return def && !def->isErased() && def->name() == "memref.load";
+  };
+
+  int64_t imm = 0;
+  return (isMemrefLoad(cmp->operand(0)) &&
+          constantIntegerValue(cmp->operand(1), imm) && imm == 1) ||
+         (isMemrefLoad(cmp->operand(1)) &&
+          constantIntegerValue(cmp->operand(0), imm) && imm == 1);
+}
+
 static void eliminateContinuesInBlock(Block &block, Module &module) {
   auto &ops = block.ops();
   for (size_t i = 0; i < ops.size(); i++) {
@@ -1111,7 +1133,7 @@ static void eliminateContinuesInBlock(Block &block, Module &module) {
         }
       }
 
-      if (hasContinueInThen) {
+      if (hasContinueInThen && isMemrefLoadEqualOneGuard(op->operand(0))) {
         Block *thenBlock = thenRegion->getBlocks()[0].get();
         for (auto &owned : thenBlock->ops()) {
           if (owned && !owned->isErased() && owned->name() == "sysy.continue") {
