@@ -377,6 +377,8 @@ void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void runMemrefLinearization(Module &module, SelfOptStats *stats = nullptr);
 void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats = nullptr);
 void runClosedFormDivReduction(Module &module, SelfOptStats *stats = nullptr);
+void runSignedPow2RemainderRewrite(Module &module, const std::string &target,
+                                    SelfOptStats *stats = nullptr);
 void runLocalCSE(Module &module, SelfOptStats *stats = nullptr);
 void runPolyhedralLoopPermutation(Module &module, SelfOptStats *stats = nullptr);
 void runParityProductCompareStrength(Module &module, SelfOptStats *stats = nullptr);

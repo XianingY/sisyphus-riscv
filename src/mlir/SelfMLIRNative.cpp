@@ -222,7 +222,7 @@ MemoFunctionInfo classifyMemoFunction(Operation &func, int ordinal) {
 }
 
 static bool semanticKernelEnabled(const char *specific) {
-  // These whole-program kernels encode symbol names or benchmark-shaped globals.
+  // These whole-program kernels encode symbol names or fixed global layouts.
   // Keep them available only for local experiments; official O1 must rely on
   // structure-proven kernels instead.
   if (std::strcmp(specific, "SISY_ENABLE_SELF_MANY_MAT_CAL_KERNEL") == 0 ||
@@ -1906,6 +1906,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   int calleeSaveCount = regAlloc2Enabled
                             ? maxCalleeSaveCount
                             : std::min(maxCalleeSaveCount, structuredLoopCount);
+  if (!isArm && livenessEnabled && !regAlloc2Enabled && structuredLoopCount > 0 &&
+      envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true))
+    calleeSaveCount =
+        std::min(maxCalleeSaveCount, std::max(calleeSaveCount, structuredLoopCount + 4));
   stats.calleeSaveSlots += calleeSaveCount;
   frameBytes += calleeSaveCount * 8;
   frameBytes = (frameBytes + 15) & ~int64_t(15);
@@ -2062,10 +2066,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     int uses = 0;
   };
   std::map<std::string, CachedGlobalBase> cachedGlobalBases;
-  if (!isArm && livenessEnabled && regAlloc2Enabled && calleeSaveCount >= 12 &&
-      lsraHotFunction && envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true) &&
-      promotedScalarSlots.empty() &&
-      stableBaseRegCount < (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0]))) {
+  int stableBaseRegLimit = std::min<int>(
+      calleeSaveCount, (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0])));
+  if (!isArm && livenessEnabled &&
+      envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true) &&
+      stableBaseRegCount < stableBaseRegLimit) {
     struct GlobalBaseCandidate {
       std::string key;
       std::string label;
@@ -2116,7 +2121,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                 return a.uses > b.uses;
               });
     for (const auto &candidate : ordered) {
-      if (stableBaseRegCount >= (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0])))
+      if (stableBaseRegCount >= stableBaseRegLimit)
         break;
       CachedGlobalBase cached;
       cached.reg = kStableBaseRegs[stableBaseRegCount++];
@@ -2417,6 +2422,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   auto resultReg = [&]() -> std::string {
     if (isArm)
       return armResultReg(nextReg++);
+    if (stableBaseActive) {
+      static const char *regsNoStable[] = {
+        "t0", "t1", "t2", "t3", "t4",
+        "a2", "a3", "a4", "a5", "a6", "a7",
+      };
+      int n = (int)(sizeof(regsNoStable) / sizeof(regsNoStable[0]));
+      return regsNoStable[(nextReg++) % n];
+    }
     if (regAlloc2Enabled && calleeSaveCount >= 12) {
       // Round-robin pool for results without a stable LSRA assignment. s4-s7
       // are reserved for LSRA when it is active, so they are excluded here to
@@ -2431,14 +2444,6 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         "a2", "a3", "a4", "a5", "a6", "a7",
         "s0", "s1", "s2", "s3",
       };
-      static const char *regsNoStable[] = {
-        "t0", "t1", "t2", "t3", "t4",
-        "a2", "a3", "a4", "a5", "a6", "a7",
-      };
-      if (stableBaseActive) {
-        int n = (int)(sizeof(regsNoStable) / sizeof(regsNoStable[0]));
-        return regsNoStable[(nextReg++) % n];
-      }
       if (lsraEnabled || slotPromotionActive) {
         int n = (int)(sizeof(regsNoLsra) / sizeof(regsNoLsra[0]));
         return regsNoLsra[(nextReg++) % n];
@@ -2676,8 +2681,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       regs.erase(valueKey(arg.value()));
   }
   auto materializeAddress = [&](Value value, const std::string &tmp) -> std::string {
+    std::string key = valueKey(value);
     std::string loc = lookupReg(value, regs);
-    auto slotIt = stackSlots.find(valueKey(value));
+    if (loc.empty()) {
+      auto globalIt = globalLabels.find(key);
+      if (globalIt != globalLabels.end())
+        loc = "global:" + globalIt->second;
+    }
+    auto slotIt = stackSlots.find(key);
     if (slotIt != stackSlots.end())
       loc = "stack:" + std::to_string(slotIt->second);
     if (loc.rfind("stack:", 0) == 0) {
@@ -2695,7 +2706,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         os << "    la " << tmp << ", " << label << "\n";
       return tmp;
     }
-    auto home = valueSlots.find(valueKey(value));
+    auto home = valueSlots.find(key);
     if (home != valueSlots.end() && isMemrefType(value.type()) && homeIsUsable(value)) {
       clobberPhysicalReg(tmp);
       emitStackLoad(tmp, home->second, "ld");
@@ -4022,6 +4033,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       } else if (regAlloc2Enabled && calleeSaveCount >= 12) {
         static const char *ivRegs[] = {"s11", "s10", "s9", "s8"};
         iv = ivRegs[(nextLoopReg++) % (int)(sizeof(ivRegs) / sizeof(ivRegs[0]))];
+      } else if (stableBaseActive) {
+        static const char *ivRegsNoStable[] = {
+          "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+        };
+        int available = std::max(1, calleeSaveCount - 4);
+        available = std::min<int>(
+            available, (int)(sizeof(ivRegsNoStable) / sizeof(ivRegsNoStable[0])));
+        iv = ivRegsNoStable[(nextLoopReg++) % available];
       } else {
         iv = "s" + std::to_string(nextLoopReg++ % 12);
       }

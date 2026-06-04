@@ -877,7 +877,6 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runStencilPeelingAndUnroll(*module, &stats.opt);
   runIfStoreSelectPromotion(*module, &stats.opt);
   if (effective.level != OptimizationConfig::Level::O0) {
-    runMemrefLinearization(*module, &stats.opt);
     runLoopInvariantCodeMotion(*module, &stats.opt);
     runLocalCSE(*module, &stats.opt);
   }
@@ -901,6 +900,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runProvenBitwiseHelper(*module, &stats.opt);
   if (effective.enableRotateHelper)
     runRotateHelperFold(*module, &stats.opt);
+  if (effective.level != OptimizationConfig::Level::O0) {
+    runSignedPow2RemainderRewrite(*module, target, &stats.opt);
+    runLocalCSE(*module, &stats.opt);
+  }
 
   // 4. Conservative IPO runs after structural helper recognition so it does
   // not destroy recognizable bitwise helper shapes.
@@ -965,6 +968,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
       runProvenBitwiseHelper(*module, &stats.opt);
     if (effective.enableRotateHelper)
       runRotateHelperFold(*module, &stats.opt);
+    runSignedPow2RemainderRewrite(*module, target, &stats.opt);
+    runLocalCSE(*module, &stats.opt);
   }
 
   if (effective.enableScheduler)

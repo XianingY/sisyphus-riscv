@@ -842,7 +842,7 @@ static ConstantWhileInfo classifySmallConstantWhile(Operation &loop) {
     return info;
 
   int64_t trip = bound - init;
-  if (trip < 0 || trip > 7)
+  if (trip < 0 || trip > 80)
     return info;
   info.valid = true;
   info.ivSlot = ivSlot;
@@ -956,7 +956,7 @@ static ConstantAffineInfo classifySmallConstantAffineFor(Operation &loop) {
   if (span < 0)
     return info;
   info.tripCount = (span + info.step - 1) / info.step;
-  if (info.tripCount <= 0 || info.tripCount > 7)
+  if (info.tripCount <= 0 || info.tripCount > 80)
     return info;
   Block &body = *loop.getRegions()[0]->getBlocks()[0];
   for (auto &owned : body.ops()) {
@@ -3982,6 +3982,14 @@ static Operation &insertI32Constant(Module &module, Block &block, std::size_t &i
                   {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc);
 }
 
+static Operation &insertArithI32Constant(Module &module, Block &block,
+                                         std::size_t &index, int64_t value,
+                                         Location loc) {
+  Context &ctx = module.context();
+  return insertOp(block, index, "arith.constant", {}, {ctx.i(32)},
+                  {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc);
+}
+
 static bool fullRankI32MemrefAccess(Operation *op, Value &base,
                                     std::vector<Value> &indices,
                                     bool &store) {
@@ -4021,10 +4029,11 @@ static Value insertLinearizedIndex(Module &module, Block &block,
   Value linear = indices[0];
   Type i32 = module.context().i(32);
   for (std::size_t dim = 1; dim < indices.size(); dim++) {
-    Operation &stride = insertI32Constant(module, block, index, info.shape[dim], loc);
-    Operation &mul = insertOp(block, index, "rv_machine.mulw",
+    Operation &stride = insertArithI32Constant(module, block, index,
+                                               info.shape[dim], loc);
+    Operation &mul = insertOp(block, index, "arith.muli",
                               {linear, stride.result()}, {i32}, {}, loc);
-    Operation &add = insertOp(block, index, "rv_machine.addw",
+    Operation &add = insertOp(block, index, "arith.addi",
                               {mul.result(), indices[dim]}, {i32}, {}, loc);
     linear = add.result();
     if (stats)
@@ -4052,6 +4061,14 @@ void runMemrefLinearization(Module &module, SelfOptStats *stats) {
     std::vector<Value> indices;
     bool store = false;
     if (!fullRankI32MemrefAccess(op, base, indices, store))
+      continue;
+    // Keep ordinary 2D matrix accesses shaped after the matrix/reduction
+    // pipeline.  They are better handled by row-buffer/register-blocked
+    // lowering and the native shaped-address path; flattening them here grows
+    // hot-loop SSA pressure.  Rank >= 3 still benefits from explicit arith
+    // linearization because LICM can hoist plane/row stride pieces for stencil
+    // style loops.
+    if (indices.size() < 3)
       continue;
     Block *block = op->getBlock();
     if (!block)
@@ -4497,6 +4514,81 @@ void runClosedFormDivReduction(Module &module, SelfOptStats *stats) {
     DivChainReductionInfo info = classifyDivChainReductionLoop(*loop);
     if (info.valid && applyDivChainReductionLoop(module, *loop, info, stats))
       changed = true;
+  }
+  if (changed)
+    eraseMarked(module);
+}
+
+static bool rewriteSignedPow2Remainder(Module &module, Operation &op,
+                                       SelfOptStats *stats) {
+  if ((op.name() != "arith.remi" && op.name() != "rv_machine.remw") ||
+      op.operandCount() != 2 || op.resultCount() != 1 ||
+      !isI32Like(op.resultType()))
+    return false;
+  int64_t divisor = 0;
+  int shift = 0;
+  if (!constantIntegerValue(op.operand(1), divisor) ||
+      !positivePowerOfTwoShift(divisor, shift))
+    return false;
+
+  Block *block = op.getBlock();
+  if (!block)
+    return false;
+  int rawIndex = operationIndexInBlock(*block, &op);
+  if (rawIndex < 0)
+    return false;
+  std::size_t index = (std::size_t) rawIndex;
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  Location loc = op.loc();
+
+  if (shift == 0) {
+    Operation &zero = insertArithI32Constant(module, *block, index, 0, loc);
+    replaceAllUses(module, op.result(), zero.result());
+    op.markErased();
+    if (stats) {
+      stats->pow2StrengthReductions++;
+      stats->worklistRewrites++;
+    }
+    return true;
+  }
+
+  Operation &thirtyOne = insertI32Constant(module, *block, index, 31, loc);
+  Operation &mask = insertI32Constant(module, *block, index,
+                                      (int64_t(1) << shift) - 1, loc);
+  Operation &sign = insertOp(*block, index, "rv_machine.sraw",
+                             {op.operand(0), thirtyOne.result()}, {i32}, {}, loc);
+  Operation &bias = insertOp(*block, index, "rv_machine.and",
+                             {sign.result(), mask.result()}, {i32}, {}, loc);
+  Operation &adjusted = insertOp(*block, index, "rv_machine.addw",
+                                 {op.operand(0), bias.result()}, {i32}, {}, loc);
+  Operation &low = insertOp(*block, index, "rv_machine.and",
+                            {adjusted.result(), mask.result()}, {i32}, {}, loc);
+  Operation &result = insertOp(*block, index, "rv_machine.subw",
+                               {low.result(), bias.result()}, {i32}, {}, loc);
+  replaceAllUses(module, op.result(), result.result());
+  op.markErased();
+  if (stats) {
+    stats->pow2StrengthReductions++;
+    stats->worklistRewrites++;
+  }
+  return true;
+}
+
+void runSignedPow2RemainderRewrite(Module &module, const std::string &target,
+                                   SelfOptStats *stats) {
+  if (target != "riscv")
+    return;
+  std::vector<Operation*> ops;
+  for (Operation *op : walk(module))
+    if (op && !op->isErased() &&
+        (op->name() == "arith.remi" || op->name() == "rv_machine.remw"))
+      ops.push_back(op);
+  bool changed = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    changed |= rewriteSignedPow2Remainder(module, *op, stats);
   }
   if (changed)
     eraseMarked(module);
