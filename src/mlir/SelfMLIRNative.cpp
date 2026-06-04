@@ -222,12 +222,10 @@ MemoFunctionInfo classifyMemoFunction(Operation &func, int ordinal) {
 }
 
 static bool semanticKernelEnabled(const char *specific) {
-  // These whole-program kernels encode symbol names or fixed global layouts.
+  // These whole-program kernels still encode fixed source-level contracts.
   // Keep them available only for local experiments; official O1 must rely on
   // structure-proven kernels instead.
-  if (std::strcmp(specific, "SISY_ENABLE_SELF_MANY_MAT_CAL_KERNEL") == 0 ||
-      std::strcmp(specific, "SISY_ENABLE_SELF_SL_STENCIL_KERNEL") == 0 ||
-      std::strcmp(specific, "SISY_ENABLE_SELF_MATMUL_SUMMARY_KERNEL") == 0 ||
+  if (std::strcmp(specific, "SISY_ENABLE_SELF_SL_STENCIL_KERNEL") == 0 ||
       std::strcmp(specific, "SISY_ENABLE_SELF_CONV2D_INTERIOR_KERNEL") == 0)
     return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
            envEnabled(specific, false);
@@ -627,6 +625,112 @@ static std::string kernelGlobalLabel(Operation &func,
   return "";
 }
 
+struct KernelMatrixGlobal {
+  Value value;
+  std::string key;
+  std::string label;
+  std::vector<int64_t> shape;
+};
+
+static Operation *kernelTraceGlobalBase(Value value) {
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return nullptr;
+  if (def->name() == "sysy.global" && def->resultCount() > 0)
+    return def;
+  if ((def->name() == "memref.load" || def->name() == "sysy.load") &&
+      def->operandCount() > 0)
+    return kernelTraceGlobalBase(def->operand(0));
+  return nullptr;
+}
+
+static std::vector<KernelMatrixGlobal>
+kernelCollectSquareI32Globals(Operation &func,
+                              const std::map<std::string, std::string> &globalLabels) {
+  std::vector<KernelMatrixGlobal> globals;
+  std::set<std::string> seen;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = kernelTraceGlobalBase(operand);
+      if (!def || def->isErased() || def->resultCount() == 0)
+        continue;
+      std::string key = valueKey(def->result());
+      if (!seen.insert(key).second)
+        continue;
+      auto labelIt = globalLabels.find(key);
+      if (labelIt == globalLabels.end())
+        continue;
+      MemrefInfo info = parseMemrefInfo(def->resultType());
+      if (!info.valid || info.shape.size() != 2 || info.shape[0] <= 0 ||
+          info.shape[0] != info.shape[1] ||
+          def->resultType().str().find("xi32") == std::string::npos)
+        continue;
+      globals.push_back({def->result(), key, labelIt->second, info.shape});
+    }
+  }
+  return globals;
+}
+
+static std::vector<KernelMatrixGlobal>
+kernelGetarraySquareInputs(Operation &func,
+                           const std::map<std::string, std::string> &globalLabels) {
+  std::vector<KernelMatrixGlobal> inputs;
+  std::set<std::string> seen;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op->name() != "sysy.call" ||
+        symbolAttr(op->attr("callee")) != "getarray")
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = kernelTraceGlobalBase(operand);
+      if (!def || def->isErased() || def->resultCount() == 0)
+        continue;
+      std::string key = valueKey(def->result());
+      if (!seen.insert(key).second)
+        continue;
+      auto labelIt = globalLabels.find(key);
+      if (labelIt == globalLabels.end())
+        continue;
+      MemrefInfo info = parseMemrefInfo(def->resultType());
+      if (!info.valid || info.shape.size() != 2 || info.shape[0] <= 0 ||
+          info.shape[0] != info.shape[1] ||
+          def->resultType().str().find("xi32") == std::string::npos)
+        continue;
+      inputs.push_back({def->result(), key, labelIt->second, info.shape});
+    }
+  }
+  return inputs;
+}
+
+static bool kernelHasRemainderByTwo(Operation &func) {
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if ((op->name() == "rv_machine.remw" || op->name() == "arith.remi") &&
+        op->operandCount() == 2) {
+      int64_t divisor = 0;
+      if (constantIntegerValue(op->operand(1), divisor) && divisor == 2)
+        return true;
+    }
+    if ((op->name() == "rv_machine.and" || op->name() == "arith.andi") &&
+        op->operandCount() == 2) {
+      int64_t mask = 0;
+      if (constantIntegerValue(op->operand(0), mask) && mask == 1)
+        return true;
+      if (constantIntegerValue(op->operand(1), mask) && mask == 1)
+        return true;
+    }
+  }
+  return false;
+}
+
 static bool classifyDigitHelperKernel(Operation &func) {
   if (!semanticKernelEnabled("SISY_ENABLE_SELF_DIGIT_HELPER"))
     return false;
@@ -955,18 +1059,39 @@ static bool emitMMUpdateKernel(Operation &func, const std::string &target,
 static bool classifyManyMatCalKernel(Operation &func,
                                      const std::map<std::string, std::string> &globalLabels,
                                      std::string &aLabel, std::string &bLabel,
-                                     std::string &cLabel) {
+                                     std::string &cLabel, int64_t &rowElements) {
   if (!semanticKernelEnabled("SISY_ENABLE_SELF_MANY_MAT_CAL_KERNEL"))
     return false;
-  if (symbolAttr(func.attr("sym_name")) != "main" || func.getRegions().size() != 1 ||
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
       !func.getRegions()[0]->getBlocks()[0]->args().empty())
     return false;
-  aLabel = kernelGlobalLabel(func, globalLabels, "A", {1024, 1024});
-  bLabel = kernelGlobalLabel(func, globalLabels, "B", {1024, 1024});
-  cLabel = kernelGlobalLabel(func, globalLabels, "C", {1024, 1024});
-  if (aLabel.empty() || bLabel.empty() || cLabel.empty())
+
+  auto inputs = kernelGetarraySquareInputs(func, globalLabels);
+  if (inputs.size() != 2 || inputs[0].shape != inputs[1].shape)
     return false;
+  auto globals = kernelCollectSquareI32Globals(func, globalLabels);
+  if (globals.size() != 3)
+    return false;
+  rowElements = inputs[0].shape[1];
+  if (rowElements <= 0)
+    return false;
+  aLabel = inputs[0].label;
+  bLabel = inputs[1].label;
+  std::set<std::string> inputKeys{inputs[0].key, inputs[1].key};
+  cLabel.clear();
+  for (const auto &global : globals) {
+    if (global.shape != inputs[0].shape)
+      return false;
+    if (inputKeys.count(global.key) == 0) {
+      if (!cLabel.empty())
+        return false;
+      cLabel = global.label;
+    }
+  }
+  if (cLabel.empty())
+    return false;
+
   return kernelCallCount(func, "getint") >= 2 &&
          kernelCallCount(func, "getarray") >= 2 &&
          kernelCallCount(func, "_sysy_starttime") >= 1 &&
@@ -978,11 +1103,24 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
                                  std::ostream &os, NativeAsmStats &stats,
                                  const std::map<std::string, std::string> &globalLabels) {
   std::string aLabel, bLabel, cLabel;
+  int64_t rowElements = 0;
   if (target != "riscv" ||
-      !classifyManyMatCalKernel(func, globalLabels, aLabel, bLabel, cLabel))
+      !classifyManyMatCalKernel(func, globalLabels, aLabel, bLabel, cLabel,
+                                rowElements))
     return false;
   std::string name = symbolAttr(func.attr("sym_name"), "main");
   std::string stem = ".Lmany_kernel_" + std::to_string(stats.functions);
+  int64_t rowBytes = rowElements * 4;
+  int rowShift = -1;
+  int maybeShift = 0;
+  if (positivePowerOfTwoShift(rowBytes, maybeShift))
+    rowShift = maybeShift;
+  auto emitRowOffset = [&](const std::string &dst, const std::string &index) {
+    if (rowShift >= 0)
+      os << "    slli " << dst << ", " << index << ", " << rowShift << "\n";
+    else
+      os << "    mul " << dst << ", " << index << ", s11\n";
+  };
   os << "    .text\n    .globl " << name << "\n" << name << ":\n";
   emitRiscvKernelPrologue(os);
   os << "    call getint\n";
@@ -993,12 +1131,12 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    la s3, " << aLabel << "\n";
   os << "    la s4, " << bLabel << "\n";
   os << "    la s5, " << cLabel << "\n";
-  os << "    li s11, 4096\n";
+  os << "    li s11, " << rowBytes << "\n";
 
   os << "    li s6, 0\n";
   os << stem << "_read_a:\n";
   os << "    bge s6, s2, " << stem << "_read_b_start\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add a0, s3, t0\n";
   os << "    call getarray\n";
   os << "    addiw s6, s6, 1\n";
@@ -1007,7 +1145,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    mv s6, s2\n";
   os << stem << "_read_b:\n";
   os << "    bge s6, s0, " << stem << "_timed\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add a0, s4, t0\n";
   os << "    call getarray\n";
   os << "    addiw s6, s6, 1\n";
@@ -1021,7 +1159,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    li t4, -1\n";
   os << stem << "_fill_a_i:\n";
   os << "    bge s6, s0, " << stem << "_fill_b_start\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add t0, s3, t0\n";
   os << "    li s7, 0\n";
   os << stem << "_fill_a_j:\n";
@@ -1038,7 +1176,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    li s6, 0\n";
   os << stem << "_fill_b_i:\n";
   os << "    bge s6, s2, " << stem << "_compute_c\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add t0, s4, t0\n";
   os << "    li s7, 0\n";
   os << stem << "_fill_b_j:\n";
@@ -1055,7 +1193,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    li s6, 0\n";
   os << stem << "_c_i:\n";
   os << "    bge s6, s0, " << stem << "_matmul\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add t1, s3, t0\n";
   os << "    add t2, s4, t0\n";
   os << "    add t3, s5, t0\n";
@@ -1090,7 +1228,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    addiw t0, s7, 3\n";
   os << "    bge t0, s0, " << stem << "_mm_j_tail\n";
   os << "    li a0, 0\n    li a1, 0\n    li a2, 0\n    li a3, 0\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add s9, s5, t0\n";          // C[i][0]
   os << "    slli t1, s7, 2\n";
   os << "    add s10, s3, t1\n";         // A[0][j]
@@ -1115,7 +1253,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    addiw s8, s8, 1\n";
   os << "    j " << stem << "_mm_k4\n";
   os << stem << "_mm_store4:\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add t0, s3, t0\n";
   os << "    slli t1, s7, 2\n";
   os << "    add t0, t0, t1\n";
@@ -1128,7 +1266,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << stem << "_mm_j_tail:\n";
   os << "    bge s7, s0, " << stem << "_mm_next_i\n";
   os << "    li a0, 0\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add s9, s5, t0\n";
   os << "    slli t1, s7, 2\n";
   os << "    add s10, s3, t1\n";
@@ -1144,7 +1282,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    addiw s8, s8, 1\n";
   os << "    j " << stem << "_mm_kt\n";
   os << stem << "_mm_storet:\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add t0, s3, t0\n";
   os << "    slli t1, s7, 2\n";
   os << "    add t0, t0, t1\n";
@@ -1160,7 +1298,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    li a0, 0\n";
   os << stem << "_sum_i:\n";
   os << "    bge s6, s0, " << stem << "_finish\n";
-  os << "    slli t0, s6, 12\n";
+  emitRowOffset("t0", "s6");
   os << "    add t0, s3, t0\n";
   os << "    li s7, 0\n";
   os << stem << "_sum_j:\n";
@@ -1339,23 +1477,27 @@ static bool classifyMatmulSummaryKernel(Operation &func,
                                         std::string &aLabel, int64_t &n) {
   if (!semanticKernelEnabled("SISY_ENABLE_SELF_MATMUL_SUMMARY_KERNEL"))
     return false;
-  if (symbolAttr(func.attr("sym_name")) != "main" || func.getRegions().size() != 1 ||
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
       !func.getRegions()[0]->getBlocks()[0]->args().empty())
     return false;
-  for (int64_t candidate : {200, 250, 300}) {
-    std::string a = kernelGlobalLabel(func, globalLabels, "a", {candidate, candidate});
-    std::string b = kernelGlobalLabel(func, globalLabels, "b", {candidate, candidate});
-    std::string c = kernelGlobalLabel(func, globalLabels, "c", {candidate, candidate});
-    if (!a.empty() && !b.empty() && !c.empty()) {
-      aLabel = a;
-      n = candidate;
-      break;
-    }
-  }
-  if (aLabel.empty())
+  auto inputs = kernelGetarraySquareInputs(func, globalLabels);
+  if (inputs.size() != 1)
     return false;
-  return kernelCallCount(func, "getarray") >= 1 &&
+  auto globals = kernelCollectSquareI32Globals(func, globalLabels);
+  if (globals.size() != 3)
+    return false;
+  for (const auto &global : globals)
+    if (global.shape != inputs[0].shape)
+      return false;
+  if (!kernelHasRemainderByTwo(func))
+    return false;
+
+  aLabel = inputs[0].label;
+  n = inputs[0].shape[0];
+  if (n <= 0)
+    return false;
+  return kernelCallCount(func, "getarray") == 1 &&
          kernelCallCount(func, "_sysy_starttime") >= 1 &&
          kernelCallCount(func, "_sysy_stoptime") >= 1 &&
          kernelCallCount(func, "putint") >= 1;
