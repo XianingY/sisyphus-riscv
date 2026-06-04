@@ -2309,7 +2309,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
                           structuredLoopCount >= 2 && !hasLoopInBothIfBranches;
   int calleeSaveCount = regAlloc2Enabled
-                            ? maxCalleeSaveCount
+                            ? (affineLoopCount > 0 ? maxCalleeSaveCount
+                                                   : std::min(maxCalleeSaveCount, 8))
                             : std::min(maxCalleeSaveCount, structuredLoopCount);
   if (!isArm && livenessEnabled && !regAlloc2Enabled && structuredLoopCount > 0 &&
       envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true))
@@ -2562,15 +2563,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   //     so they are preserved across calls and restored on return.
   //   * Any value that does not receive a stable register falls back to the
   //     existing spill-everything path unchanged.
-  // The pass is RISC-V only and gated by SISY_ENABLE_SELF_LSRA. It requires the
-  // regAlloc2 frame (all of s0-s11 saved) so the reserved s4-s7 are safe.
+  // The pass is RISC-V only and gated by SISY_ENABLE_SELF_LSRA. It requires a
+  // regAlloc2 callee-save frame covering s4-s7 so the reserved LSRA pool is safe.
   static const char *kLsraPool[] = {"s4", "s5", "s6", "s7"};
   std::map<std::string, std::string> lsraAssignment; // valueKey -> phys reg
   std::set<std::string> lsraReserved;
   bool slotPromotionActive = !promotedScalarSlots.empty();
   bool stableBaseActive = stableBaseRegCount > 0;
   bool lsraEnabled = !isArm && livenessEnabled && regAlloc2Enabled &&
-                     calleeSaveCount >= 12 &&
+                     calleeSaveCount >= 8 &&
                      lsraHotFunction && !slotPromotionActive &&
                      envEnabled("SISY_ENABLE_SELF_LSRA", true);
   if (lsraEnabled) {
