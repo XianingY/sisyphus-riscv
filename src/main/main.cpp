@@ -380,6 +380,10 @@ int main(int argc, char **argv) {
               << " imperfect-nests=" << selfMLIRStats.opt.imperfectNests
               << " imperfect-permutations=" << selfMLIRStats.opt.imperfectPermutations
               << " closed-form-div-reductions=" << selfMLIRStats.opt.closedFormDivReductions
+              << " unroll-budget-skips=" << selfMLIRStats.opt.unrollBudgetSkips
+              << " unroll-nested-skips=" << selfMLIRStats.opt.unrollNestedSkips
+              << " range-peels=" << selfMLIRStats.opt.rangePeels
+              << " diagonal-transpose-tiles=" << selfMLIRStats.opt.diagonalTransposeTiles
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed

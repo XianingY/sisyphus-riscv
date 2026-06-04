@@ -74,7 +74,7 @@ bool constantIntegerValue(Value value, int64_t &out) {
   if (isFloatType(value.type()))
     return false;
   auto *op = value.getDefiningOp();
-  if (!op || op->isErased())
+  if (!op)
     return false;
   if (op->name() != "arith.constant" && op->name() != "rv_machine.li" &&
       op->name() != "arm_machine.mov")

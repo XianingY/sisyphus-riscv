@@ -332,6 +332,10 @@ struct SelfOptStats {
   int imperfectNests = 0;
   int imperfectPermutations = 0;
   int closedFormDivReductions = 0;
+  int unrollBudgetSkips = 0;
+  int unrollNestedSkips = 0;
+  int rangePeels = 0;
+  int diagonalTransposeTiles = 0;
 };
 
 struct OptimizationConfig {
@@ -372,6 +376,8 @@ void runProvenBitwiseHelper(Module &module, SelfOptStats *stats = nullptr);
 void runRotateHelperFold(Module &module, SelfOptStats *stats = nullptr);
 void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats = nullptr);
 void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats = nullptr);
+void runLoopRangePeeling(Module &module, SelfOptStats *stats = nullptr);
+void runDiagonalTransposeTiling(Module &module, SelfOptStats *stats = nullptr);
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats = nullptr);
 void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void runMemrefLinearization(Module &module, SelfOptStats *stats = nullptr);

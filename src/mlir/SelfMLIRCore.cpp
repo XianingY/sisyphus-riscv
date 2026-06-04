@@ -317,6 +317,12 @@ static void dropNestedOperandUses(Operation &op) {
 void Operation::markErased() {
   if (erased)
     return;
+  for (const auto &uses : resultUses) {
+    for (const auto &use : uses) {
+      if (use.owner && !use.owner->isErased())
+        return;
+    }
+  }
   dropAllOperands();
   dropNestedOperandUses(*this);
   erased = true;
@@ -384,7 +390,8 @@ std::unique_ptr<Operation> Block::takeOperation(Operation *op) {
 void Block::eraseMarkedOperations() {
   operations.erase(std::remove_if(operations.begin(), operations.end(),
                                   [](const std::unique_ptr<Operation> &op) {
-                                    return op->isErased();
+                                    return op->isErased() && op->resultCount() == 0 &&
+                                           op->getRegions().empty();
                                   }),
                    operations.end());
 }
@@ -424,6 +431,8 @@ Operation &Builder::create(const std::string &name, const std::vector<Value> &op
 }
 
 static void walkOp(Operation &op, std::vector<Operation*> &out) {
+  if (op.isErased())
+    return;
   out.push_back(&op);
   for (auto &region : op.getRegions())
     for (auto &block : region->getBlocks())

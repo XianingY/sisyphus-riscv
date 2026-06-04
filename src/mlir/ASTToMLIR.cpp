@@ -945,13 +945,17 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
         runImperfectLoopPromotion(*module);
       if (effective.enableLoopTiling)
         runLoopTiling(*module, &stats.opt);
+      if (effective.enableLoopTiling)
+        runDiagonalTransposeTiling(*module, &stats.opt);
       if (effective.enableLoopFusion && !envDisabled("SISY_ENABLE_SELF_LOOP_FUSION"))
         runAffineLoopFusion(*module);
       if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))
         runPolyhedralLoopPermutation(*module, &stats.opt);
     }
-    if (effective.enableStencilPeel)
+    if (effective.enableStencilPeel) {
+      runLoopRangePeeling(*module, &stats.opt);
       runStencilPeelingAndUnroll(*module, &stats.opt);
+    }
     runIfStoreSelectPromotion(*module, &stats.opt);
     runMemrefLinearization(*module, &stats.opt);
     runLoopInvariantCodeMotion(*module, &stats.opt);

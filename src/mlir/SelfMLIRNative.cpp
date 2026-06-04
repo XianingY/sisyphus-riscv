@@ -1737,6 +1737,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
   std::vector<Operation*> funcOps;
   std::function<void(Operation&)> walkOp = [&](Operation &o) {
+    if (o.isErased())
+      return;
     funcOps.push_back(&o);
     for (auto &r : o.getRegions()) {
       for (auto &b : r->getBlocks()) {
@@ -1809,6 +1811,22 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     frameBytes = (frameBytes + 7) & ~int64_t(7);
     stackSlots[valueKey(op->result())] = frameBytes;
     frameBytes += memrefAllocationBytes(op->resultType());
+  }
+  for (auto *op : funcOps) {
+    if (!op || op->isErased())
+      continue;
+    for (auto operand : op->getOperands()) {
+      if (!operand.valid() || !isMemrefType(operand.type()) ||
+          stackSlots.count(valueKey(operand)) != 0)
+        continue;
+      Operation *def = operand.getDefiningOp();
+      if (!def || (def->name() != "sysy.alloca" &&
+                   def->name() != "memref.alloca"))
+        continue;
+      frameBytes = (frameBytes + 7) & ~int64_t(7);
+      stackSlots[valueKey(operand)] = frameBytes;
+      frameBytes += memrefAllocationBytes(operand.type());
+    }
   }
   std::function<void(Block&)> reserveValueSlotsForBlock = [&](Block &b) {
     for (auto &arg : b.args()) {
@@ -2569,6 +2587,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         ++it;
         continue;
       }
+      maybeSpillBeforeClobber(key, reg, false);
       it = regs.erase(it);
     }
   };
@@ -3421,6 +3440,26 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 	          continue;
 	        }
 	      }
+	      if (!isArm && (opname == "rv_machine.sllw" ||
+	                     opname == "rv_machine.sraw")) {
+	        int64_t imm = 0;
+	        if (constantIntegerValue(op.operand(1), imm) && imm >= 0 && imm < 32) {
+	          std::string lhs = ensureReg(op.operand(0), scratchReg(0));
+	          if (lhs.empty()) {
+	            lhs = scratchReg(0);
+	            os << "    li " << lhs << ", 0\n";
+	          }
+	          std::string dst = intResultReg(op.result());
+	          bindResult(op.result(), dst);
+	          const char *inst = opname == "rv_machine.sllw" ? "slliw" : "sraiw";
+	          os << "    " << inst << " " << dst << ", " << lhs << ", " << imm << "\n";
+	          if (shouldSpillDefinedValue(op.result()))
+	            spillHome(op.result(), dst);
+	          stats.machineOps++;
+	          stats.pow2StrengthReductions++;
+	          continue;
+	        }
+	      }
 	      std::string lhs = ensureReg(op.operand(0), scratchReg(0));
       std::string rhs = ensureReg(op.operand(1), scratchReg(1));
       if (lhs.empty()) {
@@ -3532,10 +3571,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
 
     if (opname == "rv_machine.neg" || opname == "arm_machine.neg" ||
         opname == "rv_machine.seqz" || opname == "arm_machine.not") {
-      std::string src = ensureReg(op.operand(0), scratchReg(0));
+      std::string src = reloadValue(op.operand(0), scratchReg(0));
       if (src.empty()) {
         stats.unsupportedOps++;
-        stats.error = "unary machine op operand has no assigned register";
+        Operation *def = op.operand(0).getDefiningOp();
+        stats.error = "unary machine op operand has no assigned register: " +
+                      op.operand(0).printName() + " key=" +
+                      valueKey(op.operand(0)) + " def=" +
+                      (def ? def->name() : std::string("<block-arg>"));
         return false;
       }
       std::string dst = isArm ? resultReg() : intResultReg(op.result());

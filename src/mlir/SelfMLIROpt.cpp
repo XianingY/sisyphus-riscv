@@ -775,6 +775,43 @@ static Operation *findConditionOp(Region &region) {
   return nullptr;
 }
 
+static bool analyzeLoopBodyForUnroll(Block &body, int64_t &opCount, bool &hasNestedLoop, bool &hasUnsafeControl) {
+  opCount = 0;
+  hasNestedLoop = false;
+  hasUnsafeControl = false;
+  std::vector<Block*> worklist{&body};
+  while (!worklist.empty()) {
+    Block *current = worklist.back();
+    worklist.pop_back();
+    if (!current)
+      continue;
+    for (auto &owned : current->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+      if (op->name() == "scf.yield" || op->name() == "affine.yield")
+        continue;
+      opCount++;
+      if (op->name() == "scf.while" || op->name() == "affine.for" || op->name() == "scf.for") {
+        hasNestedLoop = true;
+      }
+      if (op->name() == "sysy.return" || op->name() == "scf.return" ||
+          op->name() == "sysy.break" || op->name() == "sysy.continue" ||
+          op->name() == "sysy.call") {
+        hasUnsafeControl = true;
+      }
+      for (auto &region : op->getRegions()) {
+        if (region) {
+          for (auto &block : region->getBlocks()) {
+            worklist.push_back(block.get());
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
 struct ConstantWhileInfo {
   bool valid = false;
   Value ivSlot;
@@ -784,7 +821,8 @@ struct ConstantWhileInfo {
   Operation *stepStore = nullptr;
 };
 
-static ConstantWhileInfo classifySmallConstantWhile(Operation &loop) {
+static ConstantWhileInfo classifySmallConstantWhile(Operation &loop,
+                                                    SelfOptStats *stats) {
   ConstantWhileInfo info;
   if (loop.name() != "scf.while" || loop.getRegions().size() != 2 ||
       loop.getRegions()[0]->getBlocks().size() != 1 ||
@@ -841,9 +879,28 @@ static ConstantWhileInfo classifySmallConstantWhile(Operation &loop) {
       !addOneFromSlot(ivStores[0]->operand(0), ivSlot))
     return info;
 
+  int64_t opCount = 0;
+  bool hasNestedLoop = false;
+  bool hasUnsafeControl = false;
+  analyzeLoopBodyForUnroll(body, opCount, hasNestedLoop, hasUnsafeControl);
+  if (opCount > 0)
+    opCount--;
+  if (hasNestedLoop) {
+    if (stats)
+      stats->unrollNestedSkips++;
+    return info;
+  }
+  if (hasUnsafeControl)
+    return info;
+
   int64_t trip = bound - init;
   if (trip < 0 || trip > 80)
     return info;
+  if (trip * opCount > 150) {
+    if (stats)
+      stats->unrollBudgetSkips++;
+    return info;
+  }
   info.valid = true;
   info.ivSlot = ivSlot;
   info.init = init;
@@ -861,12 +918,21 @@ static std::unique_ptr<Operation> cloneForUnrolledIteration(
 
   bool replaceIvLoad = loadFromSlot(&op, ivSlot) && op.resultCount() == 1 &&
                        isI32Like(op.resultType());
-  std::string clonedName = replaceIvLoad ? "arith.constant" : op.name();
-  std::vector<Value> operands = replaceIvLoad ? std::vector<Value>{}
-                                              : remapOperandsForClone(op, valueMap);
+  int64_t negImm = 0;
+  bool foldNegConstant =
+      !replaceIvLoad && op.resultCount() == 1 && op.operandCount() == 1 &&
+      (op.name() == "rv_machine.neg" || op.name() == "arm_machine.neg") &&
+      constantIntegerValue(op.operand(0), negImm);
+  std::string clonedName = (replaceIvLoad || foldNegConstant) ? "arith.constant"
+                                                              : op.name();
+  std::vector<Value> operands = (replaceIvLoad || foldNegConstant)
+                                    ? std::vector<Value>{}
+                                    : remapOperandsForClone(op, valueMap);
   std::map<std::string, Attribute> attrs = op.attrs();
   if (replaceIvLoad)
     attrs = {{"value", module.context().integerAttr(ivValue, op.resultType())}};
+  if (foldNegConstant)
+    attrs = {{"value", module.context().integerAttr(-negImm, op.resultType())}};
   auto cloned = std::make_unique<Operation>(clonedName, operands, resultTypesOf(op),
                                             attrs, op.loc());
   for (auto &region : op.getRegions()) {
@@ -941,7 +1007,8 @@ struct ConstantAffineInfo {
   int64_t tripCount = 0;
 };
 
-static ConstantAffineInfo classifySmallConstantAffineFor(Operation &loop) {
+static ConstantAffineInfo classifySmallConstantAffineFor(Operation &loop,
+                                                         SelfOptStats *stats) {
   ConstantAffineInfo info;
   if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
       loop.getRegions().size() != 1 ||
@@ -968,6 +1035,24 @@ static ConstantAffineInfo classifySmallConstantAffineFor(Operation &loop) {
         op->name() == "sysy.call")
       return ConstantAffineInfo();
   }
+
+  int64_t opCount = 0;
+  bool hasNestedLoop = false;
+  bool hasUnsafeControl = false;
+  analyzeLoopBodyForUnroll(body, opCount, hasNestedLoop, hasUnsafeControl);
+  if (hasNestedLoop) {
+    if (stats)
+      stats->unrollNestedSkips++;
+    return ConstantAffineInfo();
+  }
+  if (hasUnsafeControl)
+    return ConstantAffineInfo();
+  if (info.tripCount * opCount > 150) {
+    if (stats)
+      stats->unrollBudgetSkips++;
+    return ConstantAffineInfo();
+  }
+
   info.valid = true;
   return info;
 }
@@ -1850,6 +1935,434 @@ void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats) {
     eraseMarked(module);
 }
 
+static bool peelOpHasName(Operation *op, std::initializer_list<const char*> names) {
+  if (!op)
+    return false;
+  for (const char *name : names) {
+    if (op->name() == name)
+      return true;
+  }
+  return false;
+}
+
+static Operation &peelInsertI32Constant(Module &module, Block &block, std::size_t &index,
+                                        int64_t value, Location loc) {
+  Context &ctx = module.context();
+  return insertOp(block, index, "rv_machine.li", {}, {ctx.i(32)},
+                  {{"value", ctx.integerAttr(value, ctx.i(32))}}, loc);
+}
+
+static bool foldConstantIf(Module &module, Operation &ifOp) {
+  if (ifOp.name() != "scf.if" || ifOp.operandCount() != 1)
+    return false;
+  int64_t condVal = 0;
+  if (!constantIntegerValue(ifOp.operand(0), condVal))
+    return false;
+
+  Block *parent = ifOp.getBlock();
+  if (!parent)
+    return false;
+
+  int rawIndex = operationIndexInBlock(*parent, &ifOp);
+  if (rawIndex < 0)
+    return false;
+  std::size_t insertIndex = (std::size_t) rawIndex;
+
+  bool hasElse = ifOp.getRegions().size() > 1 && !ifOp.getRegions()[1]->getBlocks().empty();
+  Block *targetBlock = nullptr;
+  if (condVal != 0) {
+    if (!ifOp.getRegions().empty() && !ifOp.getRegions()[0]->getBlocks().empty()) {
+      targetBlock = ifOp.getRegions()[0]->getBlocks()[0].get();
+    }
+  } else {
+    if (hasElse) {
+      targetBlock = ifOp.getRegions()[1]->getBlocks()[0].get();
+    }
+  }
+
+  if (targetBlock) {
+    Operation *yield = nullptr;
+    for (auto &owned : targetBlock->ops()) {
+      if (owned && !owned->isErased() && owned->name() == "scf.yield") {
+        yield = owned.get();
+        break;
+      }
+    }
+
+    if (yield) {
+      for (int i = 0; i < ifOp.resultCount(); i++) {
+        if (i < yield->operandCount()) {
+          replaceAllUses(module, ifOp.result(i), yield->operand(i));
+        }
+      }
+    }
+
+    std::vector<Operation*> toMove;
+    for (auto &owned : targetBlock->ops()) {
+      if (owned && !owned->isErased() && owned.get() != yield) {
+        toMove.push_back(owned.get());
+      }
+    }
+
+    for (Operation *op : toMove) {
+      auto owned = targetBlock->takeOperation(op);
+      if (owned) {
+        owned->setBlock(parent);
+        parent->insertOperation(insertIndex++, std::move(owned));
+      }
+    }
+  }
+
+  ifOp.markErased();
+  return true;
+}
+
+static void runConstantIfFolding(Module &module) {
+  std::vector<Operation*> ifs;
+  for (auto *op : walk(module)) {
+    if (op && !op->isErased() && op->name() == "scf.if") {
+      ifs.push_back(op);
+    }
+  }
+  bool changed = false;
+  for (Operation *op : ifs) {
+    if (op && !op->isErased()) {
+      changed |= foldConstantIf(module, *op);
+    }
+  }
+  if (changed)
+    eraseMarked(module);
+}
+
+static void collectPeelingOffsets(Block &body, Value iv, Value upper, int64_t &minOffset, int64_t &maxOffset, bool &hasPeeling) {
+  minOffset = 0;
+  maxOffset = 0;
+  hasPeeling = false;
+
+  std::map<std::string, int64_t> linearMap;
+  linearMap[valueKey(iv)] = 0;
+
+  std::set<int64_t> offsets;
+
+  std::vector<Block*> worklist{&body};
+  while (!worklist.empty()) {
+    Block *current = worklist.back();
+    worklist.pop_back();
+    if (!current)
+      continue;
+    for (auto &owned : current->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+
+      if (peelOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) &&
+          op->operandCount() == 2) {
+        int64_t c = 0;
+        if (linearMap.count(valueKey(op->operand(0))) && constantIntegerValue(op->operand(1), c)) {
+          linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(0))] + c;
+        } else if (linearMap.count(valueKey(op->operand(1))) && constantIntegerValue(op->operand(0), c)) {
+          linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(1))] + c;
+        }
+      } else if (peelOpHasName(op, {"arith.subi", "rv_machine.subw", "arm_machine.sub"}) &&
+                 op->operandCount() == 2) {
+        int64_t c = 0;
+        if (linearMap.count(valueKey(op->operand(0))) && constantIntegerValue(op->operand(1), c)) {
+          linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(0))] - c;
+        }
+      }
+
+      if (peelOpHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) &&
+          op->operandCount() == 2) {
+        std::string pred = symbolAttr(op->attr("predicate"));
+        Value lhs = op->operand(0);
+        Value rhs = op->operand(1);
+
+        if (linearMap.count(valueKey(lhs))) {
+          int64_t offset = linearMap[valueKey(lhs)];
+          int64_t c = 0;
+          if (constantIntegerValue(rhs, c) && c == 0) {
+            if (pred == "sge" || pred == "sgt" || pred == "slt" || pred == "sle") {
+              offsets.insert(offset);
+            }
+          } else if (valueKey(rhs) == valueKey(upper)) {
+            if (pred == "slt" || pred == "sle" || pred == "sgt" || pred == "sge") {
+              offsets.insert(offset);
+            }
+          }
+        }
+        if (linearMap.count(valueKey(rhs))) {
+          int64_t offset = linearMap[valueKey(rhs)];
+          int64_t c = 0;
+          if (constantIntegerValue(lhs, c) && c == 0) {
+            if (pred == "sle" || pred == "slt" || pred == "sge" || pred == "sgt") {
+              offsets.insert(offset);
+            }
+          } else if (valueKey(lhs) == valueKey(upper)) {
+            if (pred == "sgt" || pred == "sge" || pred == "slt" || pred == "sle") {
+              offsets.insert(offset);
+            }
+          }
+        }
+      }
+
+      for (auto &region : op->getRegions()) {
+        for (auto &block : region->getBlocks()) {
+          worklist.push_back(block.get());
+        }
+      }
+    }
+  }
+
+  if (!offsets.empty()) {
+    minOffset = *offsets.begin();
+    maxOffset = *offsets.rbegin();
+    hasPeeling = true;
+  }
+}
+
+static bool rewritePeeledInteriorComparisons(Module &module, Block &body, Value iv, Value upper, int64_t peelStart, int64_t peelEnd) {
+  std::map<std::string, int64_t> linearMap;
+  linearMap[valueKey(iv)] = 0;
+
+  bool changed = false;
+  std::vector<Block*> worklist{&body};
+  while (!worklist.empty()) {
+    Block *current = worklist.back();
+    worklist.pop_back();
+    if (!current)
+      continue;
+
+    std::vector<Operation*> opsToReplace;
+    for (auto &owned : current->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+
+      if (peelOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) &&
+          op->operandCount() == 2) {
+        int64_t c = 0;
+        if (linearMap.count(valueKey(op->operand(0))) && constantIntegerValue(op->operand(1), c)) {
+          linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(0))] + c;
+        } else if (linearMap.count(valueKey(op->operand(1))) && constantIntegerValue(op->operand(0), c)) {
+          linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(1))] + c;
+        }
+      } else if (peelOpHasName(op, {"arith.subi", "rv_machine.subw", "arm_machine.sub"}) &&
+                 op->operandCount() == 2) {
+        int64_t c = 0;
+        if (linearMap.count(valueKey(op->operand(0))) && constantIntegerValue(op->operand(1), c)) {
+          linearMap[valueKey(op->result(0))] = linearMap[valueKey(op->operand(0))] - c;
+        }
+      }
+
+      if (peelOpHasName(op, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) &&
+          op->operandCount() == 2) {
+        std::string pred = symbolAttr(op->attr("predicate"));
+        Value lhs = op->operand(0);
+        Value rhs = op->operand(1);
+
+        bool isTrue = false;
+
+        if (linearMap.count(valueKey(lhs))) {
+          int64_t offset = linearMap[valueKey(lhs)];
+          int64_t c = 0;
+          if (constantIntegerValue(rhs, c) && c == 0) {
+            if (pred == "sge" && (peelStart + offset >= 0)) {
+              isTrue = true;
+            } else if (pred == "sgt" && (peelStart + offset > 0)) {
+              isTrue = true;
+            }
+          } else if (valueKey(rhs) == valueKey(upper)) {
+            if (pred == "slt" && (offset <= peelEnd)) {
+              isTrue = true;
+            } else if (pred == "sle" && (offset <= peelEnd + 1)) {
+              isTrue = true;
+            }
+          }
+        }
+        if (linearMap.count(valueKey(rhs))) {
+          int64_t offset = linearMap[valueKey(rhs)];
+          int64_t c = 0;
+          if (constantIntegerValue(lhs, c) && c == 0) {
+            if (pred == "sle" && (peelStart + offset >= 0)) {
+              isTrue = true;
+            } else if (pred == "slt" && (peelStart + offset > 0)) {
+              isTrue = true;
+            }
+          } else if (valueKey(lhs) == valueKey(upper)) {
+            if (pred == "sgt" && (offset <= peelEnd)) {
+              isTrue = true;
+            } else if (pred == "sge" && (offset <= peelEnd + 1)) {
+              isTrue = true;
+            }
+          }
+        }
+
+        if (isTrue) {
+          opsToReplace.push_back(op);
+        }
+      }
+
+      for (auto &region : op->getRegions()) {
+        for (auto &block : region->getBlocks()) {
+          worklist.push_back(block.get());
+        }
+      }
+    }
+
+    for (Operation *op : opsToReplace) {
+      if (!op || op->isErased())
+        continue;
+      Block *b = op->getBlock();
+      int rawIdx = operationIndexInBlock(*b, op);
+      if (rawIdx >= 0) {
+        std::size_t idx = (std::size_t) rawIdx;
+        Operation &one = peelInsertI32Constant(module, *b, idx, 1, op->loc());
+        replaceAllUses(module, op->result(0), one.result(0));
+        op->markErased();
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+static Value insertMin(Module &module, Block &block, std::size_t &index, Value a, Value b, Location loc) {
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  Operation &cond = insertOp(block, index, "arith.cmpi", {a, b}, {i32}, {{"predicate", ctx.stringAttr("slt")}}, loc);
+  Operation &sel = insertOp(block, index, "arith.select", {cond.result(0), a, b}, {a.type()}, {}, loc);
+  return sel.result(0);
+}
+
+static Value insertMax(Module &module, Block &block, std::size_t &index, Value a, Value b, Location loc) {
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  Operation &cond = insertOp(block, index, "arith.cmpi", {a, b}, {i32}, {{"predicate", ctx.stringAttr("sgt")}}, loc);
+  Operation &sel = insertOp(block, index, "arith.select", {cond.result(0), a, b}, {a.type()}, {}, loc);
+  return sel.result(0);
+}
+
+static Operation* cloneLoopWithBounds(Module &module, Operation &loop, Value newLower, Value newUpper, Block *parent, std::size_t &insertIndex) {
+  Location loc = loop.loc();
+
+  std::vector<Value> operands{newLower, newUpper, loop.operand(2)};
+  auto newLoop = std::make_unique<Operation>("affine.for", operands, std::vector<Type>{}, loop.attrs(), loc);
+  Region &newRegion = newLoop->addRegion();
+  Block &newBlock = newRegion.addBlock();
+
+  Block &oldBody = *loop.getRegions()[0]->getBlocks()[0];
+  Value oldIv = oldBody.args()[0]->value();
+  BlockArgument &newIv = newBlock.addArgument(oldIv.type(), loc, "iv");
+
+  std::map<std::string, Value> valueMap;
+  valueMap[valueKey(oldIv)] = newIv.value();
+
+  std::set<Operation*> skipOps;
+  for (auto &owned : oldBody.ops()) {
+    if (!owned || owned->isErased() || owned->name() == "affine.yield")
+      continue;
+    auto cloned = cloneForUnrolledIteration(module, *owned, valueMap, skipOps, Value(), 0);
+    if (!cloned)
+      continue;
+    Operation &inserted = newBlock.addOperation(std::move(cloned));
+    for (int i = 0; i < owned->resultCount(); i++)
+      valueMap[valueKey(owned->result(i))] = inserted.result(i);
+  }
+
+  std::vector<Value> yieldOperands;
+  auto yield = std::make_unique<Operation>("affine.yield", yieldOperands, std::vector<Type>{}, std::map<std::string, Attribute>{}, loc);
+  newBlock.addOperation(std::move(yield));
+
+  Operation &insertedLoop = parent->insertOperation(insertIndex++, std::move(newLoop));
+  return &insertedLoop;
+}
+
+static bool applyRangePeeling(Module &module, Operation &loop) {
+  if (loop.name() != "affine.for" || loop.operandCount() < 3 ||
+      loop.getRegions().size() != 1 || loop.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  if (loop.attr("range_peeled"))
+    return false;
+
+  Block &body = *loop.getRegions()[0]->getBlocks()[0];
+  Value iv = body.args()[0]->value();
+  Value lower = loop.operand(0);
+  Value upper = loop.operand(1);
+
+  int64_t lowerVal = 0;
+  if (!constantIntegerValue(lower, lowerVal) || lowerVal != 0)
+    return false;
+
+  int64_t minOffset = 0, maxOffset = 0;
+  bool hasPeeling = false;
+  collectPeelingOffsets(body, iv, upper, minOffset, maxOffset, hasPeeling);
+  if (!hasPeeling)
+    return false;
+
+  int64_t peelStart = std::max(int64_t(0), -minOffset);
+  int64_t peelEnd = std::max(int64_t(0), maxOffset);
+  if (peelStart == 0 && peelEnd == 0)
+    return false;
+
+  Block *parent = loop.getBlock();
+  if (!parent)
+    return false;
+  int loopIndex = operationIndexInBlock(*parent, &loop);
+  if (loopIndex < 0)
+    return false;
+  std::size_t insertIndex = (std::size_t) loopIndex;
+
+  Location loc = loop.loc();
+  loop.setAttr("range_peeled", module.context().boolAttr(true));
+  Operation &constStart = peelInsertI32Constant(module, *parent, insertIndex, peelStart, loc);
+  Value limitStart = constStart.result(0);
+  Value upper1 = insertMin(module, *parent, insertIndex, limitStart, upper, loc);
+
+  Operation &constEnd = peelInsertI32Constant(module, *parent, insertIndex, peelEnd, loc);
+  Operation &upperMinusEnd = insertOp(*parent, insertIndex, "rv_machine.subw", {upper, constEnd.result(0)}, {module.context().i(32)}, {}, loc);
+  Value limitEnd = upperMinusEnd.result(0);
+  Value upper2 = insertMax(module, *parent, insertIndex, upper1, limitEnd, loc);
+
+  cloneLoopWithBounds(module, loop, lower, upper1, parent, insertIndex);
+  Operation *loop2 = cloneLoopWithBounds(module, loop, upper1, upper2, parent, insertIndex);
+  cloneLoopWithBounds(module, loop, upper2, upper, parent, insertIndex);
+
+  Block &body2 = *loop2->getRegions()[0]->getBlocks()[0];
+  Value iv2 = body2.args()[0]->value();
+  rewritePeeledInteriorComparisons(module, body2, iv2, upper, peelStart, peelEnd);
+
+  loop.markErased();
+  return true;
+}
+
+void runLoopRangePeeling(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_RANGE_PEEL", true))
+    return;
+  std::vector<Operation*> loops;
+  for (auto *op : walk(module))
+    if (op && !op->isErased() && op->name() == "affine.for")
+      loops.push_back(op);
+  bool changed = false;
+  int peeled = 0;
+  for (Operation *loop : loops) {
+    if (!loop || loop->isErased())
+      continue;
+    if (applyRangePeeling(module, *loop)) {
+      changed = true;
+      peeled++;
+    }
+  }
+  if (!changed)
+    return;
+  eraseMarked(module);
+  runLocalCSE(module, stats);
+  runConstantIfFolding(module);
+  if (stats) {
+    stats->rangePeels += peeled;
+    stats->interiorPeels += peeled;
+  }
+}
+
 void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_STENCIL_PEEL", true))
     return;
@@ -1866,13 +2379,13 @@ void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
       bool unrolled = false;
       int64_t tripCount = 0;
       if (loop->name() == "scf.while") {
-        ConstantWhileInfo info = classifySmallConstantWhile(*loop);
+        ConstantWhileInfo info = classifySmallConstantWhile(*loop, stats);
         if (info.valid) {
           unrolled = unrollSmallConstantWhile(module, *loop, info);
           tripCount = info.tripCount;
         }
       } else if (loop->name() == "affine.for") {
-        ConstantAffineInfo info = classifySmallConstantAffineFor(*loop);
+        ConstantAffineInfo info = classifySmallConstantAffineFor(*loop, stats);
         if (info.valid) {
           unrolled = unrollSmallConstantAffineFor(module, *loop, info);
           tripCount = info.tripCount;
@@ -1890,6 +2403,7 @@ void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats) {
     if (!changed)
       break;
   }
+
 }
 
 static bool tileOpHasName(Operation *op, std::initializer_list<const char*> names) {
@@ -1985,21 +2499,136 @@ static Value tileAppendIntConstant(Module &module, Block &block, int64_t value,
   return op.result();
 }
 
+static bool tileCanCloneValueDef(Operation *def) {
+  if (!def || def->isErased() || def->resultCount() != 1 ||
+      !def->getRegions().empty())
+    return false;
+  return tileOpHasName(def, {"sysy.load", "memref.load", "rv_machine.li",
+                             "arith.constant", "arith.addi", "arith.subi",
+                             "arith.muli", "arith.divi", "arith.remi",
+                             "arith.andi", "arith.ori", "arith.xori",
+                             "arith.shli", "arith.shrsi", "arith.select",
+                             "rv_machine.addw", "rv_machine.subw",
+                             "rv_machine.mulw", "rv_machine.divw",
+                             "rv_machine.remw", "rv_machine.and",
+                             "rv_machine.or", "rv_machine.xor",
+                             "rv_machine.sllw", "rv_machine.sraw",
+                             "rv_machine.cmp", "rv_machine.select",
+                             "arm_machine.add", "arm_machine.sub",
+                             "arm_machine.mul", "arm_machine.sdiv",
+                             "arm_machine.and", "arm_machine.orr",
+                             "arm_machine.eor", "arm_machine.cmp",
+                             "arm_machine.select"});
+}
+
+static Value tileMaterializeValueImpl(Module &module, Block &block, Value value,
+                                      Location loc,
+                                      std::map<std::string, Value> &cache,
+                                      std::set<std::string> &visiting,
+                                      int depth) {
+  if (!value.valid())
+    return value;
+  std::string key = valueKey(value);
+  auto cached = cache.find(key);
+  if (cached != cache.end())
+    return cached->second;
+
+  int64_t imm = 0;
+  if (constantIntegerValue(value, imm)) {
+    Value materialized = tileAppendIntConstant(module, block, imm, loc);
+    cache[key] = materialized;
+    return materialized;
+  }
+  if (depth > 16 || isMemrefType(value.type()) || value.isBlockArgument())
+    return value;
+  Operation *def = value.getDefiningOp();
+  if (!tileCanCloneValueDef(def) || visiting.count(key))
+    return value;
+
+  visiting.insert(key);
+  std::vector<Value> operands;
+  operands.reserve(def->operandCount());
+  for (auto operand : def->getOperands()) {
+    if (isMemrefType(operand.type()))
+      operands.push_back(operand);
+    else
+      operands.push_back(tileMaterializeValueImpl(module, block, operand, loc,
+                                                  cache, visiting, depth + 1));
+  }
+  Operation &clone = appendOp(block, def->name(), operands, resultTypesOf(*def),
+                              def->attrs(), loc);
+  visiting.erase(key);
+  cache[key] = clone.result();
+  return clone.result();
+}
+
 static Value tileMaterializeValue(Module &module, Block &block, Value value,
                                   Location loc) {
+  std::map<std::string, Value> cache;
+  std::set<std::string> visiting;
+  return tileMaterializeValueImpl(module, block, value, loc, cache, visiting, 0);
+}
+
+static Value tileInsertIntConstant(Module &module, Block &block,
+                                   std::size_t &index, int64_t value,
+                                   Location loc) {
+  Operation &op = insertOp(
+      block, index, "rv_machine.li", {}, {module.context().i(32)},
+      {{"value", module.context().integerAttr(value, module.context().i(32))}},
+      loc);
+  return op.result();
+}
+
+static Value tileInsertMaterializeValueImpl(Module &module, Block &block,
+                                            std::size_t &index, Value value,
+                                            Location loc,
+                                            std::map<std::string, Value> &cache,
+                                            std::set<std::string> &visiting,
+                                            int depth) {
+  if (!value.valid())
+    return value;
+  std::string key = valueKey(value);
+  auto cached = cache.find(key);
+  if (cached != cache.end())
+    return cached->second;
+
   int64_t imm = 0;
-  if (constantIntegerValue(value, imm))
-    return tileAppendIntConstant(module, block, imm, loc);
-  Operation *def = value.getDefiningOp();
-  if (def && !def->isErased() && def->resultCount() == 1 &&
-      tileOpHasName(def, {"sysy.load", "memref.load", "rv_machine.li",
-                          "arith.constant", "arith.addi", "arith.subi",
-                          "rv_machine.addw", "rv_machine.subw"})) {
-    Operation &clone = appendOp(block, def->name(), def->getOperands(),
-                                resultTypesOf(*def), def->attrs(), loc);
-    return clone.result();
+  if (constantIntegerValue(value, imm)) {
+    Value materialized = tileInsertIntConstant(module, block, index, imm, loc);
+    cache[key] = materialized;
+    return materialized;
   }
-  return value;
+  if (depth > 16 || isMemrefType(value.type()) || value.isBlockArgument())
+    return value;
+  Operation *def = value.getDefiningOp();
+  if (!tileCanCloneValueDef(def) || visiting.count(key))
+    return value;
+
+  visiting.insert(key);
+  std::vector<Value> operands;
+  operands.reserve(def->operandCount());
+  for (auto operand : def->getOperands()) {
+    if (isMemrefType(operand.type()))
+      operands.push_back(operand);
+    else
+      operands.push_back(tileInsertMaterializeValueImpl(module, block, index,
+                                                        operand, loc, cache,
+                                                        visiting, depth + 1));
+  }
+  Operation &clone = insertOp(block, index, def->name(), operands,
+                              resultTypesOf(*def), def->attrs(), loc);
+  visiting.erase(key);
+  cache[key] = clone.result();
+  return clone.result();
+}
+
+static Value tileInsertMaterializeValue(Module &module, Block &block,
+                                        std::size_t &index, Value value,
+                                        Location loc) {
+  std::map<std::string, Value> cache;
+  std::set<std::string> visiting;
+  return tileInsertMaterializeValueImpl(module, block, index, value, loc, cache,
+                                        visiting, 0);
 }
 
 static Operation &tileAppendAffineLoop(Module &module, Block &block, Value lower,
@@ -3819,6 +4448,8 @@ static bool stripMineInnermostAffineLoop(Module &module, Operation &loop,
   for (auto &owned : body->ops()) {
     if (!owned || owned->isErased())
       continue;
+    if (tileOpTreeHasAnyName(*owned, {"memref.store", "sysy.store"}))
+      return false;
     if (tileOpTreeHasAnyName(*owned, {"memref.load", "memref.store"})) {
       hasMemrefAccess = true;
       break;
@@ -3844,21 +4475,28 @@ static bool stripMineInnermostAffineLoop(Module &module, Operation &loop,
   Context &ctx = module.context();
   Location loc = loop.loc();
   std::size_t insertIndex = (std::size_t) loopIndex;
+  Value lower = tileInsertMaterializeValue(module, *parent, insertIndex,
+                                           loop.operand(0), loc);
+  Value upper = tileInsertMaterializeValue(module, *parent, insertIndex,
+                                           loop.operand(1), loc);
+  Value materializedStep = tileInsertMaterializeValue(module, *parent,
+                                                     insertIndex,
+                                                     loop.operand(2), loc);
   Operation &tileConst = insertOp(
       *parent, insertIndex, "rv_machine.li", {}, {ctx.i(32)},
       {{"value", ctx.integerAttr(tileSize, ctx.i(32))}}, loc);
   Value tileStep = tileConst.result();
   Operation &tileLoop = tileInsertAffineLoop(module, *parent, insertIndex,
-                                             loop.operand(0), loop.operand(1),
-                                             tileStep, loc, "tile");
+                                             lower, upper, tileStep, loc,
+                                             "tile");
   Block &tileBody = *tileLoop.getRegions()[0]->getBlocks()[0];
   Value tileIv = tileBody.args()[0]->value();
   Operation &tileEndRaw = appendOp(tileBody, "rv_machine.addw",
                                    {tileIv, tileStep}, {ctx.i(32)}, {}, loc);
   Value tileEnd = tileAppendMinValue(module, tileBody, tileEndRaw.result(),
-                                     loop.operand(1), loc);
+                                     upper, loc);
   Operation &inner = tileAppendAffineLoop(module, tileBody, tileIv, tileEnd,
-                                          loop.operand(2), loc, "iv");
+                                          materializedStep, loc, "iv");
   Block &innerBody = *inner.getRegions()[0]->getBlocks()[0];
   Value oldIv = body->args()[0]->value();
   Value newIv = innerBody.args()[0]->value();
@@ -3879,6 +4517,180 @@ static bool stripMineInnermostAffineLoop(Module &module, Operation &loop,
   appendOp(tileBody, "affine.yield", {}, {}, {}, loc);
   loop.markErased();
   return true;
+}
+
+static bool blockContainsOnlyLoopAndYield(Block &block, Operation *loop) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op == loop || op->name() == "affine.yield")
+      continue;
+    return false;
+  }
+  return true;
+}
+
+static bool classifyTransposeStore(Operation &store, Value outerIv,
+                                   Value innerIv) {
+  if (store.name() != "memref.store" || store.operandCount() < 4 ||
+      store.operand(2) != innerIv || store.operand(3) != outerIv)
+    return false;
+  Operation *load = store.operand(0).getDefiningOp();
+  if (!load || load->isErased() || load->name() != "memref.load" ||
+      load->operandCount() < 3)
+    return false;
+  if (valueKey(load->operand(0)) == valueKey(store.operand(1)))
+    return false;
+  return load->operand(1) == outerIv && load->operand(2) == innerIv;
+}
+
+static bool innerBodyIsTransposeLike(Block &body, Value outerIv, Value innerIv) {
+  int transposeStores = 0;
+  for (auto &owned : body.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "affine.yield")
+      continue;
+    if (tileOpTreeHasAnyName(*op, {"sysy.call", "sysy.return", "scf.return",
+                                   "sysy.break", "sysy.continue",
+                                   "scf.while", "affine.for", "scf.for"}))
+      return false;
+    if (op->name() == "memref.store") {
+      if (!classifyTransposeStore(*op, outerIv, innerIv))
+        return false;
+      transposeStores++;
+      continue;
+    }
+    if (op->name() == "scf.if")
+      return false;
+  }
+  return transposeStores == 1;
+}
+
+static bool applyDiagonalTransposeTiling(Module &module, Operation &outer,
+                                         int64_t tileSize, SelfOptStats *stats) {
+  if (outer.name() != "affine.for" || outer.operandCount() < 3 ||
+      outer.getRegions().size() != 1)
+    return false;
+  int64_t outerStep = 0;
+  if (!constantIntegerValue(outer.operand(2), outerStep) || outerStep != 1)
+    return false;
+  Block *outerBody = tileSingleBlock(outer);
+  if (!outerBody || outerBody->args().empty())
+    return false;
+  Operation *inner = tileSingleDirectAffineChild(*outerBody);
+  if (!inner || inner->operandCount() < 3 || !blockContainsOnlyLoopAndYield(*outerBody, inner))
+    return false;
+  int64_t innerStep = 0;
+  if (!constantIntegerValue(inner->operand(2), innerStep) || innerStep != 1)
+    return false;
+  Block *innerBody = tileSingleBlock(*inner);
+  if (!innerBody || innerBody->args().empty())
+    return false;
+  Value outerIv = outerBody->args()[0]->value();
+  Value innerIv = innerBody->args()[0]->value();
+  if (tileValueTreeUsesValue(inner->operand(0), outerIv) ||
+      tileValueTreeUsesValue(inner->operand(1), outerIv) ||
+      tileValueTreeUsesValue(inner->operand(2), outerIv))
+    return false;
+  if (!innerBodyIsTransposeLike(*innerBody, outerIv, innerIv))
+    return false;
+
+  Block *parent = outer.getBlock();
+  if (!parent)
+    return false;
+  int rawIndex = operationIndexInBlock(*parent, &outer);
+  if (rawIndex < 0)
+    return false;
+  std::size_t insertIndex = (std::size_t) rawIndex;
+  Location loc = outer.loc();
+  Context &ctx = module.context();
+  Operation &tileConst = insertOp(
+      *parent, insertIndex, "rv_machine.li", {}, {ctx.i(32)},
+      {{"value", ctx.integerAttr(tileSize, ctx.i(32))}}, loc);
+  Value tileStep = tileConst.result();
+
+  Operation &iTile = tileInsertAffineLoop(module, *parent, insertIndex,
+                                          outer.operand(0), outer.operand(1),
+                                          tileStep, loc, "it");
+  Block &iTileBody = *iTile.getRegions()[0]->getBlocks()[0];
+  Value iTileIv = iTileBody.args()[0]->value();
+  Operation &iEndRaw = appendOp(iTileBody, "rv_machine.addw",
+                                {iTileIv, tileStep}, {ctx.i(32)}, {}, loc);
+  Value iEnd = tileAppendMinValue(module, iTileBody, iEndRaw.result(),
+                                  outer.operand(1), loc);
+
+  Operation &jTile = tileAppendAffineLoop(module, iTileBody, inner->operand(0),
+                                          inner->operand(1), tileStep, loc, "jt");
+  Block &jTileBody = *jTile.getRegions()[0]->getBlocks()[0];
+  Value jTileIv = jTileBody.args()[0]->value();
+  Operation &jEndRaw = appendOp(jTileBody, "rv_machine.addw",
+                                {jTileIv, tileStep}, {ctx.i(32)}, {}, loc);
+  Value jEnd = tileAppendMinValue(module, jTileBody, jEndRaw.result(),
+                                  inner->operand(1), loc);
+
+  Operation &iLoop = tileAppendAffineLoop(module, jTileBody, iTileIv, iEnd,
+                                          outer.operand(2), loc, "i");
+  Block &iLoopBody = *iLoop.getRegions()[0]->getBlocks()[0];
+  Value newOuterIv = iLoopBody.args()[0]->value();
+  Operation &jLoop = tileAppendAffineLoop(module, iLoopBody, jTileIv, jEnd,
+                                          inner->operand(2), loc, "j");
+  Block &jLoopBody = *jLoop.getRegions()[0]->getBlocks()[0];
+  Value newInnerIv = jLoopBody.args()[0]->value();
+
+  std::map<std::string, Value> valueMap;
+  valueMap[valueKey(outerIv)] = newOuterIv;
+  valueMap[valueKey(innerIv)] = newInnerIv;
+  std::set<Operation*> skipOps;
+  for (auto &owned : innerBody->ops()) {
+    if (!owned || owned->isErased() || owned->name() == "affine.yield")
+      continue;
+    auto cloned = cloneForUnrolledIteration(module, *owned, valueMap, skipOps,
+                                            Value(), 0);
+    if (!cloned)
+      continue;
+    Operation &inserted = jLoopBody.addOperation(std::move(cloned));
+    for (int i = 0; i < owned->resultCount(); i++)
+      valueMap[valueKey(owned->result(i))] = inserted.result(i);
+  }
+  appendOp(jLoopBody, "affine.yield", {}, {}, {}, loc);
+  appendOp(iLoopBody, "affine.yield", {}, {}, {}, loc);
+  appendOp(jTileBody, "affine.yield", {}, {}, {}, loc);
+  appendOp(iTileBody, "affine.yield", {}, {}, {}, loc);
+  outer.markErased();
+  if (stats) {
+    stats->diagonalTransposeTiles++;
+    stats->loopTiles++;
+    stats->polyTiles++;
+  }
+  return true;
+}
+
+void runDiagonalTransposeTiling(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_DIAGONAL_TRANSPOSE_TILE", true))
+    return;
+  int64_t tileSize = 16;
+  if (const char *ts = std::getenv("SISY_SELF_TRANSPOSE_TILE_SIZE")) {
+    try {
+      tileSize = std::stoll(ts);
+    } catch (...) {
+      tileSize = 16;
+    }
+  }
+  if (tileSize <= 1)
+    tileSize = 16;
+  std::vector<Operation*> loops;
+  for (Operation *op : walk(module))
+    if (op && !op->isErased() && op->name() == "affine.for")
+      loops.push_back(op);
+  bool changed = false;
+  for (Operation *loop : loops) {
+    if (!loop || loop->isErased())
+      continue;
+    changed |= applyDiagonalTransposeTiling(module, *loop, tileSize, stats);
+  }
+  if (changed)
+    eraseMarked(module);
 }
 
 static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
@@ -3957,11 +4769,9 @@ static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
 void runLoopTiling(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_TILE", true))
     return;
-  if (envEnabled("SISY_ENABLE_SELF_TILE_LEGACY", false)) {
-    runAffineLoopTiling(module);
-    return;
-  }
   runSafeLoopTiling(module, stats);
+  if (envEnabled("SISY_ENABLE_SELF_TILE_LEGACY", false))
+    runAffineLoopTiling(module);
 }
 
 static bool isLinearizedAccess(Operation *op) {
@@ -4545,6 +5355,26 @@ static bool rewriteSignedPow2Remainder(Module &module, Operation &op,
   if (shift == 0) {
     Operation &zero = insertArithI32Constant(module, *block, index, 0, loc);
     replaceAllUses(module, op.result(), zero.result());
+    op.markErased();
+    if (stats) {
+      stats->pow2StrengthReductions++;
+      stats->worklistRewrites++;
+    }
+    return true;
+  }
+
+  if (shift == 1) {
+    Operation &one = insertI32Constant(module, *block, index, 1, loc);
+    Operation &thirtyOne = insertI32Constant(module, *block, index, 31, loc);
+    Operation &low = insertOp(*block, index, "rv_machine.and",
+                              {op.operand(0), one.result()}, {i32}, {}, loc);
+    Operation &sign = insertOp(*block, index, "rv_machine.sraw",
+                               {op.operand(0), thirtyOne.result()}, {i32}, {}, loc);
+    Operation &xorResult = insertOp(*block, index, "rv_machine.xor",
+                                    {low.result(), sign.result()}, {i32}, {}, loc);
+    Operation &result = insertOp(*block, index, "rv_machine.subw",
+                                 {xorResult.result(), sign.result()}, {i32}, {}, loc);
+    replaceAllUses(module, op.result(), result.result());
     op.markErased();
     if (stats) {
       stats->pow2StrengthReductions++;
