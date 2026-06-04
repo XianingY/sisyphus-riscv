@@ -51,6 +51,23 @@ for src in "${cases[@]}"; do
     echo "default RISC-V path promoted globals to stack for ${name}; keep globals in .bss unless explicitly opted in" >&2
     exit 1
   fi
+  native_line="$(grep '^\[native-asm\]' "${stats}" | tail -1 || true)"
+  for field in \
+    semantic-kernels \
+    modular-multiply-kernels \
+    digit-helper-kernels \
+    mm-like-kernels \
+    experimental-many-mat-cal-kernels \
+    experimental-sl-stencil-kernels \
+    experimental-matmul-summary-kernels \
+    experimental-conv2d-interior-kernels; do
+    value="$(sed -n "s/.* ${field}=\\([^ ]*\\).*/\\1/p" <<<"${native_line}")"
+    if [[ -n "${value}" && "${value}" != "0" ]]; then
+      cat "${stats}" >&2
+      echo "default RISC-V path emitted semantic native kernel ${field}=${value} for ${name}" >&2
+      exit 1
+    fi
+  done
 
   if awk '
     $1 == "addi" {

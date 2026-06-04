@@ -39,12 +39,26 @@ require_absent_file() {
   fi
 }
 
+require_stat_zero() {
+  local stats="$1"
+  local field="$2"
+  local line
+  line="$(grep '^\[native-asm\]' <<<"${stats}" | tail -1 || true)"
+  local value
+  value="$(sed -n "s/.* ${field}=\\([^ ]*\\).*/\\1/p" <<<"${line}")"
+  if [[ -n "${value}" && "${value}" != "0" ]]; then
+    echo "default RISC-V path emitted semantic native kernel ${field}=${value}" >&2
+    exit 1
+  fi
+}
+
 o1_stats="$("${COMPILER}" "${CASE}" -S -o "${OUT_DIR}/basic.o1.rv.s" \
   -O1 --target=riscv --verify-ir --stats 2>&1 >/dev/null)"
 echo "${o1_stats}"
 
 require_present "${o1_stats}" "\\[self-mlir\\].*source=ast.*frontend_path=self-mlir.*failed=0" \
   "expected default O1 production path to use AST-direct self-MLIR"
+require_stat_zero "${o1_stats}" "semantic-kernels"
 require_absent_file "${OUT_DIR}/basic.o1.rv.s" '\bvsetvli\b|\bv[ls]e[0-9]+\.v\b|\bv[ls]se[0-9]+\.v\b' \
   "default RISC-V path must not emit RVV"
 require_absent_file "${OUT_DIR}/basic.o1.rv.s" '\.L(functional|matrix|scheduling)_fixup_output|call[[:space:]]+printf' \
@@ -68,6 +82,7 @@ for name in "${perf_cases[@]}"; do
   echo "${stats}"
   require_present "${stats}" "\\[self-mlir\\].*source=ast.*failed=0" \
     "expected ${name} to compile through self-MLIR"
+  require_stat_zero "${stats}" "semantic-kernels"
   require_absent_file "${asm}" '\bvsetvli\b|\bv[ls]e[0-9]+\.v\b|\bv[ls]se[0-9]+\.v\b' \
     "default RISC-V path emitted RVV for ${name}"
 done

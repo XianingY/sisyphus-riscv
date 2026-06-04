@@ -222,8 +222,8 @@ MemoFunctionInfo classifyMemoFunction(Operation &func, int ordinal) {
 }
 
 static bool semanticKernelEnabled(const char *specific) {
-  return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", true) &&
-         envEnabled(specific, true);
+  return envEnabled("SISY_ENABLE_SELF_SEMANTIC_KERNELS", false) &&
+         envEnabled(specific, false);
 }
 
 static bool kernelIsLoadFromSlot(Value value, Value slot) {
