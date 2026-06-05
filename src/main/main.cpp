@@ -468,7 +468,6 @@ int main(int argc, char **argv) {
               << " structural-stencil3d-kernels=" << asmStats.stencil3DKernels
               << " structural-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
               << " structural-digest-kernels=" << asmStats.digestKernels
-              << " structural-collatz-sum-kernels=" << asmStats.collatzSumKernels
               << " structural-map-reduce-kernels=" << asmStats.mapReduceKernels
               << " structural-ludcmp-kernels=" << asmStats.ludcmpKernels
               << " structural-nussinov-kernels=" << asmStats.nussinovKernels

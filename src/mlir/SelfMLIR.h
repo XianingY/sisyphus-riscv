@@ -511,7 +511,6 @@ struct NativeAsmStats {
   int matmulSummaryKernels = 0;
   int conv2dInteriorKernels = 0;
   int digestKernels = 0;
-  int collatzSumKernels = 0;
   int mapReduceKernels = 0;
   int ludcmpKernels = 0;
   int nussinovKernels = 0;
