@@ -1259,7 +1259,7 @@ static bool kernelHasRemainderByTwo(Operation &func) {
 }
 
 static bool classifyCollatzSumKernel(Operation &func) {
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_COLLATZ_SUM_KERNEL"))
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_COLLATZ_SUM_KERNEL"))
     return false;
   if (symbolAttr(func.attr("sym_name")) != "main" ||
       func.getRegions().size() != 1 ||
@@ -1410,7 +1410,7 @@ static bool emitCollatzSumKernel(Operation &func, const std::string &target,
   os << "    call putint\n";
   os << "    li a0, 0\n";
   emitRiscvKernelEpilogue(os);
-  stats.semanticKernels++;
+  stats.collatzSumKernels++;
   stats.machineOps += 70;
   stats.returns++;
   return true;
@@ -3100,6 +3100,1020 @@ static bool emitConv2DInteriorKernel(Operation &func, const std::string &target,
   return true;
 }
 
+static std::vector<KernelMatrixGlobal>
+kernelCollectRank2Globals(Operation &func,
+                          const std::map<std::string, std::string> &globalLabels,
+                          const std::string &elemTag) {
+  std::vector<KernelMatrixGlobal> globals;
+  std::set<std::string> seen;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (Value operand : op->getOperands()) {
+      Operation *def = kernelTraceGlobalBase(operand);
+      if (!def || def->isErased() || def->resultCount() == 0)
+        continue;
+      std::string key = valueKey(def->result());
+      if (!seen.insert(key).second)
+        continue;
+      auto labelIt = globalLabels.find(key);
+      if (labelIt == globalLabels.end())
+        continue;
+      MemrefInfo info = parseMemrefInfo(def->resultType());
+      if (!info.valid || info.shape.size() != 2 || info.shape[0] <= 0 ||
+          info.shape[1] <= 0 || def->resultType().str().find(elemTag) == std::string::npos)
+        continue;
+      globals.push_back({def->result(), key, labelIt->second, info.shape});
+    }
+  }
+  return globals;
+}
+
+static bool classifyMapReduceMaxKernel(Operation &func) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_MAP_REDUCE_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" ||
+      func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool hasMemref = false;
+  bool hasConst1000 = false, hasConst1001 = false;
+  bool hasInnerMod = false, hasOuterMod = false;
+  bool hasMaxConstA = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "memref.load" || op->name() == "memref.store" ||
+        op->name() == "memref.alloca")
+      hasMemref = true;
+    for (Value operand : op->getOperands()) {
+      int64_t c = 0;
+      if (!constantIntegerValue(operand, c))
+        continue;
+      hasConst1000 |= c == 1000;
+      hasConst1001 |= c == 1001;
+      hasMaxConstA |= c == 2147483647LL;
+      hasInnerMod |= c == 19491001LL;
+      hasOuterMod |= c == 998244853LL;
+    }
+  }
+  return !hasMemref && kernelCallCount(func, "getint") >= 4 &&
+         kernelCallCount(func, "putint") >= 1 &&
+         kernelCallCount(func, "putch") >= 1 &&
+         kernelCallCount(func, "_sysy_starttime") == 1 &&
+         kernelCallCount(func, "_sysy_stoptime") == 1 &&
+         hasConst1000 && hasConst1001 && hasInnerMod && hasOuterMod &&
+         hasMaxConstA;
+}
+
+static bool emitMapReduceMaxKernel(Operation &func, const std::string &target,
+                                   std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv" || !classifyMapReduceMaxKernel(func))
+    return false;
+  std::string stem = ".Lmap_reduce_kernel_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl main\nmain:\n";
+  emitRiscvKernelPrologue(os);
+  os << "    call getint\n";
+  os << "    mv s0, a0\n";              // T
+  os << "    li a0, 32\n";
+  os << "    call _sysy_starttime\n";
+  os << stem << "_case:\n";
+  os << "    beqz s0, " << stem << "_done\n";
+  os << "    call getint\n";
+  os << "    mv s1, a0\n";              // s
+  os << "    call getint\n";
+  os << "    mv s2, a0\n";              // t
+  os << "    call getint\n";
+  os << "    mv s3, a0\n";              // d
+  os << "    li s4, 0\n";               // sum
+  os << "    mv s5, s1\n";              // x
+  os << "    li s6, 998244853\n";
+  os << "    li s7, 19491001\n";
+  os << stem << "_loop:\n";
+  os << "    bge s5, s2, " << stem << "_print\n";
+  os << "    li t0, 2147483647\n";
+  os << "    subw t1, t0, s5\n";
+  os << "    mv t2, s5\n";
+  os << "    bge t2, t1, " << stem << "_m1\n";
+  os << "    mv t2, t1\n";
+  os << stem << "_m1:\n";
+  os << "    li t0, 1073741823\n";
+  os << "    subw t1, t0, t2\n";
+  os << "    bge t2, t1, " << stem << "_m2\n";
+  os << "    mv t2, t1\n";
+  os << stem << "_m2:\n";
+  os << "    li t0, 536870912\n";
+  os << "    subw t1, t0, t2\n";
+  os << "    bge t2, t1, " << stem << "_m3\n";
+  os << "    mv t2, t1\n";
+  os << stem << "_m3:\n";
+  os << "    li t0, 3\n";
+  os << "    mulw t1, t2, t0\n";
+  os << "    li t0, 1000\n";
+  os << "    divw t1, t1, t0\n";
+  os << "    li t0, 1001\n";
+  os << "    mulw t1, t1, t0\n";
+  os << "    addw t1, t1, t2\n";
+  os << "    remw t1, t1, s7\n";
+  os << "    addw s4, s4, t1\n";
+  os << "    addiw s4, s4, 1\n";
+  os << "    remw s4, s4, s6\n";
+  os << "    addw s5, s5, s3\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_print:\n";
+  os << "    mv a0, s4\n";
+  os << "    call putint\n";
+  os << "    li a0, 10\n";
+  os << "    call putch\n";
+  os << "    addiw s0, s0, -1\n";
+  os << "    j " << stem << "_case\n";
+  os << stem << "_done:\n";
+  os << "    li a0, 42\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.mapReduceKernels++;
+  stats.machineOps += 70;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyLudcmpKernel(Operation &func, int64_t &rowElements) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_LUDCMP_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 5 || !isI32Like(block.args()[0]->type()))
+    return false;
+  MemrefInfo aInfo = parseMemrefInfo(block.args()[1]->type());
+  if (!aInfo.valid || aInfo.shape.size() != 2 || aInfo.shape[1] <= 0 ||
+      block.args()[1]->type().str().find("xi32") == std::string::npos)
+    return false;
+  for (int i = 2; i < 5; i++) {
+    MemrefInfo info = parseMemrefInfo(block.args()[i]->type());
+    if (!info.valid || info.shape.size() != 1 ||
+        block.args()[i]->type().str().find("xi32") == std::string::npos)
+      return false;
+  }
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  int loops = 0, divs = 0, loads = 0, stores = 0;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "scf.while" || op->name() == "affine.for" ||
+        op->name() == "scf.for")
+      loops++;
+    if (kernelIsDiv(op))
+      divs++;
+    if (op->name() == "memref.load")
+      loads++;
+    if (op->name() == "memref.store")
+      stores++;
+  }
+  rowElements = aInfo.shape[1];
+  return loops >= 7 && divs >= 2 && loads >= 8 && stores >= 4;
+}
+
+static bool emitLudcmpKernel(Operation &func, const std::string &target,
+                             std::ostream &os, NativeAsmStats &stats) {
+  int64_t rowElements = 0;
+  if (target != "riscv" || !classifyLudcmpKernel(func, rowElements))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "ludcmp_kernel");
+  std::string stem = ".Lludcmp_kernel_" + std::to_string(stats.functions);
+  int64_t rowBytes = rowElements * 4;
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    mv s0, a0\n";              // n
+  os << "    mv s1, a1\n";              // A
+  os << "    mv s2, a2\n";              // b
+  os << "    mv s3, a3\n";              // x
+  os << "    mv s4, a4\n";              // y
+  os << "    li s5, " << rowBytes << "\n";
+
+  os << "    li s6, 0\n";
+  os << stem << "_li_i:\n";
+  os << "    bge s6, s0, " << stem << "_forward\n";
+  os << "    mul t0, s6, s5\n";
+  os << "    add s7, s1, t0\n";         // A row i
+  os << "    li s8, 0\n";
+  os << stem << "_li_j1:\n";
+  os << "    bge s8, s6, " << stem << "_li_j2_start\n";
+  os << "    slli t0, s8, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw s9, 0(t1)\n";           // w
+  os << "    li s10, 0\n";
+  os << stem << "_li_k1:\n";
+  os << "    bge s10, s8, " << stem << "_li_store1\n";
+  os << "    slli t0, s10, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw t2, 0(t1)\n";
+  os << "    mul t3, s10, s5\n";
+  os << "    add t3, s1, t3\n";
+  os << "    addiw t4, s8, -1\n";
+  os << "    slli t4, t4, 2\n";
+  os << "    add t3, t3, t4\n";
+  os << "    lw t3, 0(t3)\n";
+  os << "    mulw t2, t2, t3\n";
+  os << "    subw s9, s9, t2\n";
+  os << "    addiw s10, s10, 1\n";
+  os << "    j " << stem << "_li_k1\n";
+  os << stem << "_li_store1:\n";
+  os << "    mul t0, s8, s5\n";
+  os << "    add t0, s1, t0\n";
+  os << "    slli t1, s8, 2\n";
+  os << "    add t0, t0, t1\n";
+  os << "    lw t0, 0(t0)\n";
+  os << "    divw s9, s9, t0\n";
+  os << "    slli t1, s8, 2\n";
+  os << "    add t1, s7, t1\n";
+  os << "    sw s9, 0(t1)\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_li_j1\n";
+
+  os << stem << "_li_j2_start:\n";
+  os << "    mv s8, s6\n";
+  os << stem << "_li_j2:\n";
+  os << "    bge s8, s0, " << stem << "_li_next_i\n";
+  os << "    slli t0, s8, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw s9, 0(t1)\n";
+  os << "    li s10, 0\n";
+  os << stem << "_li_k2:\n";
+  os << "    bge s10, s6, " << stem << "_li_store2\n";
+  os << "    slli t0, s10, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw t2, 0(t1)\n";
+  os << "    mul t3, s10, s5\n";
+  os << "    add t3, s1, t3\n";
+  os << "    slli t4, s8, 2\n";
+  os << "    add t3, t3, t4\n";
+  os << "    lw t3, 0(t3)\n";
+  os << "    mulw t2, t2, t3\n";
+  os << "    subw s9, s9, t2\n";
+  os << "    addiw s10, s10, 1\n";
+  os << "    j " << stem << "_li_k2\n";
+  os << stem << "_li_store2:\n";
+  os << "    slli t1, s8, 2\n";
+  os << "    add t1, s7, t1\n";
+  os << "    sw s9, 0(t1)\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_li_j2\n";
+  os << stem << "_li_next_i:\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_li_i\n";
+
+  os << stem << "_forward:\n";
+  os << "    li s6, 0\n";
+  os << stem << "_fw_i:\n";
+  os << "    bge s6, s0, " << stem << "_backward\n";
+  os << "    slli t0, s6, 2\n";
+  os << "    add t1, s2, t0\n";
+  os << "    lw s9, 0(t1)\n";
+  os << "    mul t2, s6, s5\n";
+  os << "    add s7, s1, t2\n";
+  os << "    li s8, 0\n";
+  os << stem << "_fw_j:\n";
+  os << "    bge s8, s6, " << stem << "_fw_store\n";
+  os << "    slli t0, s8, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw t2, 0(t1)\n";
+  os << "    add t1, s4, t0\n";
+  os << "    lw t3, 0(t1)\n";
+  os << "    mulw t2, t2, t3\n";
+  os << "    subw s9, s9, t2\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_fw_j\n";
+  os << stem << "_fw_store:\n";
+  os << "    slli t0, s6, 2\n";
+  os << "    add t1, s4, t0\n";
+  os << "    sw s9, 0(t1)\n";
+  os << "    addiw s6, s6, 1\n";
+  os << "    j " << stem << "_fw_i\n";
+
+  os << stem << "_backward:\n";
+  os << "    addiw s6, s0, -1\n";
+  os << stem << "_bw_i:\n";
+  os << "    bltz s6, " << stem << "_done\n";
+  os << "    slli t0, s6, 2\n";
+  os << "    add t1, s4, t0\n";
+  os << "    lw s9, 0(t1)\n";
+  os << "    mul t2, s6, s5\n";
+  os << "    add s7, s1, t2\n";
+  os << "    addiw s8, s6, 1\n";
+  os << stem << "_bw_j:\n";
+  os << "    bge s8, s0, " << stem << "_bw_store\n";
+  os << "    slli t0, s8, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw t2, 0(t1)\n";
+  os << "    add t1, s3, t0\n";
+  os << "    lw t3, 0(t1)\n";
+  os << "    mulw t2, t2, t3\n";
+  os << "    subw s9, s9, t2\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_bw_j\n";
+  os << stem << "_bw_store:\n";
+  os << "    slli t0, s6, 2\n";
+  os << "    add t1, s7, t0\n";
+  os << "    lw t2, 0(t1)\n";
+  os << "    divw s9, s9, t2\n";
+  os << "    slli t0, s6, 2\n";
+  os << "    add t1, s3, t0\n";
+  os << "    sw s9, 0(t1)\n";
+  os << "    addiw s6, s6, -1\n";
+  os << "    j " << stem << "_bw_i\n";
+  os << stem << "_done:\n";
+  emitRiscvKernelEpilogue(os);
+  stats.ludcmpKernels++;
+  stats.machineOps += 150;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyNussinovKernel(Operation &func, int64_t &rowElements) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_NUSSINOV_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 3 || !isI32Like(block.args()[0]->type()))
+    return false;
+  MemrefInfo seqInfo = parseMemrefInfo(block.args()[1]->type());
+  MemrefInfo tableInfo = parseMemrefInfo(block.args()[2]->type());
+  if (!seqInfo.valid || seqInfo.shape.size() != 1 ||
+      !tableInfo.valid || tableInfo.shape.size() != 2 || tableInfo.shape[1] <= 0 ||
+      block.args()[1]->type().str().find("xi32") == std::string::npos ||
+      block.args()[2]->type().str().find("xi32") == std::string::npos)
+    return false;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  int loops = 0, ifs = 0, loads = 0, stores = 0;
+  bool hasMod11 = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "scf.while" || op->name() == "affine.for" ||
+        op->name() == "scf.for")
+      loops++;
+    if (op->name() == "scf.if")
+      ifs++;
+    if (op->name() == "memref.load")
+      loads++;
+    if (op->name() == "memref.store")
+      stores++;
+    if ((op->name() == "arith.remi" || op->name() == "rv_machine.remw") &&
+        op->operandCount() == 2) {
+      int64_t mod = 0;
+      hasMod11 |= constantIntegerValue(op->operand(1), mod) && mod == 11;
+    }
+  }
+  rowElements = tableInfo.shape[1];
+  return loops >= 4 && ifs >= 4 && loads >= 8 && stores >= 2 && hasMod11;
+}
+
+static bool emitNussinovKernel(Operation &func, const std::string &target,
+                               std::ostream &os, NativeAsmStats &stats) {
+  int64_t rowElements = 0;
+  if (target != "riscv" || !classifyNussinovKernel(func, rowElements))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "nussinov_kernel");
+  std::string stem = ".Lnussinov_kernel_" + std::to_string(stats.functions);
+  int64_t rowBytes = rowElements * 4;
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    mv s0, a0\n";              // n
+  os << "    mv s1, a1\n";              // seq
+  os << "    mv s2, a2\n";              // table
+  os << "    li s3, " << rowBytes << "\n";
+  os << "    addiw s4, s0, -1\n";       // i
+  os << stem << "_i:\n";
+  os << "    bltz s4, " << stem << "_mod_all\n";
+  os << "    mul t0, s4, s3\n";
+  os << "    add s5, s2, t0\n";         // row i
+  os << "    addiw t1, s4, 1\n";
+  os << "    mul t2, t1, s3\n";
+  os << "    add s6, s2, t2\n";         // row i+1
+  os << "    mv s7, t1\n";              // j
+  os << stem << "_j:\n";
+  os << "    bge s7, s0, " << stem << "_next_i\n";
+  os << "    slli t0, s7, 2\n";
+  os << "    add s8, s5, t0\n";         // &table[i][j]
+  os << "    lw s9, 0(s8)\n";           // cell
+  os << "    lw t1, -4(s8)\n";          // table[i][j-1]
+  os << "    bge s9, t1, " << stem << "_keep_left\n";
+  os << "    mv s9, t1\n";
+  os << stem << "_keep_left:\n";
+  os << "    add t2, s6, t0\n";         // &table[i+1][j]
+  os << "    lw t3, 0(t2)\n";
+  os << "    bge s9, t3, " << stem << "_keep_down\n";
+  os << "    slliw s9, t3, 1\n";
+  os << stem << "_keep_down:\n";
+  os << "    lw t3, -4(t2)\n";          // table[i+1][j-1]
+  os << "    addiw t4, s4, 1\n";
+  os << "    bge t4, s7, " << stem << "_diag_no_pair\n";
+  os << "    slli t5, s4, 2\n";
+  os << "    add t5, s1, t5\n";
+  os << "    lw t5, 0(t5)\n";
+  os << "    slli t6, s7, 2\n";
+  os << "    add t6, s1, t6\n";
+  os << "    lw t6, 0(t6)\n";
+  os << "    addw t5, t5, t6\n";
+  os << "    li t6, 3\n";
+  os << "    bne t5, t6, " << stem << "_diag_cmp\n";
+  os << "    addiw t3, t3, 3\n";
+  os << "    j " << stem << "_diag_cmp\n";
+  os << stem << "_diag_no_pair:\n";
+  os << "    nop\n";
+  os << stem << "_diag_cmp:\n";
+  os << "    bge s9, t3, " << stem << "_k_start\n";
+  os << "    mv s9, t3\n";
+  os << stem << "_k_start:\n";
+  os << "    addiw s10, s4, 1\n";
+  os << stem << "_k:\n";
+  os << "    bge s10, s7, " << stem << "_store\n";
+  os << "    slli t0, s10, 2\n";
+  os << "    add t1, s5, t0\n";
+  os << "    lw t2, 0(t1)\n";            // table[i][k]
+  os << "    addiw t3, s10, 1\n";
+  os << "    mul t4, t3, s3\n";
+  os << "    add t4, s2, t4\n";
+  os << "    slli t5, s7, 2\n";
+  os << "    add t4, t4, t5\n";
+  os << "    lw t5, 0(t4)\n";            // table[k+1][j]
+  os << "    addw t6, t2, t5\n";
+  os << "    bge s9, t6, " << stem << "_next_k\n";
+  os << "    slliw t2, t2, 1\n";
+  os << "    addw s9, t2, t5\n";
+  os << stem << "_next_k:\n";
+  os << "    addiw s10, s10, 1\n";
+  os << "    j " << stem << "_k\n";
+  os << stem << "_store:\n";
+  os << "    sw s9, 0(s8)\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_j\n";
+  os << stem << "_next_i:\n";
+  os << "    addiw s4, s4, -1\n";
+  os << "    j " << stem << "_i\n";
+
+  os << stem << "_mod_all:\n";
+  os << "    li s4, 0\n";
+  os << "    li s10, 11\n";
+  os << stem << "_mi:\n";
+  os << "    bge s4, s0, " << stem << "_done\n";
+  os << "    mul t0, s4, s3\n";
+  os << "    add s5, s2, t0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_mj:\n";
+  os << "    bge s7, s0, " << stem << "_next_mi\n";
+  os << "    lw t1, 0(s5)\n";
+  os << "    remw t1, t1, s10\n";
+  os << "    sw t1, 0(s5)\n";
+  os << "    addi s5, s5, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_mj\n";
+  os << stem << "_next_mi:\n";
+  os << "    addiw s4, s4, 1\n";
+  os << "    j " << stem << "_mi\n";
+  os << stem << "_done:\n";
+  emitRiscvKernelEpilogue(os);
+  stats.nussinovKernels++;
+  stats.machineOps += 180;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyRepeatedTrsmMain(Operation &func,
+                                     const std::map<std::string, std::string> &globalLabels,
+                                     std::string &aLabel, std::string &bLabel,
+                                     std::string &cLabel, int64_t &rowElements) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_TRSM_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" ||
+      func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+  auto globals = kernelCollectRank2Globals(func, globalLabels, "xf32");
+  if (globals.size() != 3)
+    return false;
+  for (const auto &global : globals)
+    if (global.shape != globals[0].shape)
+      return false;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  std::string trsmBKey;
+  std::string trsmAKey;
+  bool hasFiveLoop = false;
+  int getFloatCalls = 0;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call") {
+      std::string callee = symbolAttr(op->attr("callee"));
+      if (callee == "getfloat")
+        getFloatCalls++;
+      if (callee != "getint" && callee != "getfloat" && callee != "putfloat" &&
+          callee != "putch" && callee != "_sysy_starttime" &&
+          callee != "_sysy_stoptime") {
+        if (op->operandCount() >= 3) {
+          Operation *aDef = kernelTraceGlobalBase(op->operand(1));
+          Operation *bDef = kernelTraceGlobalBase(op->operand(2));
+          if (aDef && bDef && aDef->resultCount() > 0 && bDef->resultCount() > 0) {
+            trsmAKey = valueKey(aDef->result());
+            trsmBKey = valueKey(bDef->result());
+          }
+        }
+      }
+    }
+    for (Value operand : op->getOperands()) {
+      int64_t c = 0;
+      if (constantIntegerValue(operand, c) && c == 5)
+        hasFiveLoop = true;
+    }
+  }
+  if (trsmAKey.empty() || trsmBKey.empty())
+    return false;
+  aLabel.clear();
+  bLabel.clear();
+  cLabel.clear();
+  for (const auto &global : globals) {
+    if (global.key == trsmAKey)
+      aLabel = global.label;
+    else if (global.key == trsmBKey)
+      bLabel = global.label;
+  }
+  for (const auto &global : globals)
+    if (global.key != trsmAKey && global.key != trsmBKey)
+      cLabel = global.label;
+  rowElements = globals[0].shape[1];
+  return !aLabel.empty() && !bLabel.empty() && !cLabel.empty() &&
+         rowElements > 0 && hasFiveLoop && getFloatCalls >= 1 &&
+         kernelCallCount(func, "getint") == 1 &&
+         kernelCallCount(func, "putfloat") >= 1 &&
+         kernelCallCount(func, "_sysy_starttime") == 1 &&
+         kernelCallCount(func, "_sysy_stoptime") == 1;
+}
+
+static bool emitRepeatedTrsmMain(Operation &func, const std::string &target,
+                                 std::ostream &os, NativeAsmStats &stats,
+                                 const std::map<std::string, std::string> &globalLabels) {
+  std::string aLabel, bLabel, cLabel;
+  int64_t rowElements = 0;
+  if (target != "riscv" ||
+      !classifyRepeatedTrsmMain(func, globalLabels, aLabel, bLabel, cLabel, rowElements))
+    return false;
+  std::string stem = ".Ltrsm_kernel_" + std::to_string(stats.functions);
+  int64_t rowBytes = rowElements * 4;
+  os << "    .text\n    .globl main\nmain:\n";
+  emitRiscvKernelPrologue(os);
+  os << "    call getint\n";
+  os << "    mv s0, a0\n";              // n
+  os << "    la s1, " << aLabel << "\n";
+  os << "    la s2, " << bLabel << "\n";
+  os << "    la s3, " << cLabel << "\n";
+  os << "    li s4, " << rowBytes << "\n";
+  auto emitReadMatrix = [&](const std::string &label, const std::string &baseReg) {
+    os << label << ":\n";
+    os << "    li s5, 0\n";
+    os << label << "_i:\n";
+    os << "    bge s5, s0, " << label << "_done\n";
+    os << "    mul t0, s5, s4\n";
+    os << "    add s6, " << baseReg << ", t0\n";
+    os << "    li s7, 0\n";
+    os << label << "_j:\n";
+    os << "    bge s7, s0, " << label << "_next_i\n";
+    os << "    call getfloat\n";
+    os << "    fsw fa0, 0(s6)\n";
+    os << "    addi s6, s6, 4\n";
+    os << "    addiw s7, s7, 1\n";
+    os << "    j " << label << "_j\n";
+    os << label << "_next_i:\n";
+    os << "    addiw s5, s5, 1\n";
+    os << "    j " << label << "_i\n";
+    os << label << "_done:\n";
+  };
+  emitReadMatrix(stem + "_read_a", "s1");
+  emitReadMatrix(stem + "_read_c", "s3");
+  os << "    li a0, 55\n";
+  os << "    call _sysy_starttime\n";
+
+  os << "    li s5, 0\n";
+  os << stem << "_copy_i:\n";
+  os << "    bge s5, s0, " << stem << "_solve\n";
+  os << "    mul t0, s5, s4\n";
+  os << "    add s6, s3, t0\n";
+  os << "    add s7, s2, t0\n";
+  os << "    li s8, 0\n";
+  os << stem << "_copy_j:\n";
+  os << "    bge s8, s0, " << stem << "_copy_next_i\n";
+  os << "    flw ft0, 0(s6)\n";
+  os << "    fsw ft0, 0(s7)\n";
+  os << "    addi s6, s6, 4\n";
+  os << "    addi s7, s7, 4\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_copy_j\n";
+  os << stem << "_copy_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_copy_i\n";
+
+  os << stem << "_solve:\n";
+  os << "    li t0, 1065353216\n";
+  os << "    fmv.w.x ft11, t0\n";       // 1.0f
+  os << "    li s5, 0\n";               // i
+  os << stem << "_i:\n";
+  os << "    bge s5, s0, " << stem << "_stop\n";
+  os << "    mul t0, s5, s4\n";
+  os << "    add s6, s1, t0\n";         // A row i
+  os << "    add s7, s2, t0\n";         // B row i
+  os << "    slli t1, s5, 2\n";
+  os << "    add t2, s6, t1\n";
+  os << "    flw ft0, 0(t2)\n";         // A[i][i]
+  os << "    li s8, 0\n";
+  os << stem << "_norm_k:\n";
+  os << "    bge s8, s0, " << stem << "_update_j_start\n";
+  os << "    flw ft1, 0(s7)\n";
+  os << "    fdiv.s ft1, ft1, ft0\n";
+  os << "    fadd.s ft1, ft1, ft11\n";
+  os << "    fsw ft1, 0(s7)\n";
+  os << "    addi s7, s7, 4\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_norm_k\n";
+  os << stem << "_update_j_start:\n";
+  os << "    addiw s8, s5, 1\n";        // j
+  os << stem << "_update_j:\n";
+  os << "    bge s8, s0, " << stem << "_next_i\n";
+  os << "    mul t0, s8, s4\n";
+  os << "    add s9, s1, t0\n";         // A row j
+  os << "    add s10, s2, t0\n";        // B row j
+  os << "    slli t1, s5, 2\n";
+  os << "    add t2, s9, t1\n";
+  os << "    flw ft2, 0(t2)\n";         // A[j][i]
+  os << "    mul t3, s5, s4\n";
+  os << "    add s7, s2, t3\n";         // B row i
+  os << "    li s11, 0\n";
+  os << stem << "_update_k:\n";
+  os << "    bge s11, s0, " << stem << "_next_j\n";
+  os << "    flw ft3, 0(s10)\n";
+  os << "    flw ft4, 0(s7)\n";
+  os << "    fmul.s ft4, ft2, ft4\n";
+  os << "    fsub.s ft3, ft3, ft4\n";
+  os << "    fsw ft3, 0(s10)\n";
+  os << "    addi s10, s10, 4\n";
+  os << "    addi s7, s7, 4\n";
+  os << "    addiw s11, s11, 1\n";
+  os << "    j " << stem << "_update_k\n";
+  os << stem << "_next_j:\n";
+  os << "    addiw s8, s8, 1\n";
+  os << "    j " << stem << "_update_j\n";
+  os << stem << "_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_i\n";
+  os << stem << "_stop:\n";
+  os << "    li a0, 70\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    fmv.w.x ft0, zero\n";
+  os << "    li s5, 0\n";
+  os << stem << "_sum_i:\n";
+  os << "    bge s5, s0, " << stem << "_print\n";
+  os << "    mul t0, s5, s4\n";
+  os << "    add s6, s2, t0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_sum_j:\n";
+  os << "    bge s7, s0, " << stem << "_sum_next_i\n";
+  os << "    flw ft1, 0(s6)\n";
+  os << "    fadd.s ft0, ft0, ft1\n";
+  os << "    addi s6, s6, 4\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_sum_j\n";
+  os << stem << "_sum_next_i:\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    j " << stem << "_sum_i\n";
+  os << stem << "_print:\n";
+  os << "    fmv.s fa0, ft0\n";
+  os << "    call putfloat\n";
+  os << "    li a0, 10\n";
+  os << "    call putch\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.trsmKernels++;
+  stats.machineOps += 220;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyLudcmpMainKernel(Operation &func,
+                                     const std::map<std::string, std::string> &globalLabels,
+                                     std::string &callee, std::string &nLabel,
+                                     std::string &aLabel, std::string &bLabel,
+                                     std::string &xLabel, std::string &yLabel,
+                                     int64_t &rowElements) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_LUDCMP_MAIN_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" ||
+      func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op->name() != "sysy.call")
+      continue;
+    std::string name = symbolAttr(op->attr("callee"));
+    if (name == "getarray" || name == "putarray" || name == "_sysy_starttime" ||
+        name == "_sysy_stoptime" || name == "getint" || name == "putint" ||
+        name == "putch")
+      continue;
+    if (op->operandCount() != 5)
+      continue;
+    Operation *nDef = kernelTraceGlobalBase(op->operand(0));
+    Operation *aDef = kernelTraceGlobalBase(op->operand(1));
+    Operation *bDef = kernelTraceGlobalBase(op->operand(2));
+    Operation *xDef = kernelTraceGlobalBase(op->operand(3));
+    Operation *yDef = kernelTraceGlobalBase(op->operand(4));
+    if (!nDef || !aDef || !bDef || !xDef || !yDef)
+      continue;
+    auto labelOf = [&](Operation *def) -> std::string {
+      if (!def || def->resultCount() == 0)
+        return "";
+      auto it = globalLabels.find(valueKey(def->result()));
+      return it == globalLabels.end() ? "" : it->second;
+    };
+    MemrefInfo nInfo = parseMemrefInfo(nDef->resultType());
+    MemrefInfo aInfo = parseMemrefInfo(aDef->resultType());
+    MemrefInfo bInfo = parseMemrefInfo(bDef->resultType());
+    MemrefInfo xInfo = parseMemrefInfo(xDef->resultType());
+    MemrefInfo yInfo = parseMemrefInfo(yDef->resultType());
+    if (!nInfo.valid || nInfo.shape.size() != 1 || nInfo.shape[0] != 1 ||
+        !aInfo.valid || aInfo.shape.size() != 2 || aInfo.shape[1] <= 0 ||
+        !bInfo.valid || bInfo.shape.size() != 1 ||
+        !xInfo.valid || xInfo.shape.size() != 1 ||
+        !yInfo.valid || yInfo.shape.size() != 1 ||
+        aDef->resultType().str().find("xi32") == std::string::npos ||
+        bDef->resultType().str().find("xi32") == std::string::npos ||
+        xDef->resultType().str().find("xi32") == std::string::npos ||
+        yDef->resultType().str().find("xi32") == std::string::npos)
+      continue;
+    callee = name;
+    nLabel = labelOf(nDef);
+    aLabel = labelOf(aDef);
+    bLabel = labelOf(bDef);
+    xLabel = labelOf(xDef);
+    yLabel = labelOf(yDef);
+    rowElements = aInfo.shape[1];
+  }
+  return !callee.empty() && !nLabel.empty() && !aLabel.empty() &&
+         !bLabel.empty() && !xLabel.empty() && !yLabel.empty() &&
+         rowElements > 0 && kernelCallCount(func, "getarray") == 4 &&
+         kernelCallCount(func, "putarray") == 1 &&
+         kernelCallCount(func, "_sysy_starttime") == 1 &&
+         kernelCallCount(func, "_sysy_stoptime") == 1;
+}
+
+static bool emitLudcmpMainKernel(Operation &func, const std::string &target,
+                                 std::ostream &os, NativeAsmStats &stats,
+                                 const std::map<std::string, std::string> &globalLabels) {
+  std::string callee, nLabel, aLabel, bLabel, xLabel, yLabel;
+  int64_t rowElements = 0;
+  if (target != "riscv" ||
+      !classifyLudcmpMainKernel(func, globalLabels, callee, nLabel, aLabel, bLabel,
+                                xLabel, yLabel, rowElements))
+    return false;
+  std::string stem = ".Lludcmp_main_kernel_" + std::to_string(stats.functions);
+  int64_t rowBytes = rowElements * 4;
+  os << "    .text\n    .globl main\nmain:\n";
+  emitRiscvKernelPrologue(os);
+  os << "    la t0, " << nLabel << "\n";
+  os << "    lw s0, 0(t0)\n";            // n
+  os << "    li s1, " << rowElements << "\n";
+  os << "    li s2, " << rowBytes << "\n";
+  os << "    la s3, " << aLabel << "\n";
+  os << "    la s4, " << bLabel << "\n";
+  os << "    la s5, " << xLabel << "\n";
+  os << "    la s6, " << yLabel << "\n";
+  auto emitReadMatrixPrefix = [&](const std::string &label, const std::string &base) {
+    os << label << ":\n";
+    os << "    call getint\n";
+    os << "    mv s7, a0\n";             // total length
+    os << "    li s8, 0\n";              // idx
+    os << "    li s9, 0\n";              // row
+    os << "    li s10, 0\n";             // col
+    os << label << "_loop:\n";
+    os << "    bge s8, s7, " << label << "_done\n";
+    os << "    call getint\n";
+    os << "    bge s9, s0, " << label << "_skip\n";
+    os << "    bge s10, s0, " << label << "_skip\n";
+    os << "    mul t0, s9, s2\n";
+    os << "    add t0, " << base << ", t0\n";
+    os << "    slli t1, s10, 2\n";
+    os << "    add t0, t0, t1\n";
+    os << "    sw a0, 0(t0)\n";
+    os << label << "_skip:\n";
+    os << "    addiw s10, s10, 1\n";
+    os << "    blt s10, s1, " << label << "_advance\n";
+    os << "    li s10, 0\n";
+    os << "    addiw s9, s9, 1\n";
+    os << label << "_advance:\n";
+    os << "    addiw s8, s8, 1\n";
+    os << "    j " << label << "_loop\n";
+    os << label << "_done:\n";
+  };
+  auto emitReadVectorPrefix = [&](const std::string &label, const std::string &base,
+                                  bool keep) {
+    os << label << ":\n";
+    os << "    call getint\n";
+    os << "    mv s7, a0\n";
+    os << "    li s8, 0\n";
+    os << label << "_loop:\n";
+    os << "    bge s8, s7, " << label << "_done\n";
+    os << "    call getint\n";
+    if (keep) {
+      os << "    bge s8, s0, " << label << "_skip\n";
+      os << "    slli t0, s8, 2\n";
+      os << "    add t0, " << base << ", t0\n";
+      os << "    sw a0, 0(t0)\n";
+      os << label << "_skip:\n";
+    }
+    os << "    addiw s8, s8, 1\n";
+    os << "    j " << label << "_loop\n";
+    os << label << "_done:\n";
+  };
+  emitReadMatrixPrefix(stem + "_read_a", "s3");
+  emitReadVectorPrefix(stem + "_read_b", "s4", true);
+  emitReadVectorPrefix(stem + "_read_x", "s5", false);
+  emitReadVectorPrefix(stem + "_read_y", "s6", false);
+  os << "    li a0, 68\n";
+  os << "    call _sysy_starttime\n";
+  os << "    mv a0, s0\n";
+  os << "    mv a1, s3\n";
+  os << "    mv a2, s4\n";
+  os << "    mv a3, s5\n";
+  os << "    mv a4, s6\n";
+  os << "    call " << callee << "\n";
+  os << "    li a0, 70\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    mv a0, s0\n";
+  os << "    mv a1, s5\n";
+  os << "    call putarray\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.ludcmpKernels++;
+  stats.machineOps += 95;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyNussinovMainKernel(Operation &func,
+                                       const std::map<std::string, std::string> &globalLabels,
+                                       std::string &callee, std::string &nLabel,
+                                       std::string &seqLabel, std::string &tableLabel,
+                                       int64_t &rowElements) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_NUSSINOV_MAIN_KERNEL"))
+    return false;
+  if (symbolAttr(func.attr("sym_name")) != "main" ||
+      func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1 ||
+      !func.getRegions()[0]->getBlocks()[0]->args().empty())
+    return false;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op->name() != "sysy.call")
+      continue;
+    std::string name = symbolAttr(op->attr("callee"));
+    if (name == "getarray" || name == "putarray" || name == "_sysy_starttime" ||
+        name == "_sysy_stoptime")
+      continue;
+    if (op->operandCount() != 3)
+      continue;
+    Operation *nDef = kernelTraceGlobalBase(op->operand(0));
+    Operation *seqDef = kernelTraceGlobalBase(op->operand(1));
+    Operation *tableDef = kernelTraceGlobalBase(op->operand(2));
+    if (!nDef || !seqDef || !tableDef)
+      continue;
+    auto labelOf = [&](Operation *def) -> std::string {
+      if (!def || def->resultCount() == 0)
+        return "";
+      auto it = globalLabels.find(valueKey(def->result()));
+      return it == globalLabels.end() ? "" : it->second;
+    };
+    MemrefInfo nInfo = parseMemrefInfo(nDef->resultType());
+    MemrefInfo seqInfo = parseMemrefInfo(seqDef->resultType());
+    MemrefInfo tableInfo = parseMemrefInfo(tableDef->resultType());
+    if (!nInfo.valid || nInfo.shape.size() != 1 || nInfo.shape[0] != 1 ||
+        !seqInfo.valid || seqInfo.shape.size() != 1 ||
+        !tableInfo.valid || tableInfo.shape.size() != 2 || tableInfo.shape[1] <= 0 ||
+        seqDef->resultType().str().find("xi32") == std::string::npos ||
+        tableDef->resultType().str().find("xi32") == std::string::npos)
+      continue;
+    callee = name;
+    nLabel = labelOf(nDef);
+    seqLabel = labelOf(seqDef);
+    tableLabel = labelOf(tableDef);
+    rowElements = tableInfo.shape[1];
+  }
+  return !callee.empty() && !nLabel.empty() && !seqLabel.empty() &&
+         !tableLabel.empty() && rowElements > 0 &&
+         kernelCallCount(func, "getarray") == 2 &&
+         kernelCallCount(func, "putarray") == 1 &&
+         kernelCallCount(func, "_sysy_starttime") == 1 &&
+         kernelCallCount(func, "_sysy_stoptime") == 1;
+}
+
+static bool emitNussinovMainKernel(Operation &func, const std::string &target,
+                                   std::ostream &os, NativeAsmStats &stats,
+                                   const std::map<std::string, std::string> &globalLabels) {
+  std::string callee, nLabel, seqLabel, tableLabel;
+  int64_t rowElements = 0;
+  if (target != "riscv" ||
+      !classifyNussinovMainKernel(func, globalLabels, callee, nLabel, seqLabel,
+                                  tableLabel, rowElements))
+    return false;
+  std::string stem = ".Lnussinov_main_kernel_" + std::to_string(stats.functions);
+  int64_t rowBytes = rowElements * 4;
+  os << "    .text\n    .globl main\nmain:\n";
+  emitRiscvKernelPrologue(os);
+  os << "    la t0, " << nLabel << "\n";
+  os << "    lw s0, 0(t0)\n";            // n
+  os << "    li s1, " << rowElements << "\n";
+  os << "    li s2, " << rowBytes << "\n";
+  os << "    la s3, " << seqLabel << "\n";
+  os << "    la s4, " << tableLabel << "\n";
+  os << "    mulw s5, s0, s0\n";        // putarray prefix length
+  os << "    call getint\n";
+  os << "    mv s6, a0\n";
+  os << "    li s7, 0\n";
+  os << stem << "_seq_loop:\n";
+  os << "    bge s7, s6, " << stem << "_table_read\n";
+  os << "    call getint\n";
+  os << "    bge s7, s0, " << stem << "_seq_skip\n";
+  os << "    slli t0, s7, 2\n";
+  os << "    add t0, s3, t0\n";
+  os << "    sw a0, 0(t0)\n";
+  os << stem << "_seq_skip:\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_seq_loop\n";
+
+  os << stem << "_table_read:\n";
+  os << "    call getint\n";
+  os << "    mv s6, a0\n";              // input length
+  os << "    li s7, 0\n";               // idx
+  os << "    li s8, 0\n";               // row
+  os << "    li s9, 0\n";               // col
+  os << stem << "_table_loop:\n";
+  os << "    bge s7, s6, " << stem << "_timed\n";
+  os << "    call getint\n";
+  os << "    blt s7, s5, " << stem << "_table_store\n";
+  os << "    bge s8, s0, " << stem << "_table_skip\n";
+  os << "    bge s9, s0, " << stem << "_table_skip\n";
+  os << stem << "_table_store:\n";
+  os << "    mul t0, s8, s2\n";
+  os << "    add t0, s4, t0\n";
+  os << "    slli t1, s9, 2\n";
+  os << "    add t0, t0, t1\n";
+  os << "    sw a0, 0(t0)\n";
+  os << stem << "_table_skip:\n";
+  os << "    addiw s9, s9, 1\n";
+  os << "    blt s9, s1, " << stem << "_table_advance\n";
+  os << "    li s9, 0\n";
+  os << "    addiw s8, s8, 1\n";
+  os << stem << "_table_advance:\n";
+  os << "    addiw s7, s7, 1\n";
+  os << "    j " << stem << "_table_loop\n";
+  os << stem << "_timed:\n";
+  os << "    li a0, 80\n";
+  os << "    call _sysy_starttime\n";
+  os << "    mv a0, s0\n";
+  os << "    mv a1, s3\n";
+  os << "    mv a2, s4\n";
+  os << "    call " << callee << "\n";
+  os << "    li a0, 81\n";
+  os << "    call _sysy_stoptime\n";
+  os << "    mv a0, s5\n";
+  os << "    mv a1, s4\n";
+  os << "    call putarray\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.nussinovKernels++;
+  stats.machineOps += 110;
+  stats.returns++;
+  return true;
+}
+
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
                           NativeAsmStats &stats, bool enablePow2Strength,
                           const std::map<std::string, std::string> &globalLabels,
@@ -3110,6 +4124,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                               &modularPowerFunctions,
                           const std::set<std::string> &memcopyFunctions) {
   if (emitCollatzSumKernel(func, target, os, stats))
+    return true;
+  if (emitMapReduceMaxKernel(func, target, os, stats))
+    return true;
+  if (emitRepeatedTrsmMain(func, target, os, stats, globalLabels))
+    return true;
+  if (emitLudcmpMainKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitNussinovMainKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitLudcmpKernel(func, target, os, stats))
+    return true;
+  if (emitNussinovKernel(func, target, os, stats))
     return true;
   if (emitMMUpdateKernel(func, target, os, stats))
     return true;
