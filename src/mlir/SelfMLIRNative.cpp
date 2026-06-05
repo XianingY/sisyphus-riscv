@@ -506,6 +506,7 @@ static bool emitTriangularTransposeKernel(Operation &func, const std::string &ta
   os << name << ":\n";
   os << "    divw t0, a0, a2\n";          // colsize = n / rowsize
   os << "    slliw t6, t0, 2\n";          // destination column stride in bytes
+  os << "    li a7, 4\n";
   os << "    li t1, 0\n";                 // i
   os << stem << "_outer:\n";
   os << "    bge t1, t0, " << stem << "_done\n";
@@ -521,15 +522,35 @@ static bool emitTriangularTransposeKernel(Operation &func, const std::string &ta
   os << "    add t3, a1, t3\n";           // source pointer
   os << "    slli t4, t1, 2\n";
   os << "    add t4, a1, t4\n";           // destination pointer
-  os << "    li t2, 0\n";                 // j
-  os << stem << "_inner:\n";
-  os << "    bge t2, a4, " << stem << "_next_i\n";
+  os << "    slli a5, t6, 1\n";           // 2 * destination stride
+  os << "    add a6, a5, t6\n";           // 3 * destination stride
+  os << "    slli a0, t6, 2\n";           // 4 * destination stride
+  os << "    mv t2, a4\n";                // remaining j elements
+  os << stem << "_inner4:\n";
+  os << "    blt t2, a7, " << stem << "_tail\n";
+  os << "    lw t5, 0(t3)\n";
+  os << "    sw t5, 0(t4)\n";
+  os << "    lw t5, 4(t3)\n";
+  os << "    add a3, t4, t6\n";
+  os << "    sw t5, 0(a3)\n";
+  os << "    lw t5, 8(t3)\n";
+  os << "    add a3, t4, a5\n";
+  os << "    sw t5, 0(a3)\n";
+  os << "    lw t5, 12(t3)\n";
+  os << "    add a3, t4, a6\n";
+  os << "    sw t5, 0(a3)\n";
+  os << "    addi t3, t3, 16\n";
+  os << "    add t4, t4, a0\n";
+  os << "    addiw t2, t2, -4\n";
+  os << "    j " << stem << "_inner4\n";
+  os << stem << "_tail:\n";
+  os << "    blez t2, " << stem << "_next_i\n";
   os << "    lw t5, 0(t3)\n";
   os << "    sw t5, 0(t4)\n";
   os << "    addi t3, t3, 4\n";
   os << "    add t4, t4, t6\n";
-  os << "    addiw t2, t2, 1\n";
-  os << "    j " << stem << "_inner\n";
+  os << "    addiw t2, t2, -1\n";
+  os << "    j " << stem << "_tail\n";
   os << stem << "_next_i:\n";
   os << "    addiw t1, t1, 1\n";
   os << "    j " << stem << "_outer\n";
@@ -1861,7 +1882,9 @@ static bool emitStencil3DKernel(Operation &func, const std::string &target,
   os << "    addi s11, s11, -4\n";
   os << "    addiw a6, s0, -2\n";       // remaining inner elements
   os << "    lw t5, -4(a4)\n";          // loop-carried left neighbor
-  os << stem << "_k:\n";
+  os << "    li t2, 3\n";
+  os << "    beq s1, t2, " << stem << "_k_fast_setup\n";
+  os << stem << "_k_generic:\n";
   os << "    blez a6, " << stem << "_next_j\n";
   os << "    lw t0, 0(s9)\n";
   os << "    lw t1, 0(s10)\n";
@@ -1875,18 +1898,7 @@ static bool emitStencil3DKernel(Operation &func, const std::string &target,
   os << "    addw t0, t0, t1\n";
   os << "    lw t1, 0(s11)\n";
   os << "    addw t0, t0, t1\n";
-  os << "    li t2, 3\n";
-  os << "    bne s1, t2, " << stem << "_div_generic\n";
-  os << "    mv t1, t0\n";
-  os << "    li t2, 1431655766\n";
-  os << "    mul t0, t0, t2\n";
-  os << "    srai t0, t0, 32\n";
-  os << "    sraiw t1, t1, 31\n";
-  os << "    subw t0, t0, t1\n";
-  os << "    j " << stem << "_div_done\n";
-  os << stem << "_div_generic:\n";
   os << "    divw t0, t0, s1\n";
-  os << stem << "_div_done:\n";
   os << "    sw t0, 0(a4)\n";
   os << "    mv t5, t0\n";
   os << "    addi a4, a4, 4\n";
@@ -1896,7 +1908,38 @@ static bool emitStencil3DKernel(Operation &func, const std::string &target,
   os << "    addi a3, a3, 4\n";
   os << "    addi s11, s11, 4\n";
   os << "    addiw a6, a6, -1\n";
-  os << "    j " << stem << "_k\n";
+  os << "    j " << stem << "_k_generic\n";
+  os << stem << "_k_fast_setup:\n";
+  os << "    li t2, 1431655766\n";
+  os << stem << "_k_fast:\n";
+  os << "    blez a6, " << stem << "_next_j\n";
+  os << "    lw t0, 0(s9)\n";
+  os << "    lw t1, 0(s10)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 0(a2)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 0(a3)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    addw t0, t0, t5\n";
+  os << "    lw t1, 4(a4)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    lw t1, 0(s11)\n";
+  os << "    addw t0, t0, t1\n";
+  os << "    mv t1, t0\n";
+  os << "    mul t0, t0, t2\n";
+  os << "    srai t0, t0, 32\n";
+  os << "    sraiw t1, t1, 31\n";
+  os << "    subw t0, t0, t1\n";
+  os << "    sw t0, 0(a4)\n";
+  os << "    mv t5, t0\n";
+  os << "    addi a4, a4, 4\n";
+  os << "    addi s9, s9, 4\n";
+  os << "    addi s10, s10, 4\n";
+  os << "    addi a2, a2, 4\n";
+  os << "    addi a3, a3, 4\n";
+  os << "    addi s11, s11, 4\n";
+  os << "    addiw a6, a6, -1\n";
+  os << "    j " << stem << "_k_fast\n";
   os << stem << "_next_j:\n";
   os << "    addiw s6, s6, 1\n";
   os << "    j " << stem << "_j\n";
