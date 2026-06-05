@@ -1109,6 +1109,136 @@ static bool isMemrefLoadEqualOneGuard(Value condition) {
           constantIntegerValue(cmp->operand(0), imm) && imm == 1);
 }
 
+struct ContinueLatch {
+  Operation *load = nullptr;
+  Operation *step = nullptr;
+  Operation *store = nullptr;
+  Value slot;
+  Value stepValue;
+};
+
+static bool isLoopLatchStore(Operation *store, ContinueLatch &out) {
+  if (!store || store->isErased() || store->name() != "sysy.store" ||
+      store->operandCount() < 2)
+    return false;
+  Operation *step = store->operand(0).getDefiningOp();
+  if (!step || step->isErased() || step->operandCount() < 2)
+    return false;
+  if (step->name() != "arith.addi" && step->name() != "rv_machine.addw" &&
+      step->name() != "arm_machine.add")
+    return false;
+
+  Operation *load = step->operand(0).getDefiningOp();
+  Value stepValue = step->operand(1);
+  if (!load || findAllocaForLoad(load) != store->operand(1).getDefiningOp()) {
+    load = step->operand(1).getDefiningOp();
+    stepValue = step->operand(0);
+  }
+  if (!load || load->isErased() ||
+      findAllocaForLoad(load) != store->operand(1).getDefiningOp())
+    return false;
+
+  out.load = load;
+  out.step = step;
+  out.store = store;
+  out.slot = store->operand(1);
+  out.stepValue = stepValue;
+  return true;
+}
+
+static bool latchStepsEquivalent(Value a, Value b) {
+  if (a == b)
+    return true;
+  int64_t av = 0, bv = 0;
+  return constantIntegerValue(a, av) && constantIntegerValue(b, bv) && av == bv;
+}
+
+static int indexOfOp(Block &block, Operation *needle) {
+  if (!needle)
+    return -1;
+  for (std::size_t i = 0; i < block.ops().size(); i++)
+    if (block.ops()[i].get() == needle)
+      return (int)i;
+  return -1;
+}
+
+static bool findThenContinueLatch(Block &thenBlock, ContinueLatch &latch,
+                                  Operation *&continueOp) {
+  auto &ops = thenBlock.ops();
+  for (std::size_t i = 0; i < ops.size(); i++) {
+    Operation *op = ops[i].get();
+    if (!op || op->isErased() || op->name() != "sysy.continue")
+      continue;
+    continueOp = op;
+    for (std::size_t j = i; j-- > 0;) {
+      Operation *cand = ops[j].get();
+      if (!cand || cand->isErased())
+        continue;
+      if (isLoopLatchStore(cand, latch))
+        return true;
+      if (cand->isTerminator())
+        return false;
+    }
+    return false;
+  }
+  return false;
+}
+
+static bool findTailLatch(Block &block, std::size_t ifIndex, std::size_t lastIdx,
+                          const ContinueLatch &thenLatch,
+                          ContinueLatch &tailLatch, std::size_t &tailStart) {
+  auto &ops = block.ops();
+  if (ifIndex >= ops.size())
+    return false;
+  for (std::size_t j = lastIdx + 1; j-- > ifIndex + 1;) {
+    Operation *cand = ops[j].get();
+    if (!cand || cand->isErased() || cand->isTerminator())
+      continue;
+    ContinueLatch current;
+    if (!isLoopLatchStore(cand, current))
+      continue;
+    if (current.slot != thenLatch.slot ||
+        !latchStepsEquivalent(current.stepValue, thenLatch.stepValue))
+      return false;
+
+    int loadIdx = indexOfOp(block, current.load);
+    int stepIdx = indexOfOp(block, current.step);
+    int storeIdx = indexOfOp(block, current.store);
+    if (loadIdx < 0 || stepIdx < 0 || storeIdx < 0)
+      return false;
+    int first = std::min(loadIdx, std::min(stepIdx, storeIdx));
+    if (first <= (int)ifIndex)
+      return false;
+    tailLatch = current;
+    tailStart = (std::size_t)first;
+    return true;
+  }
+  return false;
+}
+
+static void eraseThenLatchAndConvertContinue(Block &thenBlock,
+                                             const ContinueLatch &latch,
+                                             Operation *continueOp) {
+  bool afterContinue = false;
+  for (auto &owned : thenBlock.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op == continueOp) {
+      op->rename("scf.yield");
+      afterContinue = true;
+      continue;
+    }
+    if (op == latch.store || op == latch.step || op == latch.load) {
+      op->markErased();
+      continue;
+    }
+    if (afterContinue)
+      op->markErased();
+  }
+  thenBlock.eraseMarkedOperations();
+}
+
 static void eliminateContinuesInBlock(Block &block, Module &module) {
   auto &ops = block.ops();
   for (size_t i = 0; i < ops.size(); i++) {
@@ -1135,12 +1265,20 @@ static void eliminateContinuesInBlock(Block &block, Module &module) {
 
       if (hasContinueInThen && isMemrefLoadEqualOneGuard(op->operand(0))) {
         Block *thenBlock = thenRegion->getBlocks()[0].get();
-        for (auto &owned : thenBlock->ops()) {
-          if (owned && !owned->isErased() && owned->name() == "sysy.continue") {
-            owned->markErased();
-          }
+        ContinueLatch thenLatch;
+        ContinueLatch tailLatch;
+        Operation *continueOp = nullptr;
+
+        size_t lastIdx = ops.size() - 1;
+        while (lastIdx > i && ops[lastIdx]->isTerminator()) {
+          lastIdx--;
         }
-        thenBlock->eraseMarkedOperations();
+        size_t tailStart = lastIdx + 1;
+        if (!findThenContinueLatch(*thenBlock, thenLatch, continueOp) ||
+            !findTailLatch(block, i, lastIdx, thenLatch, tailLatch, tailStart)) {
+          continue;
+        }
+        eraseThenLatchAndConvertContinue(*thenBlock, thenLatch, continueOp);
 
         if (op->getRegions().size() < 2) {
           Region &elseRegion = op->addRegion();
@@ -1148,18 +1286,17 @@ static void eliminateContinuesInBlock(Block &block, Module &module) {
         }
         Block *elseBlock = op->getRegions()[1]->getBlocks()[0].get();
 
-        size_t lastIdx = ops.size() - 1;
-        while (lastIdx > i && ops[lastIdx]->isTerminator()) {
-          lastIdx--;
+        std::vector<Operation*> moveOps;
+        for (size_t j = i + 1; j < tailStart && j < ops.size(); j++) {
+          Operation *toMove = ops[j].get();
+          if (toMove && !toMove->isErased() && !toMove->isTerminator())
+            moveOps.push_back(toMove);
         }
-
-        for (size_t j = i + 1; j <= lastIdx; ) {
-          if (j < ops.size()) {
-            Operation *toMove = ops[j].get();
+        for (Operation *toMove : moveOps) {
+          if (toMove && toMove->getBlock() == &block) {
             auto taken = block.takeOperation(toMove);
-            elseBlock->addOperation(std::move(taken));
-          } else {
-            break;
+            if (taken)
+              elseBlock->addOperation(std::move(taken));
           }
         }
 

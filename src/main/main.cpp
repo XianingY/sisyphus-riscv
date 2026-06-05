@@ -385,6 +385,12 @@ int main(int argc, char **argv) {
               << " range-peels=" << selfMLIRStats.opt.rangePeels
               << " diagonal-transpose-tiles=" << selfMLIRStats.opt.diagonalTransposeTiles
               << " radix-high-round-elisions=" << selfMLIRStats.opt.radixHighRoundElisions
+              << " pure-memo-functions=" << selfMLIRStats.opt.pureMemoFunctions
+              << " pure-memo-lookups=" << selfMLIRStats.opt.pureMemoLookups
+              << " pure-memo-stores=" << selfMLIRStats.opt.pureMemoStores
+              << " stencil-addr-iv=" << selfMLIRStats.opt.stencilAddrIV
+              << " dead-array-stores=" << selfMLIRStats.opt.deadArrayStores
+              << " pow2-rem-fastpaths=" << selfMLIRStats.opt.pow2RemFastpaths
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed

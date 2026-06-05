@@ -2405,6 +2405,383 @@ void runAccumulatorRecursiveMemoization(Module &module, SelfOptStats *stats) {
   runAccumulatorRecursiveMemoizationImpl(module, stats);
 }
 
+struct PureRecursiveMemoInfo {
+  Operation *func = nullptr;
+  std::string name;
+  int argCount = 0;
+};
+
+static bool pureMemoCollect(Operation &op, std::vector<Operation*> &ops,
+                            std::set<std::string> &localSlots) {
+  if (op.isErased())
+    return true;
+  ops.push_back(&op);
+  if (isLocalAllocaOp(&op))
+    localSlots.insert(valueKey(op.result()));
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        if (child && !pureMemoCollect(*child, ops, localSlots))
+          return false;
+  return true;
+}
+
+static bool pureMemoStoreIsLocal(Operation &op,
+                                 const std::set<std::string> &localSlots) {
+  if (op.name() != "sysy.store" && op.name() != "memref.store")
+    return true;
+  if (op.operandCount() < 2)
+    return false;
+  return localSlots.count(valueKey(op.operand(1))) != 0;
+}
+
+static PureRecursiveMemoInfo classifyPureRecursiveMemoCandidate(Operation &func) {
+  PureRecursiveMemoInfo info;
+  if (func.name() != "sysy.func" || func.attr("pure_memoized") ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty() || name == "main" || name.find(".__pure_memo_body") != std::string::npos)
+    return info;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  if (entry.args().empty() || entry.args().size() > 2)
+    return info;
+  for (auto &arg : entry.args()) {
+    if (!arg || !isI32Like(arg->type()))
+      return info;
+  }
+
+  std::vector<Operation*> ops;
+  std::set<std::string> localSlots;
+  pureMemoCollect(func, ops, localSlots);
+
+  bool sawSelfCall = false;
+  bool sawReturn = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op == &func)
+      continue;
+    const std::string &opName = op->name();
+    if (opName == "sysy.call") {
+      if (symbolAttr(op->attr("callee")) != name)
+        return {};
+      if (op->operandCount() != (int) entry.args().size() ||
+          op->resultCount() != 1 || !isI32Like(op->resultType()))
+        return {};
+      sawSelfCall = true;
+      continue;
+    }
+    if (opName == "sysy.return" || opName == "scf.return") {
+      if (op->operandCount() != 1 || !isI32Like(op->operand(0).type()))
+        return {};
+      sawReturn = true;
+      continue;
+    }
+    if (opName == "sysy.store" || opName == "memref.store") {
+      if (!pureMemoStoreIsLocal(*op, localSlots))
+        return {};
+      continue;
+    }
+    if (opName == "sysy.break" || opName == "sysy.continue" ||
+        opName == "getint" || opName == "putint" || opName == "putch" ||
+        opName == "putarray" || opName == "getarray")
+      return {};
+    if (opName == "memref.alloca" || opName == "sysy.alloca" ||
+        opName == "memref.load" || opName == "sysy.load" ||
+        opName == "scf.if" || opName == "affine.for" ||
+        opName == "scf.while" || opName == "scf.for" ||
+        opName == "scf.yield" || opName == "affine.yield" ||
+        opName == "arith.constant" || opName.rfind("arith.", 0) == 0 ||
+        opName.rfind("rv_machine.", 0) == 0 ||
+        opName.rfind("arm_machine.", 0) == 0)
+      continue;
+    if (!op->getRegions().empty())
+      continue;
+  }
+
+  if (!sawSelfCall || !sawReturn)
+    return info;
+  info.func = &func;
+  info.name = name;
+  info.argCount = (int) entry.args().size();
+  return info;
+}
+
+static Operation &pureMemoI32Const(Module &module, Block &block, int64_t value,
+                                   Location loc) {
+  return appendOp(block, "arith.constant", {}, {module.context().i(32)},
+                  {{"value", module.context().integerAttr(value, module.context().i(32))}},
+                  loc);
+}
+
+static Operation &pureMemoLoadScalar(Module &module, Block &block, Value base,
+                                     Location loc) {
+  return appendOp(block, "sysy.load", {base}, {module.context().i(32)}, {}, loc);
+}
+
+static Operation &pureMemoLoadArray(Module &module, Block &block, Value base,
+                                    Value index, Location loc) {
+  return appendOp(block, "memref.load", {base, index}, {module.context().i(32)}, {}, loc);
+}
+
+static void pureMemoStoreScalar(Block &block, Value value, Value base, Location loc) {
+  appendOp(block, "sysy.store", {value, base}, {}, {}, loc);
+}
+
+static void pureMemoStoreArray(Block &block, Value value, Value base, Value index,
+                               Location loc) {
+  appendOp(block, "memref.store", {value, base, index}, {}, {}, loc);
+}
+
+static Value pureMemoAdd(Module &module, Block &block, Value lhs, Value rhs,
+                         Location loc) {
+  Operation &op = appendOp(block, "arith.addi", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value pureMemoSub(Module &module, Block &block, Value lhs, Value rhs,
+                         Location loc) {
+  Operation &op = appendOp(block, "arith.subi", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value pureMemoMul(Module &module, Block &block, Value lhs, Value rhs,
+                         Location loc) {
+  Operation &op = appendOp(block, "arith.muli", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value pureMemoAnd(Module &module, Block &block, Value lhs, Value rhs,
+                         Location loc) {
+  Operation &op = appendOp(block, "arith.andi", {lhs, rhs},
+                           {module.context().i(32)}, {}, loc);
+  return op.result();
+}
+
+static Value pureMemoEq(Module &module, Block &block, Value lhs, Value rhs,
+                        Location loc) {
+  Operation &op = appendOp(block, "arith.cmpi", {lhs, rhs},
+                           {module.context().i(32)},
+                           {{"predicate", module.context().stringAttr("eq")}}, loc);
+  return op.result();
+}
+
+static Value pureMemoHash(Module &module, Block &block,
+                          const std::vector<Value> &args, Location loc) {
+  Value hash = pureMemoI32Const(module, block, 0, loc).result();
+  static const int64_t kFactors[2] = {1103515245LL, 12345LL};
+  for (std::size_t i = 0; i < args.size(); i++) {
+    Value factor = pureMemoI32Const(module, block, kFactors[i], loc).result();
+    Value scaled = pureMemoMul(module, block, args[i], factor, loc);
+    hash = pureMemoAdd(module, block, hash, scaled, loc);
+  }
+  Value mask = pureMemoI32Const(module, block, 65535, loc).result();
+  return pureMemoAnd(module, block, hash, mask, loc);
+}
+
+struct PureMemoTables {
+  Value valid;
+  Value key0;
+  Value key1;
+  Value value;
+  Value epoch;
+  Value depth;
+};
+
+static PureMemoTables createPureMemoTables(Module &module, Block &top,
+                                           const std::string &prefix,
+                                           int argCount, Location loc) {
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  auto global = [&](const std::string &suffix, Type type) -> Value {
+    Operation &op = appendOp(top, "sysy.global", {}, {type},
+                             {{"symbol", ctx.stringAttr(prefix + suffix)}}, loc);
+    return op.result();
+  };
+  PureMemoTables tables;
+  tables.valid = global(".valid", ctx.memref({65536}, i32));
+  tables.key0 = global(".key0", ctx.memref({65536}, i32));
+  if (argCount > 1)
+    tables.key1 = global(".key1", ctx.memref({65536}, i32));
+  tables.value = global(".value", ctx.memref({65536}, i32));
+  tables.epoch = global(".epoch", ctx.memref({1}, i32));
+  tables.depth = global(".depth", ctx.memref({1}, i32));
+  return tables;
+}
+
+static bool cloneFunctionBodyTo(Module &module, Operation &src, Operation &dst) {
+  if (src.getRegions().empty() || dst.getRegions().empty() ||
+      src.getRegions()[0]->getBlocks().empty() ||
+      dst.getRegions()[0]->getBlocks().empty())
+    return false;
+  Block &srcBlock = *src.getRegions()[0]->getBlocks()[0];
+  Block &dstBlock = *dst.getRegions()[0]->getBlocks()[0];
+  std::map<std::string, Value> valueMap;
+  if (srcBlock.args().size() != dstBlock.args().size())
+    return false;
+  for (std::size_t i = 0; i < srcBlock.args().size(); i++)
+    valueMap[valueKey(srcBlock.args()[i]->value())] = dstBlock.args()[i]->value();
+  std::set<Operation*> skipOps;
+  for (auto &owned : srcBlock.ops()) {
+    if (!owned || owned->isErased())
+      continue;
+    auto cloned = cloneForUnrolledIteration(module, *owned, valueMap, skipOps,
+                                            Value(), 0);
+    if (!cloned)
+      return false;
+    Operation &inserted = dstBlock.addOperation(std::move(cloned));
+    for (int i = 0; i < owned->resultCount(); i++)
+      valueMap[valueKey(owned->result(i))] = inserted.result(i);
+  }
+  return true;
+}
+
+static bool applyPureMemoWrapper(Module &module, const PureRecursiveMemoInfo &info,
+                                 int ordinal, SelfOptStats *stats) {
+  if (!info.func || info.func->isErased() || module.body().getBlocks().empty())
+    return false;
+  Operation &func = *info.func;
+  if (func.getRegions().empty() || func.getRegions()[0]->getBlocks().empty())
+    return false;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  Location loc = func.loc();
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  std::string bodyName = info.name + ".__pure_memo_body" + std::to_string(ordinal);
+  std::string prefix = ".__pure_memo." + std::to_string(ordinal);
+
+  Block &top = *module.body().getBlocks()[0];
+  Operation &bodyFunc = appendOp(top, "sysy.func", {}, {},
+                                 {{"sym_name", ctx.stringAttr(bodyName)},
+                                  {"type", func.attr("type")}},
+                                 loc, 1);
+  Block &bodyBlock = bodyFunc.getRegions()[0]->addBlock();
+  for (auto &arg : entry.args())
+    bodyBlock.addArgument(arg->type(), arg->loc(), arg->name());
+  if (!cloneFunctionBodyTo(module, func, bodyFunc)) {
+    bodyFunc.markErased();
+    return false;
+  }
+
+  PureMemoTables tables = createPureMemoTables(module, top, prefix, info.argCount, loc);
+  std::vector<Value> args;
+  for (auto &arg : entry.args())
+    args.push_back(arg->value());
+
+  accClearBlock(entry);
+  Value zero = pureMemoI32Const(module, entry, 0, loc).result();
+  Value one = pureMemoI32Const(module, entry, 1, loc).result();
+  Operation &depthBefore = pureMemoLoadScalar(module, entry, tables.depth, loc);
+  Value isTop = pureMemoEq(module, entry, depthBefore.result(), zero, loc);
+  Operation &topIf = appendOp(entry, "scf.if", {isTop}, {}, {}, loc, 1);
+  Block &topThen = topIf.getRegions()[0]->addBlock();
+  Operation &epochBefore = pureMemoLoadScalar(module, topThen, tables.epoch, loc);
+  Value nextEpoch = pureMemoAdd(module, topThen, epochBefore.result(), one, loc);
+  pureMemoStoreScalar(topThen, nextEpoch, tables.epoch, loc);
+  appendOp(topThen, "scf.yield", {}, {}, {}, loc);
+
+  Value depthNow = pureMemoAdd(module, entry, depthBefore.result(), one, loc);
+  pureMemoStoreScalar(entry, depthNow, tables.depth, loc);
+  Operation &epoch = pureMemoLoadScalar(module, entry, tables.epoch, loc);
+  Value idx = pureMemoHash(module, entry, args, loc);
+  Operation &valid = pureMemoLoadArray(module, entry, tables.valid, idx, loc);
+  Value hit = pureMemoEq(module, entry, valid.result(), epoch.result(), loc);
+  Operation &key0 = pureMemoLoadArray(module, entry, tables.key0, idx, loc);
+  hit = pureMemoAnd(module, entry, hit,
+                   pureMemoEq(module, entry, key0.result(), args[0], loc), loc);
+  if (info.argCount > 1) {
+    Operation &key1 = pureMemoLoadArray(module, entry, tables.key1, idx, loc);
+    hit = pureMemoAnd(module, entry, hit,
+                     pureMemoEq(module, entry, key1.result(), args[1], loc), loc);
+  }
+
+  Operation &hitIf = appendOp(entry, "scf.if", {hit}, {}, {}, loc, 1);
+  Block &hitThen = hitIf.getRegions()[0]->addBlock();
+  Operation &cached = pureMemoLoadArray(module, hitThen, tables.value, idx, loc);
+  Value depthHit = pureMemoSub(module, hitThen, depthNow, one, loc);
+  pureMemoStoreScalar(hitThen, depthHit, tables.depth, loc);
+  appendOp(hitThen, "sysy.return", {cached.result()}, {}, {}, loc);
+
+  Operation &call = appendOp(entry, "sysy.call", args, {i32},
+                             {{"callee", ctx.stringAttr(bodyName)}}, loc);
+  pureMemoStoreArray(entry, args[0], tables.key0, idx, loc);
+  if (info.argCount > 1)
+    pureMemoStoreArray(entry, args[1], tables.key1, idx, loc);
+  pureMemoStoreArray(entry, call.result(), tables.value, idx, loc);
+  pureMemoStoreArray(entry, epoch.result(), tables.valid, idx, loc);
+  Value depthExit = pureMemoSub(module, entry, depthNow, one, loc);
+  pureMemoStoreScalar(entry, depthExit, tables.depth, loc);
+  appendOp(entry, "sysy.return", {call.result()}, {}, {}, loc);
+  func.setAttr("pure_memoized", ctx.boolAttr(true));
+  if (stats) {
+    stats->pureMemoFunctions++;
+    stats->pureMemoLookups++;
+    stats->pureMemoStores++;
+    stats->worklistRewrites++;
+  }
+  return true;
+}
+
+static int coreizeAccumulatorRecursionsForPureMemo(Module &module) {
+  if (module.body().getBlocks().empty())
+    return 0;
+  std::vector<AccumulatorRecursionInfo> matches;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func" ||
+        op->attr("pure_memoized"))
+      continue;
+    auto info = classifyAccumulatorRecursion(*op);
+    if (info.func)
+      matches.push_back(info);
+  }
+  if (matches.empty())
+    return 0;
+  Block &top = *module.body().getBlocks()[0];
+  int ordinal = 0;
+  int changed = 0;
+  for (auto &info : matches) {
+    Operation *func = info.func;
+    if (!func || func->isErased())
+      continue;
+    std::string coreName = info.name + ".__pure_core" + std::to_string(++ordinal);
+    Operation &core = appendOp(
+        top, "sysy.func", {}, {},
+        {{"sym_name", module.context().stringAttr(coreName)},
+         {"type", module.context().stringAttr("(i32) -> (i32)")}},
+        func->loc(), 1);
+    Block &coreBlock = core.getRegions()[0]->addBlock();
+    coreBlock.addArgument(module.context().i(32), func->loc(), "n");
+    accEmitCoreBody(module, core, info);
+    Block &wrapper = *func->getRegions()[0]->getBlocks()[0];
+    accClearBlock(wrapper);
+    accEmitWrapperBody(module, *func, info, coreName);
+    changed++;
+  }
+  return changed;
+}
+
+void runPureRecursiveMemoization(Module &module, SelfOptStats *stats) {
+  if (envEnabled("SISY_ENABLE_SELF_PURE_RECURSIVE_MEMO", true) == false)
+    return;
+  coreizeAccumulatorRecursionsForPureMemo(module);
+  std::vector<PureRecursiveMemoInfo> candidates;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    auto info = classifyPureRecursiveMemoCandidate(*op);
+    if (info.func)
+      candidates.push_back(info);
+  }
+  int ordinal = 0;
+  bool changed = false;
+  for (const auto &info : candidates)
+    changed |= applyPureMemoWrapper(module, info, ++ordinal, stats);
+  if (changed)
+    eraseMarked(module);
+}
+
 void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_SELECT_PROMOTION", true))
     return;
@@ -5738,11 +6115,82 @@ void runMemrefLinearization(Module &module, SelfOptStats *stats) {
     }
     op->markErased();
     changed = true;
-    if (stats)
+    if (stats) {
       stats->memrefLinearized++;
+      if (indices.size() >= 3)
+        stats->stencilAddrIV++;
+    }
   }
   if (changed)
     eraseMarked(module);
+}
+
+void runDeadArrayWriteDSE(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_DEAD_ARRAY_DSE", true))
+    return;
+  struct BaseUseInfo {
+    Value base;
+    bool hasLoad = false;
+    bool escaped = false;
+    std::vector<Operation*> stores;
+  };
+  std::map<std::string, BaseUseInfo> infos;
+  auto noteBase = [&](Value base) -> BaseUseInfo& {
+    std::string key = valueKey(base);
+    auto &info = infos[key];
+    info.base = base;
+    return info;
+  };
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "memref.load" && op->operandCount() > 0) {
+      noteBase(op->operand(0)).hasLoad = true;
+      continue;
+    }
+    if (op->name() == "memref.store" && op->operandCount() > 1) {
+      noteBase(op->operand(1)).stores.push_back(op);
+      continue;
+    }
+    if (op->name() == "sysy.call") {
+      for (Value operand : op->getOperands())
+        if (operand.valid() && isMemrefType(operand.type()))
+          noteBase(operand).escaped = true;
+      continue;
+    }
+    for (int i = 0; i < op->operandCount(); i++) {
+      Value operand = op->operand(i);
+      if (!operand.valid() || !isMemrefType(operand.type()))
+        continue;
+      bool baseAccess = ((op->name() == "memref.load" && i == 0) ||
+                         (op->name() == "memref.store" && i == 1));
+      if (!baseAccess)
+        noteBase(operand).escaped = true;
+    }
+  }
+
+  int removed = 0;
+  for (auto &kv : infos) {
+    BaseUseInfo &info = kv.second;
+    if (!info.base.valid() || info.hasLoad || info.escaped || info.stores.empty())
+      continue;
+    MemrefInfo memref = parseMemrefInfo(info.base.type());
+    if (!memref.valid || memref.shape.size() < 2)
+      continue;
+    for (Operation *store : info.stores) {
+      if (!store || store->isErased())
+        continue;
+      store->markErased();
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    eraseMarked(module);
+    if (stats) {
+      stats->deadArrayStores += removed;
+      stats->memoryRemovedStores += removed;
+    }
+  }
 }
 
 static bool licmPureHoistable(Operation *op) {
@@ -6726,6 +7174,7 @@ static bool rewriteSignedPow2Remainder(Module &module, Operation &op,
     op.markErased();
     if (stats) {
       stats->pow2StrengthReductions++;
+      stats->pow2RemFastpaths++;
       stats->worklistRewrites++;
     }
     return true;
@@ -6746,6 +7195,7 @@ static bool rewriteSignedPow2Remainder(Module &module, Operation &op,
     op.markErased();
     if (stats) {
       stats->pow2StrengthReductions++;
+      stats->pow2RemFastpaths++;
       stats->worklistRewrites++;
     }
     return true;
@@ -6768,6 +7218,7 @@ static bool rewriteSignedPow2Remainder(Module &module, Operation &op,
   op.markErased();
   if (stats) {
     stats->pow2StrengthReductions++;
+    stats->pow2RemFastpaths++;
     stats->worklistRewrites++;
   }
   return true;

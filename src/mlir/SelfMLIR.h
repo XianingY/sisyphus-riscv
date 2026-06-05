@@ -337,6 +337,12 @@ struct SelfOptStats {
   int rangePeels = 0;
   int diagonalTransposeTiles = 0;
   int radixHighRoundElisions = 0;
+  int pureMemoFunctions = 0;
+  int pureMemoLookups = 0;
+  int pureMemoStores = 0;
+  int stencilAddrIV = 0;
+  int deadArrayStores = 0;
+  int pow2RemFastpaths = 0;
 };
 
 struct OptimizationConfig {
@@ -387,6 +393,8 @@ void runClosedFormDivReduction(Module &module, SelfOptStats *stats = nullptr);
 void runRadixHighRoundElision(Module &module, SelfOptStats *stats = nullptr);
 void runAccumulatorRecursiveMemoization(Module &module,
                                         SelfOptStats *stats = nullptr);
+void runPureRecursiveMemoization(Module &module, SelfOptStats *stats = nullptr);
+void runDeadArrayWriteDSE(Module &module, SelfOptStats *stats = nullptr);
 void runSignedPow2RemainderRewrite(Module &module, const std::string &target,
                                     SelfOptStats *stats = nullptr);
 void runLocalCSE(Module &module, SelfOptStats *stats = nullptr);

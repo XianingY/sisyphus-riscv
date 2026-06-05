@@ -958,6 +958,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     }
     runIfStoreSelectPromotion(*module, &stats.opt);
     runMemrefLinearization(*module, &stats.opt);
+    runDeadArrayWriteDSE(*module, &stats.opt);
     runLoopInvariantCodeMotion(*module, &stats.opt);
     runClosedFormDivReduction(*module, &stats.opt);
     runLocalCSE(*module, &stats.opt);
@@ -976,6 +977,12 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runLocalCSE(*module, &stats.opt);
   }
 
+  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0) {
+    runPureRecursiveMemoization(*module, &stats.opt);
+    runLoopInvariantCodeMotion(*module, &stats.opt);
+    runLocalCSE(*module, &stats.opt);
+    runSignedPow2RemainderRewrite(*module, target, &stats.opt);
+  }
   if (target == "riscv" && effective.level != OptimizationConfig::Level::O0 &&
       envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", false))
     runAccumulatorRecursiveMemoization(*module, &stats.opt);
