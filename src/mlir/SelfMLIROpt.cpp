@@ -5267,24 +5267,13 @@ static bool licmPureHoistable(Operation *op) {
   return tileOpHasName(op, {"arith.constant", "rv_machine.li",
                             "arith.addi", "arith.subi", "arith.muli",
                             "arith.andi", "arith.ori", "arith.xori",
+                            "arith.shli", "arith.shrsi", "arith.cmpi",
+                            "arith.select",
                             "rv_machine.addw", "rv_machine.subw",
                             "rv_machine.mulw", "rv_machine.and",
                             "rv_machine.or", "rv_machine.xor",
-                            "rv_machine.sllw", "rv_machine.sraw"});
-}
-
-static bool licmAddressHoistable(Operation *op) {
-  if (!licmPureHoistable(op))
-    return false;
-  if (tileOpHasName(op, {"arith.constant", "rv_machine.li"}))
-    return true;
-  if (!tileOpHasName(op, {"arith.muli", "rv_machine.mulw"}))
-    return false;
-  if (op->operandCount() != 2)
-    return false;
-  int64_t imm = 0;
-  return constantIntegerValue(op->operand(0), imm) ||
-         constantIntegerValue(op->operand(1), imm);
+                            "rv_machine.sllw", "rv_machine.sraw",
+                            "rv_machine.cmp", "rv_machine.select"});
 }
 
 static void collectDefinedValuesInBlockTree(Block &block,
@@ -5304,11 +5293,75 @@ static void collectDefinedValuesInBlockTree(Block &block,
   }
 }
 
+static void collectStoredMemoryBasesInBlockTree(Block &block,
+                                                std::set<std::string> &storedBases) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.store" || op->name() == "memref.store") {
+      std::string base = memoryBaseKey(*op);
+      if (!base.empty())
+        storedBases.insert(base);
+    }
+    for (auto &region : op->getRegions())
+      for (auto &nested : region->getBlocks())
+        collectStoredMemoryBasesInBlockTree(*nested, storedBases);
+  }
+}
+
+static void collectStoredMemoryBasesInLoop(Operation &loop,
+                                           std::set<std::string> &storedBases) {
+  for (auto &region : loop.getRegions())
+    for (auto &block : region->getBlocks())
+      collectStoredMemoryBasesInBlockTree(*block, storedBases);
+}
+
+static bool valueDependsOnLoopMutatedLoad(Value value,
+                                          const std::set<std::string> &storedBases,
+                                          std::set<std::string> &visiting,
+                                          int depth = 0) {
+  if (!value.valid() || depth > 16)
+    return false;
+  std::string key = valueKey(value);
+  if (!visiting.insert(key).second)
+    return false;
+
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased()) {
+    visiting.erase(key);
+    return false;
+  }
+
+  if (def->name() == "sysy.load" || def->name() == "memref.load") {
+    std::string base = memoryBaseKey(*def);
+    bool mutated = !base.empty() && storedBases.count(base) != 0;
+    visiting.erase(key);
+    return mutated;
+  }
+
+  for (Value operand : def->getOperands()) {
+    if (valueDependsOnLoopMutatedLoad(operand, storedBases, visiting, depth + 1)) {
+      visiting.erase(key);
+      return true;
+    }
+  }
+  visiting.erase(key);
+  return false;
+}
+
 static bool opOperandsLoopInvariant(Operation &op,
-                                    const std::set<std::string> &definedInLoop) {
-  for (Value operand : op.getOperands())
-    if (operand.valid() && definedInLoop.count(valueKey(operand)) != 0)
+                                    const std::set<std::string> &definedInLoop,
+                                    const std::set<std::string> &storedBases) {
+  for (Value operand : op.getOperands()) {
+    if (!operand.valid())
+      continue;
+    if (definedInLoop.count(valueKey(operand)) != 0)
       return false;
+    std::set<std::string> visiting;
+    if (valueDependsOnLoopMutatedLoad(operand, storedBases, visiting))
+      return false;
+  }
   return true;
 }
 
@@ -5323,28 +5376,81 @@ static bool blockNestedIn(Block *block, Block *root) {
   return false;
 }
 
-static bool opResultUsesStayInLoop(Operation &op, Block &loopBody) {
+static bool opResultUsesStayInLoop(Operation &op, Operation &loop) {
   for (int i = 0; i < op.resultCount(); i++) {
     if ((std::size_t) i >= op.resultUses.size())
       continue;
     for (const Use &use : op.resultUses[i]) {
       if (!use.owner || use.owner->isErased())
         continue;
-      if (!blockNestedIn(use.owner->getBlock(), &loopBody))
+      bool inLoop = false;
+      Block *useBlock = use.owner->getBlock();
+      for (auto &region : loop.getRegions()) {
+        for (auto &root : region->getBlocks()) {
+          if (blockNestedIn(useBlock, root.get())) {
+            inLoop = true;
+            break;
+          }
+        }
+        if (inLoop)
+          break;
+      }
+      if (!inLoop)
         return false;
     }
   }
   return true;
 }
 
-static bool hoistInvariantsFromAffineLoop(Module &module, Operation &loop,
-                                          SelfOptStats *stats) {
-  if (loop.name() != "affine.for" || loop.getRegions().size() != 1 ||
-      loop.getRegions()[0]->getBlocks().size() != 1)
+static bool opResultFeedsCall(Operation &op) {
+  for (int i = 0; i < op.resultCount(); i++) {
+    if ((std::size_t) i >= op.resultUses.size())
+      continue;
+    for (const Use &use : op.resultUses[i]) {
+      if (use.owner && !use.owner->isErased() && use.owner->name() == "sysy.call")
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool licmGenericLoop(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "affine.for" || op->name() == "scf.while" ||
+          op->name() == "scf.for");
+}
+
+static void collectDefinedValuesInLoop(Operation &loop,
+                                       std::set<std::string> &defined) {
+  for (auto &region : loop.getRegions())
+    for (auto &block : region->getBlocks())
+      collectDefinedValuesInBlockTree(*block, defined);
+}
+
+static void collectHoistCandidatesInBlock(Block &block,
+                                          std::vector<Operation*> &candidates) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased())
+      continue;
+    if (licmPureHoistable(op))
+      candidates.push_back(op);
+  }
+}
+
+static void collectHoistCandidatesInLoop(Operation &loop,
+                                         std::vector<Operation*> &candidates) {
+  for (auto &region : loop.getRegions())
+    for (auto &block : region->getBlocks())
+      collectHoistCandidatesInBlock(*block, candidates);
+}
+
+static bool hoistInvariantsFromGenericLoop(Module &module, Operation &loop,
+                                           SelfOptStats *stats) {
+  if (!licmGenericLoop(&loop) || loop.getRegions().empty())
     return false;
   Block *parent = loop.getBlock();
-  Block *body = loop.getRegions()[0]->getBlocks()[0].get();
-  if (!parent || !body)
+  if (!parent)
     return false;
   int loopIndex = operationIndexInBlock(*parent, &loop);
   if (loopIndex < 0)
@@ -5355,19 +5461,22 @@ static bool hoistInvariantsFromAffineLoop(Module &module, Operation &loop,
   while (localChanged) {
     localChanged = false;
     std::set<std::string> definedInLoop;
-    collectDefinedValuesInBlockTree(*body, definedInLoop);
+    collectDefinedValuesInLoop(loop, definedInLoop);
+    std::set<std::string> storedBases;
+    collectStoredMemoryBasesInLoop(loop, storedBases);
     loopIndex = operationIndexInBlock(*parent, &loop);
     if (loopIndex < 0)
       return changed;
     std::size_t insertIndex = (std::size_t) loopIndex;
-    std::vector<Operation*> bodyOps;
-    for (auto &owned : body->ops())
-      if (owned && !owned->isErased())
-        bodyOps.push_back(owned.get());
-    for (Operation *op : bodyOps) {
-      if (!licmAddressHoistable(op) || !opOperandsLoopInvariant(*op, definedInLoop))
+    std::vector<Operation*> candidates;
+    collectHoistCandidatesInLoop(loop, candidates);
+    for (Operation *op : candidates) {
+      if (!licmPureHoistable(op) ||
+          !opOperandsLoopInvariant(*op, definedInLoop, storedBases))
         continue;
-      if (!opResultUsesStayInLoop(*op, *body))
+      if (opResultFeedsCall(*op))
+        continue;
+      if (!opResultUsesStayInLoop(*op, loop))
         continue;
       auto clone = std::make_unique<Operation>(op->name(), op->getOperands(),
                                                resultTypesOf(*op), op->attrs(),
@@ -5402,8 +5511,8 @@ static bool runLICMInRegion(Module &module, Region &region, SelfOptStats *stats)
     for (Operation *op : ops) {
       for (auto &nested : op->getRegions())
         changed |= runLICMInRegion(module, *nested, stats);
-      if (op->name() == "affine.for")
-        changed |= hoistInvariantsFromAffineLoop(module, *op, stats);
+      if (licmGenericLoop(op))
+        changed |= hoistInvariantsFromGenericLoop(module, *op, stats);
     }
   }
   return changed;
