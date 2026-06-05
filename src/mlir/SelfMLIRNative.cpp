@@ -6098,8 +6098,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       bool hasElse = op->getRegions().size() > 1;
       bool thenHasYield = hasThen && regionEndsWith(*op->getRegions()[0], "scf.yield");
       bool elseHasYield = hasElse && regionEndsWith(*op->getRegions()[1], "scf.yield");
-      if (hasElse && !thenHasYield)
-        scheduleBefore(firstLiveOpInRegion(*op->getRegions()[1]), ".Lelse_" + std::to_string(ifId) + ":");
+      if (hasElse && !thenHasYield) {
+        Operation *elseFirst = firstLiveOpInRegion(*op->getRegions()[1]);
+        if (elseFirst) {
+          scheduleBefore(elseFirst, "    " + std::string(isArm ? "b" : "j") +
+                                         " .Lendif_" + std::to_string(ifId));
+          scheduleBefore(elseFirst, ".Lelse_" + std::to_string(ifId) + ":");
+        } else {
+          scheduleAfter(*op, ".Lelse_" + std::to_string(ifId) + ":");
+        }
+      }
       if ((hasElse && !elseHasYield) || (!hasElse && !thenHasYield))
         scheduleAfter(*op, ".Lendif_" + std::to_string(ifId) + ":");
     } else if (op->name() == "scf.while") {
