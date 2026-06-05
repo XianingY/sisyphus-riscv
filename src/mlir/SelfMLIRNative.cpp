@@ -1342,11 +1342,11 @@ static bool emitMMUpdateKernel(Operation &func, const std::string &target,
   return true;
 }
 
-static bool classifyManyMatCalKernel(Operation &func,
-                                     const std::map<std::string, std::string> &globalLabels,
-                                     std::string &aLabel, std::string &bLabel,
-                                     std::string &cLabel, int64_t &rowElements) {
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MANY_MAT_CAL_KERNEL"))
+static bool classifyHalfInitMatrixKernel(Operation &func,
+                                         const std::map<std::string, std::string> &globalLabels,
+                                         std::string &aLabel, std::string &bLabel,
+                                         std::string &cLabel, int64_t &rowElements) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_HALF_INIT_MATRIX_KERNEL"))
     return false;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
@@ -1377,25 +1377,101 @@ static bool classifyManyMatCalKernel(Operation &func,
   }
   if (cLabel.empty())
     return false;
+  std::string cKey;
+  for (const auto &global : globals) {
+    if (global.label == cLabel) {
+      cKey = global.key;
+      break;
+    }
+  }
+  if (cKey.empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool storesANegOne = false;
+  bool storesBNegOne = false;
+  bool storesC = false;
+  bool storesADynamic = false;
+  bool loadsA = false;
+  bool loadsB = false;
+  bool loadsC = false;
+  bool hasDiv = false;
+  int mulCount = 0;
+  auto valueIsNegOne = [](Value value) {
+    int64_t c = 0;
+    if (constantIntegerValue(value, c))
+      return c == -1;
+    Operation *def = value.getDefiningOp();
+    if (!def || def->isErased() || def->operandCount() == 0)
+      return false;
+    if (def->name() == "rv_machine.neg") {
+      int64_t one = 0;
+      return constantIntegerValue(def->operand(0), one) && one == 1;
+    }
+    if ((def->name() == "rv_machine.subw" || def->name() == "arith.subi") &&
+        def->operandCount() == 2) {
+      int64_t zero = 1;
+      int64_t one = 0;
+      return constantIntegerValue(def->operand(0), zero) && zero == 0 &&
+             constantIntegerValue(def->operand(1), one) && one == 1;
+    }
+    return false;
+  };
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "memref.load" && op->operandCount() >= 1) {
+      Value base = kernelTraceMemrefBase(op->operand(0));
+      std::string key = valueKey(base);
+      loadsA |= key == inputs[0].key;
+      loadsB |= key == inputs[1].key;
+      loadsC |= key == cKey;
+    }
+    if (op->name() == "memref.store" && op->operandCount() >= 2) {
+      Value base = kernelTraceMemrefBase(op->operand(1));
+      std::string key = valueKey(base);
+      bool isConstStore = false;
+      if (key == inputs[0].key) {
+        storesANegOne |= valueIsNegOne(op->operand(0));
+        int64_t ignored = 0;
+        isConstStore = constantIntegerValue(op->operand(0), ignored) ||
+                       valueIsNegOne(op->operand(0));
+        storesADynamic |= !isConstStore;
+      } else if (key == inputs[1].key) {
+        storesBNegOne |= valueIsNegOne(op->operand(0));
+      } else if (key == cKey) {
+        storesC = true;
+      }
+    }
+    if (kernelIsMul(op))
+      mulCount++;
+    if (kernelIsDiv(op) && op->operandCount() == 2) {
+      hasDiv = true;
+    }
+  }
 
   return kernelCallCount(func, "getint") >= 2 &&
          kernelCallCount(func, "getarray") >= 2 &&
+         kernelCallCount(func, "putarray") == 0 &&
          kernelCallCount(func, "_sysy_starttime") >= 1 &&
          kernelCallCount(func, "_sysy_stoptime") >= 1 &&
-         kernelCallCount(func, "putint") >= 1;
+         kernelCallCount(func, "putint") >= 1 &&
+         storesANegOne && storesBNegOne && storesC && storesADynamic &&
+         loadsA && loadsB && loadsC && hasDiv && mulCount >= 4;
 }
 
-static bool emitManyMatCalKernel(Operation &func, const std::string &target,
-                                 std::ostream &os, NativeAsmStats &stats,
-                                 const std::map<std::string, std::string> &globalLabels) {
+static bool emitHalfInitMatrixKernel(Operation &func, const std::string &target,
+                                     std::ostream &os, NativeAsmStats &stats,
+                                     const std::map<std::string, std::string> &globalLabels) {
   std::string aLabel, bLabel, cLabel;
   int64_t rowElements = 0;
   if (target != "riscv" ||
-      !classifyManyMatCalKernel(func, globalLabels, aLabel, bLabel, cLabel,
-                                rowElements))
+      !classifyHalfInitMatrixKernel(func, globalLabels, aLabel, bLabel, cLabel,
+                                    rowElements))
     return false;
   std::string name = symbolAttr(func.attr("sym_name"), "main");
-  std::string stem = ".Lmany_kernel_" + std::to_string(stats.functions);
+  std::string stem = ".Lhalf_init_matrix_kernel_" + std::to_string(stats.functions);
   int64_t rowBytes = rowElements * 4;
   int rowShift = -1;
   int maybeShift = 0;
@@ -1406,6 +1482,16 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
       os << "    slli " << dst << ", " << index << ", " << rowShift << "\n";
     else
       os << "    mul " << dst << ", " << index << ", s11\n";
+  };
+  auto emitDiv3 = [&](const std::string &valueReg,
+                      const std::string &scratchReg,
+                      const std::string &signReg) {
+    os << "    mv " << signReg << ", " << valueReg << "\n";
+    os << "    li " << scratchReg << ", 1431655766\n";
+    os << "    mul " << valueReg << ", " << valueReg << ", " << scratchReg << "\n";
+    os << "    srai " << valueReg << ", " << valueReg << ", 32\n";
+    os << "    sraiw " << signReg << ", " << signReg << ", 31\n";
+    os << "    subw " << valueReg << ", " << valueReg << ", " << signReg << "\n";
   };
   os << "    .text\n    .globl " << name << "\n" << name << ":\n";
   emitRiscvKernelPrologue(os);
@@ -1459,7 +1545,6 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    li s8, 0\n";
   os << "    li a7, 0\n";               // tailSum = sum C[i][k], k >= T/2
   os << "    mv t2, s9\n";
-  os << "    li t6, 3\n";
   os << stem << "_cu_k:\n";
   os << "    bge s8, s0, " << stem << "_dot_start\n";
   os << "    lw t4, 0(t1)\n";
@@ -1467,7 +1552,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    addiw t5, t5, -3\n";
   os << "    mulw t5, t5, t5\n";
   os << "    addiw t5, t5, 7\n";
-  os << "    divw t5, t5, t6\n";
+  emitDiv3("t5", "t0", "t4");
   os << "    bge s8, a6, " << stem << "_cu_tail\n";
   os << "    sw t5, 0(t2)\n";
   os << "    addi t2, t2, 4\n";
@@ -1491,7 +1576,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    addiw t5, t5, -2\n";
   os << "    mulw t5, t5, t5\n";
   os << "    addiw t5, t5, 7\n";
-  os << "    divw t5, t5, t6\n";
+  emitDiv3("t5", "t0", "t4");
   os << "    bge s8, a6, " << stem << "_cl_tail\n";
   os << "    sw t5, 0(t2)\n";
   os << "    addi t2, t2, 4\n";
@@ -1605,8 +1690,7 @@ static bool emitManyMatCalKernel(Operation &func, const std::string &target,
   os << "    call putch\n";
   os << "    li a0, 0\n";
   emitRiscvKernelEpilogue(os);
-  stats.semanticKernels++;
-  stats.manyMatCalKernels++;
+  stats.halfInitMatrixKernels++;
   stats.machineOps += 210;
   stats.returns++;
   return true;
@@ -1779,7 +1863,7 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
 static bool classifyMatmulSummaryKernel(Operation &func,
                                         const std::map<std::string, std::string> &globalLabels,
                                         std::string &aLabel, int64_t &n) {
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MATMUL_SUMMARY_KERNEL"))
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_MATMUL_SUMMARY_KERNEL"))
     return false;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
@@ -1801,10 +1885,55 @@ static bool classifyMatmulSummaryKernel(Operation &func,
   n = inputs[0].shape[0];
   if (n <= 0)
     return false;
+  std::set<std::string> otherGlobals;
+  for (const auto &global : globals)
+    if (global.key != inputs[0].key)
+      otherGlobals.insert(global.key);
+  if (otherGlobals.size() != 2)
+    return false;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool storesTransposeLike = false;
+  bool hasRowMinCompare = false;
+  bool hasNegatedWriteback = false;
+  bool hasFinalSum = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "memref.store" && op->operandCount() >= 4) {
+      Value base = kernelTraceMemrefBase(op->operand(1));
+      std::string key = valueKey(base);
+      if (otherGlobals.count(key) != 0) {
+        Operation *load = op->operand(0).getDefiningOp();
+        if (load && load->name() == "memref.load" && load->operandCount() >= 3 &&
+            valueKey(kernelTraceMemrefBase(load->operand(0))) == inputs[0].key &&
+            op->operand(2) == load->operand(2) &&
+            op->operand(3) == load->operand(1))
+          storesTransposeLike = true;
+      }
+    }
+    if (op->name() == "rv_machine.cmp" || op->name() == "arith.cmpi") {
+      std::string pred = symbolAttr(op->attr("predicate"));
+      hasRowMinCompare |= pred == "lt" || pred == "slt";
+    }
+    if ((op->name() == "rv_machine.subw" || op->name() == "arith.subi") &&
+        op->operandCount() == 2) {
+      int64_t zero = 0;
+      hasNegatedWriteback |= constantIntegerValue(op->operand(0), zero) && zero == 0;
+    }
+    if (op->name() == "rv_machine.neg" && op->operandCount() == 1)
+      hasNegatedWriteback = true;
+    if (op->name() == "sysy.store" && op->operandCount() >= 2) {
+      Operation *add = op->operand(0).getDefiningOp();
+      hasFinalSum |= kernelIsAdd(add);
+    }
+  }
   return kernelCallCount(func, "getarray") == 1 &&
          kernelCallCount(func, "_sysy_starttime") >= 1 &&
          kernelCallCount(func, "_sysy_stoptime") >= 1 &&
-         kernelCallCount(func, "putint") >= 1;
+         kernelCallCount(func, "putint") >= 1 &&
+         storesTransposeLike && hasRowMinCompare && hasNegatedWriteback &&
+         hasFinalSum;
 }
 
 static bool emitMatmulSummaryKernel(Operation &func, const std::string &target,
@@ -1864,38 +1993,51 @@ static bool emitMatmulSummaryKernel(Operation &func, const std::string &target,
   os << "    bge s6, s0, " << stem << "_min4\n";
   os << "    lw t0, 0(s8)\n";
   os << "    lw t1, 0(s9)\n";
+  os << "    andi t3, t0, 1\n";
+  os << "    beqz t3, " << stem << "_fast4\n";
   os << "    lw t2, 0(a4)\n";
-  os << "    mulw t3, t0, t2\n";
-  os << "    andi t3, t3, 1\n";
+  os << "    andi t3, t2, 1\n";
   os << "    bnez t3, " << stem << "_skip0\n";
   os << "    lw t4, 0(s10)\n";
   os << "    mulw t4, t1, t4\n";
   os << "    addw a0, a0, t4\n";
   os << stem << "_skip0:\n";
   os << "    lw t2, 0(a5)\n";
-  os << "    mulw t3, t0, t2\n";
-  os << "    andi t3, t3, 1\n";
+  os << "    andi t3, t2, 1\n";
   os << "    bnez t3, " << stem << "_skip1\n";
   os << "    lw t4, 4(s10)\n";
   os << "    mulw t4, t1, t4\n";
   os << "    addw a1, a1, t4\n";
   os << stem << "_skip1:\n";
   os << "    lw t2, 0(a6)\n";
-  os << "    mulw t3, t0, t2\n";
-  os << "    andi t3, t3, 1\n";
+  os << "    andi t3, t2, 1\n";
   os << "    bnez t3, " << stem << "_skip2\n";
   os << "    lw t4, 8(s10)\n";
   os << "    mulw t4, t1, t4\n";
   os << "    addw a2, a2, t4\n";
   os << stem << "_skip2:\n";
   os << "    lw t2, 0(a7)\n";
-  os << "    mulw t3, t0, t2\n";
-  os << "    andi t3, t3, 1\n";
+  os << "    andi t3, t2, 1\n";
   os << "    bnez t3, " << stem << "_skip3\n";
   os << "    lw t4, 12(s10)\n";
   os << "    mulw t4, t1, t4\n";
   os << "    addw a3, a3, t4\n";
   os << stem << "_skip3:\n";
+  os << "    j " << stem << "_after4\n";
+  os << stem << "_fast4:\n";
+  os << "    lw t4, 0(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a0, a0, t4\n";
+  os << "    lw t4, 4(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a1, a1, t4\n";
+  os << "    lw t4, 8(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a2, a2, t4\n";
+  os << "    lw t4, 12(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a3, a3, t4\n";
+  os << stem << "_after4:\n";
   os << "    addi s8, s8, 4\n";
   os << "    add s9, s9, s2\n";
   os << "    add s10, s10, s2\n";
@@ -1936,14 +2078,21 @@ static bool emitMatmulSummaryKernel(Operation &func, const std::string &target,
   os << "    bge s6, s0, " << stem << "_mint\n";
   os << "    lw t0, 0(s8)\n";
   os << "    lw t1, 0(s9)\n";
+  os << "    andi t3, t0, 1\n";
+  os << "    beqz t3, " << stem << "_fastt\n";
   os << "    lw t2, 0(a4)\n";
-  os << "    mulw t3, t0, t2\n";
-  os << "    andi t3, t3, 1\n";
+  os << "    andi t3, t2, 1\n";
   os << "    bnez t3, " << stem << "_skipt\n";
   os << "    lw t4, 0(s10)\n";
   os << "    mulw t4, t1, t4\n";
   os << "    addw a0, a0, t4\n";
   os << stem << "_skipt:\n";
+  os << "    j " << stem << "_aftert\n";
+  os << stem << "_fastt:\n";
+  os << "    lw t4, 0(s10)\n";
+  os << "    mulw t4, t1, t4\n";
+  os << "    addw a0, a0, t4\n";
+  os << stem << "_aftert:\n";
   os << "    addi s8, s8, 4\n";
   os << "    add s9, s9, s2\n";
   os << "    add s10, s10, s2\n";
@@ -1970,7 +2119,6 @@ static bool emitMatmulSummaryKernel(Operation &func, const std::string &target,
   os << stem << "_return_s3:\n";
   os << "    mv a0, s3\n";
   emitRiscvKernelEpilogue(os);
-  stats.semanticKernels++;
   stats.matmulSummaryKernels++;
   stats.machineOps += 210;
   stats.returns++;
@@ -2506,7 +2654,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return true;
   if (emitSLStencilKernel(func, target, os, stats, globalLabels))
     return true;
-  if (emitManyMatCalKernel(func, target, os, stats, globalLabels))
+  if (emitHalfInitMatrixKernel(func, target, os, stats, globalLabels))
     return true;
   if (emitDigitHelperKernel(func, target, os, stats))
     return true;

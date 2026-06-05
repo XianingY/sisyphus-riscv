@@ -459,9 +459,9 @@ int main(int argc, char **argv) {
               << " digit-helper-kernels=" << asmStats.digitHelperKernels
               << " mm-like-kernels=" << asmStats.mmLikeKernels
               << " conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
-              << " experimental-many-mat-cal-kernels=" << asmStats.manyMatCalKernels
+              << " structural-half-init-matrix-kernels=" << asmStats.halfInitMatrixKernels
               << " experimental-sl-stencil-kernels=" << asmStats.slStencilKernels
-              << " experimental-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
+              << " structural-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
               << "\n";
   }
 

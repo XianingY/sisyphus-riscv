@@ -501,7 +501,7 @@ struct NativeAsmStats {
   int modularMultiplyKernels = 0;
   int digitHelperKernels = 0;
   int mmLikeKernels = 0;
-  int manyMatCalKernels = 0;
+  int halfInitMatrixKernels = 0;
   int slStencilKernels = 0;
   int matmulSummaryKernels = 0;
   int conv2dInteriorKernels = 0;
