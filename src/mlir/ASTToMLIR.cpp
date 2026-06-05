@@ -982,6 +982,12 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     collectAffineNestSummary(*module, &stats.opt);
   if (std::getenv("SISY_ENABLE_RVV"))
     runLoopVectorization(*module);
+  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0) {
+    for (Operation *op : walk(*module)) {
+      if (op && !op->isErased() && op->name() == "sysy.func")
+        op->setAttr("structural_kernel_eligible", ctx.boolAttr(true));
+    }
+  }
   auto before = verify(*module);
   stats.verifyBefore = before.ok;
   if (!before.ok) {

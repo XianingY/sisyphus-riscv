@@ -458,10 +458,10 @@ int main(int argc, char **argv) {
               << " modular-multiply-kernels=" << asmStats.modularMultiplyKernels
               << " digit-helper-kernels=" << asmStats.digitHelperKernels
               << " mm-like-kernels=" << asmStats.mmLikeKernels
+              << " conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
               << " experimental-many-mat-cal-kernels=" << asmStats.manyMatCalKernels
               << " experimental-sl-stencil-kernels=" << asmStats.slStencilKernels
               << " experimental-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
-              << " experimental-conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
               << "\n";
   }
 

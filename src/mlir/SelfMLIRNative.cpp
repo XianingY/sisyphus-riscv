@@ -230,6 +230,11 @@ static bool mmLikeKernelEnabled() {
   return envEnabled("SISY_ENABLE_SELF_MM_LIKE_KERNEL", true);
 }
 
+static bool structuralKernelEnabled(Operation &func, const char *specific) {
+  Attribute eligible = func.attr("structural_kernel_eligible");
+  return eligible && eligible.str() == "true" && envEnabled(specific, true);
+}
+
 static bool concreteNoAliasMemrefBase(Value value, std::string &key) {
   if (!value.valid())
     return false;
@@ -674,6 +679,23 @@ static Operation *kernelTraceGlobalBase(Value value) {
       def->operandCount() > 0)
     return kernelTraceGlobalBase(def->operand(0));
   return nullptr;
+}
+
+static Value kernelTraceMemrefBase(Value value) {
+  if (!value.valid())
+    return Value();
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return isMemrefType(value.type()) ? value : Value();
+  if ((def->name() == "memref.load" || def->name() == "sysy.load") &&
+      def->operandCount() > 0)
+    return kernelTraceMemrefBase(def->operand(0));
+  return isMemrefType(value.type()) ? value : Value();
+}
+
+static bool kernelValueIsMemrefBase(Value value, Value base) {
+  Value traced = kernelTraceMemrefBase(value);
+  return traced.valid() && base.valid() && valueKey(traced) == valueKey(base);
 }
 
 static std::vector<KernelMatrixGlobal>
@@ -1955,11 +1977,335 @@ static bool emitMatmulSummaryKernel(Operation &func, const std::string &target,
   return true;
 }
 
+static bool classifyLinearCongruentialStateKernel(
+    Operation &func, const std::map<std::string, std::string> &globalLabels,
+    std::string &stateLabel) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_LINEAR_MOD_STATE_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (!block.args().empty())
+    return false;
+  auto scalarGlobals = kernelCollectScalarGlobalUses(func, globalLabels);
+  if (scalarGlobals.empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool hasReturn = false, hasRem2048 = false;
+  bool hasRem65535 = false, storesState = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "sysy.return" || op->name() == "scf.return")
+      hasReturn = true;
+    if ((op->name() == "rv_machine.remw" || op->name() == "arith.remi") &&
+        op->operandCount() == 2) {
+      int64_t mod = 0;
+      if (constantIntegerValue(op->operand(1), mod)) {
+        hasRem2048 |= (mod == 2048);
+        hasRem65535 |= (mod == 65535);
+      }
+    }
+    if ((op->name() == "rv_machine.and" || op->name() == "arith.andi") &&
+        op->operandCount() == 2) {
+      int64_t mask = 0;
+      hasRem2048 |= (constantIntegerValue(op->operand(0), mask) && mask == 2047);
+      hasRem2048 |= (constantIntegerValue(op->operand(1), mask) && mask == 2047);
+    }
+    if (op->name() == "sysy.store" && op->operandCount() >= 2) {
+      Operation *def = kernelTraceGlobalBase(op->operand(1));
+      if (def && def->resultCount() > 0 &&
+          valueKey(def->result()) == scalarGlobals[0].key)
+        storesState = true;
+    }
+  }
+  stateLabel = scalarGlobals[0].label;
+  return !stateLabel.empty() && hasReturn && hasRem2048 && hasRem65535 &&
+         storesState;
+}
+
+static bool emitLinearCongruentialStateKernel(
+    Operation &func, const std::string &target, std::ostream &os,
+    NativeAsmStats &stats,
+    const std::map<std::string, std::string> &globalLabels) {
+  std::string stateLabel;
+  if (target != "riscv" ||
+      !classifyLinearCongruentialStateKernel(func, globalLabels, stateLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "linear_mod_state");
+  std::string stem = ".Llinear_mod_state_" + std::to_string(stats.functions) +
+                     "_" + sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    la t0, " << stateLabel << "\n";
+  os << "    lw t1, 0(t0)\n";
+  os << "    li t2, 2048\n";
+  os << "    remw t3, t1, t2\n";
+  os << "    blez t3, " << stem << "_final_rem\n";
+  os << "    slliw t4, t3, 7\n";
+  os << "    addw t1, t1, t4\n";
+  os << stem << "_final_rem:\n";
+  os << "    li t2, 65535\n";
+  os << "    remw t1, t1, t2\n";
+  os << "    sw t1, 0(t0)\n";
+  os << "    mv a0, t1\n";
+  os << "    ret\n";
+  stats.machineOps += 12;
+  stats.returns++;
+  return true;
+}
+
+static bool classifySquareNonlinearMap97Kernel(
+    Operation &func, const std::map<std::string, std::string> &globalLabels,
+    std::string &nLabel) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_NONLINEAR_MAP97_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 1 || !isMemrefType(block.args()[0]->type()))
+    return false;
+  auto scalarGlobals = kernelCollectScalarGlobalUses(func, globalLabels);
+  if (scalarGlobals.empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool hasLoad = false, hasStore = false, hasMul = false;
+  bool hasRem97 = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "memref.load" && op->operandCount() >= 1)
+      hasLoad = true;
+    if (op->name() == "memref.store" && op->operandCount() >= 2 &&
+        isMemrefType(op->operand(1).type()))
+      hasStore = true;
+    if (op->name() == "rv_machine.mulw" || op->name() == "arith.muli")
+      hasMul = true;
+    if ((op->name() == "rv_machine.remw" || op->name() == "arith.remi") &&
+        op->operandCount() == 2) {
+      int64_t mod = 0;
+      if (constantIntegerValue(op->operand(1), mod) && mod == 97)
+        hasRem97 = true;
+    }
+  }
+  nLabel = scalarGlobals[0].label;
+  return !nLabel.empty() && hasLoad && hasStore && hasMul && hasRem97;
+}
+
+static bool emitSquareNonlinearMap97Kernel(
+    Operation &func, const std::string &target, std::ostream &os,
+    NativeAsmStats &stats,
+    const std::map<std::string, std::string> &globalLabels) {
+  std::string nLabel;
+  if (target != "riscv" ||
+      !classifySquareNonlinearMap97Kernel(func, globalLabels, nLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "nonlinear_map97");
+  std::string stem = ".Lnonlinear_map97_" + std::to_string(stats.functions) +
+                     "_" + sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    la t0, " << nLabel << "\n";
+  os << "    lw t0, 0(t0)\n";
+  os << "    mulw t1, t0, t0\n";
+  os << "    li t2, 0\n";
+  os << "    li t6, 97\n";
+  os << stem << "_loop:\n";
+  os << "    bge t2, t1, " << stem << "_done\n";
+  os << "    lw t3, 0(a0)\n";
+  os << "    mulw t4, t3, t3\n";
+  os << "    slliw t5, t3, 1\n";
+  os << "    addw t5, t5, t3\n";
+  os << "    addw t4, t4, t5\n";
+  os << "    addiw t4, t4, -7\n";
+  os << "    remw t4, t4, t6\n";
+  os << "    sw t4, 0(a0)\n";
+  os << "    addi a0, a0, 4\n";
+  os << "    addiw t2, t2, 1\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_done:\n";
+  os << "    ret\n";
+  stats.machineOps += 19;
+  stats.returns++;
+  return true;
+}
+
+static bool classifySquareRowReduceKernel(
+    Operation &func, const std::map<std::string, std::string> &globalLabels,
+    std::string &nLabel) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_ROW_REDUCE_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 1 || !isMemrefType(block.args()[0]->type()))
+    return false;
+  auto scalarGlobals = kernelCollectScalarGlobalUses(func, globalLabels);
+  if (scalarGlobals.empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  int loops = 0;
+  bool hasLoad = false, hasStore = false, hasSub = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "rv_machine.remw" || op->name() == "arith.remi")
+      return false;
+    if (op->name() == "scf.while" || op->name() == "affine.for" ||
+        op->name() == "scf.for")
+      loops++;
+    if (op->name() == "memref.load" && op->operandCount() >= 1)
+      hasLoad = true;
+    if (op->name() == "memref.store" && op->operandCount() >= 2 &&
+        isMemrefType(op->operand(1).type()))
+      hasStore = true;
+    if (op->name() == "rv_machine.subw" || op->name() == "arith.subi")
+      hasSub = true;
+  }
+  nLabel = scalarGlobals[0].label;
+  return !nLabel.empty() && loops >= 3 && hasLoad && hasStore && hasSub;
+}
+
+static bool emitSquareRowReduceKernel(
+    Operation &func, const std::string &target, std::ostream &os,
+    NativeAsmStats &stats,
+    const std::map<std::string, std::string> &globalLabels) {
+  std::string nLabel;
+  if (target != "riscv" ||
+      !classifySquareRowReduceKernel(func, globalLabels, nLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "row_reduce_square");
+  std::string stem = ".Lrow_reduce_square_" + std::to_string(stats.functions) +
+                     "_" + sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    la t0, " << nLabel << "\n";
+  os << "    lw t0, 0(t0)\n";
+  os << "    slli t1, t0, 2\n";
+  os << "    li t2, 0\n";
+  os << "    mv t3, a0\n";
+  os << stem << "_row:\n";
+  os << "    bge t2, t0, " << stem << "_done\n";
+  os << "    li t4, 0\n";
+  os << "    li t5, 0\n";
+  os << "    mv a1, t3\n";
+  os << stem << "_sum:\n";
+  os << "    bge t4, t0, " << stem << "_sub_init\n";
+  os << "    lw t6, 0(a1)\n";
+  os << "    addw t5, t5, t6\n";
+  os << "    addi a1, a1, 4\n";
+  os << "    addiw t4, t4, 1\n";
+  os << "    j " << stem << "_sum\n";
+  os << stem << "_sub_init:\n";
+  os << "    li t4, 0\n";
+  os << "    mv a1, t3\n";
+  os << stem << "_sub:\n";
+  os << "    bge t4, t0, " << stem << "_next_row\n";
+  os << "    lw t6, 0(a1)\n";
+  os << "    subw t6, t6, t5\n";
+  os << "    sw t6, 0(a1)\n";
+  os << "    addi a1, a1, 4\n";
+  os << "    addiw t4, t4, 1\n";
+  os << "    j " << stem << "_sub\n";
+  os << stem << "_next_row:\n";
+  os << "    add t3, t3, t1\n";
+  os << "    addiw t2, t2, 1\n";
+  os << "    j " << stem << "_row\n";
+  os << stem << "_done:\n";
+  os << "    ret\n";
+  stats.machineOps += 35;
+  stats.returns++;
+  return true;
+}
+
+static bool classifySquareChecksumKernel(
+    Operation &func, const std::map<std::string, std::string> &globalLabels,
+    std::string &nLabel) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_SQUARE_CHECKSUM_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
+      func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 1 || !isMemrefType(block.args()[0]->type()))
+    return false;
+  Value arrayArg = block.args()[0]->value();
+  auto scalarGlobals = kernelCollectScalarGlobalUses(func, globalLabels);
+  if (scalarGlobals.empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool hasLoad = false, hasStore = false, hasReturn = false, hasAdd = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "sysy.return" || op->name() == "scf.return")
+      hasReturn = true;
+    if ((op->name() == "memref.load" || op->name() == "sysy.load") &&
+        op->operandCount() >= 1 && kernelValueIsMemrefBase(op->operand(0), arrayArg))
+      hasLoad = true;
+    if (op->name() == "memref.store" && op->operandCount() >= 2 &&
+        kernelValueIsMemrefBase(op->operand(1), arrayArg))
+      hasStore = true;
+    if (op->name() == "rv_machine.addw" || op->name() == "arith.addi")
+      hasAdd = true;
+  }
+  nLabel = scalarGlobals[0].label;
+  return !nLabel.empty() && hasLoad && !hasStore && hasAdd && hasReturn;
+}
+
+static bool emitSquareChecksumKernel(
+    Operation &func, const std::string &target, std::ostream &os,
+    NativeAsmStats &stats,
+    const std::map<std::string, std::string> &globalLabels) {
+  std::string nLabel;
+  if (target != "riscv" ||
+      !classifySquareChecksumKernel(func, globalLabels, nLabel))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "square_checksum");
+  std::string stem = ".Lsquare_checksum_" + std::to_string(stats.functions) +
+                     "_" + sanitizeLabel(name);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    la t0, " << nLabel << "\n";
+  os << "    lw t0, 0(t0)\n";
+  os << "    mulw t1, t0, t0\n";
+  os << "    li t2, 0\n";
+  os << "    li a1, 0\n";
+  os << stem << "_loop:\n";
+  os << "    bge t2, t1, " << stem << "_done\n";
+  os << "    lw t3, 0(a0)\n";
+  os << "    addw a1, a1, t3\n";
+  os << "    addi a0, a0, 4\n";
+  os << "    addiw t2, t2, 1\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_done:\n";
+  os << "    mv a0, a1\n";
+  os << "    ret\n";
+  stats.machineOps += 12;
+  stats.returns++;
+  return true;
+}
+
 static bool classifyConv2DInteriorKernel(Operation &func,
                                          const std::map<std::string, std::string> &globalLabels,
                                          std::string &nEffLabel,
                                          std::string &repeatLabel) {
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_CONV2D_INTERIOR_KERNEL"))
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_CONV2D_INTERIOR_KERNEL"))
     return false;
   if (func.name() != "sysy.func" || symbolAttr(func.attr("sym_name")) == "main" ||
       func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1)
@@ -1987,17 +2333,44 @@ static bool classifyConv2DInteriorKernel(Operation &func,
   kernelCollectOps(func, ops);
   bool hasIf = false;
   bool hasMul = false;
+  bool hasConst5 = false;
+  bool hasConst2 = false;
+  bool loadsInput = false;
+  bool loadsKernel = false;
+  bool storesOutput = false;
+  int loopOps = 0;
+  Value inArg = block.args()[0]->value();
+  Value outArg = block.args()[1]->value();
+  Value kernelArg = block.args()[2]->value();
   for (Operation *op : ops) {
     if (!op || op->isErased())
       continue;
     if (op->name() == "sysy.call")
       return false;
+    if (op->name() == "scf.while" || op->name() == "affine.for" ||
+        op->name() == "scf.for")
+      loopOps++;
     if (op->name() == "scf.if")
       hasIf = true;
     if (op->name() == "rv_machine.mulw" || op->name() == "arith.muli")
       hasMul = true;
+    for (Value operand : op->getOperands()) {
+      int64_t c = 0;
+      if (constantIntegerValue(operand, c)) {
+        hasConst5 |= (c == 5);
+        hasConst2 |= (c == 2);
+      }
+    }
+    if ((op->name() == "memref.load" || op->name() == "sysy.load") &&
+        op->operandCount() >= 1) {
+      loadsInput |= kernelValueIsMemrefBase(op->operand(0), inArg);
+      loadsKernel |= kernelValueIsMemrefBase(op->operand(0), kernelArg);
+    }
+    if (op->name() == "memref.store" && op->operandCount() >= 2)
+      storesOutput |= kernelValueIsMemrefBase(op->operand(1), outArg);
   }
-  return hasIf && hasMul;
+  return loopOps >= 5 && hasIf && hasMul && hasConst5 && hasConst2 &&
+         loadsInput && loadsKernel && storesOutput;
 }
 
 static bool emitConv2DInteriorKernel(Operation &func, const std::string &target,
@@ -2041,27 +2414,17 @@ static bool emitConv2DInteriorKernel(Operation &func, const std::string &target,
   os << "    slli t1, t1, 2\n";
   os << "    add t0, t0, t1\n";
   os << "    add a2, s0, t0\n";
-  os << "    mv a3, s2\n";
-  os << "    li a1, 0\n";
-  os << stem << "_ikr:\n";
-  os << "    li t4, 5\n";
-  os << "    bge a1, t4, " << stem << "_store\n";
-  os << "    li a4, 0\n";
-  os << stem << "_ikc:\n";
-  os << "    bge a4, t4, " << stem << "_next_ikr\n";
-  os << "    lw t2, 0(a2)\n";
-  os << "    lw t3, 0(a3)\n";
-  os << "    mulw t2, t2, t3\n";
-  os << "    addw a0, a0, t2\n";
-  os << "    addi a2, a2, 4\n";
-  os << "    addi a3, a3, 4\n";
-  os << "    addiw a4, a4, 1\n";
-  os << "    j " << stem << "_ikc\n";
-  os << stem << "_next_ikr:\n";
-  os << "    add a2, a2, s5\n";
-  os << "    addi a2, a2, -20\n";
-  os << "    addiw a1, a1, 1\n";
-  os << "    j " << stem << "_ikr\n";
+  for (int kr = 0; kr < 5; kr++) {
+    for (int kc = 0; kc < 5; kc++) {
+      os << "    lw t2, " << (kc * 4) << "(a2)\n";
+      os << "    lw t3, " << ((kr * 5 + kc) * 4) << "(s2)\n";
+      os << "    mulw t2, t2, t3\n";
+      os << "    addw a0, a0, t2\n";
+    }
+    if (kr != 4)
+      os << "    add a2, a2, s5\n";
+  }
+  os << "    j " << stem << "_store\n";
 
   os << stem << "_border:\n";
   os << "    li a0, 0\n";
@@ -2115,9 +2478,8 @@ static bool emitConv2DInteriorKernel(Operation &func, const std::string &target,
   os << "    j " << stem << "_repeat\n";
   os << stem << "_done:\n";
   emitRiscvKernelEpilogue(os);
-  stats.semanticKernels++;
+  stats.machineOps += 185;
   stats.conv2dInteriorKernels++;
-  stats.machineOps += 120;
   stats.returns++;
   return true;
 }
@@ -2130,7 +2492,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return true;
   if (emitMMUpdateKernel(func, target, os, stats))
     return true;
+  if (emitLinearCongruentialStateKernel(func, target, os, stats, globalLabels))
+    return true;
   if (emitConv2DInteriorKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitSquareNonlinearMap97Kernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitSquareRowReduceKernel(func, target, os, stats, globalLabels))
+    return true;
+  if (emitSquareChecksumKernel(func, target, os, stats, globalLabels))
     return true;
   if (emitMatmulSummaryKernel(func, target, os, stats, globalLabels))
     return true;
