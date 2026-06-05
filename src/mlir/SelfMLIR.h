@@ -516,6 +516,7 @@ struct NativeAsmStats {
   int nussinovKernels = 0;
   int trsmKernels = 0;
   int hashAggregateKernels = 0;
+  int accumulatorMemoKernels = 0;
   int deadFunctionsSkipped = 0;
   std::string error;
 };

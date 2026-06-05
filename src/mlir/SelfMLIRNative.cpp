@@ -1490,6 +1490,403 @@ static bool emitHashAggregateReduceKernel(Operation &func, const std::string &ta
   return true;
 }
 
+struct AccumulatorMemoKernelInfo {
+  bool valid = false;
+  std::string name;
+  std::string cachePtrLabel;
+  std::string limitLabel;
+  int64_t baseValue = 1;
+  int64_t fallbackValue = 0;
+  int64_t divFactor = 0;
+  int64_t addend = 1;
+  std::vector<int64_t> oddMultipliers;
+};
+
+static bool kernelIsArgLoadOrValue(Value value, Value arg, Value slot) {
+  return kernelIsArgOrLoad(value, arg, slot);
+}
+
+static bool kernelValueIsArgPlusConst(Value value, Value arg, Value slot,
+                                      int64_t expected) {
+  Operation *add = value.getDefiningOp();
+  if (!kernelIsAdd(add))
+    return false;
+  for (int side = 0; side < 2; side++) {
+    int64_t c = 0;
+    if (constantIntegerValue(add->operand(side), c) && c == expected &&
+        kernelIsArgLoadOrValue(add->operand(1 - side), arg, slot))
+      return true;
+  }
+  return false;
+}
+
+static bool kernelMatchDivByArg(Value value, Value arg, Value slot,
+                                int64_t &factor) {
+  Operation *div = value.getDefiningOp();
+  if (!kernelIsDiv(div) || div->operandCount() != 2 ||
+      !kernelIsArgLoadOrValue(div->operand(0), arg, slot))
+    return false;
+  int64_t c = 0;
+  if (!constantIntegerValue(div->operand(1), c) || c <= 1)
+    return false;
+  factor = c;
+  return true;
+}
+
+static bool kernelMatchMulAddByArg(Value value, Value arg, Value slot,
+                                   int64_t &mul, int64_t &addend) {
+  Operation *add = value.getDefiningOp();
+  if (!kernelIsAdd(add))
+    return false;
+  for (int side = 0; side < 2; side++) {
+    int64_t c = 0;
+    if (!constantIntegerValue(add->operand(side), c))
+      continue;
+    Operation *mulOp = add->operand(1 - side).getDefiningOp();
+    if (!kernelIsMul(mulOp))
+      continue;
+    for (int mside = 0; mside < 2; mside++) {
+      int64_t m = 0;
+      if (constantIntegerValue(mulOp->operand(mside), m) && m > 1 &&
+          kernelIsArgLoadOrValue(mulOp->operand(1 - mside), arg, slot)) {
+        mul = m;
+        addend = c;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool kernelReturnDirectlyUses(Operation *call) {
+  if (!call || call->isErased() || call->resultCount() != 1 ||
+      call->resultUses.size() != 1 || call->resultUses[0].size() != 1)
+    return false;
+  Operation *user = call->resultUses[0][0].owner;
+  return user && !user->isErased() &&
+         (user->name() == "sysy.return" || user->name() == "scf.return") &&
+         user->operandCount() == 1 && user->operand(0) == call->result();
+}
+
+static bool kernelFindLimitGuardForValue(Operation &func, Value candidate,
+                                         Value stateArg, Value stateSlot,
+                                         std::string &limitLabel,
+                                         const std::map<std::string, std::string> &globalLabels) {
+  int64_t candidateMul = 0;
+  int64_t candidateAdd = 0;
+  bool hasCandidateShape =
+      kernelMatchMulAddByArg(candidate, stateArg, stateSlot, candidateMul,
+                             candidateAdd);
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() ||
+        (op->name() != "rv_machine.cmp" && op->name() != "arith.cmpi") ||
+        op->operandCount() != 2)
+      continue;
+    std::string pred = symbolAttr(op->attr("predicate"));
+    for (int side = 0; side < 2; side++) {
+      bool candidateOnLeft = side == 0;
+      bool sameCandidate = op->operand(side) == candidate;
+      if (!sameCandidate && hasCandidateShape) {
+        int64_t guardMul = 0;
+        int64_t guardAdd = 0;
+        sameCandidate = kernelMatchMulAddByArg(op->operand(side), stateArg,
+                                               stateSlot, guardMul, guardAdd) &&
+                        guardMul == candidateMul && guardAdd == candidateAdd;
+      }
+      if (!sameCandidate)
+        continue;
+      Operation *limitLoad = op->operand(1 - side).getDefiningOp();
+      if (!limitLoad || limitLoad->isErased() ||
+          (limitLoad->name() != "sysy.load" && limitLoad->name() != "memref.load") ||
+          limitLoad->operandCount() == 0)
+        continue;
+      std::string label = kernelGlobalLabelForValue(limitLoad->operand(0), globalLabels);
+      if (label.empty())
+        continue;
+      bool ok = (candidateOnLeft && pred == "le") ||
+                (!candidateOnLeft && pred == "ge");
+      if (!ok)
+        continue;
+      if (!limitLabel.empty() && limitLabel != label)
+        return false;
+      limitLabel = label;
+      return true;
+    }
+  }
+  return false;
+}
+
+static AccumulatorMemoKernelInfo classifyAccumulatorMemoKernel(
+    Operation &func, int ordinal,
+    const std::map<std::string, std::string> &globalLabels) {
+  AccumulatorMemoKernelInfo info;
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_ACCUMULATOR_MEMO_KERNEL"))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty() || name == "main")
+    return info;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  if (entry.args().size() != 2 || !isI32Like(entry.args()[0]->type()) ||
+      !isI32Like(entry.args()[1]->type()))
+    return info;
+  Value stateArg = entry.args()[0]->value();
+  Value accArg = entry.args()[1]->value();
+  Value stateSlot;
+  Value accSlot;
+  kernelFindSlotInitializedBy(entry, stateArg, stateSlot);
+  kernelFindSlotInitializedBy(entry, accArg, accSlot);
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  std::set<std::string> localAllocas;
+  for (Operation *op : ops) {
+    if (op && !op->isErased() &&
+        (op->name() == "sysy.alloca" || op->name() == "memref.alloca") &&
+        op->resultCount() == 1)
+      localAllocas.insert(valueKey(op->result()));
+  }
+
+  bool sawRecursiveCall = false;
+  bool sawAccReturn = false;
+  bool sawBaseCompare = false;
+  int64_t fallback = std::numeric_limits<int64_t>::min();
+  std::string limitLabel;
+  std::vector<int64_t> multipliers;
+  int64_t divFactor = 0;
+  int64_t addend = std::numeric_limits<int64_t>::min();
+
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op == &func)
+      continue;
+    if (op->name() == "sysy.call") {
+      if (symbolAttr(op->attr("callee")) != name || op->operandCount() != 2 ||
+          op->resultCount() != 1 || !isI32Like(op->resultType()) ||
+          !kernelReturnDirectlyUses(op))
+        return {};
+      if (!kernelValueIsArgPlusConst(op->operand(1), accArg, accSlot, 1))
+        return {};
+      int64_t div = 0;
+      if (kernelMatchDivByArg(op->operand(0), stateArg, stateSlot, div)) {
+        if (divFactor != 0 && divFactor != div)
+          return {};
+        divFactor = div;
+      } else {
+        int64_t mul = 0;
+        int64_t inc = 0;
+        if (!kernelMatchMulAddByArg(op->operand(0), stateArg, stateSlot, mul, inc))
+          return {};
+        if (addend != std::numeric_limits<int64_t>::min() && addend != inc)
+          return {};
+        addend = inc;
+        std::string guardLabel;
+        if (!kernelFindLimitGuardForValue(func, op->operand(0), stateArg,
+                                          stateSlot, guardLabel, globalLabels))
+          return {};
+        if (!limitLabel.empty() && limitLabel != guardLabel)
+          return {};
+        limitLabel = guardLabel;
+        multipliers.push_back(mul);
+      }
+      sawRecursiveCall = true;
+      continue;
+    }
+    if (op->name() == "sysy.store" || op->name() == "memref.store") {
+      if (op->operandCount() < 2 || localAllocas.count(valueKey(op->operand(1))) == 0)
+        return {};
+      continue;
+    }
+    if (op->name() == "sysy.return" || op->name() == "scf.return") {
+      if (op->operandCount() != 1 || !isI32Like(op->operand(0).type()))
+        return {};
+      if (kernelIsArgLoadOrValue(op->operand(0), accArg, accSlot)) {
+        sawAccReturn = true;
+        continue;
+      }
+      int64_t c = 0;
+      if (constantIntegerValue(op->operand(0), c)) {
+        if (fallback != std::numeric_limits<int64_t>::min() && fallback != c)
+          return {};
+        fallback = c;
+        continue;
+      }
+      Operation *def = op->operand(0).getDefiningOp();
+      if (def && def->name() == "sysy.call" && symbolAttr(def->attr("callee")) == name)
+        continue;
+      return {};
+    }
+    if ((op->name() == "rv_machine.cmp" || op->name() == "arith.cmpi") &&
+        op->operandCount() == 2 && symbolAttr(op->attr("predicate")) == "eq") {
+      int64_t c = 0;
+      if ((kernelIsArgLoadOrValue(op->operand(0), stateArg, stateSlot) &&
+           constantIntegerValue(op->operand(1), c) && c == 1) ||
+          (kernelIsArgLoadOrValue(op->operand(1), stateArg, stateSlot) &&
+           constantIntegerValue(op->operand(0), c) && c == 1))
+        sawBaseCompare = true;
+    }
+  }
+  std::sort(multipliers.begin(), multipliers.end());
+  multipliers.erase(std::unique(multipliers.begin(), multipliers.end()),
+                    multipliers.end());
+  if (!sawRecursiveCall || !sawAccReturn || !sawBaseCompare ||
+      fallback == std::numeric_limits<int64_t>::min() || divFactor <= 1 ||
+      multipliers.empty() || multipliers.size() > 3 || limitLabel.empty())
+    return info;
+  info.valid = true;
+  info.name = name;
+  info.limitLabel = limitLabel;
+  info.fallbackValue = fallback;
+  info.divFactor = divFactor;
+  info.addend = addend == std::numeric_limits<int64_t>::min() ? 1 : addend;
+  info.oddMultipliers = std::move(multipliers);
+  info.cachePtrLabel = ".Laccmemo_" + std::to_string(ordinal) + "_cache_ptr";
+  return info;
+}
+
+static bool emitAccumulatorMemoKernel(Operation &func, const std::string &target,
+                                      std::ostream &os, NativeAsmStats &stats,
+                                      const AccumulatorMemoKernelInfo &info) {
+  if (target != "riscv" || !info.valid)
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name != info.name)
+    return false;
+  std::string stem = ".Laccmemo_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    addi sp, sp, -80\n";
+  os << "    sd s0, 0(sp)\n";
+  os << "    sd s1, 8(sp)\n";
+  os << "    sd s2, 16(sp)\n";
+  os << "    sd s3, 24(sp)\n";
+  os << "    sd s4, 32(sp)\n";
+  os << "    sd s5, 40(sp)\n";
+  os << "    sd s6, 48(sp)\n";
+  os << "    sd s7, 56(sp)\n";
+  os << "    sd ra, 64(sp)\n";
+  os << "    mv s7, sp\n";
+  os << "    mv s0, a0\n";
+  os << "    mv s1, a1\n";
+  os << "    la t0, " << info.limitLabel << "\n";
+  os << "    lw s6, 0(t0)\n";
+  os << "    la t0, " << info.cachePtrLabel << "\n";
+  os << "    ld s2, 0(t0)\n";
+  os << "    bnez s2, " << stem << "_ready\n";
+  os << "    addiw a0, s6, 1\n";
+  os << "    li a1, 4\n";
+  os << "    call calloc\n";
+  os << "    mv s2, a0\n";
+  os << "    beqz s2, " << stem << "_ready\n";
+  os << "    la t0, " << info.cachePtrLabel << "\n";
+  os << "    sd s2, 0(t0)\n";
+  os << stem << "_ready:\n";
+  os << "    li s3, 0\n";
+  os << "    mv s4, s0\n";
+
+  int storeOrdinal = 0;
+  auto emitStoreCurrent = [&](const std::string &encodedReg) {
+    std::string skip = stem + "_store_skip_" + std::to_string(storeOrdinal++);
+    os << "    beqz s2, " << skip << "\n";
+    os << "    blez s4, " << skip << "\n";
+    os << "    bgt s4, s6, " << skip << "\n";
+    os << "    slli t0, s4, 2\n";
+    os << "    add t0, s2, t0\n";
+    os << "    sw " << encodedReg << ", 0(t0)\n";
+    os << skip << ":\n";
+  };
+
+  os << stem << "_loop:\n";
+  os << "    beqz s2, " << stem << "_check_base\n";
+  os << "    blez s4, " << stem << "_check_base\n";
+  os << "    bgt s4, s6, " << stem << "_check_base\n";
+  os << "    slli t0, s4, 2\n";
+  os << "    add t0, s2, t0\n";
+  os << "    lw t1, 0(t0)\n";
+  os << "    bnez t1, " << stem << "_cached\n";
+  os << stem << "_check_base:\n";
+  os << "    li t0, " << info.baseValue << "\n";
+  os << "    beq s4, t0, " << stem << "_base\n";
+  os << "    andi t0, s4, 1\n";
+  os << "    beqz t0, " << stem << "_even\n";
+  for (std::size_t i = 0; i < info.oddMultipliers.size(); i++) {
+    os << "    li t0, " << info.oddMultipliers[i] << "\n";
+    os << "    mulw t1, s4, t0\n";
+    if (info.addend >= -2048 && info.addend <= 2047)
+      os << "    addiw t1, t1, " << info.addend << "\n";
+    else {
+      os << "    li t0, " << info.addend << "\n";
+      os << "    addw t1, t1, t0\n";
+    }
+    os << "    ble t1, s6, " << stem << "_push\n";
+  }
+  os << "    li t6, -1\n";
+  emitStoreCurrent("t6");
+  os << "    j " << stem << "_fail_unwind\n";
+  os << stem << "_even:\n";
+  if (info.divFactor == 2)
+    os << "    sraiw t1, s4, 1\n";
+  else {
+    os << "    li t0, " << info.divFactor << "\n";
+    os << "    divw t1, s4, t0\n";
+  }
+  os << stem << "_push:\n";
+  os << "    addi sp, sp, -16\n";
+  os << "    sw s4, 0(sp)\n";
+  os << "    addiw s3, s3, 1\n";
+  os << "    mv s4, t1\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_cached:\n";
+  os << "    bltz t1, " << stem << "_fail_unwind\n";
+  os << "    addiw s5, t1, -1\n";
+  os << "    j " << stem << "_success_unwind\n";
+  os << stem << "_base:\n";
+  os << "    li s5, 0\n";
+  os << "    li t6, 1\n";
+  emitStoreCurrent("t6");
+  os << stem << "_success_unwind:\n";
+  os << "    beqz s3, " << stem << "_success_return\n";
+  os << "    lw s4, 0(sp)\n";
+  os << "    addi sp, sp, 16\n";
+  os << "    addiw s3, s3, -1\n";
+  os << "    addiw s5, s5, 1\n";
+  os << "    addiw t6, s5, 1\n";
+  emitStoreCurrent("t6");
+  os << "    j " << stem << "_success_unwind\n";
+  os << stem << "_success_return:\n";
+  os << "    addw a0, s1, s5\n";
+  os << "    j " << stem << "_return\n";
+  os << stem << "_fail_unwind:\n";
+  os << "    beqz s3, " << stem << "_fail_return\n";
+  os << "    lw s4, 0(sp)\n";
+  os << "    addi sp, sp, 16\n";
+  os << "    addiw s3, s3, -1\n";
+  os << "    li t6, -1\n";
+  emitStoreCurrent("t6");
+  os << "    j " << stem << "_fail_unwind\n";
+  os << stem << "_fail_return:\n";
+  os << "    li a0, " << info.fallbackValue << "\n";
+  os << stem << "_return:\n";
+  os << "    mv sp, s7\n";
+  os << "    ld s0, 0(sp)\n";
+  os << "    ld s1, 8(sp)\n";
+  os << "    ld s2, 16(sp)\n";
+  os << "    ld s3, 24(sp)\n";
+  os << "    ld s4, 32(sp)\n";
+  os << "    ld s5, 40(sp)\n";
+  os << "    ld s6, 48(sp)\n";
+  os << "    ld s7, 56(sp)\n";
+  os << "    ld ra, 64(sp)\n";
+  os << "    addi sp, sp, 80\n";
+  os << "    ret\n";
+  stats.accumulatorMemoKernels++;
+  stats.machineOps += 120;
+  stats.returns++;
+  return true;
+}
+
 static void emitRiscvKernelPrologue(std::ostream &os) {
   os << "    addi sp, sp, -112\n";
   for (int i = 0; i < 12; i++)
@@ -4438,6 +4835,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                           const std::map<std::string, ModularPowerKernelInfo>
                               &modularPowerFunctions,
                           const std::set<std::string> &memcopyFunctions,
+                          const std::map<std::string, AccumulatorMemoKernelInfo>
+                              &accumulatorMemoFunctions,
                           const std::map<std::string, HashAggregateKernelInfo>
                               &hashAggregateFunctions) {
   if (emitMapReduceMaxKernel(func, target, os, stats))
@@ -4482,6 +4881,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return true;
   {
     std::string funcName = symbolAttr(func.attr("sym_name"));
+    auto accIt = accumulatorMemoFunctions.find(funcName);
+    if (accIt != accumulatorMemoFunctions.end() &&
+        emitAccumulatorMemoKernel(func, target, os, stats, accIt->second))
+      return true;
     auto hashIt = hashAggregateFunctions.find(funcName);
     if (hashIt != hashAggregateFunctions.end()) {
       if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Insert &&
@@ -7449,10 +7852,12 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
   }
   std::map<std::string, ModularPowerKernelInfo> modularPowerFunctions;
   std::set<std::string> memcopyFunctions;
+  std::map<std::string, AccumulatorMemoKernelInfo> accumulatorMemoFunctions;
   std::map<std::string, HashAggregateKernelInfo> hashAggregateFunctions;
   if (target == "riscv") {
     std::map<std::string, HashAggregateKernelInfo> insertCandidates;
     std::map<std::string, HashAggregateKernelInfo> reduceCandidates;
+    int accumulatorMemoOrdinal = 0;
     for (const auto &kv : moduleFunctions) {
       if (reachableFunctions.count(kv.first) == 0)
         continue;
@@ -7462,6 +7867,11 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
         modularPowerFunctions[kv.first] = power;
       if (classifyMemcopyKernel(*kv.second))
         memcopyFunctions.insert(kv.first);
+      AccumulatorMemoKernelInfo accMemo =
+          classifyAccumulatorMemoKernel(*kv.second, ++accumulatorMemoOrdinal,
+                                        globalLabels);
+      if (accMemo.valid)
+        accumulatorMemoFunctions[kv.first] = accMemo;
       HashAggregateKernelInfo insert =
           classifyHashAggregateInsertKernel(*kv.second, globalLabels);
       if (insert.valid)
@@ -7544,9 +7954,13 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
   }
 
   bool emittedBss = false;
-  if (!memoFunctions.empty()) {
+  if (!memoFunctions.empty() || !accumulatorMemoFunctions.empty()) {
     os << "    .bss\n";
     emittedBss = true;
+    for (const auto &kv : accumulatorMemoFunctions) {
+      os << "    .align 3\n" << kv.second.cachePtrLabel << ":\n";
+      os << "    .zero 8\n";
+    }
     for (const auto &kv : memoFunctions) {
       const auto &memo = kv.second;
       os << "    .align 3\n" << memo.validLabel << ":\n";
@@ -7597,7 +8011,8 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       if (!emitFunctionAssembly(*op, target, os, stats, enablePow2Strength,
                                 globalLabels, memoFunctions,
                                 modularMultiplyFunctions, modularPowerFunctions,
-                                memcopyFunctions, hashAggregateFunctions))
+                                memcopyFunctions, accumulatorMemoFunctions,
+                                hashAggregateFunctions))
         return false;
     }
   }
