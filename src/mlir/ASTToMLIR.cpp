@@ -976,9 +976,11 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runLocalCSE(*module, &stats.opt);
   }
 
-  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0)
+  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0 &&
+      envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", false))
     runAccumulatorRecursiveMemoization(*module, &stats.opt);
-  if (effective.level != OptimizationConfig::Level::O0)
+  if (effective.level != OptimizationConfig::Level::O0 &&
+      envEnabled("SISY_ENABLE_SELF_RADIX_HIGH_ROUND_ELISION", false))
     runRadixHighRoundElision(*module, &stats.opt);
 
   if (effective.enableScheduler)
@@ -987,7 +989,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     collectAffineNestSummary(*module, &stats.opt);
   if (std::getenv("SISY_ENABLE_RVV"))
     runLoopVectorization(*module);
-  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0) {
+  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0 &&
+      envEnabled("SISY_ENABLE_SELF_STRUCTURAL_KERNELS", false)) {
     for (Operation *op : walk(*module)) {
       if (op && !op->isErased() && op->name() == "sysy.func")
         op->setAttr("structural_kernel_eligible", ctx.boolAttr(true));

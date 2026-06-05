@@ -2082,7 +2082,7 @@ static void accEmitWrapperBody(Module &module, Operation &func,
 static void runAccumulatorRecursiveMemoizationImpl(Module &module,
                                                    SelfOptStats *stats) {
   (void) stats;
-  if (envEnabled("SISY_ENABLE_SELF_DIRECT_RECURSIVE_MEMO", true) == false)
+  if (envEnabled("SISY_ENABLE_SELF_DIRECT_RECURSIVE_MEMO", false) == false)
     return;
   if (module.body().getBlocks().empty())
     return;
@@ -6656,6 +6656,9 @@ static bool classifyRadixHighRoundElisionCandidate(Operation &func) {
 }
 
 void runRadixHighRoundElision(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_RADIX_HIGH_ROUND_ELISION", false))
+    return;
+
   std::set<std::string> candidates;
   for (Operation *op : walk(module)) {
     if (!op || op->isErased() || op->name() != "sysy.func")

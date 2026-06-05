@@ -125,7 +125,7 @@ struct MemoFunctionInfo {
 
 MemoFunctionInfo classifyMemoFunction(Operation &func, int ordinal) {
   MemoFunctionInfo info;
-  if (!envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", true))
+  if (!envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", false))
     return info;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1)
@@ -238,13 +238,24 @@ static bool semanticKernelEnabled(const char *specific) {
          envEnabled(specific, false);
 }
 
+static bool structuralKernelSuiteEnabled() {
+  return envEnabled("SISY_ENABLE_SELF_STRUCTURAL_KERNELS", false);
+}
+
+static bool experimentalStructuralKernelEnabled(const char *specific) {
+  return structuralKernelSuiteEnabled() &&
+         (envEnabled("SISY_ENABLE_SELF_ALL_STRUCTURAL_KERNELS", false) ||
+          envEnabled(specific, false));
+}
+
 static bool mmLikeKernelEnabled() {
-  return envEnabled("SISY_ENABLE_SELF_MM_LIKE_KERNEL", true);
+  return experimentalStructuralKernelEnabled("SISY_ENABLE_SELF_MM_LIKE_KERNEL");
 }
 
 static bool structuralKernelEnabled(Operation &func, const char *specific) {
   Attribute eligible = func.attr("structural_kernel_eligible");
-  return eligible && eligible.str() == "true" && envEnabled(specific, true);
+  return eligible && eligible.str() == "true" &&
+         experimentalStructuralKernelEnabled(specific);
 }
 
 static bool concreteNoAliasMemrefBase(Value value, std::string &key) {
@@ -4453,60 +4464,64 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                           const std::set<std::string> &memcopyFunctions,
                           const std::map<std::string, HashAggregateKernelInfo>
                               &hashAggregateFunctions) {
-  if (emitMapReduceMaxKernel(func, target, os, stats))
-    return true;
-  if (emitRepeatedTrsmMain(func, target, os, stats, globalLabels))
-    return true;
-  if (emitLudcmpMainKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitNussinovMainKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitLudcmpKernel(func, target, os, stats))
-    return true;
-  if (emitNussinovKernel(func, target, os, stats))
-    return true;
-  if (emitMMUpdateKernel(func, target, os, stats))
-    return true;
-  if (emitLinearCongruentialStateKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitConv2DInteriorKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitSquareNonlinearMap97Kernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitSquareRowReduceKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitSquareChecksumKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitMatmulSummaryKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitStencil3DKernel(func, target, os, stats, globalLabels))
-    return true;
-  if (emitHalfInitMatrixKernel(func, target, os, stats, globalLabels))
-    return true;
+  if (structuralKernelSuiteEnabled()) {
+    if (emitMapReduceMaxKernel(func, target, os, stats))
+      return true;
+    if (emitRepeatedTrsmMain(func, target, os, stats, globalLabels))
+      return true;
+    if (emitLudcmpMainKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitNussinovMainKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitLudcmpKernel(func, target, os, stats))
+      return true;
+    if (emitNussinovKernel(func, target, os, stats))
+      return true;
+    if (emitMMUpdateKernel(func, target, os, stats))
+      return true;
+    if (emitLinearCongruentialStateKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitConv2DInteriorKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitSquareNonlinearMap97Kernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitSquareRowReduceKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitSquareChecksumKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitMatmulSummaryKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitStencil3DKernel(func, target, os, stats, globalLabels))
+      return true;
+    if (emitHalfInitMatrixKernel(func, target, os, stats, globalLabels))
+      return true;
+  }
   if (emitDigitHelperKernel(func, target, os, stats))
     return true;
-  if (emitTriangularTransposeKernel(func, target, os, stats))
-    return true;
-  if (emitByteDigestKernel(func, target, os, stats))
-    return true;
-  if (emitModularPowerKernel(func, target, os, stats, modularMultiplyFunctions))
-    return true;
-  if (emitMemcopyKernel(func, target, os, stats))
-    return true;
-  {
-    std::string funcName = symbolAttr(func.attr("sym_name"));
-    auto hashIt = hashAggregateFunctions.find(funcName);
-    if (hashIt != hashAggregateFunctions.end()) {
-      if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Insert &&
-          emitHashAggregateInsertKernel(func, target, os, stats, hashIt->second))
-        return true;
-      if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Reduce &&
-          emitHashAggregateReduceKernel(func, target, os, stats, hashIt->second))
-        return true;
+  if (structuralKernelSuiteEnabled()) {
+    if (emitTriangularTransposeKernel(func, target, os, stats))
+      return true;
+    if (emitByteDigestKernel(func, target, os, stats))
+      return true;
+    if (emitModularPowerKernel(func, target, os, stats, modularMultiplyFunctions))
+      return true;
+    if (emitMemcopyKernel(func, target, os, stats))
+      return true;
+    {
+      std::string funcName = symbolAttr(func.attr("sym_name"));
+      auto hashIt = hashAggregateFunctions.find(funcName);
+      if (hashIt != hashAggregateFunctions.end()) {
+        if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Insert &&
+            emitHashAggregateInsertKernel(func, target, os, stats, hashIt->second))
+          return true;
+        if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Reduce &&
+            emitHashAggregateReduceKernel(func, target, os, stats, hashIt->second))
+          return true;
+      }
     }
+    if (emitModularMultiplyKernel(func, target, os, stats))
+      return true;
   }
-  if (emitModularMultiplyKernel(func, target, os, stats))
-    return true;
 
   if (func.getRegions().size() != 1 || func.getRegions()[0]->getBlocks().size() != 1) {
     stats.unsupportedOps++;
@@ -7445,7 +7460,8 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     stats.error = verified.errors.empty() ? "self-MLIR verify failed" : verified.errors.front();
     return false;
   }
-  markNoAliasMMLikeCallees(module);
+  if (structuralKernelSuiteEnabled())
+    markNoAliasMMLikeCallees(module);
 
   std::map<std::string, std::string> globalLabels;
   std::map<std::string, uint32_t> scalarGlobalInits;
@@ -7463,7 +7479,7 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       globalWordInits[valueKey(op->result())] = std::move(words);
   }
   std::map<std::string, MemoFunctionInfo> memoFunctions;
-  if (target == "riscv" && envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", true)) {
+  if (target == "riscv" && envEnabled("SISY_ENABLE_SELF_RECURSIVE_MEMO", false)) {
     int memoOrdinal = 0;
     for (auto *op : walk(module)) {
       if (!op || op->isErased() || op->name() != "sysy.func")
