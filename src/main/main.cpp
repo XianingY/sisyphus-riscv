@@ -472,6 +472,7 @@ int main(int argc, char **argv) {
               << " structural-ludcmp-kernels=" << asmStats.ludcmpKernels
               << " structural-nussinov-kernels=" << asmStats.nussinovKernels
               << " structural-trsm-kernels=" << asmStats.trsmKernels
+              << " structural-hash-aggregate-kernels=" << asmStats.hashAggregateKernels
               << " dead-functions-skipped=" << asmStats.deadFunctionsSkipped
               << "\n";
   }

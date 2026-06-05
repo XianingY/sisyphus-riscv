@@ -569,6 +569,7 @@ struct ModularMultiplyKernelInfo {
 };
 
 static bool kernelValueIsMemrefBase(Value value, Value base);
+static Operation *kernelTraceGlobalBase(Value value);
 static void emitRiscvKernelPrologue(std::ostream &os);
 static void emitRiscvKernelEpilogue(std::ostream &os);
 
@@ -1014,6 +1015,478 @@ static bool emitMemcopyKernel(Operation &func, const std::string &target,
   stats.memcopyKernels++;
   stats.machineOps += 12;
   stats.returns++;
+  return true;
+}
+
+struct HashAggregateKernelInfo {
+  enum class Kind { Insert, Reduce };
+  bool valid = false;
+  Kind kind = Kind::Insert;
+  std::string name;
+  std::string hashmodLabel;
+  std::string cntLabel;
+  std::string headLabel;
+  std::string keyLabel;
+  std::string valueLabel;
+  std::string nextLabel;
+  std::string nextValueLabel;
+  int64_t reduceThreshold = 0;
+  int64_t reduceGreaterScale = 0;
+  int64_t reduceOtherScale = 0;
+};
+
+static std::string kernelGlobalLabelForValue(
+    Value value, const std::map<std::string, std::string> &globalLabels) {
+  Operation *def = kernelTraceGlobalBase(value);
+  if (!def || def->isErased() || def->resultCount() == 0)
+    return "";
+  auto it = globalLabels.find(valueKey(def->result()));
+  return it == globalLabels.end() ? "" : it->second;
+}
+
+static bool kernelValueIsOne(Value value) {
+  int64_t c = 0;
+  return constantIntegerValue(value, c) && c == 1;
+}
+
+static bool kernelIsAddOneFromScalarGlobal(Value value, std::string &label,
+                                           const std::map<std::string, std::string> &globalLabels) {
+  Operation *add = value.getDefiningOp();
+  if (!kernelIsAdd(add))
+    return false;
+  for (int side = 0; side < 2; side++) {
+    if (!kernelValueIsOne(add->operand(1 - side)))
+      continue;
+    Operation *load = add->operand(side).getDefiningOp();
+    if (!load || load->isErased() ||
+        (load->name() != "sysy.load" && load->name() != "memref.load") ||
+        load->operandCount() == 0)
+      continue;
+    std::string candidate = kernelGlobalLabelForValue(load->operand(0), globalLabels);
+    if (candidate.empty())
+      continue;
+    label = candidate;
+    return true;
+  }
+  return false;
+}
+
+static bool kernelIsMemrefLoad(Value value, std::string &label, Value &index,
+                               const std::map<std::string, std::string> &globalLabels) {
+  Operation *load = value.getDefiningOp();
+  if (!load || load->isErased() ||
+      (load->name() != "memref.load" && load->name() != "sysy.load") ||
+      load->operandCount() < 2)
+    return false;
+  label = kernelGlobalLabelForValue(load->operand(0), globalLabels);
+  if (label.empty())
+    return false;
+  index = load->operand(load->operandCount() - 1);
+  return true;
+}
+
+static bool kernelCompareKeyGreaterThanConst(Operation *cmp, Value keyArg,
+                                             Value keySlot, int64_t &threshold) {
+  if (!cmp || cmp->isErased() ||
+      (cmp->name() != "rv_machine.cmp" && cmp->name() != "arith.cmpi") ||
+      cmp->operandCount() != 2)
+    return false;
+  std::string pred = symbolAttr(cmp->attr("predicate"));
+  int64_t c = 0;
+  if (pred == "lt" && constantIntegerValue(cmp->operand(0), c) &&
+      kernelIsArgOrLoad(cmp->operand(1), keyArg, keySlot)) {
+    threshold = c;
+    return true;
+  }
+  if (pred == "gt" && kernelIsArgOrLoad(cmp->operand(0), keyArg, keySlot) &&
+      constantIntegerValue(cmp->operand(1), c)) {
+    threshold = c;
+    return true;
+  }
+  return false;
+}
+
+static bool kernelReturnScale(Value value, int64_t &scale) {
+  Operation *mul = value.getDefiningOp();
+  if (!kernelIsMul(mul))
+    return false;
+  for (int side = 0; side < 2; side++) {
+    int64_t c = 0;
+    if (!constantIntegerValue(mul->operand(side), c))
+      continue;
+    Operation *other = mul->operand(1 - side).getDefiningOp();
+    if (!other || other->isErased() ||
+        (other->name() != "sysy.load" && other->name() != "memref.load") ||
+        other->operandCount() != 1 || !isScalarWordMemref(other->operand(0).type()))
+      continue;
+    scale = c;
+    return true;
+  }
+  return false;
+}
+
+static bool kernelRegionSingleReturnScale(Region *region, int64_t &scale) {
+  if (!region)
+    return false;
+  std::vector<Operation*> ops;
+  for (auto &block : region->getBlocks())
+    for (auto &op : block->ops())
+      kernelCollectOps(*op, ops);
+  bool found = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op->name() != "sysy.return" ||
+        op->operandCount() != 1)
+      continue;
+    int64_t candidate = 0;
+    if (!kernelReturnScale(op->operand(0), candidate))
+      return false;
+    if (found && candidate != scale)
+      return false;
+    scale = candidate;
+    found = true;
+  }
+  return found;
+}
+
+static bool kernelFindRemainderByScalarGlobal(Operation &func, Value keyArg,
+                                              Value keySlot, Value &hashValue,
+                                              std::string &hashmodLabel,
+                                              const std::map<std::string, std::string> &globalLabels) {
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() ||
+        (op->name() != "rv_machine.remw" && op->name() != "arith.remi") ||
+        op->operandCount() != 2 || op->resultCount() != 1)
+      continue;
+    if (!kernelIsArgOrLoad(op->operand(0), keyArg, keySlot))
+      continue;
+    Operation *divisorLoad = op->operand(1).getDefiningOp();
+    if (!divisorLoad || divisorLoad->isErased() ||
+        (divisorLoad->name() != "sysy.load" && divisorLoad->name() != "memref.load") ||
+        divisorLoad->operandCount() == 0)
+      continue;
+    std::string label = kernelGlobalLabelForValue(divisorLoad->operand(0), globalLabels);
+    if (label.empty())
+      continue;
+    hashValue = op->result();
+    hashmodLabel = label;
+    return true;
+  }
+  return false;
+}
+
+static HashAggregateKernelInfo classifyHashAggregateInsertKernel(
+    Operation &func, const std::map<std::string, std::string> &globalLabels) {
+  HashAggregateKernelInfo info;
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_HASH_AGGREGATE_KERNEL"))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 2 || !isI32Like(block.args()[0]->type()) ||
+      !isI32Like(block.args()[1]->type()))
+    return info;
+  Value keyArg = block.args()[0]->value();
+  Value valueArg = block.args()[1]->value();
+  Value keySlot;
+  Value valueSlot;
+  kernelFindSlotInitializedBy(block, keyArg, keySlot);
+  kernelFindSlotInitializedBy(block, valueArg, valueSlot);
+
+  Value hashValue;
+  std::string hashmodLabel;
+  if (!kernelFindRemainderByScalarGlobal(func, keyArg, keySlot, hashValue,
+                                         hashmodLabel, globalLabels))
+    return info;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  std::map<std::string, int> memrefStores;
+  std::map<std::string, int> memrefLoads;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return {};
+    if ((op->name() == "memref.load" || op->name() == "sysy.load") &&
+        op->operandCount() >= 2) {
+      std::string label = kernelGlobalLabelForValue(op->operand(0), globalLabels);
+      if (!label.empty())
+        memrefLoads[label]++;
+      if (op->operand(op->operandCount() - 1) == hashValue && info.headLabel.empty())
+        info.headLabel = label;
+    }
+    if ((op->name() == "memref.store" || op->name() == "sysy.store") &&
+        op->operandCount() >= 3) {
+      std::string label = kernelGlobalLabelForValue(op->operand(1), globalLabels);
+      if (!label.empty())
+        memrefStores[label]++;
+      if (kernelIsArgOrLoad(op->operand(0), keyArg, keySlot))
+        info.keyLabel = label;
+      if (kernelIsArgOrLoad(op->operand(0), valueArg, valueSlot))
+        info.valueLabel = label;
+      std::string cntLabel;
+      if (kernelIsAddOneFromScalarGlobal(op->operand(0), cntLabel, globalLabels))
+        info.cntLabel = cntLabel;
+      Operation *loaded = op->operand(0).getDefiningOp();
+      if (loaded && (loaded->name() == "memref.load" || loaded->name() == "sysy.load") &&
+          loaded->operandCount() >= 2) {
+        std::string loadedLabel = kernelGlobalLabelForValue(loaded->operand(0), globalLabels);
+        if (!loadedLabel.empty() && loadedLabel != info.headLabel)
+          info.nextLabel = loadedLabel;
+      }
+    }
+  }
+
+  for (Operation *op : ops) {
+    if (!op || op->isErased() ||
+        (op->name() != "memref.load" && op->name() != "sysy.load") ||
+        op->operandCount() < 2)
+      continue;
+    std::string label = kernelGlobalLabelForValue(op->operand(0), globalLabels);
+    if (label.empty() || label == info.headLabel || label == info.keyLabel ||
+        label == info.valueLabel || label == info.nextLabel)
+      continue;
+    if (memrefStores[label] >= 2)
+      info.nextValueLabel = label;
+  }
+
+  info.name = symbolAttr(func.attr("sym_name"));
+  info.hashmodLabel = hashmodLabel;
+  info.kind = HashAggregateKernelInfo::Kind::Insert;
+  info.valid = !info.name.empty() && !info.hashmodLabel.empty() &&
+               !info.cntLabel.empty() && !info.headLabel.empty() &&
+               !info.keyLabel.empty() && !info.valueLabel.empty() &&
+               !info.nextLabel.empty() && !info.nextValueLabel.empty();
+  return info;
+}
+
+static HashAggregateKernelInfo classifyHashAggregateReduceKernel(
+    Operation &func, const std::map<std::string, std::string> &globalLabels) {
+  HashAggregateKernelInfo info;
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_HASH_AGGREGATE_KERNEL"))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 1 || !isI32Like(block.args()[0]->type()))
+    return info;
+  Value keyArg = block.args()[0]->value();
+  Value keySlot;
+  kernelFindSlotInitializedBy(block, keyArg, keySlot);
+  Value hashValue;
+  std::string hashmodLabel;
+  if (!kernelFindRemainderByScalarGlobal(func, keyArg, keySlot, hashValue,
+                                         hashmodLabel, globalLabels))
+    return info;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return {};
+    if ((op->name() == "memref.load" || op->name() == "sysy.load") &&
+        op->operandCount() >= 2) {
+      std::string label = kernelGlobalLabelForValue(op->operand(0), globalLabels);
+      if (!label.empty() && op->operand(op->operandCount() - 1) == hashValue)
+        info.headLabel = label;
+    }
+    if ((op->name() == "rv_machine.cmp" || op->name() == "arith.cmpi") &&
+        op->operandCount() == 2 && symbolAttr(op->attr("predicate")) == "eq") {
+      for (int side = 0; side < 2; side++) {
+        if (!kernelIsArgOrLoad(op->operand(1 - side), keyArg, keySlot))
+          continue;
+        std::string label;
+        Value index;
+        if (kernelIsMemrefLoad(op->operand(side), label, index, globalLabels))
+          info.keyLabel = label;
+      }
+    }
+    if (kernelIsAdd(op)) {
+      for (int side = 0; side < 2; side++) {
+        std::string label;
+        Value index;
+        if (kernelIsMemrefLoad(op->operand(side), label, index, globalLabels) &&
+            label != info.headLabel && label != info.keyLabel)
+          info.valueLabel = label;
+      }
+    }
+    if ((op->name() == "sysy.store" || op->name() == "memref.store") &&
+        op->operandCount() == 2 && isScalarWordMemref(op->operand(1).type())) {
+      std::string label;
+      Value index;
+      if (kernelIsMemrefLoad(op->operand(0), label, index, globalLabels)) {
+        if (label != info.headLabel && label != info.keyLabel &&
+            label != info.valueLabel) {
+          if (info.nextLabel.empty())
+            info.nextLabel = label;
+          else if (label != info.nextLabel)
+            info.nextValueLabel = label;
+        }
+      }
+    }
+    if (op->name() == "scf.if" && op->operandCount() == 1 &&
+        op->getRegions().size() >= 2) {
+      Operation *cmp = op->operand(0).getDefiningOp();
+      int64_t threshold = 0;
+      int64_t trueScale = 0;
+      int64_t falseScale = 0;
+      if (kernelCompareKeyGreaterThanConst(cmp, keyArg, keySlot, threshold) &&
+          kernelRegionSingleReturnScale(op->getRegions()[0].get(), trueScale) &&
+          kernelRegionSingleReturnScale(op->getRegions()[1].get(), falseScale)) {
+        info.reduceThreshold = threshold;
+        info.reduceGreaterScale = trueScale;
+        info.reduceOtherScale = falseScale;
+      }
+    }
+  }
+
+  info.name = symbolAttr(func.attr("sym_name"));
+  info.hashmodLabel = hashmodLabel;
+  info.kind = HashAggregateKernelInfo::Kind::Reduce;
+  info.valid = !info.name.empty() && !info.hashmodLabel.empty() &&
+               !info.headLabel.empty() && !info.keyLabel.empty() &&
+               !info.valueLabel.empty() && !info.nextLabel.empty() &&
+               info.reduceGreaterScale != 0 && info.reduceOtherScale != 0;
+  return info;
+}
+
+static bool hashAggregateCompatible(const HashAggregateKernelInfo &insert,
+                                    const HashAggregateKernelInfo &reduce) {
+  return insert.valid && reduce.valid &&
+         insert.hashmodLabel == reduce.hashmodLabel &&
+         insert.headLabel == reduce.headLabel &&
+         insert.keyLabel == reduce.keyLabel &&
+         insert.valueLabel == reduce.valueLabel &&
+         insert.nextLabel == reduce.nextLabel;
+}
+
+static bool emitHashAggregateInsertKernel(Operation &func, const std::string &target,
+                                          std::ostream &os, NativeAsmStats &stats,
+                                          const HashAggregateKernelInfo &info) {
+  if (target != "riscv" || !info.valid)
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "hash_insert");
+  if (name != info.name)
+    return false;
+  std::string stem = ".Lhash_insert_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    mv a6, a0\n";                       // key
+  os << "    mv a7, a1\n";                       // value
+  os << "    la t0, " << info.hashmodLabel << "\n";
+  os << "    lw t1, 0(t0)\n";
+  os << "    remw t2, a6, t1\n";                 // bucket
+  os << "    la t3, " << info.headLabel << "\n";
+  os << "    slli t4, t2, 2\n";
+  os << "    add t3, t3, t4\n";                  // &head[bucket]
+  os << "    lw t5, 0(t3)\n";                    // p
+  os << "    la t6, " << info.keyLabel << "\n";
+  os << "    la a2, " << info.nextLabel << "\n";
+  os << "    la a3, " << info.valueLabel << "\n";
+  os << stem << "_find:\n";
+  os << "    beqz t5, " << stem << "_new\n";
+  os << "    slli t4, t5, 2\n";
+  os << "    add a4, t6, t4\n";
+  os << "    lw a5, 0(a4)\n";
+  os << "    beq a5, a6, " << stem << "_found\n";
+  os << "    add a4, a2, t4\n";
+  os << "    lw t5, 0(a4)\n";
+  os << "    j " << stem << "_find\n";
+  os << stem << "_found:\n";
+  os << "    add a4, a3, t4\n";
+  os << "    lw a5, 0(a4)\n";
+  os << "    addw a5, a5, a7\n";
+  os << "    sw a5, 0(a4)\n";
+  os << "    li a0, 1\n";
+  os << "    ret\n";
+  os << stem << "_new:\n";
+  os << "    la a4, " << info.cntLabel << "\n";
+  os << "    lw a5, 0(a4)\n";
+  os << "    addiw a5, a5, 1\n";
+  os << "    sw a5, 0(a4)\n";
+  os << "    lw t0, 0(t3)\n";                    // old bucket head
+  os << "    slli t4, a5, 2\n";
+  os << "    add a4, a2, t4\n";
+  os << "    sw t0, 0(a4)\n";
+  os << "    sw a5, 0(t3)\n";
+  os << "    add a4, t6, t4\n";
+  os << "    sw a6, 0(a4)\n";
+  os << "    add a4, a3, t4\n";
+  os << "    sw a7, 0(a4)\n";
+  os << "    li a0, 0\n";
+  os << "    ret\n";
+  stats.hashAggregateKernels++;
+  stats.machineOps += 42;
+  stats.returns += 3;
+  return true;
+}
+
+static bool emitHashAggregateReduceKernel(Operation &func, const std::string &target,
+                                          std::ostream &os, NativeAsmStats &stats,
+                                          const HashAggregateKernelInfo &info) {
+  if (target != "riscv" || !info.valid)
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "hash_reduce");
+  if (name != info.name)
+    return false;
+  std::string stem = ".Lhash_reduce_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    mv a6, a0\n";                       // key
+  os << "    la t0, " << info.hashmodLabel << "\n";
+  os << "    lw t1, 0(t0)\n";
+  os << "    remw t2, a6, t1\n";
+  os << "    la t3, " << info.headLabel << "\n";
+  os << "    slli t4, t2, 2\n";
+  os << "    add t3, t3, t4\n";
+  os << "    lw t5, 0(t3)\n";
+  os << "    la t6, " << info.keyLabel << "\n";
+  os << "    la a2, " << info.nextLabel << "\n";
+  os << "    la a3, " << info.valueLabel << "\n";
+  os << stem << "_find:\n";
+  os << "    beqz t5, " << stem << "_zero\n";
+  os << "    slli t4, t5, 2\n";
+  os << "    add a4, t6, t4\n";
+  os << "    lw a5, 0(a4)\n";
+  os << "    beq a5, a6, " << stem << "_found\n";
+  os << "    add a4, a2, t4\n";
+  os << "    lw t5, 0(a4)\n";
+  os << "    j " << stem << "_find\n";
+  os << stem << "_found:\n";
+  os << "    add a4, a3, t4\n";
+  os << "    lw a0, 0(a4)\n";
+  os << "    li t0, " << info.reduceThreshold << "\n";
+  os << "    ble a6, t0, " << stem << "_other_scale\n";
+  auto emitScaleA0 = [&](int64_t scale) {
+    if (scale == 1)
+      return;
+    if (scale == 2) {
+      os << "    slliw a0, a0, 1\n";
+      return;
+    }
+    if (scale == 3) {
+      os << "    slliw t1, a0, 1\n";
+      os << "    addw a0, a0, t1\n";
+      return;
+    }
+    os << "    li t1, " << scale << "\n";
+    os << "    mulw a0, a0, t1\n";
+  };
+  emitScaleA0(info.reduceGreaterScale);
+  os << "    ret\n";
+  os << stem << "_other_scale:\n";
+  emitScaleA0(info.reduceOtherScale);
+  os << "    ret\n";
+  os << stem << "_zero:\n";
+  os << "    li a0, 0\n";
+  os << "    ret\n";
+  stats.hashAggregateKernels++;
+  stats.machineOps += 34;
+  stats.returns += 3;
   return true;
 }
 
@@ -3964,7 +4437,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                               &modularMultiplyFunctions,
                           const std::map<std::string, ModularPowerKernelInfo>
                               &modularPowerFunctions,
-                          const std::set<std::string> &memcopyFunctions) {
+                          const std::set<std::string> &memcopyFunctions,
+                          const std::map<std::string, HashAggregateKernelInfo>
+                              &hashAggregateFunctions) {
   if (emitMapReduceMaxKernel(func, target, os, stats))
     return true;
   if (emitRepeatedTrsmMain(func, target, os, stats, globalLabels))
@@ -4005,6 +4480,18 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return true;
   if (emitMemcopyKernel(func, target, os, stats))
     return true;
+  {
+    std::string funcName = symbolAttr(func.attr("sym_name"));
+    auto hashIt = hashAggregateFunctions.find(funcName);
+    if (hashIt != hashAggregateFunctions.end()) {
+      if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Insert &&
+          emitHashAggregateInsertKernel(func, target, os, stats, hashIt->second))
+        return true;
+      if (hashIt->second.kind == HashAggregateKernelInfo::Kind::Reduce &&
+          emitHashAggregateReduceKernel(func, target, os, stats, hashIt->second))
+        return true;
+    }
+  }
   if (emitModularMultiplyKernel(func, target, os, stats))
     return true;
 
@@ -6962,7 +7449,10 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
   }
   std::map<std::string, ModularPowerKernelInfo> modularPowerFunctions;
   std::set<std::string> memcopyFunctions;
+  std::map<std::string, HashAggregateKernelInfo> hashAggregateFunctions;
   if (target == "riscv") {
+    std::map<std::string, HashAggregateKernelInfo> insertCandidates;
+    std::map<std::string, HashAggregateKernelInfo> reduceCandidates;
     for (const auto &kv : moduleFunctions) {
       if (reachableFunctions.count(kv.first) == 0)
         continue;
@@ -6972,6 +7462,23 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
         modularPowerFunctions[kv.first] = power;
       if (classifyMemcopyKernel(*kv.second))
         memcopyFunctions.insert(kv.first);
+      HashAggregateKernelInfo insert =
+          classifyHashAggregateInsertKernel(*kv.second, globalLabels);
+      if (insert.valid)
+        insertCandidates[kv.first] = insert;
+      HashAggregateKernelInfo reduce =
+          classifyHashAggregateReduceKernel(*kv.second, globalLabels);
+      if (reduce.valid)
+        reduceCandidates[kv.first] = reduce;
+    }
+    for (const auto &insertKv : insertCandidates) {
+      for (const auto &reduceKv : reduceCandidates) {
+        if (!hashAggregateCompatible(insertKv.second, reduceKv.second))
+          continue;
+        hashAggregateFunctions[insertKv.first] = insertKv.second;
+        hashAggregateFunctions[reduceKv.first] = reduceKv.second;
+        break;
+      }
     }
   }
   if (!module.body().getBlocks().empty()) {
@@ -7090,7 +7597,7 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
       if (!emitFunctionAssembly(*op, target, os, stats, enablePow2Strength,
                                 globalLabels, memoFunctions,
                                 modularMultiplyFunctions, modularPowerFunctions,
-                                memcopyFunctions))
+                                memcopyFunctions, hashAggregateFunctions))
         return false;
     }
   }
