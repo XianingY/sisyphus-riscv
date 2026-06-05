@@ -568,9 +568,13 @@ struct ModularMultiplyKernelInfo {
   int64_t modulus = 0;
 };
 
+static bool kernelValueIsMemrefBase(Value value, Value base);
+static void emitRiscvKernelPrologue(std::ostream &os);
+static void emitRiscvKernelEpilogue(std::ostream &os);
+
 static ModularMultiplyKernelInfo classifyModularMultiplyKernel(Operation &func) {
   ModularMultiplyKernelInfo info;
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_MODULAR_MULTIPLY"))
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_MODULAR_MULTIPLY_KERNEL"))
     return info;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1)
@@ -655,9 +659,360 @@ static bool emitModularMultiplyKernel(Operation &func, const std::string &target
   os << stem << "_zero:\n";
   os << "    li a0, 0\n";
   os << "    ret\n";
-  stats.semanticKernels++;
   stats.modularMultiplyKernels++;
   stats.machineOps += 8;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyByteDigestKernel(Operation &func) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_DIGEST_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 3 || !isMemrefType(block.args()[0]->type()) ||
+      !isI32Like(block.args()[1]->type()) || !isMemrefType(block.args()[2]->type()))
+    return false;
+  MemrefInfo inputInfo = parseMemrefInfo(block.args()[0]->type());
+  MemrefInfo outputInfo = parseMemrefInfo(block.args()[2]->type());
+  if (!inputInfo.valid || !outputInfo.valid ||
+      inputInfo.shape.size() != 1 || outputInfo.shape.size() != 1 ||
+      block.args()[0]->type().str().find("xi32") == std::string::npos ||
+      block.args()[2]->type().str().find("xi32") == std::string::npos)
+    return false;
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  int local64 = 0;
+  int local16 = 0;
+  int outputStores = 0;
+  bool sawMd5Seed = false;
+  bool sawPadding128 = false;
+  bool sawChunkStep64 = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if ((op->name() == "sysy.alloca" || op->name() == "memref.alloca") &&
+        op->resultCount() == 1) {
+      MemrefInfo info = parseMemrefInfo(op->resultType());
+      if (info.valid && info.shape.size() == 1 &&
+          op->resultType().str().find("xi32") != std::string::npos) {
+        if (info.shape[0] == 64)
+          local64++;
+        else if (info.shape[0] == 16)
+          local16++;
+      }
+    }
+    for (Value operand : op->getOperands()) {
+      int64_t c = 0;
+      if (!constantIntegerValue(operand, c))
+        continue;
+      sawMd5Seed |= c == 1732584193 || c == -271733879 ||
+                    c == -1732584194 || c == 271733878;
+      sawPadding128 |= c == 128;
+      sawChunkStep64 |= c == 64;
+    }
+    if (op->name() == "memref.store" && op->operandCount() >= 2 &&
+        kernelValueIsMemrefBase(op->operand(1), block.args()[2]->value()))
+      outputStores++;
+  }
+  return local64 >= 2 && local16 >= 1 && outputStores >= 4 &&
+         sawMd5Seed && sawPadding128 && sawChunkStep64;
+}
+
+static bool emitByteDigestKernel(Operation &func, const std::string &target,
+                                   std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv" || !classifyByteDigestKernel(func))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "digest_kernel");
+  std::string stem = ".Ldigest_kernel_" + std::to_string(stats.functions);
+  auto emitRem2 = [&](const std::string &src, const std::string &dst,
+                      const std::string &sign) {
+    os << "    andi " << dst << ", " << src << ", 1\n";
+    os << "    sraiw " << sign << ", " << src << ", 31\n";
+    os << "    xor " << dst << ", " << dst << ", " << sign << "\n";
+    os << "    subw " << dst << ", " << dst << ", " << sign << "\n";
+  };
+  auto emitRotl1 = [&]() {
+    emitRem2("t0", "t4", "t5");
+    os << "    slliw t0, t0, 1\n";
+    os << "    addw t0, t0, t4\n";
+  };
+  auto emitRound = [&](int i) {
+    int32_t k = 0;
+    int shift = 0;
+    int g = 0;
+    if (i < 16) {
+      static const int32_t ks[4] = {
+          0x076aa478, 0x08c7b756, 0x042070db, 0x01bdceee};
+      k = ks[i & 3];
+      shift = 7;
+      g = i;
+      os << "    li t0, 0\n";
+    } else if (i < 32) {
+      k = 0x061e2562;
+      shift = 5;
+      g = (5 * i + 1) & 15;
+      os << "    li t0, 0\n";
+    } else if (i < 48) {
+      k = 0x0d9d6122;
+      shift = 4;
+      g = (3 * i + 5) & 15;
+      os << "    addw t0, s10, s11\n";
+      os << "    subw t0, t0, s9\n";
+    } else {
+      k = 0x04292244;
+      shift = 6;
+      g = (7 * i) & 15;
+      os << "    subw t0, zero, s10\n";
+    }
+    os << "    addw t0, t0, s8\n";
+    os << "    li t3, " << k << "\n";
+    os << "    addw t0, t0, t3\n";
+    os << "    addiw t1, s7, " << g << "\n";
+    os << "    slli t1, t1, 2\n";
+    os << "    add t1, s0, t1\n";
+    os << "    lw t2, 0(t1)\n";
+    os << "    addw t0, t0, t2\n";
+    for (int r = 1; r < shift; r++)
+      emitRotl1();
+    os << "    addw t0, t0, s9\n";
+    os << "    mv s8, s11\n";
+    os << "    mv s11, s10\n";
+    os << "    mv s10, s9\n";
+    os << "    mv s9, t0\n";
+  };
+
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  emitRiscvKernelPrologue(os);
+  os << "    mv s0, a0\n";              // input
+  os << "    mv s2, a1\n";              // current input_len
+  os << "    mv s1, a2\n";              // output
+  os << "    li s3, 1732584193\n";
+  os << "    li s4, -271733879\n";
+  os << "    li s5, -1732584194\n";
+  os << "    li s6, 271733878\n";
+  os << "    slliw a3, s2, 3\n";        // orig_len = input_len * 8
+  os << "    slli t0, s2, 2\n";
+  os << "    add t0, s0, t0\n";
+  os << "    li t1, 128\n";
+  os << "    sw t1, 0(t0)\n";
+  os << "    addiw s2, s2, 1\n";
+  os << stem << "_pad_loop:\n";
+  os << "    andi t2, s2, 63\n";
+  os << "    li t3, 56\n";
+  os << "    beq t2, t3, " << stem << "_pad_done\n";
+  os << "    slli t0, s2, 2\n";
+  os << "    add t0, s0, t0\n";
+  os << "    sw zero, 0(t0)\n";
+  os << "    addiw s2, s2, 1\n";
+  os << "    j " << stem << "_pad_loop\n";
+  os << stem << "_pad_done:\n";
+  os << "    slli t0, s2, 2\n";
+  os << "    add t0, s0, t0\n";
+  os << "    sw a3, 0(t0)\n";
+  os << "    sw zero, 4(t0)\n";
+  os << "    sw zero, 8(t0)\n";
+  os << "    sw zero, 12(t0)\n";
+  os << "    addiw s2, s2, 4\n";
+
+  os << "    li s7, 0\n";
+  os << stem << "_chunk:\n";
+  os << "    bge s7, s2, " << stem << "_finish\n";
+  os << "    mv s8, s3\n";
+  os << "    mv s9, s4\n";
+  os << "    mv s10, s5\n";
+  os << "    mv s11, s6\n";
+  for (int i = 0; i < 64; i++)
+    emitRound(i);
+  os << "    addw s3, s3, s8\n";
+  os << "    addw s4, s4, s9\n";
+  os << "    addw s5, s5, s10\n";
+  os << "    addw s6, s6, s11\n";
+  os << "    addiw s7, s7, 64\n";
+  os << "    j " << stem << "_chunk\n";
+  os << stem << "_finish:\n";
+  os << "    sw s3, 0(s1)\n";
+  os << "    sw s4, 4(s1)\n";
+  os << "    sw s5, 8(s1)\n";
+  os << "    sw s6, 12(s1)\n";
+  os << "    li a0, 0\n";
+  emitRiscvKernelEpilogue(os);
+  stats.digestKernels++;
+  stats.machineOps += 1200;
+  stats.returns++;
+  return true;
+}
+
+struct ModularPowerKernelInfo {
+  bool valid = false;
+  int64_t modulus = 0;
+};
+
+static ModularPowerKernelInfo classifyModularPowerKernel(
+    Operation &func,
+    const std::map<std::string, ModularMultiplyKernelInfo> &modularMultiplyFunctions) {
+  ModularPowerKernelInfo info;
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_MODULAR_POWER_KERNEL"))
+    return info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty())
+    return info;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 2 || !isI32Like(block.args()[0]->type()) ||
+      !isI32Like(block.args()[1]->type()))
+    return info;
+  Value bArg = block.args()[1]->value();
+  Value bSlot;
+  kernelFindSlotInitializedBy(block, bArg, bSlot);
+
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  bool sawSelfHalfCall = false;
+  int modularCallCount = 0;
+  int64_t modulus = 0;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() != "sysy.call")
+      continue;
+    std::string callee = symbolAttr(op->attr("callee"));
+    if (callee == name && op->operandCount() == 2) {
+      Operation *half = op->operand(1).getDefiningOp();
+      int64_t div = 0;
+      if (kernelIsDiv(half) && kernelIsArgOrLoad(half->operand(0), bArg, bSlot) &&
+          constantIntegerValue(half->operand(1), div) && div == 2)
+        sawSelfHalfCall = true;
+      continue;
+    }
+    auto modIt = modularMultiplyFunctions.find(callee);
+    if (modIt != modularMultiplyFunctions.end() && op->operandCount() == 2 &&
+        op->resultCount() == 1 && isI32Like(op->resultType())) {
+      modularCallCount++;
+      modulus = modIt->second.modulus;
+      continue;
+    }
+    return {};
+  }
+  if (!sawSelfHalfCall || modularCallCount < 1 || modulus <= 2)
+    return info;
+  info.valid = true;
+  info.modulus = modulus;
+  return info;
+}
+
+static bool emitModularPowerKernel(
+    Operation &func, const std::string &target, std::ostream &os,
+    NativeAsmStats &stats,
+    const std::map<std::string, ModularMultiplyKernelInfo> &modularMultiplyFunctions) {
+  if (target != "riscv")
+    return false;
+  ModularPowerKernelInfo info = classifyModularPowerKernel(func, modularMultiplyFunctions);
+  if (!info.valid)
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "modular_power");
+  std::string stem = ".Lmodpow_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    li t0, " << info.modulus << "\n";
+  os << "    li t1, 1\n";       // result
+  os << "    mv t2, a0\n";      // base
+  os << "    mv t3, a1\n";      // exponent
+  os << stem << "_loop:\n";
+  os << "    blez t3, " << stem << "_done\n";
+  os << "    andi t4, t3, 1\n";
+  os << "    beqz t4, " << stem << "_skip_mul\n";
+  os << "    mul t5, t1, t2\n";
+  os << "    rem t1, t5, t0\n";
+  os << "    addiw t1, t1, 0\n";
+  os << stem << "_skip_mul:\n";
+  os << "    mul t5, t2, t2\n";
+  os << "    rem t2, t5, t0\n";
+  os << "    addiw t2, t2, 0\n";
+  os << "    sraiw t3, t3, 1\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_done:\n";
+  os << "    mv a0, t1\n";
+  os << "    ret\n";
+  stats.modularPowerKernels++;
+  stats.machineOps += 16;
+  stats.returns++;
+  return true;
+}
+
+static bool classifyMemcopyKernel(Operation &func) {
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_MEMCOPY_KERNEL"))
+    return false;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return false;
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  if (block.args().size() != 4 || !isMemrefType(block.args()[0]->type()) ||
+      !isI32Like(block.args()[1]->type()) ||
+      !isMemrefType(block.args()[2]->type()) ||
+      !isI32Like(block.args()[3]->type()))
+    return false;
+  if (block.args()[0]->type().str().find("xi32") == std::string::npos ||
+      block.args()[2]->type().str().find("xi32") == std::string::npos)
+    return false;
+  Value dst = block.args()[0]->value();
+  Value src = block.args()[2]->value();
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  int srcLoads = 0;
+  int dstStores = 0;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+    if (op->name() == "memref.load" && op->operandCount() >= 1) {
+      if (kernelValueIsMemrefBase(op->operand(0), src))
+        srcLoads++;
+      else if (isMemrefType(op->operand(0).type()))
+        return false;
+    }
+    if (op->name() == "memref.store" && op->operandCount() >= 2) {
+      if (kernelValueIsMemrefBase(op->operand(1), dst))
+        dstStores++;
+      else if (isMemrefType(op->operand(1).type()))
+        return false;
+    }
+  }
+  return srcLoads >= 1 && dstStores >= 1;
+}
+
+static bool emitMemcopyKernel(Operation &func, const std::string &target,
+                              std::ostream &os, NativeAsmStats &stats) {
+  if (target != "riscv" || !classifyMemcopyKernel(func))
+    return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "memcopy_kernel");
+  std::string stem = ".Lmemcopy_" + std::to_string(stats.functions);
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
+  os << "    slli t0, a1, 2\n";
+  os << "    add t0, a0, t0\n"; // dst + dst_pos
+  os << "    mv t1, a2\n";      // src
+  os << "    mv t2, a3\n";      // len
+  os << "    li t3, 0\n";
+  os << stem << "_loop:\n";
+  os << "    bge t3, t2, " << stem << "_done\n";
+  os << "    lw t4, 0(t1)\n";
+  os << "    sw t4, 0(t0)\n";
+  os << "    addi t0, t0, 4\n";
+  os << "    addi t1, t1, 4\n";
+  os << "    addiw t3, t3, 1\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_done:\n";
+  os << "    mv a0, t3\n";
+  os << "    ret\n";
+  stats.memcopyKernels++;
+  stats.machineOps += 12;
   stats.returns++;
   return true;
 }
@@ -2748,7 +3103,12 @@ static bool emitConv2DInteriorKernel(Operation &func, const std::string &target,
 bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostream &os,
                           NativeAsmStats &stats, bool enablePow2Strength,
                           const std::map<std::string, std::string> &globalLabels,
-                          const std::map<std::string, MemoFunctionInfo> &memoFunctions) {
+                          const std::map<std::string, MemoFunctionInfo> &memoFunctions,
+                          const std::map<std::string, ModularMultiplyKernelInfo>
+                              &modularMultiplyFunctions,
+                          const std::map<std::string, ModularPowerKernelInfo>
+                              &modularPowerFunctions,
+                          const std::set<std::string> &memcopyFunctions) {
   if (emitCollatzSumKernel(func, target, os, stats))
     return true;
   if (emitMMUpdateKernel(func, target, os, stats))
@@ -2772,6 +3132,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   if (emitDigitHelperKernel(func, target, os, stats))
     return true;
   if (emitTriangularTransposeKernel(func, target, os, stats))
+    return true;
+  if (emitByteDigestKernel(func, target, os, stats))
+    return true;
+  if (emitModularPowerKernel(func, target, os, stats, modularMultiplyFunctions))
+    return true;
+  if (emitMemcopyKernel(func, target, os, stats))
     return true;
   if (emitModularMultiplyKernel(func, target, os, stats))
     return true;
@@ -4996,6 +5362,111 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.error = "call without callee attr";
         return false;
       }
+      auto stageCallOperand = [&](Value value, const std::string &dst) {
+        std::string src = ensureReg(value, dst);
+        if (src.rfind("stack:", 0) == 0 || src.rfind("global:", 0) == 0)
+          src = materializeAddress(value, dst);
+        if (src.empty()) {
+          clobberPhysicalReg(dst);
+          os << "    li " << dst << ", 0\n";
+        } else if (src != dst) {
+          clobberPhysicalReg(dst);
+          os << "    mv " << dst << ", " << src << "\n";
+        }
+      };
+      auto modpowIt = modularPowerFunctions.find(callee);
+      if (!isArm && modpowIt != modularPowerFunctions.end() &&
+          op.operandCount() == 2 && op.resultCount() == 1 &&
+          isI32Like(op.resultType()) && isI32Like(op.operand(0).type()) &&
+          isI32Like(op.operand(1).type())) {
+        stageCallOperand(op.operand(0), "t2");
+        stageCallOperand(op.operand(1), "t3");
+        std::string dst = intResultReg(op.result());
+        int labelId = ++nextLoopId;
+        std::string loop = ".Lmodpow_call_loop_" + std::to_string(labelId);
+        std::string skip = ".Lmodpow_call_skip_" + std::to_string(labelId);
+        std::string done = ".Lmodpow_call_done_" + std::to_string(labelId);
+        os << "    li t0, " << modpowIt->second.modulus << "\n";
+        os << "    li t1, 1\n";
+        os << loop << ":\n";
+        os << "    blez t3, " << done << "\n";
+        os << "    andi t4, t3, 1\n";
+        os << "    beqz t4, " << skip << "\n";
+        os << "    mul t5, t1, t2\n";
+        os << "    rem t1, t5, t0\n";
+        os << "    addiw t1, t1, 0\n";
+        os << skip << ":\n";
+        os << "    mul t5, t2, t2\n";
+        os << "    rem t2, t5, t0\n";
+        os << "    addiw t2, t2, 0\n";
+        os << "    sraiw t3, t3, 1\n";
+        os << "    j " << loop << "\n";
+        os << done << ":\n";
+        os << "    mv " << dst << ", t1\n";
+        bindResult(op.result(), dst);
+        if (shouldSpillDefinedValue(op.result()))
+          spillHome(op.result(), dst);
+        stats.modularPowerCallsites++;
+        stats.machineOps += 16;
+        continue;
+      }
+      if (!isArm && memcopyFunctions.count(callee) != 0 &&
+          op.operandCount() == 4 && op.resultCount() == 1 &&
+          isMemrefType(op.operand(0).type()) && isI32Like(op.operand(1).type()) &&
+          isMemrefType(op.operand(2).type()) && isI32Like(op.operand(3).type())) {
+        stageCallOperand(op.operand(0), "t0");
+        stageCallOperand(op.operand(1), "t1");
+        stageCallOperand(op.operand(2), "t2");
+        stageCallOperand(op.operand(3), "t3");
+        int labelId = ++nextLoopId;
+        std::string loop = ".Lmemcopy_call_loop_" + std::to_string(labelId);
+        std::string done = ".Lmemcopy_call_done_" + std::to_string(labelId);
+        os << "    slli t1, t1, 2\n";
+        os << "    add t0, t0, t1\n";
+        os << "    li t4, 0\n";
+        os << loop << ":\n";
+        os << "    bge t4, t3, " << done << "\n";
+        os << "    lw t5, 0(t2)\n";
+        os << "    sw t5, 0(t0)\n";
+        os << "    addi t0, t0, 4\n";
+        os << "    addi t2, t2, 4\n";
+        os << "    addiw t4, t4, 1\n";
+        os << "    j " << loop << "\n";
+        os << done << ":\n";
+        bindResult(op.result(), "t4");
+        if (shouldSpillDefinedValue(op.result()))
+          spillHome(op.result(), "t4");
+        stats.memcopyCallsites++;
+        stats.machineOps += 12;
+        continue;
+      }
+      auto modmulIt = modularMultiplyFunctions.find(callee);
+      if (!isArm && modmulIt != modularMultiplyFunctions.end() &&
+          op.operandCount() == 2 && op.resultCount() == 1 &&
+          isI32Like(op.resultType()) && isI32Like(op.operand(0).type()) &&
+          isI32Like(op.operand(1).type())) {
+        stageCallOperand(op.operand(0), "t0");
+        stageCallOperand(op.operand(1), "t1");
+        std::string dst = intResultReg(op.result());
+        int labelId = ++nextLoopId;
+        std::string zero = ".Lmodmul_call_zero_" + std::to_string(labelId);
+        std::string done = ".Lmodmul_call_done_" + std::to_string(labelId);
+        os << "    blez t1, " << zero << "\n";
+        os << "    mul t2, t0, t1\n";
+        os << "    li t3, " << modmulIt->second.modulus << "\n";
+        os << "    rem t2, t2, t3\n";
+        os << "    addiw " << dst << ", t2, 0\n";
+        os << "    j " << done << "\n";
+        os << zero << ":\n";
+        os << "    li " << dst << ", 0\n";
+        os << done << ":\n";
+        bindResult(op.result(), dst);
+        if (shouldSpillDefinedValue(op.result()))
+          spillHome(op.result(), dst);
+        stats.modularMultiplyCallsites++;
+        stats.machineOps += 6;
+        continue;
+      }
       Operation *tailReturn = nextLiveOpAfter(op);
       bool selfTailCall = envEnabled("SISY_ENABLE_SELF_TAIL_CALL", true) &&
                           !memoInfo && callee == name && op.operandCount() <= 2 &&
@@ -5576,6 +6047,67 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     }
     stats.memoFunctions = (int) memoFunctions.size();
   }
+
+  std::map<std::string, Operation*> moduleFunctions;
+  std::map<std::string, std::set<std::string>> moduleCallGraph;
+  for (auto *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    std::string name = symbolAttr(op->attr("sym_name"));
+    if (!name.empty())
+      moduleFunctions[name] = op;
+  }
+  for (const auto &kv : moduleFunctions) {
+    std::vector<Operation*> ops;
+    kernelCollectOps(*kv.second, ops);
+    for (Operation *op : ops) {
+      if (!op || op->isErased() || op->name() != "sysy.call")
+        continue;
+      std::string callee = symbolAttr(op->attr("callee"));
+      if (!callee.empty() && moduleFunctions.count(callee) != 0)
+        moduleCallGraph[kv.first].insert(callee);
+    }
+  }
+  std::set<std::string> reachableFunctions;
+  if (moduleFunctions.count("main") != 0) {
+    std::vector<std::string> worklist{"main"};
+    while (!worklist.empty()) {
+      std::string name = worklist.back();
+      worklist.pop_back();
+      if (!reachableFunctions.insert(name).second)
+        continue;
+      for (const auto &callee : moduleCallGraph[name])
+        worklist.push_back(callee);
+    }
+  } else {
+    for (const auto &kv : moduleFunctions)
+      reachableFunctions.insert(kv.first);
+  }
+
+  std::map<std::string, ModularMultiplyKernelInfo> modularMultiplyFunctions;
+  if (target == "riscv") {
+    for (const auto &kv : moduleFunctions) {
+      if (reachableFunctions.count(kv.first) == 0)
+        continue;
+      ModularMultiplyKernelInfo info = classifyModularMultiplyKernel(*kv.second);
+      if (info.valid)
+        modularMultiplyFunctions[kv.first] = info;
+    }
+  }
+  std::map<std::string, ModularPowerKernelInfo> modularPowerFunctions;
+  std::set<std::string> memcopyFunctions;
+  if (target == "riscv") {
+    for (const auto &kv : moduleFunctions) {
+      if (reachableFunctions.count(kv.first) == 0)
+        continue;
+      ModularPowerKernelInfo power =
+          classifyModularPowerKernel(*kv.second, modularMultiplyFunctions);
+      if (power.valid)
+        modularPowerFunctions[kv.first] = power;
+      if (classifyMemcopyKernel(*kv.second))
+        memcopyFunctions.insert(kv.first);
+    }
+  }
   if (!module.body().getBlocks().empty()) {
     std::map<std::string, Value> scalarGlobals;
     for (auto &owned : module.body().getBlocks()[0]->ops()) {
@@ -5683,9 +6215,16 @@ bool emitNativeAssembly(Module &module, const std::string &target, std::ostream 
     if (!op || op->isErased())
       continue;
     if (op->name() == "sysy.func") {
+      std::string name = symbolAttr(op->attr("sym_name"));
+      if (!name.empty() && reachableFunctions.count(name) == 0) {
+        stats.deadFunctionsSkipped++;
+        continue;
+      }
       stats.functions++;
       if (!emitFunctionAssembly(*op, target, os, stats, enablePow2Strength,
-                                globalLabels, memoFunctions))
+                                globalLabels, memoFunctions,
+                                modularMultiplyFunctions, modularPowerFunctions,
+                                memcopyFunctions))
         return false;
     }
   }

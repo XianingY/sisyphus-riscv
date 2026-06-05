@@ -499,12 +499,19 @@ struct NativeAsmStats {
   int semanticKernels = 0;
   int triangularTransposeKernels = 0;
   int modularMultiplyKernels = 0;
+  int modularMultiplyCallsites = 0;
+  int modularPowerKernels = 0;
+  int modularPowerCallsites = 0;
+  int memcopyKernels = 0;
+  int memcopyCallsites = 0;
   int digitHelperKernels = 0;
   int mmLikeKernels = 0;
   int halfInitMatrixKernels = 0;
   int stencil3DKernels = 0;
   int matmulSummaryKernels = 0;
   int conv2dInteriorKernels = 0;
+  int digestKernels = 0;
+  int deadFunctionsSkipped = 0;
   std::string error;
 };
 

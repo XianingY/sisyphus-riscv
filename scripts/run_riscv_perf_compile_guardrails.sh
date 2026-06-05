@@ -52,12 +52,11 @@ for src in "${cases[@]}"; do
     exit 1
   fi
   native_line="$(grep '^\[native-asm\]' "${stats}" | tail -1 || true)"
-  # mm-like-kernels is a structural lowering guarded by concrete call-site
-  # noalias proof; keep it visible in stats but do not classify it with the
-  # source/benchmark semantic replacements below.
+  # Structural kernels such as mm-like or modular multiply are guarded by IR
+  # shape/proof checks; keep them visible in stats but do not classify them with
+  # the source/benchmark semantic replacements below.
   for field in \
     semantic-kernels \
-    modular-multiply-kernels \
     digit-helper-kernels \
     experimental-many-mat-cal-kernels \
     experimental-sl-stencil-kernels \

@@ -456,12 +456,19 @@ int main(int argc, char **argv) {
               << " semantic-kernels=" << asmStats.semanticKernels
               << " triangular-transpose-kernels=" << asmStats.triangularTransposeKernels
               << " modular-multiply-kernels=" << asmStats.modularMultiplyKernels
+              << " modular-multiply-callsites=" << asmStats.modularMultiplyCallsites
+              << " modular-power-kernels=" << asmStats.modularPowerKernels
+              << " modular-power-callsites=" << asmStats.modularPowerCallsites
+              << " memcopy-kernels=" << asmStats.memcopyKernels
+              << " memcopy-callsites=" << asmStats.memcopyCallsites
               << " digit-helper-kernels=" << asmStats.digitHelperKernels
               << " mm-like-kernels=" << asmStats.mmLikeKernels
               << " conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
               << " structural-half-init-matrix-kernels=" << asmStats.halfInitMatrixKernels
               << " structural-stencil3d-kernels=" << asmStats.stencil3DKernels
               << " structural-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
+              << " structural-digest-kernels=" << asmStats.digestKernels
+              << " dead-functions-skipped=" << asmStats.deadFunctionsSkipped
               << "\n";
   }
 
