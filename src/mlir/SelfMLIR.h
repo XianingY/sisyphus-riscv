@@ -502,7 +502,7 @@ struct NativeAsmStats {
   int digitHelperKernels = 0;
   int mmLikeKernels = 0;
   int halfInitMatrixKernels = 0;
-  int slStencilKernels = 0;
+  int stencil3DKernels = 0;
   int matmulSummaryKernels = 0;
   int conv2dInteriorKernels = 0;
   std::string error;

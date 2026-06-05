@@ -460,7 +460,7 @@ int main(int argc, char **argv) {
               << " mm-like-kernels=" << asmStats.mmLikeKernels
               << " conv2d-interior-kernels=" << asmStats.conv2dInteriorKernels
               << " structural-half-init-matrix-kernels=" << asmStats.halfInitMatrixKernels
-              << " experimental-sl-stencil-kernels=" << asmStats.slStencilKernels
+              << " structural-stencil3d-kernels=" << asmStats.stencil3DKernels
               << " structural-matmul-summary-kernels=" << asmStats.matmulSummaryKernels
               << "\n";
   }

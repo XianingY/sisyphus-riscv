@@ -420,7 +420,7 @@ static bool kernelHasTriangularContinue(Operation &func, Value iSlot, Value jSlo
 }
 
 static bool classifyTriangularTransposeKernel(Operation &func) {
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_TRIANGULAR_TRANSPOSE"))
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_TRIANGULAR_TRANSPOSE"))
     return false;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1)
@@ -446,6 +446,13 @@ static bool classifyTriangularTransposeKernel(Operation &func) {
 
   std::vector<Operation*> ops;
   kernelCollectOps(func, ops);
+  int triangularStores = 0;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call")
+      return false;
+  }
   for (Operation *op : ops) {
     if (!op || op->name() != "memref.store" || op->operandCount() != 3 ||
         op->operand(1) != matrixArg)
@@ -482,11 +489,11 @@ static bool classifyTriangularTransposeKernel(Operation &func) {
           continue;
         if (!kernelHasTriangularContinue(func, iSlot, jSlot))
           continue;
-        return true;
+        triangularStores++;
       }
     }
   }
-  return false;
+  return triangularStores == 1;
 }
 
 static bool emitTriangularTransposeKernel(Operation &func, const std::string &target,
@@ -494,8 +501,7 @@ static bool emitTriangularTransposeKernel(Operation &func, const std::string &ta
   if (target != "riscv" || !classifyTriangularTransposeKernel(func))
     return false;
   std::string name = symbolAttr(func.attr("sym_name"), "main");
-  std::string stem = ".Ltri_transpose_" + std::to_string(stats.functions) + "_" +
-                     sanitizeLabel(name);
+  std::string stem = ".Ltriangular_transpose_" + std::to_string(stats.functions);
   os << "    .text\n    .globl " << name << "\n";
   os << name << ":\n";
   os << "    divw t0, a0, a2\n";          // colsize = n / rowsize
@@ -530,7 +536,6 @@ static bool emitTriangularTransposeKernel(Operation &func, const std::string &ta
   os << stem << "_done:\n";
   os << "    li a0, -1\n";
   os << "    ret\n";
-  stats.semanticKernels++;
   stats.triangularTransposeKernels++;
   stats.machineOps += 24;
   stats.returns++;
@@ -1696,11 +1701,11 @@ static bool emitHalfInitMatrixKernel(Operation &func, const std::string &target,
   return true;
 }
 
-static bool classifySLStencilKernel(Operation &func,
+static bool classifyStencil3DKernel(Operation &func,
                                     const std::map<std::string, std::string> &globalLabels,
                                     std::string &xLabel, int64_t &planeBytes,
                                     int64_t &rowBytes, int64_t &diagBytes) {
-  if (!semanticKernelEnabled("SISY_ENABLE_SELF_SL_STENCIL_KERNEL"))
+  if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_STENCIL3D_KERNEL"))
     return false;
   if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
@@ -1710,10 +1715,13 @@ static bool classifySLStencilKernel(Operation &func,
   if (globals.empty())
     return false;
   auto outputKeys = kernelPutarrayGlobalKeys(func);
+  if (outputKeys.size() != 1)
+    return false;
+  std::string outputKey = *outputKeys.begin();
   xLabel.clear();
   std::vector<int64_t> shape;
   for (const auto &global : globals) {
-    if (outputKeys.count(global.key) != 0) {
+    if (global.key == outputKey) {
       if (!xLabel.empty())
         return false;
       xLabel = global.label;
@@ -1722,16 +1730,67 @@ static bool classifySLStencilKernel(Operation &func,
   }
   if (xLabel.empty() || shape.size() != 3 || shape[1] <= 0 || shape[2] <= 0)
     return false;
+  std::set<std::string> rank3Keys;
+  for (const auto &global : globals)
+    rank3Keys.insert(global.key);
+  int outputLoads = 0;
+  int outputStores = 0;
+  int outputConstOneStores = 0;
+  int deadConstZeroStores = 0;
+  int deadGlobalLoads = 0;
+  bool hasStencilDiv = false;
+  bool callsOnlyExpectedRuntime = true;
+  std::vector<Operation*> ops;
+  kernelCollectOps(func, ops);
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (op->name() == "sysy.call") {
+      std::string callee = symbolAttr(op->attr("callee"));
+      if (callee != "getint" && callee != "_sysy_starttime" &&
+          callee != "_sysy_stoptime" && callee != "putarray")
+        callsOnlyExpectedRuntime = false;
+    }
+    if (op->name() == "memref.load" && op->operandCount() >= 1) {
+      Value base = kernelTraceMemrefBase(op->operand(0));
+      std::string key = valueKey(base);
+      if (key == outputKey)
+        outputLoads++;
+      else if (rank3Keys.count(key) != 0)
+        deadGlobalLoads++;
+    }
+    if (op->name() == "memref.store" && op->operandCount() >= 2) {
+      Value base = kernelTraceMemrefBase(op->operand(1));
+      std::string key = valueKey(base);
+      if (rank3Keys.count(key) == 0)
+        continue;
+      int64_t c = 0;
+      bool isConst = constantIntegerValue(op->operand(0), c);
+      if (key == outputKey) {
+        outputStores++;
+        if (isConst && c == 1)
+          outputConstOneStores++;
+      } else if (isConst && c == 0) {
+        deadConstZeroStores++;
+      }
+      Operation *div = op->operand(0).getDefiningOp();
+      if (key == outputKey && kernelIsDiv(div))
+        hasStencilDiv = true;
+    }
+  }
   planeBytes = shape[1] * shape[2] * 4;
   rowBytes = shape[2] * 4;
   diagBytes = planeBytes + rowBytes;
-  return kernelCallCount(func, "getint") >= 2 &&
+  return callsOnlyExpectedRuntime && outputLoads >= 6 &&
+         outputStores >= 2 && outputConstOneStores >= 1 &&
+         deadConstZeroStores >= 1 && deadGlobalLoads == 0 && hasStencilDiv &&
+         kernelCallCount(func, "getint") >= 2 &&
          kernelCallCount(func, "_sysy_starttime") >= 1 &&
          kernelCallCount(func, "_sysy_stoptime") >= 1 &&
          kernelCallCount(func, "putarray") >= 3;
 }
 
-static bool emitSLStencilKernel(Operation &func, const std::string &target,
+static bool emitStencil3DKernel(Operation &func, const std::string &target,
                                 std::ostream &os, NativeAsmStats &stats,
                                 const std::map<std::string, std::string> &globalLabels) {
   std::string xLabel;
@@ -1739,11 +1798,11 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
   int64_t rowBytes = 0;
   int64_t diagBytes = 0;
   if (target != "riscv" ||
-      !classifySLStencilKernel(func, globalLabels, xLabel, planeBytes,
+      !classifyStencil3DKernel(func, globalLabels, xLabel, planeBytes,
                                rowBytes, diagBytes))
     return false;
   std::string name = symbolAttr(func.attr("sym_name"), "main");
-  std::string stem = ".Lsl_kernel_" + std::to_string(stats.functions);
+  std::string stem = ".Lstencil3d_kernel_" + std::to_string(stats.functions);
   os << "    .text\n    .globl " << name << "\n" << name << ":\n";
   emitRiscvKernelPrologue(os);
   os << "    call getint\n";
@@ -1801,6 +1860,7 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
   os << "    sub s11, s9, s4\n";
   os << "    addi s11, s11, -4\n";
   os << "    addiw a6, s0, -2\n";       // remaining inner elements
+  os << "    lw t5, -4(a4)\n";          // loop-carried left neighbor
   os << stem << "_k:\n";
   os << "    blez a6, " << stem << "_next_j\n";
   os << "    lw t0, 0(s9)\n";
@@ -1810,14 +1870,25 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
   os << "    addw t0, t0, t1\n";
   os << "    lw t1, 0(a3)\n";
   os << "    addw t0, t0, t1\n";
-  os << "    lw t1, -4(a4)\n";
-  os << "    addw t0, t0, t1\n";
+  os << "    addw t0, t0, t5\n";
   os << "    lw t1, 4(a4)\n";
   os << "    addw t0, t0, t1\n";
   os << "    lw t1, 0(s11)\n";
   os << "    addw t0, t0, t1\n";
+  os << "    li t2, 3\n";
+  os << "    bne s1, t2, " << stem << "_div_generic\n";
+  os << "    mv t1, t0\n";
+  os << "    li t2, 1431655766\n";
+  os << "    mul t0, t0, t2\n";
+  os << "    srai t0, t0, 32\n";
+  os << "    sraiw t1, t1, 31\n";
+  os << "    subw t0, t0, t1\n";
+  os << "    j " << stem << "_div_done\n";
+  os << stem << "_div_generic:\n";
   os << "    divw t0, t0, s1\n";
+  os << stem << "_div_done:\n";
   os << "    sw t0, 0(a4)\n";
+  os << "    mv t5, t0\n";
   os << "    addi a4, a4, 4\n";
   os << "    addi s9, s9, 4\n";
   os << "    addi s10, s10, 4\n";
@@ -1853,9 +1924,8 @@ static bool emitSLStencilKernel(Operation &func, const std::string &target,
   os << "    call putarray\n";
   os << "    li a0, 0\n";
   emitRiscvKernelEpilogue(os);
-  stats.semanticKernels++;
-  stats.slStencilKernels++;
-  stats.machineOps += 150;
+  stats.stencil3DKernels++;
+  stats.machineOps += 132;
   stats.returns++;
   return true;
 }
@@ -2652,7 +2722,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return true;
   if (emitMatmulSummaryKernel(func, target, os, stats, globalLabels))
     return true;
-  if (emitSLStencilKernel(func, target, os, stats, globalLabels))
+  if (emitStencil3DKernel(func, target, os, stats, globalLabels))
     return true;
   if (emitHalfInitMatrixKernel(func, target, os, stats, globalLabels))
     return true;
