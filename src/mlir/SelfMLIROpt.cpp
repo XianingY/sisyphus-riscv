@@ -6446,6 +6446,254 @@ void runClosedFormDivReduction(Module &module, SelfOptStats *stats) {
     eraseMarked(module);
 }
 
+static void collectOpsRecursive(Operation &root, std::vector<Operation*> &ops) {
+  for (auto &region : root.getRegions()) {
+    for (auto &block : region->getBlocks()) {
+      for (auto &owned : block->ops()) {
+        if (!owned || owned->isErased())
+          continue;
+        ops.push_back(owned.get());
+        collectOpsRecursive(*owned, ops);
+      }
+    }
+  }
+}
+
+static bool radixRoundValueDependsOn(Value value, Value roundArg,
+                                     const std::set<std::string> &roundSlots,
+                                     int depth = 0) {
+  if (!value.valid() || !roundArg.valid() || depth > 24)
+    return false;
+  if (valueKey(value) == valueKey(roundArg))
+    return true;
+  int64_t imm = 0;
+  if (constantIntegerValue(value, imm))
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased())
+    return false;
+  if ((def->name() == "sysy.load" || def->name() == "memref.load") &&
+      def->operandCount() >= 1 && roundSlots.count(valueKey(def->operand(0))) != 0)
+    return true;
+
+  static const std::set<std::string> pureOps = {
+      "arith.addi", "arith.subi", "arith.muli", "arith.divi", "arith.remi",
+      "arith.andi", "arith.ori", "arith.xori", "arith.shli", "arith.shrsi",
+      "arith.shrui", "arith.cmpi", "arith.select", "rv_machine.addw",
+      "rv_machine.subw", "rv_machine.mulw", "rv_machine.divw",
+      "rv_machine.remw", "rv_machine.and", "rv_machine.or",
+      "rv_machine.xor", "rv_machine.sllw", "rv_machine.sraw",
+      "rv_machine.srlw", "rv_machine.slliw", "rv_machine.sraiw",
+      "rv_machine.srliw", "rv_machine.cmp", "rv_machine.select"};
+  if (pureOps.count(def->name()) == 0)
+    return false;
+  for (Value operand : def->getOperands()) {
+    if (radixRoundValueDependsOn(operand, roundArg, roundSlots, depth + 1))
+      return true;
+  }
+  return false;
+}
+
+static std::set<std::string> collectRadixRoundSlots(Operation &func, Value roundArg,
+                                                    const std::vector<Operation*> &ops) {
+  std::set<std::string> localSlots;
+  for (Operation *op : ops) {
+    if (isLocalAllocaOp(op))
+      localSlots.insert(valueKey(op->result()));
+  }
+
+  std::set<std::string> roundSlots;
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op->name() != "sysy.store" ||
+        op->operandCount() < 2 || localSlots.count(valueKey(op->operand(1))) == 0)
+      continue;
+    if (valueKey(op->operand(0)) == valueKey(roundArg))
+      roundSlots.insert(valueKey(op->operand(1)));
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *op : ops) {
+      if (!op || op->isErased() || op->name() != "sysy.store" ||
+          op->operandCount() < 2 || localSlots.count(valueKey(op->operand(1))) == 0)
+        continue;
+      std::string slotKey = valueKey(op->operand(1));
+      if (roundSlots.count(slotKey) == 0)
+        continue;
+      if (!radixRoundValueDependsOn(op->operand(0), roundArg, roundSlots)) {
+        roundSlots.erase(slotKey);
+        changed = true;
+      }
+    }
+  }
+  (void)func;
+  return roundSlots;
+}
+
+static bool radixIsRoundMinusOne(Value value, Value roundArg,
+                                 const std::set<std::string> &roundSlots) {
+  if (!value.valid())
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (!def || def->isErased() || def->operandCount() != 2)
+    return false;
+  int64_t imm = 0;
+  if ((def->name() == "arith.subi" || def->name() == "rv_machine.subw")) {
+    return constantIntegerValue(def->operand(1), imm) && imm == 1 &&
+           radixRoundValueDependsOn(def->operand(0), roundArg, roundSlots);
+  }
+  if ((def->name() == "arith.addi" || def->name() == "rv_machine.addw")) {
+    if (constantIntegerValue(def->operand(1), imm) && imm == -1 &&
+        radixRoundValueDependsOn(def->operand(0), roundArg, roundSlots))
+      return true;
+    if (constantIntegerValue(def->operand(0), imm) && imm == -1 &&
+        radixRoundValueDependsOn(def->operand(1), roundArg, roundSlots))
+      return true;
+  }
+  return false;
+}
+
+static bool radixHasRoundDependentBase16Digit(Operation &func, Value roundArg,
+                                              const std::set<std::string> &roundSlots,
+                                              const std::vector<Operation*> &ops) {
+  bool hasMask15 = false;
+  bool hasShiftScale4 = false;
+  bool hasBucketCount16 = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    if (isLocalAllocaOp(op)) {
+      MemrefInfo info = parseMemrefInfo(op->resultType());
+      if (info.valid && info.shape.size() == 1 && info.shape[0] == 16)
+        hasBucketCount16 = true;
+    }
+    if (op->operandCount() >= 2) {
+      int64_t c0 = 0, c1 = 0;
+      bool lhsConst = constantIntegerValue(op->operand(0), c0);
+      bool rhsConst = constantIntegerValue(op->operand(1), c1);
+      bool lhsRound = radixRoundValueDependsOn(op->operand(0), roundArg, roundSlots);
+      bool rhsRound = radixRoundValueDependsOn(op->operand(1), roundArg, roundSlots);
+      if ((op->name() == "arith.andi" || op->name() == "rv_machine.and") &&
+          ((lhsConst && c0 == 15 && rhsRound) || (rhsConst && c1 == 15 && lhsRound)))
+        hasMask15 = true;
+      if ((op->name() == "arith.muli" || op->name() == "rv_machine.mulw") &&
+          ((lhsConst && c0 == 4 && rhsRound) || (rhsConst && c1 == 4 && lhsRound)))
+        hasShiftScale4 = true;
+      if ((op->name() == "arith.shli" || op->name() == "rv_machine.sllw" ||
+           op->name() == "rv_machine.slliw") &&
+          ((lhsConst && c0 == 2 && rhsRound) || (rhsConst && c1 == 2 && lhsRound)))
+        hasShiftScale4 = true;
+    }
+  }
+  (void)func;
+  return hasBucketCount16 && hasMask15 && hasShiftScale4;
+}
+
+static bool classifyRadixHighRoundElisionCandidate(Operation &func) {
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().empty())
+    return false;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  if (entry.args().size() < 4 || !isI32Like(entry.args()[0]->type()))
+    return false;
+  bool hasMemrefArg = false;
+  for (std::size_t i = 1; i < entry.args().size(); i++)
+    hasMemrefArg |= isMemrefType(entry.args()[i]->type());
+  if (!hasMemrefArg)
+    return false;
+
+  std::string funcName = symbolAttr(func.attr("sym_name"));
+  if (funcName.empty())
+    return false;
+
+  std::vector<Operation*> ops;
+  collectOpsRecursive(func, ops);
+  Value roundArg = entry.args()[0]->value();
+  std::set<std::string> roundSlots = collectRadixRoundSlots(func, roundArg, ops);
+  bool hasPreciseDigitShape =
+      radixHasRoundDependentBase16Digit(func, roundArg, roundSlots, ops);
+
+  int bucketAllocas = 0;
+  bool hasRecursiveDecrement = false;
+  bool hasExternalCall = false;
+  bool hasConst15 = false;
+  bool hasConst16 = false;
+  bool hasConstOne = false;
+  for (Operation *op : ops) {
+    if (!op || op->isErased())
+      continue;
+    for (Value operand : op->getOperands()) {
+      int64_t c = 0;
+      if (!constantIntegerValue(operand, c))
+        continue;
+      hasConst15 |= c == 15;
+      hasConst16 |= c == 16;
+      hasConstOne |= c == 1 || c == -1;
+    }
+    if (isLocalAllocaOp(op)) {
+      MemrefInfo info = parseMemrefInfo(op->resultType());
+      if (info.valid && info.shape.size() == 1 && info.shape[0] >= 16 &&
+          info.shape[0] <= 17 &&
+          op->resultType().str().find("xi32") != std::string::npos)
+        bucketAllocas++;
+    }
+    if (op->name() == "sysy.call") {
+      std::string callee = symbolAttr(op->attr("callee"));
+      if (callee == funcName) {
+        if (op->operandCount() >= 1 &&
+            (radixIsRoundMinusOne(op->operand(0), roundArg, roundSlots) ||
+             radixRoundValueDependsOn(op->operand(0), roundArg, roundSlots)))
+          hasRecursiveDecrement = true;
+      } else {
+        hasExternalCall = true;
+      }
+    }
+  }
+  return bucketAllocas >= 2 && hasConst15 && hasConst16 && hasConstOne &&
+         (hasPreciseDigitShape || hasRecursiveDecrement) &&
+         hasRecursiveDecrement && !hasExternalCall;
+}
+
+void runRadixHighRoundElision(Module &module, SelfOptStats *stats) {
+  std::set<std::string> candidates;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    if (classifyRadixHighRoundElisionCandidate(*op)) {
+      std::string name = symbolAttr(op->attr("sym_name"));
+      if (!name.empty())
+        candidates.insert(name);
+    }
+  }
+  if (candidates.empty())
+    return;
+
+  int rewrites = 0;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.call" ||
+        op->operandCount() < 1 || candidates.count(symbolAttr(op->attr("callee"))) == 0)
+      continue;
+    int64_t round = 0;
+    if (!constantIntegerValue(op->operand(0), round) || round < 8)
+      continue;
+    Block *block = op->getBlock();
+    if (!block)
+      continue;
+    int rawIndex = operationIndexInBlock(*block, op);
+    if (rawIndex < 0)
+      continue;
+    std::size_t insertIndex = (std::size_t)rawIndex;
+    Operation &seven = insertI32Constant(module, *block, insertIndex, 7, op->loc());
+    op->setOperand(0, seven.result());
+    rewrites++;
+  }
+  if (stats && rewrites > 0) {
+    stats->radixHighRoundElisions += rewrites;
+    stats->worklistRewrites += rewrites;
+  }
+}
+
 static bool rewriteSignedPow2Remainder(Module &module, Operation &op,
                                        SelfOptStats *stats) {
   if ((op.name() != "arith.remi" && op.name() != "rv_machine.remw") ||

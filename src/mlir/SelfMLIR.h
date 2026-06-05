@@ -336,6 +336,7 @@ struct SelfOptStats {
   int unrollNestedSkips = 0;
   int rangePeels = 0;
   int diagonalTransposeTiles = 0;
+  int radixHighRoundElisions = 0;
 };
 
 struct OptimizationConfig {
@@ -383,6 +384,7 @@ void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void runMemrefLinearization(Module &module, SelfOptStats *stats = nullptr);
 void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats = nullptr);
 void runClosedFormDivReduction(Module &module, SelfOptStats *stats = nullptr);
+void runRadixHighRoundElision(Module &module, SelfOptStats *stats = nullptr);
 void runAccumulatorRecursiveMemoization(Module &module,
                                         SelfOptStats *stats = nullptr);
 void runSignedPow2RemainderRewrite(Module &module, const std::string &target,

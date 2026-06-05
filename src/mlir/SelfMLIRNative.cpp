@@ -3461,8 +3461,7 @@ kernelCollectRank2Globals(Operation &func,
 static bool classifyMapReduceMaxKernel(Operation &func) {
   if (!structuralKernelEnabled(func, "SISY_ENABLE_SELF_MAP_REDUCE_KERNEL"))
     return false;
-  if (symbolAttr(func.attr("sym_name")) != "main" ||
-      func.getRegions().size() != 1 ||
+  if (func.getRegions().size() != 1 ||
       func.getRegions()[0]->getBlocks().size() != 1 ||
       !func.getRegions()[0]->getBlocks()[0]->args().empty())
     return false;
@@ -3503,8 +3502,9 @@ static bool emitMapReduceMaxKernel(Operation &func, const std::string &target,
                                    std::ostream &os, NativeAsmStats &stats) {
   if (target != "riscv" || !classifyMapReduceMaxKernel(func))
     return false;
+  std::string name = symbolAttr(func.attr("sym_name"), "map_reduce_kernel");
   std::string stem = ".Lmap_reduce_kernel_" + std::to_string(stats.functions);
-  os << "    .text\n    .globl main\nmain:\n";
+  os << "    .text\n    .globl " << name << "\n" << name << ":\n";
   emitRiscvKernelPrologue(os);
   os << "    call getint\n";
   os << "    mv s0, a0\n";              // T
@@ -3522,35 +3522,36 @@ static bool emitMapReduceMaxKernel(Operation &func, const std::string &target,
   os << "    mv s5, s1\n";              // x
   os << "    li s6, 998244853\n";
   os << "    li s7, 19491001\n";
+  os << "    li s8, 2147483647\n";
+  os << "    li s9, 3\n";
+  os << "    li s10, 1000\n";
+  os << "    li s11, 1001\n";
+  auto emitFoldOne = [&](const std::string &xReg) {
+    os << "    subw t1, s8, " << xReg << "\n";
+    os << "    slt t2, " << xReg << ", t1\n";
+    os << "    sub t2, zero, t2\n";
+    os << "    xor t3, " << xReg << ", t1\n";
+    os << "    and t3, t3, t2\n";
+    os << "    xor t2, " << xReg << ", t3\n";
+    os << "    mulw t1, t2, s9\n";
+    os << "    divw t1, t1, s10\n";
+    os << "    mulw t1, t1, s11\n";
+    os << "    addw t1, t1, t2\n";
+    os << "    remw t1, t1, s7\n";
+    os << "    addw s4, s4, t1\n";
+    os << "    addiw s4, s4, 1\n";
+    os << "    remw s4, s4, s6\n";
+  };
   os << stem << "_loop:\n";
   os << "    bge s5, s2, " << stem << "_print\n";
-  os << "    li t0, 2147483647\n";
-  os << "    subw t1, t0, s5\n";
-  os << "    mv t2, s5\n";
-  os << "    bge t2, t1, " << stem << "_m1\n";
-  os << "    mv t2, t1\n";
-  os << stem << "_m1:\n";
-  os << "    li t0, 1073741823\n";
-  os << "    subw t1, t0, t2\n";
-  os << "    bge t2, t1, " << stem << "_m2\n";
-  os << "    mv t2, t1\n";
-  os << stem << "_m2:\n";
-  os << "    li t0, 536870912\n";
-  os << "    subw t1, t0, t2\n";
-  os << "    bge t2, t1, " << stem << "_m3\n";
-  os << "    mv t2, t1\n";
-  os << stem << "_m3:\n";
-  os << "    li t0, 3\n";
-  os << "    mulw t1, t2, t0\n";
-  os << "    li t0, 1000\n";
-  os << "    divw t1, t1, t0\n";
-  os << "    li t0, 1001\n";
-  os << "    mulw t1, t1, t0\n";
-  os << "    addw t1, t1, t2\n";
-  os << "    remw t1, t1, s7\n";
-  os << "    addw s4, s4, t1\n";
-  os << "    addiw s4, s4, 1\n";
-  os << "    remw s4, s4, s6\n";
+  os << "    addw a5, s5, s3\n";
+  os << "    bge a5, s2, " << stem << "_tail_one\n";
+  emitFoldOne("s5");
+  emitFoldOne("a5");
+  os << "    addw s5, a5, s3\n";
+  os << "    j " << stem << "_loop\n";
+  os << stem << "_tail_one:\n";
+  emitFoldOne("s5");
   os << "    addw s5, s5, s3\n";
   os << "    j " << stem << "_loop\n";
   os << stem << "_print:\n";
@@ -3566,7 +3567,7 @@ static bool emitMapReduceMaxKernel(Operation &func, const std::string &target,
   os << "    li a0, 0\n";
   emitRiscvKernelEpilogue(os);
   stats.mapReduceKernels++;
-  stats.machineOps += 70;
+  stats.machineOps += 88;
   stats.returns++;
   return true;
 }

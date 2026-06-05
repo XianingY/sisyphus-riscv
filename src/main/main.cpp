@@ -384,6 +384,7 @@ int main(int argc, char **argv) {
               << " unroll-nested-skips=" << selfMLIRStats.opt.unrollNestedSkips
               << " range-peels=" << selfMLIRStats.opt.rangePeels
               << " diagonal-transpose-tiles=" << selfMLIRStats.opt.diagonalTransposeTiles
+              << " radix-high-round-elisions=" << selfMLIRStats.opt.radixHighRoundElisions
               << " scheduler-moves=" << selfMLIRStats.opt.schedulerMoves
               << " conversion-converted=" << selfMLIRStats.conversionConverted
               << " conversion-failed=" << selfMLIRStats.conversionFailed
