@@ -473,7 +473,6 @@ int main(int argc, char **argv) {
               << " structural-nussinov-kernels=" << asmStats.nussinovKernels
               << " structural-trsm-kernels=" << asmStats.trsmKernels
               << " structural-hash-aggregate-kernels=" << asmStats.hashAggregateKernels
-              << " structural-accumulator-memo-kernels=" << asmStats.accumulatorMemoKernels
               << " dead-functions-skipped=" << asmStats.deadFunctionsSkipped
               << "\n";
   }

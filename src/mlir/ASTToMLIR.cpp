@@ -976,6 +976,9 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runLocalCSE(*module, &stats.opt);
   }
 
+  if (target == "riscv" && effective.level != OptimizationConfig::Level::O0)
+    runAccumulatorRecursiveMemoization(*module, &stats.opt);
+
   if (effective.enableScheduler)
     runLoopLocalScheduler(*module, &stats.opt);
   if (effective.enableAffine)

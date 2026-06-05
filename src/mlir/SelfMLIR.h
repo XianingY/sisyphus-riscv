@@ -383,6 +383,8 @@ void runLoopAddressIV(Module &module, SelfOptStats *stats = nullptr);
 void runMemrefLinearization(Module &module, SelfOptStats *stats = nullptr);
 void runLoopInvariantCodeMotion(Module &module, SelfOptStats *stats = nullptr);
 void runClosedFormDivReduction(Module &module, SelfOptStats *stats = nullptr);
+void runAccumulatorRecursiveMemoization(Module &module,
+                                        SelfOptStats *stats = nullptr);
 void runSignedPow2RemainderRewrite(Module &module, const std::string &target,
                                     SelfOptStats *stats = nullptr);
 void runLocalCSE(Module &module, SelfOptStats *stats = nullptr);
@@ -516,7 +518,6 @@ struct NativeAsmStats {
   int nussinovKernels = 0;
   int trsmKernels = 0;
   int hashAggregateKernels = 0;
-  int accumulatorMemoKernels = 0;
   int deadFunctionsSkipped = 0;
   std::string error;
 };

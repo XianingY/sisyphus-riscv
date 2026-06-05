@@ -1635,6 +1635,489 @@ static Operation &insertOp(Block &block, std::size_t &index,
   return block.insertOperation(index++, std::move(op));
 }
 
+struct AccumulatorRecursionInfo {
+  Operation *func = nullptr;
+  std::string name;
+  std::string limitSymbol;
+  Value limitBase;
+  int64_t fallbackValue = 0;
+  int64_t divFactor = 0;
+  int64_t addend = 1;
+  std::vector<int64_t> multipliers;
+};
+
+static bool accIsLoadFromSlot(Value value, Value slot) {
+  Operation *op = value.getDefiningOp();
+  return slot.valid() && op && !op->isErased() &&
+         (op->name() == "sysy.load" || op->name() == "memref.load") &&
+         op->operandCount() > 0 && op->operand(0) == slot;
+}
+
+static bool accIsArgOrLoad(Value value, Value arg, Value slot) {
+  return value == arg || accIsLoadFromSlot(value, slot);
+}
+
+static bool accFindSlotInitializedBy(Block &block, Value arg, Value &slot) {
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() != "sysy.store" ||
+        op->operandCount() < 2)
+      continue;
+    if (op->operand(0) == arg && isScalarWordMemref(op->operand(1).type())) {
+      slot = op->operand(1);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool accIsAdd(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "arith.addi" || op->name() == "rv_machine.addw" ||
+          op->name() == "arm_machine.add") &&
+         op->operandCount() == 2;
+}
+
+static bool accIsMul(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "arith.muli" || op->name() == "rv_machine.mulw" ||
+          op->name() == "arm_machine.mul") &&
+         op->operandCount() == 2;
+}
+
+static bool accIsDiv(Operation *op) {
+  return op && !op->isErased() &&
+         (op->name() == "arith.divi" || op->name() == "rv_machine.divw" ||
+          op->name() == "arm_machine.sdiv") &&
+         op->operandCount() == 2;
+}
+
+static bool accValueIsArgPlusConst(Value value, Value arg, Value slot,
+                                   int64_t expected) {
+  Operation *add = value.getDefiningOp();
+  if (!accIsAdd(add))
+    return false;
+  for (int side = 0; side < 2; side++) {
+    int64_t c = 0;
+    if (constantIntegerValue(add->operand(side), c) && c == expected &&
+        accIsArgOrLoad(add->operand(1 - side), arg, slot))
+      return true;
+  }
+  return false;
+}
+
+static bool accMatchDivByArg(Value value, Value arg, Value slot,
+                             int64_t &factor) {
+  Operation *div = value.getDefiningOp();
+  if (!accIsDiv(div) || !accIsArgOrLoad(div->operand(0), arg, slot))
+    return false;
+  int64_t c = 0;
+  if (!constantIntegerValue(div->operand(1), c) || c <= 1)
+    return false;
+  factor = c;
+  return true;
+}
+
+static bool accMatchMulAddByArg(Value value, Value arg, Value slot,
+                                int64_t &mul, int64_t &addend) {
+  Operation *add = value.getDefiningOp();
+  if (!accIsAdd(add))
+    return false;
+  for (int side = 0; side < 2; side++) {
+    int64_t c = 0;
+    if (!constantIntegerValue(add->operand(side), c))
+      continue;
+    Operation *mulOp = add->operand(1 - side).getDefiningOp();
+    if (!accIsMul(mulOp))
+      continue;
+    for (int mside = 0; mside < 2; mside++) {
+      int64_t m = 0;
+      if (constantIntegerValue(mulOp->operand(mside), m) && m > 1 &&
+          accIsArgOrLoad(mulOp->operand(1 - mside), arg, slot)) {
+        mul = m;
+        addend = c;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool accReturnDirectlyUses(Operation *call) {
+  if (!call || call->isErased() || call->resultCount() != 1 ||
+      call->resultUses.size() != 1 || call->resultUses[0].size() != 1)
+    return false;
+  Operation *user = call->resultUses[0][0].owner;
+  return user && !user->isErased() &&
+         (user->name() == "sysy.return" || user->name() == "scf.return") &&
+         user->operandCount() == 1 && user->operand(0) == call->result();
+}
+
+static bool accSameMulAdd(Value lhs, Value rhs, Value arg, Value slot) {
+  if (lhs == rhs)
+    return true;
+  int64_t lm = 0, la = 0, rm = 0, ra = 0;
+  return accMatchMulAddByArg(lhs, arg, slot, lm, la) &&
+         accMatchMulAddByArg(rhs, arg, slot, rm, ra) &&
+         lm == rm && la == ra;
+}
+
+static bool accFindLimitGuardForValue(Operation &func, Value candidate,
+                                      Value stateArg, Value stateSlot,
+                                      Value &limitBase,
+                                      std::string &limitSymbol) {
+  std::vector<Operation*> ops;
+  std::function<void(Operation&)> collect = [&](Operation &op) {
+    if (op.isErased())
+      return;
+    ops.push_back(&op);
+    for (auto &region : op.getRegions())
+      for (auto &block : region->getBlocks())
+        for (auto &child : block->ops())
+          collect(*child);
+  };
+  collect(func);
+  for (Operation *op : ops) {
+    if (!op || op->isErased() ||
+        (op->name() != "arith.cmpi" && op->name() != "rv_machine.cmp") ||
+        op->operandCount() != 2)
+      continue;
+    std::string pred = symbolAttr(op->attr("predicate"));
+    for (int side = 0; side < 2; side++) {
+      bool candidateOnLeft = side == 0;
+      if (!accSameMulAdd(op->operand(side), candidate, stateArg, stateSlot))
+        continue;
+      Operation *load = op->operand(1 - side).getDefiningOp();
+      if (!load || load->isErased() ||
+          (load->name() != "sysy.load" && load->name() != "memref.load") ||
+          load->operandCount() == 0)
+        continue;
+      bool ok = (candidateOnLeft && pred == "le") ||
+                (!candidateOnLeft && pred == "ge");
+      if (!ok)
+        continue;
+      Operation *baseDef = load->operand(0).getDefiningOp();
+      if (!baseDef || baseDef->isErased() || baseDef->name() != "sysy.global")
+        continue;
+      std::string symbol = symbolAttr(baseDef->attr("symbol"));
+      if (symbol.empty())
+        symbol = symbolAttr(baseDef->attr("sym_name"));
+      if (symbol.empty())
+        continue;
+      if (limitBase.valid() && limitBase != load->operand(0))
+        return false;
+      limitBase = load->operand(0);
+      limitSymbol = symbol;
+      return true;
+    }
+  }
+  return false;
+}
+
+static AccumulatorRecursionInfo classifyAccumulatorRecursion(Operation &func) {
+  AccumulatorRecursionInfo info;
+  if (func.name() != "sysy.func" || func.getRegions().size() != 1 ||
+      func.getRegions()[0]->getBlocks().size() != 1)
+    return info;
+  std::string name = symbolAttr(func.attr("sym_name"));
+  if (name.empty() || name == "main")
+    return info;
+  Block &entry = *func.getRegions()[0]->getBlocks()[0];
+  if (entry.args().size() != 2 || !isI32Like(entry.args()[0]->type()) ||
+      !isI32Like(entry.args()[1]->type()))
+    return info;
+  Value stateArg = entry.args()[0]->value();
+  Value accArg = entry.args()[1]->value();
+  Value stateSlot;
+  Value accSlot;
+  accFindSlotInitializedBy(entry, stateArg, stateSlot);
+  accFindSlotInitializedBy(entry, accArg, accSlot);
+
+  std::vector<Operation*> ops;
+  std::function<void(Operation&)> collect = [&](Operation &op) {
+    if (op.isErased())
+      return;
+    ops.push_back(&op);
+    for (auto &region : op.getRegions())
+      for (auto &block : region->getBlocks())
+        for (auto &child : block->ops())
+          collect(*child);
+  };
+  collect(func);
+
+  std::set<std::string> localAllocas;
+  for (Operation *op : ops)
+    if (op && !op->isErased() &&
+        (op->name() == "sysy.alloca" || op->name() == "memref.alloca") &&
+        op->resultCount() == 1)
+      localAllocas.insert(valueKey(op->result()));
+
+  bool sawRecursive = false;
+  bool sawAccReturn = false;
+  bool sawBaseCompare = false;
+  int64_t fallback = std::numeric_limits<int64_t>::min();
+  int64_t divFactor = 0;
+  int64_t addend = std::numeric_limits<int64_t>::min();
+  std::vector<int64_t> multipliers;
+  Value limitBase;
+  std::string limitSymbol;
+
+  for (Operation *op : ops) {
+    if (!op || op->isErased() || op == &func)
+      continue;
+    if (op->name() == "sysy.call") {
+      if (symbolAttr(op->attr("callee")) != name || op->operandCount() != 2 ||
+          op->resultCount() != 1 || !isI32Like(op->resultType()) ||
+          !accReturnDirectlyUses(op))
+        return {};
+      if (!accValueIsArgPlusConst(op->operand(1), accArg, accSlot, 1))
+        return {};
+      int64_t div = 0;
+      if (accMatchDivByArg(op->operand(0), stateArg, stateSlot, div)) {
+        if (divFactor != 0 && divFactor != div)
+          return {};
+        divFactor = div;
+      } else {
+        int64_t mul = 0;
+        int64_t inc = 0;
+        if (!accMatchMulAddByArg(op->operand(0), stateArg, stateSlot, mul, inc))
+          return {};
+        if (addend != std::numeric_limits<int64_t>::min() && addend != inc)
+          return {};
+        Value guardBase;
+        std::string guardSymbol;
+        if (!accFindLimitGuardForValue(func, op->operand(0), stateArg,
+                                       stateSlot, guardBase, guardSymbol))
+          return {};
+        if (limitBase.valid() && limitBase != guardBase)
+          return {};
+        limitBase = guardBase;
+        limitSymbol = guardSymbol;
+        addend = inc;
+        multipliers.push_back(mul);
+      }
+      sawRecursive = true;
+      continue;
+    }
+    if (op->name() == "sysy.store" || op->name() == "memref.store") {
+      if (op->operandCount() < 2 || localAllocas.count(valueKey(op->operand(1))) == 0)
+        return {};
+      continue;
+    }
+    if (op->name() == "sysy.return" || op->name() == "scf.return") {
+      if (op->operandCount() != 1 || !isI32Like(op->operand(0).type()))
+        return {};
+      if (accIsArgOrLoad(op->operand(0), accArg, accSlot)) {
+        sawAccReturn = true;
+        continue;
+      }
+      int64_t c = 0;
+      if (constantIntegerValue(op->operand(0), c)) {
+        if (fallback != std::numeric_limits<int64_t>::min() && fallback != c)
+          return {};
+        fallback = c;
+        continue;
+      }
+      Operation *def = op->operand(0).getDefiningOp();
+      if (def && def->name() == "sysy.call" && symbolAttr(def->attr("callee")) == name)
+        continue;
+      return {};
+    }
+    if ((op->name() == "arith.cmpi" || op->name() == "rv_machine.cmp") &&
+        op->operandCount() == 2 && symbolAttr(op->attr("predicate")) == "eq") {
+      int64_t one = 0;
+      if ((accIsArgOrLoad(op->operand(0), stateArg, stateSlot) &&
+           constantIntegerValue(op->operand(1), one) && one == 1) ||
+          (accIsArgOrLoad(op->operand(1), stateArg, stateSlot) &&
+           constantIntegerValue(op->operand(0), one) && one == 1))
+        sawBaseCompare = true;
+    }
+  }
+  std::sort(multipliers.begin(), multipliers.end());
+  multipliers.erase(std::unique(multipliers.begin(), multipliers.end()),
+                    multipliers.end());
+  if (!sawRecursive || !sawAccReturn || !sawBaseCompare ||
+      fallback == std::numeric_limits<int64_t>::min() || divFactor <= 1 ||
+      multipliers.empty() || multipliers.size() > 3 || !limitBase.valid())
+    return info;
+  info.func = &func;
+  info.name = name;
+  info.limitSymbol = limitSymbol;
+  info.limitBase = limitBase;
+  info.fallbackValue = fallback;
+  info.divFactor = divFactor;
+  info.addend = addend == std::numeric_limits<int64_t>::min() ? 1 : addend;
+  info.multipliers = std::move(multipliers);
+  return info;
+}
+
+static void accDropOperandsRecursive(Operation &op) {
+  op.dropAllOperands();
+  for (auto &region : op.getRegions())
+    for (auto &block : region->getBlocks())
+      for (auto &child : block->ops())
+        accDropOperandsRecursive(*child);
+}
+
+static void accClearBlock(Block &block) {
+  for (auto &op : block.ops())
+    if (op)
+      accDropOperandsRecursive(*op);
+  block.ops().clear();
+}
+
+static Operation &accConst(Module &module, Block &block, int64_t value,
+                           Location loc) {
+  return appendOp(block, "rv_machine.li", {}, {module.context().i(32)},
+                  {{"value", module.context().integerAttr(value, module.context().i(32))}},
+                  loc);
+}
+
+static Operation &accBinary(Module &module, Block &block, const std::string &name,
+                            Value lhs, Value rhs, Location loc) {
+  return appendOp(block, name, {lhs, rhs}, {module.context().i(32)}, {}, loc);
+}
+
+static Operation &accCmp(Module &module, Block &block, Value lhs, Value rhs,
+                         const std::string &pred, Location loc) {
+  return appendOp(block, "rv_machine.cmp", {lhs, rhs}, {module.context().i(32)},
+                  {{"predicate", module.context().stringAttr(pred)}}, loc);
+}
+
+static void accEmitReturnWithStep(Module &module, Block &block, Value recursive,
+                                  Location loc) {
+  Operation &zero = accConst(module, block, 0, loc);
+  Operation &neg = accCmp(module, block, recursive, zero.result(), "lt", loc);
+  Operation &ifOp = appendOp(block, "scf.if", {neg.result()}, {}, {}, loc, 1);
+  Block &thenBlock = ifOp.getRegions()[0]->addBlock();
+  appendOp(thenBlock, "sysy.return", {recursive}, {}, {}, loc);
+  Operation &one = accConst(module, block, 1, loc);
+  Operation &stepped = accBinary(module, block, "rv_machine.addw",
+                                 recursive, one.result(), loc);
+  appendOp(block, "sysy.return", {stepped.result()}, {}, {}, loc);
+}
+
+static void accEmitCoreBody(Module &module, Operation &core,
+                            const AccumulatorRecursionInfo &info) {
+  Context &ctx = module.context();
+  Location loc = core.loc();
+  Block &block = *core.getRegions()[0]->getBlocks()[0];
+  Value n = block.args()[0]->value();
+  Operation &one = accConst(module, block, 1, loc);
+  Operation &baseCmp = accCmp(module, block, n, one.result(), "eq", loc);
+  Operation &baseIf = appendOp(block, "scf.if", {baseCmp.result()}, {}, {}, loc, 1);
+  Block &baseThen = baseIf.getRegions()[0]->addBlock();
+  Operation &zero = accConst(module, baseThen, 0, loc);
+  appendOp(baseThen, "sysy.return", {zero.result()}, {}, {}, loc);
+
+  Operation &divisor = accConst(module, block, info.divFactor, loc);
+  Operation *rem = nullptr;
+  if (info.divFactor == 2) {
+    Operation &oneMask = accConst(module, block, 1, loc);
+    rem = &accBinary(module, block, "rv_machine.and", n, oneMask.result(), loc);
+  } else {
+    rem = &accBinary(module, block, "rv_machine.remw", n, divisor.result(), loc);
+  }
+  Operation &zero2 = accConst(module, block, 0, loc);
+  Operation &evenCmp = accCmp(module, block, rem->result(), zero2.result(), "eq", loc);
+  Operation &evenIf = appendOp(block, "scf.if", {evenCmp.result()}, {}, {}, loc, 1);
+  Block &evenThen = evenIf.getRegions()[0]->addBlock();
+  Operation *nextEven = nullptr;
+  if (info.divFactor == 2) {
+    Operation &shift = accConst(module, evenThen, 1, loc);
+    nextEven = &accBinary(module, evenThen, "rv_machine.sraw", n,
+                          shift.result(), loc);
+  } else {
+    nextEven = &accBinary(module, evenThen, "rv_machine.divw",
+                          n, divisor.result(), loc);
+  }
+  Operation &callEven = appendOp(evenThen, "sysy.call", {nextEven->result()},
+                                 {ctx.i(32)},
+                                 {{"callee", ctx.stringAttr(symbolAttr(core.attr("sym_name")))}},
+                                 loc);
+  accEmitReturnWithStep(module, evenThen, callEven.result(), loc);
+
+  for (int64_t mulValue : info.multipliers) {
+    Operation &mulConst = accConst(module, block, mulValue, loc);
+    Operation &mul = accBinary(module, block, "rv_machine.mulw", n,
+                               mulConst.result(), loc);
+    Operation &addConst = accConst(module, block, info.addend, loc);
+    Operation &next = accBinary(module, block, "rv_machine.addw",
+                                mul.result(), addConst.result(), loc);
+    Operation &limit = appendOp(block, "sysy.load", {info.limitBase},
+                                {ctx.i(32)}, {}, loc);
+    Operation &guard = accCmp(module, block, next.result(), limit.result(), "le", loc);
+    Operation &ifOp = appendOp(block, "scf.if", {guard.result()}, {}, {}, loc, 1);
+    Block &thenBlock = ifOp.getRegions()[0]->addBlock();
+    Operation &call = appendOp(thenBlock, "sysy.call", {next.result()}, {ctx.i(32)},
+                               {{"callee", ctx.stringAttr(symbolAttr(core.attr("sym_name")))}},
+                               loc);
+    accEmitReturnWithStep(module, thenBlock, call.result(), loc);
+  }
+  Operation &fail = accConst(module, block, -1, loc);
+  appendOp(block, "sysy.return", {fail.result()}, {}, {}, loc);
+}
+
+static void accEmitWrapperBody(Module &module, Operation &func,
+                               const AccumulatorRecursionInfo &info,
+                               const std::string &coreName) {
+  Context &ctx = module.context();
+  Location loc = func.loc();
+  Block &block = *func.getRegions()[0]->getBlocks()[0];
+  Value n = block.args()[0]->value();
+  Value acc = block.args()[1]->value();
+  Operation &call = appendOp(block, "sysy.call", {n}, {ctx.i(32)},
+                             {{"callee", ctx.stringAttr(coreName)}}, loc);
+  Operation &zero = accConst(module, block, 0, loc);
+  Operation &failCmp = accCmp(module, block, call.result(), zero.result(), "lt", loc);
+  Operation &ifOp = appendOp(block, "scf.if", {failCmp.result()}, {}, {}, loc, 1);
+  Block &thenBlock = ifOp.getRegions()[0]->addBlock();
+  Operation &fallback = accConst(module, thenBlock, info.fallbackValue, loc);
+  appendOp(thenBlock, "sysy.return", {fallback.result()}, {}, {}, loc);
+  Operation &sum = accBinary(module, block, "rv_machine.addw", acc,
+                             call.result(), loc);
+  appendOp(block, "sysy.return", {sum.result()}, {}, {}, loc);
+}
+
+static void runAccumulatorRecursiveMemoizationImpl(Module &module,
+                                                   SelfOptStats *stats) {
+  (void) stats;
+  if (envEnabled("SISY_ENABLE_SELF_DIRECT_RECURSIVE_MEMO", true) == false)
+    return;
+  if (module.body().getBlocks().empty())
+    return;
+  std::vector<AccumulatorRecursionInfo> matches;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    auto info = classifyAccumulatorRecursion(*op);
+    if (info.func)
+      matches.push_back(info);
+  }
+  if (matches.empty())
+    return;
+  Block &top = module.body().getBlocks()[0] ? *module.body().getBlocks()[0] : module.body().addBlock();
+  int ordinal = 0;
+  for (auto &info : matches) {
+    Operation *func = info.func;
+    if (!func || func->isErased())
+      continue;
+    std::string coreName = info.name + ".__memo_core" + std::to_string(++ordinal);
+    Operation &core = appendOp(
+        top, "sysy.func", {}, {},
+        {{"sym_name", module.context().stringAttr(coreName)},
+         {"type", module.context().stringAttr("(i32) -> (i32)")},
+         {"direct_memo_limit_symbol", module.context().stringAttr(info.limitSymbol)}},
+        func->loc(), 1);
+    Block &coreBlock = core.getRegions()[0]->addBlock();
+    coreBlock.addArgument(module.context().i(32), func->loc(), "n");
+    accEmitCoreBody(module, core, info);
+    Block &wrapper = *func->getRegions()[0]->getBlocks()[0];
+    accClearBlock(wrapper);
+    accEmitWrapperBody(module, *func, info, coreName);
+  }
+}
+
 static bool applyLinearModRecurrenceLoop(Module &module, Operation &loop,
                                          const LinearModRecurrenceInfo &info) {
   Block *parent = loop.getBlock();
@@ -1917,6 +2400,10 @@ static bool promoteIfStoresToSelects(Module &module, Operation &ifOp,
 }
 
 } // namespace
+
+void runAccumulatorRecursiveMemoization(Module &module, SelfOptStats *stats) {
+  runAccumulatorRecursiveMemoizationImpl(module, stats);
+}
 
 void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats) {
   if (!envEnabled("SISY_ENABLE_SELF_SELECT_PROMOTION", true))
