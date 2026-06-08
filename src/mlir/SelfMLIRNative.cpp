@@ -4732,19 +4732,6 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       break;
     }
   }
-  bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
-                          structuredLoopCount >= 2 && !hasLoopInBothIfBranches;
-  int calleeSaveCount = regAlloc2Enabled
-                            ? (affineLoopCount > 0 ? maxCalleeSaveCount
-                                                   : std::min(maxCalleeSaveCount, 8))
-                            : std::min(maxCalleeSaveCount, structuredLoopCount);
-  if (!isArm && livenessEnabled && !regAlloc2Enabled && structuredLoopCount > 0 &&
-      envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true))
-    calleeSaveCount =
-        std::min(maxCalleeSaveCount, std::max(calleeSaveCount, structuredLoopCount + 4));
-  stats.calleeSaveSlots += calleeSaveCount;
-  frameBytes += calleeSaveCount * 8;
-  frameBytes = (frameBytes + 15) & ~int64_t(15);
   int lsraMinOps = 180;
   if (const char *value = std::getenv("SISY_SELF_LSRA_MIN_OPS")) {
     try {
@@ -4754,6 +4741,28 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
   }
   bool lsraHotFunction = liveFuncOpCount >= lsraMinOps || whileLoopCount >= 2;
+  bool regAlloc2Enabled = !isArm && envEnabled("SISY_ENABLE_SELF_REGALLOC2", true) &&
+                          structuredLoopCount >= 2 && !hasLoopInBothIfBranches;
+  int calleeSaveCount = 0;
+  if (regAlloc2Enabled) {
+    if (lsraHotFunction) {
+      calleeSaveCount = affineLoopCount > 0
+                            ? maxCalleeSaveCount
+                            : std::min(maxCalleeSaveCount, 8);
+    } else {
+      calleeSaveCount =
+          std::min(maxCalleeSaveCount, std::max(4, structuredLoopCount + 2));
+    }
+  } else {
+    calleeSaveCount = std::min(maxCalleeSaveCount, structuredLoopCount);
+  }
+  if (!isArm && livenessEnabled && !regAlloc2Enabled && structuredLoopCount > 0 &&
+      envEnabled("SISY_ENABLE_SELF_GLOBAL_BASE_CACHE", true))
+    calleeSaveCount =
+        std::min(maxCalleeSaveCount, std::max(calleeSaveCount, structuredLoopCount + 4));
+  stats.calleeSaveSlots += calleeSaveCount;
+  frameBytes += calleeSaveCount * 8;
+  frameBytes = (frameBytes + 15) & ~int64_t(15);
 
   auto loopDepthOfBlock = [](Block *block) {
     int depth = 0;
@@ -4780,7 +4789,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   };
   std::map<std::string, PromotedScalarSlot> promotedScalarSlots;
   static const char *kStableBaseRegs[] = {"s0", "s1", "s2", "s3"};
+  static const char *kPromotedScalarRegs[] = {"s4", "s5", "s6", "s7"};
   int stableBaseRegCount = 0;
+  int promotedScalarRegCount = 0;
   bool scalarPromotionEnabled =
       !isArm && livenessEnabled && regAlloc2Enabled && calleeSaveCount >= 12 &&
       lsraHotFunction &&
@@ -4800,6 +4811,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       int stores = 0;
       bool reductionLike = false;
       bool forced = false;
+      bool generatedReductionSlot = false;
     };
     std::vector<SlotCandidate> candidates;
     for (auto *op : funcOps) {
@@ -4815,8 +4827,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string promoteAttr = symbolAttr(op->attr("scalar_promote"));
       candidate.forced = promoteAttr == "1" || promoteAttr == "true" ||
                          promoteAttr == "forced";
-      if (!candidate.forced && !scalarPromotionAll)
-        continue;
+      std::string symbol = symbolAttr(op->attr("symbol"));
+      candidate.generatedReductionSlot =
+          symbol.rfind(".tile_acc", 0) == 0 ||
+          symbol.rfind(".tile_cond_acc", 0) == 0;
       bool escaped = false;
       for (const auto &use : op->resultUses[0]) {
         Operation *user = use.owner;
@@ -4867,20 +4881,29 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
       if (candidate.loads == 0 && candidate.stores == 0)
         continue;
+      bool autoPromoteReduction =
+          candidate.generatedReductionSlot && candidate.reductionLike &&
+          candidate.loads > 0 &&
+          candidate.stores > 0 && candidate.maxDepth >= 2;
+      if (!candidate.forced && !scalarPromotionAll && !autoPromoteReduction)
+        continue;
       candidates.push_back(candidate);
     }
     std::sort(candidates.begin(), candidates.end(),
               [](const SlotCandidate &a, const SlotCandidate &b) {
+                if (a.generatedReductionSlot != b.generatedReductionSlot)
+                  return a.generatedReductionSlot > b.generatedReductionSlot;
                 if (a.score != b.score)
                   return a.score > b.score;
                 return a.maxDepth > b.maxDepth;
               });
     for (const auto &candidate : candidates) {
-      if (stableBaseRegCount >= (int)(sizeof(kStableBaseRegs) / sizeof(kStableBaseRegs[0])))
+      if (promotedScalarRegCount >=
+          (int)(sizeof(kPromotedScalarRegs) / sizeof(kPromotedScalarRegs[0])))
         break;
       PromotedScalarSlot slot;
       slot.slot = candidate.slot;
-      slot.reg = kStableBaseRegs[stableBaseRegCount++];
+      slot.reg = kPromotedScalarRegs[promotedScalarRegCount++];
       slot.loopCarried = candidate.loads > 0 && candidate.stores > 0 &&
                          candidate.maxDepth > 0;
       slot.reductionLike = candidate.reductionLike;
@@ -4925,6 +4948,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         store = true;
       }
       if (baseIndex < 0)
+        continue;
+      if (isScalarWordMemref(op->operand(baseIndex).type()))
         continue;
       std::string key = valueKey(op->operand(baseIndex));
       auto labelIt = globalLabels.find(key);
@@ -4996,9 +5021,12 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
   std::set<std::string> lsraReserved;
   bool slotPromotionActive = !promotedScalarSlots.empty();
   bool stableBaseActive = stableBaseRegCount > 0;
+  std::set<std::string> promotedScalarPhysRegs;
+  for (const auto &kv : promotedScalarSlots)
+    promotedScalarPhysRegs.insert(kv.second.reg);
   bool lsraEnabled = !isArm && livenessEnabled && regAlloc2Enabled &&
                      calleeSaveCount >= 8 &&
-                     lsraHotFunction && !slotPromotionActive &&
+                     lsraHotFunction &&
                      envEnabled("SISY_ENABLE_SELF_LSRA", true);
   if (lsraEnabled) {
     struct LsraInterval {
@@ -5079,8 +5107,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
                   return a.start < b.start;
                 });
       std::vector<std::string> freeRegs;
-      for (const char *reg : kLsraPool)
-        freeRegs.push_back(reg);
+      for (const char *reg : kLsraPool) {
+        if (promotedScalarPhysRegs.count(reg) == 0)
+          freeRegs.push_back(reg);
+      }
       struct ActiveInterval {
         int end = 0;
         int weight = 0;
@@ -5467,7 +5497,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       }
     }
   };
-  auto invalidateLoopHeaderRegs = [&](Value ivValue) {
+  auto invalidateLoopHeaderRegs = [&](Value ivValue, bool spillBeforeDrop) {
     std::string ivKey = valueKey(ivValue);
     for (auto it = regs.begin(); it != regs.end(); ) {
       const std::string &key = it->first;
@@ -5478,7 +5508,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         ++it;
         continue;
       }
-      maybeSpillBeforeClobber(key, reg, false);
+      if (spillBeforeDrop)
+        maybeSpillBeforeClobber(key, reg, false);
       it = regs.erase(it);
     }
   };
@@ -5632,8 +5663,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       it = regs.erase(it);
     }
   };
-  auto invalidateLoopEntryRegs = [&]() {
-    flushPromotedScalarSlots(true);
+  auto invalidateLoopEntryRegs = [&](bool spillBeforeDrop) {
+    if (spillBeforeDrop)
+      flushPromotedScalarSlots(true);
+    else {
+      for (auto &kv : promotedScalarSlots)
+        kv.second.valid = false;
+    }
     for (auto it = regs.begin(); it != regs.end(); ) {
       const std::string &key = it->first;
       const std::string &reg = it->second;
@@ -5643,7 +5679,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         ++it;
         continue;
       }
-      maybeSpillBeforeClobber(key, reg, false);
+      if (spillBeforeDrop)
+        maybeSpillBeforeClobber(key, reg, false);
       it = regs.erase(it);
     }
   };
@@ -7457,7 +7494,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       if (isArm) {
         os << "    mov " << iv << ", " << start << "\n";
         spillHome(ivValue, iv, true);
+        spillLiveRegsForControlFlow();
         emitLabel(".Lloop_cond_" + std::to_string(loopId) + ":");
+        std::string condIv = reloadValue(ivValue, iv);
+        if (condIv.empty()) {
+          stats.unsupportedOps++;
+          stats.error = "affine.for iv reload has no assigned register";
+          return false;
+        }
+        if (condIv != iv)
+          os << "    mov " << iv << ", " << condIv << "\n";
         std::string bound = reloadValue(op.operand(1), boundScratch);
         if (bound.empty()) {
           stats.unsupportedOps++;
@@ -7469,7 +7515,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       } else {
         os << "    mv " << iv << ", " << start << "\n";
         spillHome(ivValue, iv, true);
+        spillLiveRegsForControlFlow();
         emitLabel(".Lloop_cond_" + std::to_string(loopId) + ":");
+        std::string condIv = reloadValue(ivValue, iv);
+        if (condIv.empty()) {
+          stats.unsupportedOps++;
+          stats.error = "affine.for iv reload has no assigned register";
+          return false;
+        }
+        if (condIv != iv)
+          os << "    mv " << iv << ", " << condIv << "\n";
         std::string bound = reloadValue(op.operand(1), boundScratch);
         if (bound.empty()) {
           stats.unsupportedOps++;
@@ -7478,15 +7533,16 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         }
         os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
       }
-      invalidateLoopHeaderRegs(ivValue);
+      invalidateLoopHeaderRegs(ivValue, false);
       regs[valueKey(ivValue)] = iv;
       continue;
     }
 
     if (opname == "scf.while") {
       int loopId = loopOps[&op];
+      spillLiveRegsForControlFlow();
       emitLabel(".Lwhile_cond_" + std::to_string(loopId) + ":");
-      invalidateLoopEntryRegs();
+      invalidateLoopEntryRegs(false);
       continue;
     }
 

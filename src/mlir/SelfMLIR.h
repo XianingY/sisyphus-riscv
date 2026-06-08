@@ -387,6 +387,8 @@ void runProvenBitwiseHelper(Module &module, SelfOptStats *stats = nullptr);
 void runRotateHelperFold(Module &module, SelfOptStats *stats = nullptr);
 void runIfStoreSelectPromotion(Module &module, SelfOptStats *stats = nullptr);
 void runStencilPeelingAndUnroll(Module &module, SelfOptStats *stats = nullptr);
+void runTriangularLoopBoundTightening(Module &module,
+                                      SelfOptStats *stats = nullptr);
 void runLoopRangePeeling(Module &module, SelfOptStats *stats = nullptr);
 void runDiagonalTransposeTiling(Module &module, SelfOptStats *stats = nullptr);
 void runLoopRepeatReduction(Module &module, SelfOptStats *stats = nullptr);

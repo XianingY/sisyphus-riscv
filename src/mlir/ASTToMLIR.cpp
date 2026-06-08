@@ -870,6 +870,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
       runPureFunctionDeduction(*module);
     if (envEnabled("SISY_ENABLE_SELF_CONTINUE_WRAP", true))
       runContinueToIfWrap(*module);
+    runTriangularLoopBoundTightening(*module, &stats.opt);
     if (!envDisabled("SISY_ENABLE_SELF_RAISE_AFFINE"))
       stats.opt.affineWorklistItems += runRaiseToAffine(*module);
     if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", true))
@@ -943,6 +944,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
         stats.opt.affineWorklistItems += phase2;
         stats.opt.phase2AffineRaises += phase2;
       }
+      runTriangularLoopBoundTightening(*module, &stats.opt);
       if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", true))
         runImperfectLoopPromotion(*module);
       if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))

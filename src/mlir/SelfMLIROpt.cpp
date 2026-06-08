@@ -813,6 +813,39 @@ static bool analyzeLoopBodyForUnroll(Block &body, int64_t &opCount, bool &hasNes
   return true;
 }
 
+static bool blockTreeHasOpName(Block &body, const std::string &name) {
+  std::vector<Block*> worklist{&body};
+  while (!worklist.empty()) {
+    Block *current = worklist.back();
+    worklist.pop_back();
+    if (!current)
+      continue;
+    for (auto &owned : current->ops()) {
+      Operation *op = owned.get();
+      if (!op || op->isErased())
+        continue;
+      if (op->name() == name)
+        return true;
+      for (auto &region : op->getRegions())
+        for (auto &block : region->getBlocks())
+          worklist.push_back(block.get());
+    }
+  }
+  return false;
+}
+
+static int64_t smallKernelUnrollBudget() {
+  int64_t budget = 360;
+  if (const char *value = std::getenv("SISY_SELF_UNROLL_BUDGET")) {
+    try {
+      budget = std::max<int64_t>(80, std::stoll(value));
+    } catch (...) {
+      budget = 360;
+    }
+  }
+  return budget;
+}
+
 struct ConstantWhileInfo {
   bool valid = false;
   Value ivSlot;
@@ -897,7 +930,14 @@ static ConstantWhileInfo classifySmallConstantWhile(Operation &loop,
   int64_t trip = bound - init;
   if (trip < 0 || trip > 80)
     return info;
-  if (trip * opCount > 150) {
+  int64_t product = trip * opCount;
+  bool guardedKernel = blockTreeHasOpName(body, "scf.if");
+  if (product > 150 && !guardedKernel) {
+    if (stats)
+      stats->unrollBudgetSkips++;
+    return info;
+  }
+  if (product > smallKernelUnrollBudget()) {
     if (stats)
       stats->unrollBudgetSkips++;
     return info;
@@ -1048,7 +1088,14 @@ static ConstantAffineInfo classifySmallConstantAffineFor(Operation &loop,
   }
   if (hasUnsafeControl)
     return ConstantAffineInfo();
-  if (info.tripCount * opCount > 150) {
+  int64_t product = info.tripCount * opCount;
+  bool guardedKernel = blockTreeHasOpName(body, "scf.if") || loop.attr("range_peeled");
+  if (product > 150 && !guardedKernel) {
+    if (stats)
+      stats->unrollBudgetSkips++;
+    return ConstantAffineInfo();
+  }
+  if (product > smallKernelUnrollBudget()) {
     if (stats)
       stats->unrollBudgetSkips++;
     return ConstantAffineInfo();
@@ -5198,6 +5245,240 @@ static bool cacheWhileLoopIvLoads(Module &module, Operation &loop,
   return true;
 }
 
+struct TriangularWhileCondInfo {
+  Operation *condition = nullptr;
+  Operation *cmp = nullptr;
+  Value ivSlot;
+  Value upper;
+};
+
+static bool classifyWhileSlotLessThan(Operation &loop,
+                                      TriangularWhileCondInfo &info) {
+  info = TriangularWhileCondInfo();
+  if (loop.name() != "scf.while" || loop.getRegions().size() < 2 ||
+      loop.getRegions()[0]->getBlocks().empty() ||
+      loop.getRegions()[1]->getBlocks().empty())
+    return false;
+  Block &cond = *loop.getRegions()[0]->getBlocks()[0];
+  Operation *condition = findConditionOp(*loop.getRegions()[0]);
+  if (!condition || condition->operandCount() != 1)
+    return false;
+  Operation *cmp = condition->operand(0).getDefiningOp();
+  if (!tileOpHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) ||
+      cmp->operandCount() != 2)
+    return false;
+  std::string pred = symbolAttr(cmp->attr("predicate"));
+  if (pred != "lt" && pred != "slt")
+    return false;
+  Operation *ivLoad = cmp->operand(0).getDefiningOp();
+  if (!tileOpHasName(ivLoad, {"sysy.load", "memref.load"}) ||
+      ivLoad->operandCount() == 0 ||
+      !isScalarWordMemref(ivLoad->operand(0).type()))
+    return false;
+  if (cmp->getBlock() != &cond || ivLoad->getBlock() != &cond)
+    return false;
+  info.condition = condition;
+  info.cmp = cmp;
+  info.ivSlot = ivLoad->operand(0);
+  info.upper = cmp->operand(1);
+  return true;
+}
+
+static bool valueIsSlotPlusOne(Value value, Value slot) {
+  Operation *op = value.getDefiningOp();
+  if (!tileOpHasName(op, {"arith.addi", "rv_machine.addw", "arm_machine.add"}) ||
+      op->operandCount() != 2)
+    return false;
+  int64_t imm = 0;
+  return (tileIsLoadFromSlot(op->operand(0), slot) &&
+          constantIntegerValue(op->operand(1), imm) && imm == 1) ||
+         (tileIsLoadFromSlot(op->operand(1), slot) &&
+          constantIntegerValue(op->operand(0), imm) && imm == 1);
+}
+
+static bool blockOnlyIncrementsAndContinues(Block &block, Value slot) {
+  bool sawStore = false;
+  bool sawContinue = false;
+  for (auto &owned : block.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "scf.yield")
+      continue;
+    if (tileIsStoreToSlot(op, slot)) {
+      if (sawStore || !valueIsSlotPlusOne(op->operand(0), slot))
+        return false;
+      sawStore = true;
+      continue;
+    }
+    if (op->name() == "sysy.continue") {
+      sawContinue = true;
+      continue;
+    }
+    if (op->getRegions().empty() &&
+        tileOpHasName(op, {"arith.constant", "rv_machine.li", "arith.addi",
+                           "rv_machine.addw", "arm_machine.add", "sysy.load",
+                           "memref.load"}))
+      continue;
+    return false;
+  }
+  return sawStore && sawContinue;
+}
+
+static bool opIsPureTriangularGuardPrefix(Operation *op) {
+  if (!op || op->isErased() || !op->getRegions().empty())
+    return false;
+  return tileOpHasName(op, {"arith.constant", "rv_machine.li", "arith.addi",
+                            "arith.subi", "arith.muli", "arith.cmpi",
+                            "rv_machine.addw", "rv_machine.subw",
+                            "rv_machine.mulw", "rv_machine.cmp",
+                            "arm_machine.add", "arm_machine.sub",
+                            "arm_machine.mul", "arm_machine.cmp",
+                            "sysy.load", "memref.load"});
+}
+
+static Operation *findTriangularSkipIf(Block &body, Value outerSlot,
+                                       Value innerSlot) {
+  for (auto &owned : body.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op->name() == "scf.yield")
+      continue;
+    if (op->name() != "scf.if") {
+      if (!opIsPureTriangularGuardPrefix(op))
+        return nullptr;
+      continue;
+    }
+    if (op->operandCount() != 1 || op->getRegions().empty() ||
+        op->getRegions()[0]->getBlocks().empty())
+      return nullptr;
+    Operation *cmp = op->operand(0).getDefiningOp();
+    if (!tileOpHasName(cmp, {"arith.cmpi", "rv_machine.cmp", "arm_machine.cmp"}) ||
+        cmp->operandCount() != 2)
+      return nullptr;
+    std::string pred = symbolAttr(cmp->attr("predicate"));
+    if (pred != "lt" && pred != "slt")
+      return nullptr;
+    if (!tileIsLoadFromSlot(cmp->operand(0), outerSlot) ||
+        !tileIsLoadFromSlot(cmp->operand(1), innerSlot))
+      return nullptr;
+    Block &thenBlock = *op->getRegions()[0]->getBlocks()[0];
+    if (!blockOnlyIncrementsAndContinues(thenBlock, innerSlot))
+      return nullptr;
+    return op;
+  }
+  return nullptr;
+}
+
+static int countTopLevelStepStores(Block &body, Value slot, Operation *skipIf) {
+  int count = 0;
+  for (auto &owned : body.ops()) {
+    Operation *op = owned.get();
+    if (!op || op->isErased() || op == skipIf)
+      continue;
+    if (tileIsStoreToSlot(op, slot)) {
+      if (!valueIsSlotPlusOne(op->operand(0), slot))
+        return -1;
+      count++;
+      continue;
+    }
+    if (tileOpTreeStoresSlot(*op, slot))
+      return -1;
+  }
+  return count;
+}
+
+static bool tightenTriangularInnerWhile(Module &module, Operation &outer,
+                                        Operation &inner,
+                                        const TriangularWhileCondInfo &outerInfo,
+                                        const TriangularWhileCondInfo &innerInfo,
+                                        SelfOptStats *stats) {
+  if (inner.getRegions().size() < 2 || inner.getRegions()[1]->getBlocks().empty())
+    return false;
+  Block &body = *inner.getRegions()[1]->getBlocks()[0];
+  Operation *skipIf = findTriangularSkipIf(body, outerInfo.ivSlot,
+                                           innerInfo.ivSlot);
+  if (!skipIf)
+    return false;
+  if (countTopLevelStepStores(body, innerInfo.ivSlot, skipIf) != 1)
+    return false;
+
+  Block *condBlock = innerInfo.condition ? innerInfo.condition->getBlock() : nullptr;
+  if (!condBlock || innerInfo.cmp->getBlock() != condBlock)
+    return false;
+  int condIndexRaw = operationIndexInBlock(*condBlock, innerInfo.cmp);
+  if (condIndexRaw < 0)
+    return false;
+  std::size_t condIndex = (std::size_t) condIndexRaw;
+  Location loc = inner.loc();
+  Context &ctx = module.context();
+  Type i32 = ctx.i(32);
+  Operation &outerLoad = insertOp(*condBlock, condIndex, "sysy.load",
+                                  {outerInfo.ivSlot}, {i32}, {}, loc);
+  Operation &one = insertOp(*condBlock, condIndex, "rv_machine.li", {}, {i32},
+                            {{"value", ctx.integerAttr(1, i32)}}, loc);
+  Operation &outerPlusOne = insertOp(*condBlock, condIndex, "rv_machine.addw",
+                                     {outerLoad.result(), one.result()}, {i32},
+                                     {}, loc);
+  Value tightenedUpper = insertMin(module, *condBlock, condIndex,
+                                   innerInfo.upper, outerPlusOne.result(), loc);
+  innerInfo.cmp->setOperand(1, tightenedUpper);
+
+  Block *bodyBlock = skipIf->getBlock();
+  int ifIndexRaw = operationIndexInBlock(*bodyBlock, skipIf);
+  if (ifIndexRaw < 0)
+    return false;
+  std::size_t ifIndex = (std::size_t) ifIndexRaw;
+  Operation &falseConst = insertOp(*bodyBlock, ifIndex, "rv_machine.li", {},
+                                   {i32}, {{"value", ctx.integerAttr(0, i32)}},
+                                   skipIf->loc());
+  skipIf->setOperand(0, falseConst.result());
+  foldConstantIf(module, *skipIf);
+  eraseMarked(module);
+  runConstantIfFolding(module);
+  if (stats) {
+    stats->rangePeels++;
+    stats->interiorPeels++;
+    stats->loopAddressCSE++;
+  }
+  (void) outer;
+  return true;
+}
+
+void runTriangularLoopBoundTightening(Module &module, SelfOptStats *stats) {
+  if (!envEnabled("SISY_ENABLE_SELF_TRIANGULAR_BOUNDS", true))
+    return;
+  std::vector<Operation*> loops;
+  for (Operation *op : walk(module))
+    if (op && !op->isErased() && op->name() == "scf.while")
+      loops.push_back(op);
+
+  bool changed = false;
+  for (Operation *outer : loops) {
+    if (!outer || outer->isErased() || outer->getRegions().size() < 2 ||
+        outer->getRegions()[1]->getBlocks().empty())
+      continue;
+    TriangularWhileCondInfo outerInfo;
+    if (!classifyWhileSlotLessThan(*outer, outerInfo))
+      continue;
+    Block &outerBody = *outer->getRegions()[1]->getBlocks()[0];
+    for (auto &owned : outerBody.ops()) {
+      Operation *inner = owned.get();
+      if (!inner || inner->isErased() || inner->name() != "scf.while")
+        continue;
+      TriangularWhileCondInfo innerInfo;
+      if (!classifyWhileSlotLessThan(*inner, innerInfo))
+        continue;
+      if (tightenTriangularInnerWhile(module, *outer, *inner, outerInfo,
+                                      innerInfo, stats)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (changed) {
+    eraseMarked(module);
+    runLocalCSE(module, stats);
+  }
+}
+
 static bool polyIsMemrefAccess(Operation *op) {
   return op && !op->isErased() &&
          (op->name() == "memref.load" || op->name() == "memref.store");
@@ -6823,7 +7104,7 @@ static bool applyConditionalRegisterBlockedReduction(
   Context &ctx = module.context();
   Location loc = outer.loc();
   Type i32 = ctx.i(32);
-  constexpr int kBlock = 2;
+  constexpr int kBlock = 4;
   std::size_t insertIndex = (std::size_t) outerIndex;
 
   std::vector<Value> accSlots;
@@ -7456,6 +7737,8 @@ static void runSafeLoopTiling(Module &module, SelfOptStats *stats) {
     if (tileSize <= 1)
       tileSize = 32;
   }
+
+  runTriangularLoopBoundTightening(module, stats);
 
   std::vector<Operation*> whileLoops;
   if (envEnabled("SISY_ENABLE_SELF_WHILE_IV_CACHE", true)) {
