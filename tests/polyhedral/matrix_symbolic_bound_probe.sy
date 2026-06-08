@@ -1,0 +1,26 @@
+int a[64][64];
+int b[64][64];
+int c[64][64];
+
+int mm(int n) {
+  int i = 0;
+  while (i < n) {
+    int j = 0;
+    while (j < n) {
+      int sum = 0;
+      int k = 0;
+      while (k < n) {
+        sum = sum + a[i][k] * b[k][j];
+        k = k + 1;
+      }
+      c[i][j] = sum;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return c[0][0];
+}
+
+int main() {
+  return mm(64);
+}

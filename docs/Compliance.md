@@ -4,7 +4,7 @@ This document is the source of truth for optimization legality in this
 repository. It describes what is acceptable in the default compiler profile and
 which existing experimental passes must stay opt-in.
 
-Last reviewed: 2026-05-31.
+Last reviewed: 2026-06-06.
 
 ## Core Rule
 
@@ -101,11 +101,12 @@ Its legality boundary is intentionally narrow:
   expected output, inspect public inputs, or key off source path/function/case
   names.
 
-The default kill switch is `SISY_ENABLE_SYNTH_CONST_ARRAY=0`.
+Branches exposing this pass must keep `SISY_ENABLE_SYNTH_CONST_ARRAY=0` as the
+default-profile kill switch.
 
 ## Proven Prefix And Helper Reductions
 
-The default RISC-V O1 profile may also use two narrow proof-driven reductions:
+The default RISC-V O1 profile may also use narrow proof-driven reductions:
 
 - `PrefixCallReduction` may collapse a countdown loop to its final positive
   iteration only when the loop's observable value is overwritten each iteration,
@@ -118,9 +119,16 @@ The default RISC-V O1 profile may also use two narrow proof-driven reductions:
   are not statically non-negative, it emits a runtime guard and keeps the
   original helper as fallback; the opt-in `StructuralBitwise` whole recognizer
   remains disabled.
+- `RotateHelperFold` may fold source-defined shift-scale helper functions only
+  when every case is an explicit `n == k` branch returning `x * 2^k` or
+  `x / 2^k`, all cases agree on one direction, the default return is the
+  original `x`, and dynamic shifts lower to a bounded helper with the original
+  in-range semantics. It must not infer rotation algorithms from function names,
+  source paths, public cases, or output behavior.
 
 The kill switches are `SISY_ENABLE_PREFIX_CALL_REDUCTION=0` and
-`SISY_ENABLE_SELF_PROVEN_BITWISE=0`.
+`SISY_ENABLE_SELF_PROVEN_BITWISE=0`; use `SISY_ENABLE_SELF_ROT_HELPER=0` to
+disable rotate-helper folding for bisection.
 
 ## Strict-Mode Or Experimental Only
 
@@ -137,6 +145,7 @@ with a written, general legality proof:
 | `Cached` / compile-time precompute | off | Can materialize compile-time results into the binary. |
 | `AdvancedConv2DTransform` / Winograd or im2col dispatcher | off | Safe only after a general affine/padding legality proof; otherwise too close to algorithm-specific lowering. |
 | HIR stencil interior dispatcher | off unless explicitly enabled | Can be valid, but only as a general guarded-loop transform, not a conv2d fingerprint. |
+| self-MLIR semantic/native kernel emitters | off | `SISY_ENABLE_SELF_SEMANTIC_KERNELS` and `SISY_ENABLE_SELF_STRUCTURAL_KERNELS` emit whole helper/native kernels such as digest, matmul summary, conv2d interior, LUDCMP, Nussinov, TRSM, hash aggregate, modular multiply/power, and memcopy. |
 
 The following constant-table variants remain prohibited by default:
 
@@ -144,6 +153,7 @@ The following constant-table variants remain prohibited by default:
 - function-equivalence or sample-based whole-function replacement;
 - unguarded structural bitwise or modular-multiplication recognizers;
 - row-scratch matrix helper replacement;
+- self-MLIR whole-kernel replacements under `SISY_ENABLE_SELF_*KERNEL` switches;
 - fixed `printf` assembly output paths or checksum/output replacement.
 
 Current environment switches for these features are documented in

@@ -3,8 +3,7 @@
 This document records how Sisyphus optimizations are designed, enabled, and
 validated. It complements `docs/Compliance.md`; if there is any conflict, the
 compliance policy wins.
-
-Last reviewed: 2026-05-31.
+Last reviewed: 2026-06-06.
 
 Current production path:
 
@@ -12,18 +11,14 @@ Current production path:
 AST -> self-MLIR(sysy/scf/memref/arith/affine)
     -> dialect conversion
     -> rv_machine/arm_machine
-    -> asm
+    -> native asm
 ```
-
-Older HIR/CFG pass names remain useful when reading historical commits, but
-new default RISC-V O1 work should land on self-MLIR, DRR, memref/affine
-analyses, or machine-dialect scheduling.
 
 ## 1. Default Profile Philosophy
 
-The current default profile is a general compiler optimization profile, not a
-benchmark-recognition profile. It enables broad IR and backend improvements and
-keeps high-risk semantic recognizers off by default.
+The default profile is a general compiler optimization profile, not a
+benchmark-recognition profile. New default RISC-V O1 work should land on
+self-MLIR, DRR, memref/affine analyses, or machine-dialect scheduling.
 
 Default-preferred work:
 
@@ -35,11 +30,11 @@ Default-preferred work:
 - reduce arithmetic with normal algebraic and range-based identities;
 - improve machine-dialect register allocation, scheduling, and peepholes.
 
-Do not optimize by recognizing public case names, expected checksums, hidden
-input behavior, or algorithm-specific helper substitutions.
+Do not optimize by recognizing public case names, source filenames, expected
+outputs, public input behavior, checksum/timing behavior, or algorithm-specific
+helper substitutions.
 
 ## 2. Current Pass Inventory
-
 ### Stable General Optimizations
 
 These are appropriate for default use when verifier and regression checks pass:
@@ -52,32 +47,40 @@ These are appropriate for default use when verifier and regression checks pass:
   nested-region traversal. Global-to-stack promotion is default-off because
   large SysY arrays must remain in `.bss` for stable RISC-V board execution.
 - self-MLIR affine transforms: structure recovery, fusion, interchange,
-  reduction privatization, invariant guard hoisting, partial unroll, and
-  unroll-and-jam when dependence analysis proves legality.
-- `SCEV`-style induction facts and ordinary loop strength reduction.
-- Hardened loop rotation is allowed only after guaranteed-execution and
+  dependence-proven tiling, guarded stencil peeling, and address recurrence
+  rewriting.
+- hardened loop rotation/repeat reduction only after guaranteed-execution and
   zero-trip semantics are preserved. Store-containing rotation remains opt-in
   because `conv2d` and Nussinov-style conditional stores previously exposed
   correctness risk.
+- `ProvenBitwiseHelper` and `RotateHelperFold` under the narrow proof boundaries
+  in `docs/Compliance.md`.
 - Runtime memoization for proven pure recursive functions. It adds runtime
   cache tables and does not precompute answers at compile time.
 - `rv_machine`/`arm_machine` lowering, scheduling, hotness-aware register
   allocation, rematerialization-friendly heuristics, and target peepholes.
 
+Environment variables controlling self-MLIR tiling:
+
+- `SISY_ENABLE_SELF_TILE`: set to `0` to disable the self-MLIR tiling pass
+  (default enabled for O1 in this branch).
+- `SISY_SELF_TILE_SIZE`: integer tile size used by the conservative two-level
+  tiling pass (default `32`).
+
 ### Default-Off Or Strict-Mode Experiments
 
-These files may be useful for experiments, but they are not the default
+These features may be useful for experiments, but they are not the default
 compliance path:
 
-- `FunctionEquivalence.cpp`
-- `StructuralBitwise.cpp`
-- `StructuralModMul.cpp`
-- `RowScratchMatmul.cpp`
-- `Cached.cpp`
-- `SynthConstArray.cpp` variants that do not satisfy the source-constant proof
-  in `docs/Compliance.md`
-- `AdvancedConv2DTransform.cpp`
-- HIR stencil/interior dispatcher when used as a conv-specific shortcut
+- legacy `FunctionEquivalence`, `StructuralBitwise`, `StructuralModMul`,
+  `RowScratchMatmul`, and `Cached` behavior if restored for comparison;
+- `SynthConstArray` variants that do not satisfy the source-constant proof in
+  `docs/Compliance.md`;
+- `AdvancedConv2DTransform` / Winograd / im2col dispatchers;
+- self-MLIR semantic/native kernel emitters gated by
+  `SISY_ENABLE_SELF_SEMANTIC_KERNELS` or `SISY_ENABLE_SELF_STRUCTURAL_KERNELS`,
+  including digest, modular multiply/power, memcopy, matmul summary, conv2d
+  interior, LUDCMP, Nussinov, TRSM, and hash aggregate helpers.
 
 Use their environment switches only for explicit comparison runs. Do not submit
 a profile that depends on them unless the implementation has been redesigned as
@@ -244,6 +247,9 @@ important defaults as of this review:
   disables guarded lowering of source-defined 32-bit bitwise helpers. The pass
   is self-MLIR shape driven and emits fallback code when signedness is not
   statically safe.
+- `SISY_ENABLE_SELF_ROT_HELPER=true`; `SISY_ENABLE_SELF_ROT_HELPER=0`
+  disables only the proof-driven shift-scale helper fold. This is distinct
+  from the strict-mode structural bitwise/modmul recognizers.
 - `SISY_ENABLE_SELF_MACHINE_LIVENESS=true`; `SISY_ENABLE_SELF_MACHINE_LIVENESS=0`
   returns the native emitter to conservative home-spill behavior. The default
   local liveness mode still spills before caller-saved clobbers or register
@@ -251,13 +257,23 @@ important defaults as of this review:
 - `SISY_ENABLE_SELF_MACHINE_SCHED=true` is reserved for machine-dialect
   scheduling bisection as the scheduler grows; current default scheduling stays
   conservative and scalar.
-- `SISY_ENABLE_FUNCTION_EQUIVALENCE=false`
-- `SISY_ENABLE_STRUCTURAL_BITWISE=false`
-- `SISY_ENABLE_STRUCTURAL_MODMUL=false`
-- `SISY_ENABLE_ROW_SCRATCH_MATMUL=false`
-- `SISY_ENABLE_CACHED_PRECOMPUTE=false`
-- `SISY_ENABLE_SYNTH_CONST_ARRAY=true` for default RISC-V O1, with
-  `SISY_ENABLE_SYNTH_CONST_ARRAY=0` as the bisection kill switch
+- `SISY_ENABLE_SELF_SEMANTIC_KERNELS=false`; semantic helper/native kernel
+  emission is strict-mode only.
+- `SISY_ENABLE_SELF_STRUCTURAL_KERNELS=false`; structural native kernel
+  emission is strict-mode only, even when a specific
+  `SISY_ENABLE_SELF_*_KERNEL` flag is set.
+- `SISY_ENABLE_SELF_ALL_STRUCTURAL_KERNELS=false`; bulk enabling all
+  structural native kernels is strict-mode only.
+- legacy `SISY_ENABLE_FUNCTION_EQUIVALENCE=false`,
+  `SISY_ENABLE_STRUCTURAL_BITWISE=false`, `SISY_ENABLE_STRUCTURAL_MODMUL=false`,
+  `SISY_ENABLE_ROW_SCRATCH_MATMUL=false`, and
+  `SISY_ENABLE_CACHED_PRECOMPUTE=false` remain strict-mode experiments if they
+  are restored in a branch.
+- source-constant table synthesis is default-allowed only under the proof
+  boundary in `docs/Compliance.md`. Branches exposing
+  `SISY_ENABLE_SYNTH_CONST_ARRAY` should use `SISY_ENABLE_SYNTH_CONST_ARRAY=0`
+  as the bisection kill switch; it is not a strict-mode whole-function
+  precompute switch.
 - `SISY_ENABLE_LOOP_ROTATE=true` for default scalar RISC-V O1, with
   `SISY_ENABLE_LOOP_ROTATE=0` as the bisection kill switch.  The public CLI
   controls `--disable-loop-rotate` and `--enable-loop-rotate` remain available.
@@ -275,12 +291,15 @@ important defaults as of this review:
 - `SISY_ENABLE_CFG_BOUNDS_CHECK=false`; CFG-level bounds-branch elimination is
   still experimental and remains opt-in until it can prove multi-predecessor
   rotated-loop exits without path-sensitive phi loss.
-- `SISY_SYNTH_CONST_ARRAY_MAX=4096` caps the default source-constant table
-  synthesis budget, including input-independent initialization loops
+- `SISY_SYNTH_CONST_ARRAY_MAX=4096`, on branches exposing the pass, caps the
+  source-constant table synthesis budget, including input-independent
+  initialization loops.
 - `SISY_ENABLE_FINAL_ITER_COLLAPSE=true` enables the narrow IR-proven
   countdown-loop final-iteration collapse used for overwrite-style repeats;
   loops whose stores depend on loop-local loads or call results are rejected
-- `SISY_ENABLE_ADVANCED_CONV2D=false`
+- `SISY_ENABLE_ADVANCED_CONV2D=false`; conv-specific Winograd/im2col
+  dispatch remains strict-mode unless redesigned as a general affine lowering
+  with a written legality proof.
 - historical `SISY_HIR_*` switches apply only to retired/compatibility
   experiments; new default RISC-V O1 tuning should use self-MLIR switches and
   stats

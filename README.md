@@ -164,6 +164,8 @@ Optimization bisection switches:
 - `SISY_HIR_ENABLE_UNROLL_JAM=0`
 - `SISY_HIR_ENABLE_REDUCTION_MICROTILE=0`
 - `SISY_HIR_ENABLE_CONDITIONAL_ROW_JAM=0`
+- `SISY_ENABLE_SYNTH_CONST_ARRAY=0` on branches exposing source-constant
+  synthesis
 
 Strict-mode opt-in switches for high-risk recognizers:
 
@@ -171,7 +173,8 @@ Strict-mode opt-in switches for high-risk recognizers:
 - `SISY_ENABLE_STRUCTURAL_MODMUL=1`
 - `SISY_ENABLE_ROW_SCRATCH_MATMUL=1`
 - `SISY_ENABLE_CACHED_PRECOMPUTE=1`
-- `SISY_ENABLE_SYNTH_CONST_ARRAY=1`
+- `SISY_ENABLE_SELF_SEMANTIC_KERNELS=1 SISY_ENABLE_SELF_DIGIT_HELPER=1`
+- `SISY_ENABLE_SELF_STRUCTURAL_KERNELS=1 SISY_ENABLE_SELF_ALL_STRUCTURAL_KERNELS=1`
 
 Compare/validator environment variables:
 

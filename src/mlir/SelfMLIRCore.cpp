@@ -346,7 +346,8 @@ Region &Operation::addRegion() {
 }
 
 bool Operation::isTerminator() const {
-  return opName == "scf.yield" || opName == "scf.return" ||
+  return opName == "affine.yield" ||
+         opName == "scf.yield" || opName == "scf.return" ||
          opName == "sysy.return" || opName == "sysy.break" ||
          opName == "sysy.continue" ||
          opName == "cf.br" || opName == "cf.cond_br" ||
@@ -615,6 +616,8 @@ bool Operation::isLoop() const {
 }
 
 static void verifyOp(Operation &op, VerifyResult &result) {
+  if (op.isErased())
+    return;
   auto fail = [&](const std::string &msg) {
     result.ok = false;
     result.errors.push_back(op.name() + ": " + msg);
@@ -644,13 +647,23 @@ static void verifyOp(Operation &op, VerifyResult &result) {
         if (!arg->type())
           fail("block argument has no type");
       }
+      size_t lastLiveOp = block->ops().size();
+      for (size_t i = block->ops().size(); i > 0; i--) {
+        Operation *candidate = block->ops()[i - 1].get();
+        if (candidate && !candidate->isErased()) {
+          lastLiveOp = i - 1;
+          break;
+        }
+      }
       for (size_t i = 0; i < block->ops().size(); i++) {
         auto &child = *block->ops()[i];
+        if (child.isErased())
+          continue;
         if (child.getBlock() != block.get())
           fail("child block owner mismatch");
-        if (child.isTerminator() && i + 1 != block->ops().size())
+        if (child.isTerminator() && i != lastLiveOp)
           fail("terminator is not the final block operation");
-        if (!child.isTerminator() && i + 1 == block->ops().size() &&
+        if (!child.isTerminator() && i == lastLiveOp &&
             (child.name() == "scf.yield" || child.name() == "cf.br"))
           fail("bad terminator placement");
         verifyOp(child, result);

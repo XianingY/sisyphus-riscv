@@ -1,7 +1,6 @@
 #include "Polyhedral.h"
 #include <algorithm>
 #include <functional>
-#include <iostream>
 #include <map>
 #include <set>
 #include <string>
@@ -114,6 +113,35 @@ static bool regionHasStoreToAlloca(Region *region, Operation *allocaOp,
   return regionHasStoreToAlloca(region, allocaOp, excepts);
 }
 
+static bool opTreeLoadsMemrefBase(Operation *op, Value base) {
+  if (!op || op->isErased() || !base.valid())
+    return false;
+  if (op->name() == "memref.load" && op->operandCount() > 0 &&
+      op->operand(0) == base)
+    return true;
+  for (auto &nested : op->getRegions()) {
+    for (auto &block : nested->getBlocks()) {
+      for (auto &owned : block->ops()) {
+        if (opTreeLoadsMemrefBase(owned.get(), base))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool regionLoadsMemrefBase(Region *region, Value base) {
+  if (!region || !base.valid())
+    return false;
+  for (auto &block : region->getBlocks()) {
+    for (auto &owned : block->ops()) {
+      if (opTreeLoadsMemrefBase(owned.get(), base))
+        return true;
+    }
+  }
+  return false;
+}
+
 static bool regionHasCallTo(Region *region, const std::string &callee) {
   if (!region || callee.empty())
     return false;
@@ -133,7 +161,42 @@ static bool regionHasCallTo(Region *region, const std::string &callee) {
   return false;
 }
 
-static bool regionHasAnyCall(Region *region) {
+static bool boolAttr(Attribute attr) {
+  if (!attr)
+    return false;
+  std::string text = attr.str();
+  return text == "true" || text == "1";
+}
+
+static bool isKnownPureOrIntrinsicCallee(const std::string &callee) {
+  static const std::set<std::string> names = {
+      "abs", "fabs", "fabsf", "min", "max", "fmin", "fmax",
+      "__builtin_abs", "__builtin_fabs", "__builtin_fabsf",
+      "llvm.abs", "llvm.smin", "llvm.smax", "llvm.umin", "llvm.umax",
+      "llvm.fabs", "memcpy", "memset", "llvm.memcpy", "llvm.memset"};
+  return names.count(callee) != 0 ||
+         callee.rfind("llvm.", 0) == 0 ||
+         callee.rfind("__builtin_", 0) == 0;
+}
+
+static bool functionMarkedPure(Module &module, const std::string &callee) {
+  if (callee.empty())
+    return false;
+  for (Operation *op : walk(module)) {
+    if (!op || op->isErased() || op->name() != "sysy.func")
+      continue;
+    if (stringAttr(op->attr("sym_name")) == callee && boolAttr(op->attr("pure")))
+      return true;
+  }
+  return false;
+}
+
+static bool calleeIsPureOrIntrinsic(Module &module, const std::string &callee) {
+  return isKnownPureOrIntrinsicCallee(callee) ||
+         functionMarkedPure(module, callee);
+}
+
+static bool regionHasImpureCall(Module &module, Region *region) {
   if (!region)
     return false;
   for (auto &block : region->getBlocks()) {
@@ -141,10 +204,11 @@ static bool regionHasAnyCall(Region *region) {
       Operation *op = owned.get();
       if (!op || op->isErased())
         continue;
-      if (op->name() == "sysy.call")
+      if (op->name() == "sysy.call" &&
+          !calleeIsPureOrIntrinsic(module, stringAttr(op->attr("callee"))))
         return true;
       for (auto &nested : op->getRegions()) {
-        if (regionHasAnyCall(nested.get()))
+        if (regionHasImpureCall(module, nested.get()))
           return true;
       }
     }
@@ -270,8 +334,12 @@ static bool blockReadsAllocaAfter(Block *block, Operation *anchor, Operation *al
       pastAnchor = true;
       continue;
     }
-    if (pastAnchor && opTreeHasLoadFromAlloca(op, allocaOp))
+    if (!pastAnchor)
+      continue;
+    if (opTreeHasLoadFromAlloca(op, allocaOp))
       return true;
+    if (opTreeHasStoreToAlloca(op, allocaOp))
+      return false;
   }
   return false;
 }
@@ -441,10 +509,12 @@ static bool tryRaiseWhileToAffine(Module &module, Operation *op) {
   Region *condRegion = op->getRegions()[0].get();
   if (regionHasLoopControl(bodyRegion))
     return false;
-  if (regionHasAnyCall(bodyRegion))
+  if (regionHasImpureCall(module, bodyRegion))
     return false;
   if (Operation *func = enclosingFunction(op)) {
-    if (regionHasCallTo(bodyRegion, stringAttr(func->attr("sym_name"))))
+    std::string funcName = stringAttr(func->attr("sym_name"));
+    if (regionHasCallTo(bodyRegion, funcName) &&
+        !calleeIsPureOrIntrinsic(module, funcName))
       return false;
   }
   if (regionHasStoreToAlloca(bodyRegion, allocaOp, allStores))
@@ -661,10 +731,10 @@ void runAffineLoopTiling(Module &module) {
       inner = findInBlock(b.get());
       if (inner) break;
     }
-    // conservative legality: skip if inner region contains calls (side-effects)
+    // Allow pure helper calls and known intrinsics while still blocking impure calls.
     if (inner && !inner->getRegions().empty()) {
       Region *r = inner->getRegions()[0].get();
-      if (regionHasAnyCall(r))
+      if (regionHasImpureCall(module, r))
         continue;
     }
     if (!inner) {
@@ -677,12 +747,12 @@ void runAffineLoopTiling(Module &module) {
 
     int64_t outerLowerC, outerStepC;
     int64_t innerLowerC, innerStepC;
-    // require constant lower bounds and step==1 for conservative strip-mining
+    // require constant positive steps; tile loops advance by step * tileSize.
     if (!constIntValue(op->operand(0), outerLowerC)) continue;
     if (!constIntValue(op->operand(2), outerStepC)) continue;
     if (!constIntValue(inner->operand(0), innerLowerC)) continue;
     if (!constIntValue(inner->operand(2), innerStepC)) continue;
-    if (outerStepC != 1 || innerStepC != 1) continue;
+    if (outerStepC <= 0 || innerStepC <= 0) continue;
 
     // Prepare insertion at the position of outer in its parent block
     Block *parent = op->getBlock();
@@ -723,7 +793,7 @@ void runAffineLoopTiling(Module &module) {
     }
 
     // Create tile size constant in parent
-    Attribute tileAttr = ctx.integerAttr(tileSize, ctx.i(32));
+    Attribute tileAttr = ctx.integerAttr(tileSize * outerStepC, ctx.i(32));
     auto tileConst = std::make_unique<Operation>("arith.constant", std::vector<Value>{}, std::vector<Type>{ctx.i(32)}, std::map<std::string, Attribute>{{"value", tileAttr}}, op->loc());
     Operation &tileConstOp = parent->insertOperation(insertIndex, std::move(tileConst));
     insertIndex++;
@@ -762,7 +832,7 @@ void runAffineLoopTiling(Module &module) {
     BlockArgument &midIv = midBody.addArgument(ctx.i(32), op->loc(), "j");
 
     // create tiled inner loop (2D tiling): create tile constant for inner
-    auto innerTileConst = std::make_unique<Operation>("arith.constant", std::vector<Value>{}, std::vector<Type>{ctx.i(32)}, std::map<std::string, Attribute>{{"value", ctx.integerAttr(tileSize, ctx.i(32))}}, inner->loc());
+    auto innerTileConst = std::make_unique<Operation>("arith.constant", std::vector<Value>{}, std::vector<Type>{ctx.i(32)}, std::map<std::string, Attribute>{{"value", ctx.integerAttr(tileSize * innerStepC, ctx.i(32))}}, inner->loc());
     Operation &innerTileConstOp = midBody.addOperation(std::move(innerTileConst));
 
     if (constantIntegerValue(innerUpperVal, innerConstVal)) {
@@ -1380,6 +1450,8 @@ void runImperfectLoopPromotion(Module &module) {
     for (int i = 2; i < writeback_store->operandCount(); i++) {
       array_indices.push_back(writeback_store->operand(i));
     }
+    if (regionLoadsMemrefBase(loop_k->getRegions()[0].get(), array_base))
+      continue;
 
     Block *parentBlock = loop_j->getBlock();
     int insertIdx = operationIndexInBlock(*parentBlock, loop_j);
@@ -1442,8 +1514,11 @@ void runImperfectLoopPromotion(Module &module) {
             "memref.load", load_ops, std::vector<Type>{ctx.i(32)},
             std::map<std::string, Attribute>{}, op_in_k->loc());
 
-        int op_idx = operationIndexInBlock(*body_k, op_in_k);
-        Operation &inserted_load = body_k->insertOperation(op_idx, std::move(new_load));
+        Block *targetBlock = op_in_k->getBlock();
+        int op_idx = targetBlock ? operationIndexInBlock(*targetBlock, op_in_k) : -1;
+        if (op_idx < 0)
+          continue;
+        Operation &inserted_load = targetBlock->insertOperation(op_idx, std::move(new_load));
 
         replaceAllUses(module, op_in_k->result(), inserted_load.result());
         op_in_k->markErased();
@@ -1455,8 +1530,11 @@ void runImperfectLoopPromotion(Module &module) {
             "memref.store", store_ops, std::vector<Type>{},
             std::map<std::string, Attribute>{}, op_in_k->loc());
 
-        int op_idx = operationIndexInBlock(*body_k, op_in_k);
-        body_k->insertOperation(op_idx, std::move(new_store));
+        Block *targetBlock = op_in_k->getBlock();
+        int op_idx = targetBlock ? operationIndexInBlock(*targetBlock, op_in_k) : -1;
+        if (op_idx < 0)
+          continue;
+        targetBlock->insertOperation(op_idx, std::move(new_store));
         op_in_k->markErased();
       }
     }

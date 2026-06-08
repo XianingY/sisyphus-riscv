@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPILER="${ROOT_DIR}/build/compiler"
+COMPILER="${SISY_COMPILER_PATH:-${ROOT_DIR}/build/compiler}"
 CASE_DIR="${SISY_RISCV_PERF_CASE_DIR:-${ROOT_DIR}/test2026/performance_riscv}"
 OUT_DIR="${ROOT_DIR}/tests/.out/riscv-perf-compile"
 mkdir -p "${OUT_DIR}"
@@ -16,9 +16,20 @@ if [[ ! -d "${CASE_DIR}" ]]; then
   exit 1
 fi
 
-if rg -n 'inputFile\.find|path\.find|basename\(|caseName|case_name|sourcePath|emitKnown.*Fixup|fixup_output|SISY_ENABLE_.*FIXUPS' \
-    "${ROOT_DIR}/src" >/tmp/sisy-riscv-guard-source.txt; then
-  cat /tmp/sisy-riscv-guard-source.txt >&2
+FORBIDDEN_SOURCE_TRIGGER_RE='inputFile\.find|path\.find|basename\(|caseName|case_name|sourcePath|emitKnown.*Fixup|fixup_output|SISY_ENABLE_.*FIXUPS'
+FORBIDDEN_SOURCE_OUT="${OUT_DIR}/forbidden-source-triggers.txt"
+if command -v rg >/dev/null 2>&1; then
+  scan_forbidden_source() {
+    rg -n "${FORBIDDEN_SOURCE_TRIGGER_RE}" "${ROOT_DIR}/src"
+  }
+else
+  scan_forbidden_source() {
+    grep -R -n -E "${FORBIDDEN_SOURCE_TRIGGER_RE}" "${ROOT_DIR}/src"
+  }
+fi
+
+if scan_forbidden_source >"${FORBIDDEN_SOURCE_OUT}"; then
+  cat "${FORBIDDEN_SOURCE_OUT}" >&2
   echo "source-name or fixed-output optimization trigger found under src/" >&2
   exit 1
 fi
@@ -52,20 +63,38 @@ for src in "${cases[@]}"; do
     exit 1
   fi
   native_line="$(grep '^\[native-asm\]' "${stats}" | tail -1 || true)"
-  # Structural kernels such as mm-like or modular multiply are guarded by IR
-  # shape/proof checks; keep them visible in stats but do not classify them with
-  # the source/benchmark semantic replacements below.
+  # Native semantic/structural kernel emitters are strict-mode experiments.
+  # The default contest profile must keep every such counter present and zero.
   for field in \
     semantic-kernels \
+    triangular-transpose-kernels \
+    modular-multiply-kernels \
+    modular-multiply-callsites \
+    modular-power-kernels \
+    modular-power-callsites \
+    memcopy-kernels \
+    memcopy-callsites \
     digit-helper-kernels \
-    experimental-many-mat-cal-kernels \
-    experimental-sl-stencil-kernels \
-    experimental-matmul-summary-kernels \
-    experimental-conv2d-interior-kernels; do
+    mm-like-kernels \
+    conv2d-interior-kernels \
+    structural-half-init-matrix-kernels \
+    structural-stencil3d-kernels \
+    structural-matmul-summary-kernels \
+    structural-digest-kernels \
+    structural-map-reduce-kernels \
+    structural-ludcmp-kernels \
+    structural-nussinov-kernels \
+    structural-trsm-kernels \
+    structural-hash-aggregate-kernels; do
     value="$(sed -n "s/.* ${field}=\\([^ ]*\\).*/\\1/p" <<<"${native_line}")"
-    if [[ -n "${value}" && "${value}" != "0" ]]; then
+    if [[ -z "${value}" ]]; then
       cat "${stats}" >&2
-      echo "default RISC-V path emitted semantic native kernel ${field}=${value} for ${name}" >&2
+      echo "default RISC-V path did not report native kernel guard field ${field} for ${name}" >&2
+      exit 1
+    fi
+    if [[ "${value}" != "0" ]]; then
+      cat "${stats}" >&2
+      echo "default RISC-V path emitted native semantic/structural kernel ${field}=${value} for ${name}" >&2
       exit 1
     fi
   done

@@ -1,0 +1,19 @@
+void write_row(int a[][4]) {
+  int i = 0;
+  while (i < 3) {
+    int j = 0;
+    while (j < 4) {
+      a[i][j] = i * 10 + j;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+}
+
+int main() {
+  int a[3][4];
+  write_row(a);
+  putint(a[2][3] - a[1][2]);
+  putch(10);
+  return 0;
+}

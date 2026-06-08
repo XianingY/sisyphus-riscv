@@ -1,0 +1,14 @@
+int a[128][128];
+
+int main() {
+  int i = 0;
+  while (i < 128) {
+    int j = 0;
+    while (j < 128) {
+      a[i][j] = i + j;
+      j = j + 2;
+    }
+    i = i + 2;
+  }
+  return a[0][0];
+}

@@ -356,8 +356,12 @@ int main(int argc, char **argv) {
               << " addr-iv-rewrites=" << selfMLIRStats.opt.addrIvRewrites
               << " poly-nests=" << selfMLIRStats.opt.polyNests
               << " poly-deps-proved=" << selfMLIRStats.opt.polyDepsProved
+              << " poly-matrix-nests=" << selfMLIRStats.opt.polyMatrixNests
+              << " poly-dep-directions=" << selfMLIRStats.opt.polyDepDirections
               << " poly-permutations=" << selfMLIRStats.opt.polyPermutations
               << " poly-tiles=" << selfMLIRStats.opt.polyTiles
+              << " matrix-register-tiles=" << selfMLIRStats.opt.matrixRegisterTiles
+              << " tile-insert-fixes=" << selfMLIRStats.opt.tileInsertFixes
               << " reduction-blocks=" << selfMLIRStats.opt.reductionBlocks
               << " reduction-regs=" << selfMLIRStats.opt.reductionRegs
               << " interior-peels=" << selfMLIRStats.opt.interiorPeels

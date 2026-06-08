@@ -92,27 +92,47 @@ Useful flags:
 
 ## Architecture
 
-The default frontend path is the dialect pipeline:
+The production frontend/codegen path is the self-MLIR pipeline:
 
-`AST -> HIR build -> HIR verify/canonicalize -> CFG -> CFG verify -> legacy ModuleOp adapter -> existing optimization/backend pipeline`
+`AST -> self-MLIR(sysy/scf/memref/arith/affine) -> self-MLIR optimization -> dialect conversion -> rv_machine/arm_machine -> native asm`
 
-The legacy frontend path (`AST -> CodeGen -> ModuleOp`) is still available with `--use-legacy-codegen`. Backend and O1/O2 pipelines operate on the existing legacy `ModuleOp` representation after the CFG adapter.
+All HIR/CFG/legacy-`ModuleOp` material described in older revisions of this
+document has been retired. The self-MLIR layer in `src/mlir/` is now the single
+IR substrate for optimization and code generation; `--use-legacy-codegen` and
+the `--dump-hir`/`--dump-cfg` flags are compatibility stubs only.
 
-High-level source layout:
+High-level source layout (verified against the tree):
 
-- `src/main/`: CLI parsing, default target selection, and optimization pipeline profile construction.
-- `src/parse/`: SysY lexer/parser/type-system pieces that produce the AST.
-- `src/frontend/`: frontend facade; new top-level integration should include this facade instead of raw parse/codegen internals.
-- `src/hir/`: structured high-level IR, builder, verifier, canonicalization, affine/polyhedral utilities, and migration lowering.
-- `src/cfg/`: explicit control-flow dialect between HIR and legacy IR, including CFG verification and the CFG-to-legacy adapter.
-- `src/codegen/`: legacy IR data model (`ModuleOp`/ops/attrs) and legacy AST-to-IR lowering.
-- `src/pre-opt/`: early structured/CFG cleanup passes such as alloca movement, const folding, loop raising, CFG flattening, and mem2reg.
-- `src/opt/`: mid-level optimization passes such as alias analysis, DSE/DLE, GVN, LICM, inlining, loop transforms, range folding, vectorization, and pass management.
-- `src/pass/`: thin forwarding header (`PassRegistry.h`) that re-exports `PassManager` and `PipelineProfiles`; actual pass ordering is centralized in `src/main/PipelineProfiles.cpp`.
-- `src/rv/` and `src/arm/`: current RISC-V and ARM backend lowering, scheduling, register allocation, and assembly dumping.
-- `src/backend/`: thin architecture-boundary facade headers (`BackendPasses.h` per target, `RegAllocHotness.h` shared utility, `RiscvParams.h` hardware constants); primary implementation still lives in `src/rv/` and `src/arm/`.
-- `src/utils/`: common utilities, including Presburger/SMT helpers used by loop and affine analyses.
+- `src/main/`: CLI parsing (`Options.cpp`), default target selection
+  (`DefaultTarget.h`), and the `OptimizationConfig`/pipeline driving in
+  `main.cpp`.
+- `src/parse/`: SysY lexer, parser, AST (`ASTNode.h`), and type system
+  (`Type`, `TypeContext`, `Sema`) that produce the AST.
+- `src/frontend/`: `FrontendFacade.h` thin include boundary; new top-level
+  integration should depend on this facade rather than raw parse internals.
+- `src/mlir/`: the entire IR + optimization + native backend. This is where
+  the bulk of the compiler lives.
+  - `SelfMLIR.{h,cpp}`: self-MLIR IR data model (`Context`/`Type`/`Attribute`/
+    `Operation`/`Region`/`Block`/`Value`), the self-MLIR optimization passes
+    (`runGlobalOpt`, `runMemoryOpt`, `runProvenBitwiseHelper`,
+    `runLoopAddressIV`, `runLoopTiling`, etc.), dialect conversion, and the
+    native RISC-V/ARM assembly emitter (`emitNativeAssembly` /
+    `emitFunctionAssembly`, including register allocation/spilling).
+  - `ASTToMLIR.{h,cpp}`: AST -> self-MLIR lowering.
+  - `IPO.{h,cpp}`: interprocedural summaries/inlining over self-MLIR.
+  - `Polyhedral.{h,cpp}` and `polyhedral/`: affine/loop analysis helpers.
+  - `canonicalize.drr`: declarative rewrite patterns.
+- `src/pass/`: `PassRegistry.h` thin forwarding header.
+- `src/rt/`: target runtime assembly stubs (`arm-clone.s`, `arm-join.s`).
+- `src/utils/`: common utilities; `presburger/` (Presburger set/legality) and
+  `smt/` (SMT/bitvector helpers) used by loop and affine analyses,
+  `DynamicCast.h`.
 - `runtime/`: SysY runtime library used by runtime evaluation scripts.
+
+Note: there is no `src/hir/`, `src/cfg/`, `src/codegen/`, `src/pre-opt/`,
+`src/opt/`, `src/rv/`, `src/arm/`, or `src/backend/` directory. Pass and
+backend logic referenced by those historical names now lives in
+`src/mlir/SelfMLIR.cpp`.
 
 ## Optimization Profiles and Bisection
 
@@ -131,20 +151,33 @@ helper replacements as a default scoring path.
 Common bisection switches:
 
 ```bash
+SISY_ENABLE_SELF_AFFINE_OPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_MEMOPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_PROVEN_BITWISE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_ROT_HELPER=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_HIR_ENABLE_INTERCHANGE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_HIR_ENABLE_UNROLL_JAM=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SYNTH_CONST_ARRAY=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+```
+
+Strict-mode comparison switches:
+
+```bash
 SISY_ENABLE_FUNCTION_EQUIVALENCE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_STRUCTURAL_BITWISE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_STRUCTURAL_MODMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
-SISY_ENABLE_SYNTH_CONST_ARRAY=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_ADVANCED_CONV2D=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_SEMANTIC_KERNELS=1 SISY_ENABLE_SELF_DIGIT_HELPER=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_STRUCTURAL_KERNELS=1 SISY_ENABLE_SELF_ALL_STRUCTURAL_KERNELS=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
 
-The switches set to `1` above are strict-mode/experiment toggles, not default
-submission guidance.
+The strict-mode switches above are experiment toggles, not default submission
+guidance. Source-constant table synthesis is only allowed inside the
+`docs/Compliance.md` proof boundary and should be disabled with
+`SISY_ENABLE_SYNTH_CONST_ARRAY=0` for bisection on branches that expose it.
 
 ## Dual-Target Submission
 

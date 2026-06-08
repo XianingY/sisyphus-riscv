@@ -866,11 +866,13 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
 
   // 2. High-level structure recovery and polyhedral preparation
   if (effective.enableAffine && !envDisabled("SISY_ENABLE_SELF_AFFINE_OPT")) {
+    if (effective.level != OptimizationConfig::Level::O0)
+      runPureFunctionDeduction(*module);
     if (envEnabled("SISY_ENABLE_SELF_CONTINUE_WRAP", true))
       runContinueToIfWrap(*module);
     if (!envDisabled("SISY_ENABLE_SELF_RAISE_AFFINE"))
       stats.opt.affineWorklistItems += runRaiseToAffine(*module);
-    if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", false))
+    if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", true))
       runImperfectLoopPromotion(*module);
   }
   if (effective.enableStencilPeel)
@@ -941,8 +943,10 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
         stats.opt.affineWorklistItems += phase2;
         stats.opt.phase2AffineRaises += phase2;
       }
-      if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", false))
+      if (envEnabled("SISY_ENABLE_SELF_IMPERFECT_PROMOTION", true))
         runImperfectLoopPromotion(*module);
+      if (effective.enableLoopInterchange && !envDisabled("SISY_ENABLE_SELF_LOOP_INTERCHANGE"))
+        runPolyhedralLoopPermutation(*module, &stats.opt);
       if (effective.enableLoopTiling)
         runLoopTiling(*module, &stats.opt);
       if (effective.enableLoopTiling)
@@ -994,7 +998,8 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
     runLoopLocalScheduler(*module, &stats.opt);
   if (effective.enableAffine)
     collectAffineNestSummary(*module, &stats.opt);
-  if (std::getenv("SISY_ENABLE_RVV"))
+  if (std::getenv("SISY_ENABLE_RVV") ||
+      (target == "arm" && effective.level == OptimizationConfig::Level::O2))
     runLoopVectorization(*module);
   if (target == "riscv" && effective.level != OptimizationConfig::Level::O0 &&
       envEnabled("SISY_ENABLE_SELF_STRUCTURAL_KERNELS", false)) {
@@ -1003,6 +1008,7 @@ std::unique_ptr<Module> runProductionGateFromAST(Context &ctx, const sys::ASTNod
         op->setAttr("structural_kernel_eligible", ctx.boolAttr(true));
     }
   }
+  repairAffineYieldTerminators(*module, &stats.opt);
   auto before = verify(*module);
   stats.verifyBefore = before.ok;
   if (!before.ok) {

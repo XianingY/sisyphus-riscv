@@ -1,0 +1,6 @@
+const int K = 5;
+
+int main() {
+  putint(K);
+  return 0;
+}

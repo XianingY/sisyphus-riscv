@@ -3,14 +3,21 @@
 ## Current State
 - Canonical pass entry: `src/pass/PassRegistry.h`
 - Current implementation lives in:
-  - `src/pre-opt`: structured control-flow passes
-  - `src/opt`: flattened CFG/SSA passes
-  - `src/rv` and `src/arm`: backend lowering/cleanup passes
+  - `src/mlir/ASTToMLIR.cpp`: production pipeline wiring
+  - `src/mlir/SelfMLIROpt.cpp`: self-MLIR scalar, affine, polyhedral,
+    memory, bitwise, and vector rewrites
+  - `src/mlir/SelfMLIR.cpp`: optimization profile defaults and dialect
+    conversion patterns
+  - `src/mlir/SelfMLIRNative.cpp`: RISC-V/ARM native lowering, liveness, and
+    register allocation
 
 ## Boundary Rule
-- New wiring should use pass registry + pipeline profile APIs.
-- Direct includes to individual pass directories are allowed only in implementation files.
+- New optimization wiring should flow through `OptimizationConfig` and
+  `runProductionGateFromAST`.
+- Default-profile legality must be decided from IR facts, not source names,
+  paths, fixed outputs, or benchmark fingerprints.
 
 ## Next Steps
-- Expand pass registry to expose named profile presets and profile dumps.
-- Keep pass ordering centralized under pipeline profile implementation.
+- Keep pass ordering centralized in the self-MLIR production pipeline.
+- Extend stats when adding new optimization families so compile/runtime
+  attribution remains reproducible.

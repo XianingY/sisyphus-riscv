@@ -137,10 +137,14 @@ The default RISC-V profile keeps general optimizations enabled. High-risk
 semantic or structural recognizers are strict-mode opt-in, while ordinary
 generic passes keep bisection kill switches. Examples:
 
+O1 now enables self-MLIR loop tiling by default for proven affine nests;
+use `SISY_ENABLE_SELF_TILE=0` for bisection.
+
 ```bash
 SISY_ENABLE_SELF_AFFINE_OPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_SELF_MEMOPT=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_SELF_PROVEN_BITWISE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_ROT_HELPER=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_SELF_MACHINE_LIVENESS=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_SELF_MACHINE_SCHED=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_VECTORIZE=0 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
@@ -175,6 +179,8 @@ SISY_ENABLE_ROW_SCRATCH_MATMUL=1 ./build/compiler testcase.sy -S -o tests/.out/c
 SISY_ENABLE_CACHED_PRECOMPUTE=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O2
 SISY_ENABLE_ADVANCED_CONV2D=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 SISY_ENABLE_CFG_BOUNDS_CHECK=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_SEMANTIC_KERNELS=1 SISY_ENABLE_SELF_DIGIT_HELPER=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
+SISY_ENABLE_SELF_STRUCTURAL_KERNELS=1 SISY_ENABLE_SELF_ALL_STRUCTURAL_KERNELS=1 ./build/compiler testcase.sy -S -o tests/.out/case.s --target=riscv -O1
 ```
 
 Do not use the strict-mode switches as submission defaults without updating

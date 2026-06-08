@@ -1,0 +1,14 @@
+void emit(int x) {
+  if (x == 0) {
+    putint(1);
+    return;
+  }
+  putint(2);
+}
+
+int main() {
+  emit(0);
+  emit(1);
+  putint(3);
+  return 0;
+}

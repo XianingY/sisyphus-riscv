@@ -1,7 +1,7 @@
 #ifndef PASS_REGISTRY_H
 #define PASS_REGISTRY_H
 
-#include "../opt/PassManager.h"
-#include "../main/PipelineProfiles.h"
+#include "../mlir/ASTToMLIR.h"
+#include "../mlir/SelfMLIR.h"
 
 #endif

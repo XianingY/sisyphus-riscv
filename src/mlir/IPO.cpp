@@ -779,8 +779,16 @@ void runIPCP(Module &module, SelfOptStats *stats) {
 }
 
 void runPureFunctionDeduction(Module &module) {
-  (void) module;
-  // Deduce pure functions (no side effects) and add "pure" attribute.
+  std::set<std::string> pureNames = deducePureIntegerFunctions(module);
+  if (pureNames.empty())
+    return;
+  Context &ctx = module.context();
+  SymbolTable symbols = buildSymbolTable(module);
+  for (const std::string &name : pureNames) {
+    auto it = symbols.all().find(name);
+    if (it != symbols.all().end() && it->second)
+      it->second->setAttr("pure", ctx.boolAttr(true));
+  }
 }
 
 }

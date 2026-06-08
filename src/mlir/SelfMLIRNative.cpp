@@ -5017,6 +5017,8 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     for (auto *op : funcOps) {
       if (!op || op->isErased())
         continue;
+      if (op->name() == "sysy.load" || op->name() == "memref.load")
+        continue;
       auto defIt = opIndex.find(op);
       if (defIt == opIndex.end())
         continue;
@@ -5100,11 +5102,25 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         expireOldIntervals(iv.start);
         std::string reg;
         if (freeRegs.empty()) {
+          auto worst = std::min_element(
+              active.begin(), active.end(),
+              [](const ActiveInterval &a, const ActiveInterval &b) {
+                if (a.weight != b.weight)
+                  return a.weight < b.weight;
+                return a.end > b.end;
+              });
+          if (worst == active.end() || worst->weight >= iv.weight) {
+            stats.lsraWeightedSpills++;
+            continue; // spill this interval -> fallback path
+          }
+          lsraAssignment.erase(worst->key);
+          reg = worst->reg;
+          active.erase(worst);
           stats.lsraWeightedSpills++;
-          continue; // spill this interval -> fallback path
+        } else {
+          reg = freeRegs.back();
+          freeRegs.pop_back();
         }
-        reg = freeRegs.back();
-        freeRegs.pop_back();
         lsraAssignment[valueKey(iv.value)] = reg;
         lsraReserved.insert(reg);
         stats.lsraStableValues++;
@@ -5255,12 +5271,13 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (isArm)
       return armResultReg(nextReg++);
     if (stableBaseActive) {
-      static const char *regsNoStable[] = {
-        "t0", "t1", "t2", "t3", "t4",
-        "a2", "a3", "a4", "a5", "a6", "a7",
+      std::vector<std::string> regsNoStable = {
+          "t0", "t1", "t2", "t3", "t4",
+          "a2", "a3", "a4", "a5", "a6", "a7",
       };
-      int n = (int)(sizeof(regsNoStable) / sizeof(regsNoStable[0]));
-      return regsNoStable[(nextReg++) % n];
+      for (int s = stableBaseRegCount; s < 4 && s < calleeSaveCount; s++)
+        regsNoStable.push_back("s" + std::to_string(s));
+      return regsNoStable[(nextReg++) % (int) regsNoStable.size()];
     }
     if (regAlloc2Enabled && calleeSaveCount >= 12) {
       // Round-robin pool for results without a stable LSRA assignment. s4-s7
@@ -5324,6 +5341,49 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       os << "    li " << intScratchForFloatBits() << ", " << bits
          << "\n    fmv.w.x " << dst << ", " << intScratchForFloatBits() << "\n";
   };
+  std::function<bool(Value, int)> canRematerializeScalar =
+      [&](Value value, int depth) -> bool {
+    if (!value.valid() || depth > 6 || isMemrefType(value.type()) ||
+        isFloatType(value.type()) || value.type().str().find("vector") != std::string::npos)
+      return false;
+    int64_t imm = 0;
+    if (constantIntegerValue(value, imm))
+      return true;
+    if (value.isBlockArgument())
+      return depth > 0;
+    Operation *def = value.getDefiningOp();
+    if (!def || def->isErased() || def->resultCount() != 1 ||
+        !def->getRegions().empty())
+      return false;
+    std::string name = def->name();
+    if (name == "rv_machine.li" || name == "arm_machine.mov" ||
+        name == "arith.constant")
+      return true;
+    if (name == "rv_machine.neg" || name == "rv_machine.seqz" ||
+        name == "arm_machine.neg" || name == "arm_machine.not")
+      return def->operandCount() == 1 &&
+             canRematerializeScalar(def->operand(0), depth + 1);
+    if (name == "rv_machine.cmp" || name == "arm_machine.cmp")
+      return def->operandCount() == 2 &&
+             canRematerializeScalar(def->operand(0), depth + 1) &&
+             canRematerializeScalar(def->operand(1), depth + 1);
+    if (name == "rv_machine.select" || name == "arm_machine.select")
+      return def->operandCount() == 3 &&
+             canRematerializeScalar(def->operand(0), depth + 1) &&
+             canRematerializeScalar(def->operand(1), depth + 1) &&
+             canRematerializeScalar(def->operand(2), depth + 1);
+    if (name == "rv_machine.addw" || name == "rv_machine.subw" ||
+        name == "rv_machine.mulw" || name == "rv_machine.and" ||
+        name == "rv_machine.or" || name == "rv_machine.xor" ||
+        name == "rv_machine.sllw" || name == "rv_machine.sraw" ||
+        name == "arm_machine.add" || name == "arm_machine.sub" ||
+        name == "arm_machine.mul" || name == "arm_machine.and" ||
+        name == "arm_machine.orr" || name == "arm_machine.eor")
+      return def->operandCount() == 2 &&
+             canRematerializeScalar(def->operand(0), depth + 1) &&
+             canRematerializeScalar(def->operand(1), depth + 1);
+    return false;
+  };
   auto isDeferredHomeReg = [&](const std::string &reg) {
     if (!regAlloc2Enabled ||
         !envEnabled("SISY_ENABLE_SELF_REGALLOC2_LAZY", false) ||
@@ -5350,6 +5410,19 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (regAlloc2Enabled)
       stats.lsra2Spills++;
   };
+  auto flushPromotedScalarSlots = [&](bool invalidate) {
+    for (auto &kv : promotedScalarSlots) {
+      PromotedScalarSlot &slot = kv.second;
+      if (slot.valid && slot.dirty) {
+        auto stackIt = stackSlots.find(valueKey(slot.slot));
+        if (stackIt != stackSlots.end())
+          emitStackStore(slot.reg, stackIt->second, "sw");
+        slot.dirty = false;
+      }
+      if (invalidate)
+        slot.valid = false;
+    }
+  };
   auto maybeSpillBeforeClobber = [&](const std::string &key, const std::string &reg,
                                      bool callBoundary) {
     if (!livenessEnabled || key.empty() || reg.empty() ||
@@ -5357,6 +5430,10 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         remainingUses[key] <= 0 || homeValid.count(key) != 0 ||
         valueByKey.count(key) == 0)
       return;
+    if (canRematerializeScalar(valueByKey[key], 0)) {
+      stats.deadSpillsAvoided++;
+      return;
+    }
     spillHome(valueByKey[key], reg, true);
     if (callBoundary)
       stats.callBoundarySpills++;
@@ -5427,8 +5504,14 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       return false;
     }
     Operation *def = value.getDefiningOp();
-    if (def && !def->isErased() && def->attr("licm_hoisted"))
+    if (def && !def->isErased() && def->attr("licm_hoisted")) {
+      int64_t imm = 0;
+      if (constantIntegerValue(value, imm)) {
+        stats.deadSpillsAvoided++;
+        return false;
+      }
       return true;
+    }
     if (def && !def->isErased()) {
       Operation *onlyUser = nullptr;
       int liveUses = 0;
@@ -5449,7 +5532,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         stats.deadSpillsAvoided++;
         return false;
       }
-      if (isFloatType(value.type()) && defIt != opIndex.end()) {
+      if (!isMemrefType(value.type()) && defIt != opIndex.end()) {
         bool allLocalUses = liveUses > 0;
         int lastUseIndex = defIt->second;
         for (const auto &use : def->resultUses[value.getResultIndex()]) {
@@ -5489,10 +5572,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     return true;
   };
   auto forgetHoistedResultReg = [&](Operation &def) {
-    if (def.attr("licm_hoisted") && def.resultCount() == 1)
-      regs.erase(valueKey(def.result()));
+    if (def.attr("licm_hoisted") && def.resultCount() == 1) {
+      std::string key = valueKey(def.result());
+      if (remainingUses[key] > 0)
+        return;
+      regs.erase(key);
+    }
   };
   auto invalidateCallerSavedForCall = [&]() {
+    flushPromotedScalarSlots(true);
     for (auto it = regs.begin(); it != regs.end(); ) {
       const std::string reg = it->second;
       bool callerSaved = false;
@@ -5508,6 +5596,55 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       } else {
         ++it;
       }
+    }
+  };
+  auto spillLiveRegsForControlFlow = [&]() {
+    flushPromotedScalarSlots(false);
+    std::vector<std::pair<std::string, std::string>> liveRegs;
+    for (const auto &kv : regs)
+      liveRegs.push_back(kv);
+    for (const auto &kv : liveRegs) {
+      const std::string &key = kv.first;
+      const std::string &reg = kv.second;
+      if (key.empty() || reg.empty() || reg.rfind("stack:", 0) == 0 ||
+          reg.rfind("global:", 0) == 0 || globalLabels.count(key) != 0 ||
+          remainingUses[key] <= 0 ||
+          valueByKey.count(key) == 0 || homeValid.count(key) != 0)
+        continue;
+      if (canRematerializeScalar(valueByKey[key], 0)) {
+        stats.deadSpillsAvoided++;
+        continue;
+      }
+      spillHome(valueByKey[key], reg, true);
+    }
+  };
+  auto invalidateControlFlowJoinRegs = [&]() {
+    flushPromotedScalarSlots(true);
+    for (auto it = regs.begin(); it != regs.end(); ) {
+      const std::string &key = it->first;
+      const std::string &reg = it->second;
+      if (reg.rfind("stack:", 0) == 0 || reg.rfind("global:", 0) == 0 ||
+          globalLabels.count(key) != 0 ||
+          (lsraEnabled && lsraAssignment.count(key) != 0)) {
+        ++it;
+        continue;
+      }
+      it = regs.erase(it);
+    }
+  };
+  auto invalidateLoopEntryRegs = [&]() {
+    flushPromotedScalarSlots(true);
+    for (auto it = regs.begin(); it != regs.end(); ) {
+      const std::string &key = it->first;
+      const std::string &reg = it->second;
+      if (reg.rfind("stack:", 0) == 0 || reg.rfind("global:", 0) == 0 ||
+          globalLabels.count(key) != 0 ||
+          (lsraEnabled && lsraAssignment.count(key) != 0)) {
+        ++it;
+        continue;
+      }
+      maybeSpillBeforeClobber(key, reg, false);
+      it = regs.erase(it);
     }
   };
   int incomingIntRegs = 0;
@@ -5583,7 +5720,168 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
     return loc;
   };
-  auto ensureReg = [&](Value value, const std::string &tmp) -> std::string {
+  std::function<std::string(Value, const std::string &)> ensureReg;
+  std::function<std::string(Value, const std::string &, int)> rematerializeValue;
+  int nextRematSelectId = stats.functions * 10000;
+  auto normalizePredicate = [](std::string pred) {
+    if (pred.size() > 1 && pred[0] == 's')
+      pred = pred.substr(1);
+    return pred;
+  };
+  auto emitIntegerCompare = [&](const std::string &dst, const std::string &lhs,
+                                const std::string &rhs, std::string pred) {
+    pred = normalizePredicate(std::move(pred));
+    if (isArm) {
+      os << "    cmp " << lhs << ", " << rhs << "\n";
+      os << "    cset " << dst << ", " << pred << "\n";
+      return;
+    }
+    if (pred == "lt") {
+      os << "    slt " << dst << ", " << lhs << ", " << rhs << "\n";
+    } else if (pred == "le") {
+      os << "    slt " << dst << ", " << rhs << ", " << lhs << "\n";
+      os << "    xori " << dst << ", " << dst << ", 1\n";
+    } else if (pred == "gt") {
+      os << "    slt " << dst << ", " << rhs << ", " << lhs << "\n";
+    } else if (pred == "ge") {
+      os << "    slt " << dst << ", " << lhs << ", " << rhs << "\n";
+      os << "    xori " << dst << ", " << dst << ", 1\n";
+    } else if (pred == "eq") {
+      os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
+      os << "    seqz " << dst << ", " << dst << "\n";
+    } else {
+      os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
+      os << "    snez " << dst << ", " << dst << "\n";
+    }
+  };
+  rematerializeValue = [&](Value value, const std::string &tmp, int depth) -> std::string {
+    if (!canRematerializeScalar(value, depth))
+      return "";
+    int64_t imm = 0;
+    if (constantIntegerValue(value, imm)) {
+      clobberPhysicalReg(tmp);
+      if (isArm)
+        os << "    mov " << tmp << ", #" << imm << "\n";
+      else
+        os << "    li " << tmp << ", " << imm << "\n";
+      stats.machineOps++;
+      return tmp;
+    }
+    Operation *def = value.getDefiningOp();
+    if (!def || def->isErased())
+      return "";
+    std::string name = def->name();
+    std::string otherTmp = tmp == scratchReg(0) ? scratchReg(1) : scratchReg(0);
+    if (name == "rv_machine.neg" || name == "rv_machine.seqz" ||
+        name == "arm_machine.neg" || name == "arm_machine.not") {
+      std::string src = ensureReg(def->operand(0), tmp);
+      if (src.empty())
+        return "";
+      clobberPhysicalReg(tmp);
+      if (isArm) {
+        if (name == "arm_machine.not")
+          os << "    cmp " << src << ", #0\n    cset " << tmp << ", eq\n";
+        else
+          os << "    neg " << tmp << ", " << src << "\n";
+      } else {
+        if (name == "rv_machine.seqz")
+          os << "    seqz " << tmp << ", " << src << "\n";
+        else
+          os << "    negw " << tmp << ", " << src << "\n";
+      }
+      stats.machineOps++;
+      return tmp;
+    }
+    if (def->operandCount() != 2)
+    {
+      if (name != "rv_machine.select" && name != "arm_machine.select")
+        return "";
+      std::string condTmp = tmp == scratchReg(0) ? scratchReg(1) : scratchReg(0);
+      std::string cond = ensureReg(def->operand(0), condTmp);
+      if (cond.empty())
+        return "";
+      if (cond == tmp) {
+        clobberPhysicalReg(condTmp);
+        if (isArm)
+          os << "    mov " << condTmp << ", " << cond << "\n";
+        else
+          os << "    mv " << condTmp << ", " << cond << "\n";
+        cond = condTmp;
+      }
+      std::string valueTmp = cond == scratchReg(0) ? scratchReg(1) : scratchReg(0);
+      std::string falseSrc = ensureReg(def->operand(2), valueTmp);
+      if (falseSrc.empty())
+        return "";
+      clobberPhysicalReg(tmp);
+      if (falseSrc != tmp) {
+        if (isArm)
+          os << "    mov " << tmp << ", " << falseSrc << "\n";
+        else
+          os << "    mv " << tmp << ", " << falseSrc << "\n";
+      }
+      int labelId = ++nextRematSelectId;
+      std::string done = ".Lremat_select_done_" + std::to_string(labelId);
+      if (isArm)
+        os << "    cbz " << cond << ", " << done << "\n";
+      else
+        os << "    beqz " << cond << ", " << done << "\n";
+      std::string trueSrc = ensureReg(def->operand(1), valueTmp);
+      if (trueSrc.empty())
+        return "";
+      if (trueSrc != tmp) {
+        if (isArm)
+          os << "    mov " << tmp << ", " << trueSrc << "\n";
+        else
+          os << "    mv " << tmp << ", " << trueSrc << "\n";
+      }
+      os << done << ":\n";
+      stats.machineOps++;
+      return tmp;
+    }
+    std::string lhs = ensureReg(def->operand(0), tmp);
+    if (lhs.empty())
+      return "";
+    std::string rhsTmp = lhs == scratchReg(0) ? scratchReg(1) : scratchReg(0);
+    if (rhsTmp == lhs)
+      rhsTmp = otherTmp;
+    std::string rhs = ensureReg(def->operand(1), rhsTmp);
+    if (rhs.empty())
+      return "";
+    clobberPhysicalReg(tmp);
+    if (name == "rv_machine.cmp" || name == "arm_machine.cmp") {
+      emitIntegerCompare(tmp, lhs, rhs, symbolAttr(def->attr("predicate")));
+      stats.machineOps++;
+      return tmp;
+    }
+    if (isArm) {
+      std::string inst;
+      if (name == "arm_machine.add") inst = "add";
+      else if (name == "arm_machine.sub") inst = "sub";
+      else if (name == "arm_machine.mul") inst = "mul";
+      else if (name == "arm_machine.and") inst = "and";
+      else if (name == "arm_machine.orr") inst = "orr";
+      else if (name == "arm_machine.eor") inst = "eor";
+      else return "";
+      os << "    " << inst << " " << tmp << ", " << lhs << ", " << rhs << "\n";
+    } else {
+      std::string inst;
+      if (name == "rv_machine.addw") inst = "addw";
+      else if (name == "rv_machine.subw") inst = "subw";
+      else if (name == "rv_machine.mulw") inst = "mulw";
+      else if (name == "rv_machine.and") inst = "and";
+      else if (name == "rv_machine.or") inst = "or";
+      else if (name == "rv_machine.xor") inst = "xor";
+      else if (name == "rv_machine.sllw") inst = "sllw";
+      else if (name == "rv_machine.sraw") inst = "sraw";
+      else return "";
+      os << "    " << inst << " " << tmp << ", " << lhs << ", " << rhs << "\n";
+      if (inst == "and" || inst == "or" || inst == "xor")
+        os << "    addiw " << tmp << ", " << tmp << ", 0\n";
+    }
+    stats.machineOps++;
+    return tmp;
+  };
+  ensureReg = [&](Value value, const std::string &tmp) -> std::string {
     std::string actualTmp = scratchForValue(value, tmp);
     std::string loc = lookupReg(value, regs);
     if (!loc.empty()) {
@@ -5624,6 +5922,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       emitStackLoad(actualTmp, home->second, ptr ? "ld" : (fp ? "flw" : "lw"));
       return actualTmp;
     }
+    std::string remat = rematerializeValue(value, actualTmp, 0);
+    if (!remat.empty())
+      return remat;
     return "";
   };
   auto reloadValue = [&](Value value, const std::string &tmp) -> std::string {
@@ -6430,16 +6731,28 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string rhs = ensureReg(op.operand(1), isArm ? "s31" : "ft11");
       if (lhs.empty()) lhs = isArm ? "s0" : "ft0";
       if (rhs.empty()) rhs = isArm ? "s1" : "ft1";
-      std::string dst = floatReg();
+      const bool isVec = op.resultType().str().find("vector") != std::string::npos;
+      std::string dst = isVec ? "v" + std::to_string(nextVecReg++) : floatReg();
       bindResult(op.result(), dst);
       if (isArm) {
         std::string inst = opname.substr(std::string("arm_machine.").size());
-        os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
+        if (isVec)
+          os << "    " << inst << " " << dst << ".4s, " << lhs << ".4s, "
+             << rhs << ".4s\n";
+        else
+          os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
       } else {
         std::string inst = "fadd.s";
-        if (opname == "rv_machine.fsub") inst = "fsub.s";
-        else if (opname == "rv_machine.fmul") inst = "fmul.s";
-        else if (opname == "rv_machine.fdiv") inst = "fdiv.s";
+        if (isVec) {
+          inst = "vfadd.vv";
+          if (opname == "rv_machine.fsub") inst = "vfsub.vv";
+          else if (opname == "rv_machine.fmul") inst = "vfmul.vv";
+          else if (opname == "rv_machine.fdiv") inst = "vfdiv.vv";
+        } else {
+          if (opname == "rv_machine.fsub") inst = "fsub.s";
+          else if (opname == "rv_machine.fmul") inst = "fmul.s";
+          else if (opname == "rv_machine.fdiv") inst = "fdiv.s";
+        }
         os << "    " << inst << " " << dst << ", " << lhs << ", " << rhs << "\n";
       }
       if (shouldSpillDefinedValue(op.result()))
@@ -7119,18 +7432,38 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       loopIvRegs[&op] = iv;
       bindReg(ivValue, iv);
       std::string pinnedBound = ensureReg(op.operand(1), boundScratch);
-      if (!pinnedBound.empty())
+      if (pinnedBound.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "affine.for bound has no assigned register";
+        return false;
+      }
+      if (!pinnedBound.empty() && !canRematerializeScalar(op.operand(1), 0))
         spillHome(op.operand(1), pinnedBound, true);
       std::string pinnedStep = ensureReg(op.operand(2), boundScratch);
-      if (!pinnedStep.empty())
+      if (pinnedStep.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "affine.for step has no assigned register";
+        return false;
+      }
+      if (!pinnedStep.empty() && !canRematerializeScalar(op.operand(2), 0))
         spillHome(op.operand(2), pinnedStep, true);
       std::string start = reloadValue(op.operand(0), isArm ? "w16" : scratchReg(0));
+      if (start.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "affine.for lower bound has no assigned register";
+        return false;
+      }
 
       if (isArm) {
         os << "    mov " << iv << ", " << start << "\n";
         spillHome(ivValue, iv, true);
         emitLabel(".Lloop_cond_" + std::to_string(loopId) + ":");
         std::string bound = reloadValue(op.operand(1), boundScratch);
+        if (bound.empty()) {
+          stats.unsupportedOps++;
+          stats.error = "affine.for bound reload has no assigned register";
+          return false;
+        }
         os << "    cmp " << iv << ", " << bound << "\n";
         os << "    bge .Lloop_end_" << loopId << "\n";
       } else {
@@ -7138,6 +7471,11 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         spillHome(ivValue, iv, true);
         emitLabel(".Lloop_cond_" + std::to_string(loopId) + ":");
         std::string bound = reloadValue(op.operand(1), boundScratch);
+        if (bound.empty()) {
+          stats.unsupportedOps++;
+          stats.error = "affine.for bound reload has no assigned register";
+          return false;
+        }
         os << "    bge " << iv << ", " << bound << ", .Lloop_end_" << loopId << "\n";
       }
       invalidateLoopHeaderRegs(ivValue);
@@ -7148,6 +7486,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     if (opname == "scf.while") {
       int loopId = loopOps[&op];
       emitLabel(".Lwhile_cond_" + std::to_string(loopId) + ":");
+      invalidateLoopEntryRegs();
       continue;
     }
 
@@ -7184,10 +7523,20 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         continue;
       }
       std::string step = ensureReg(parentFor->operand(2), scratchReg(1));
+      if (step.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "affine.yield parent step has no assigned register";
+        return false;
+      }
       Value ivValue = parentFor->getRegions()[0]->getBlocks()[0]->args()[0]->value();
       std::string preferredIv = loopIvRegs.count(parentFor) ? loopIvRegs[parentFor]
                                                             : scratchReg(0);
       std::string iv = ensureReg(ivValue, preferredIv);
+      if (iv.empty()) {
+        stats.unsupportedOps++;
+        stats.error = "affine.yield parent iv has no assigned register";
+        return false;
+      }
       if (iv != preferredIv) {
         if (isArm)
           os << "    mov " << preferredIv << ", " << iv << "\n";
@@ -7211,6 +7560,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         os << "    j .Lloop_cond_" << loopId << "\n";
         emitLabel(".Lloop_end_" + std::to_string(loopId) + ":");
       }
+      invalidateControlFlowJoinRegs();
       continue;
     }
 
@@ -7279,8 +7629,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       std::string rhs = ensureReg(op.operand(1), isFloatType(op.operand(1).type()) ? (isArm ? "s31" : "ft11") : scratchReg(1));
       std::string dst = isArm ? resultReg() : intResultReg(op.result());
       bindResult(op.result(), dst);
-
       std::string pred = symbolAttr(op.attr("predicate"));
+      if (pred.size() > 1 && pred[0] == 's')
+        pred = pred.substr(1);
 
       if (opname == "rv_machine.fcmp") {
         if (pred == "lt") {
@@ -7305,9 +7656,17 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         } else if (pred == "le") {
           os << "    slt " << dst << ", " << rhs << ", " << lhs << "\n";
           os << "    xori " << dst << ", " << dst << ", 1\n";
+        } else if (pred == "gt") {
+          os << "    slt " << dst << ", " << rhs << ", " << lhs << "\n";
+        } else if (pred == "ge") {
+          os << "    slt " << dst << ", " << lhs << ", " << rhs << "\n";
+          os << "    xori " << dst << ", " << dst << ", 1\n";
         } else if (pred == "eq") {
           os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
           os << "    seqz " << dst << ", " << dst << "\n";
+        } else if (pred == "ne") {
+          os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
+          os << "    snez " << dst << ", " << dst << "\n";
         } else {
           os << "    sub " << dst << ", " << lhs << ", " << rhs << "\n";
           os << "    snez " << dst << ", " << dst << "\n";
@@ -7384,8 +7743,9 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
     }
 
     if (opname == "scf.if") {
-      std::string cond = ensureReg(op.operand(0), scratchReg(0));
       int ifId = loopOps[&op];
+      spillLiveRegsForControlFlow();
+      std::string cond = ensureReg(op.operand(0), scratchReg(0));
 
       if (isArm) {
         os << "    cbz " << cond << ", ." << (op.getRegions().size() > 1 ? "Lelse_" : "Lendif_") << ifId << "\n";
@@ -7400,6 +7760,7 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
       Operation *parent = region ? region->getParent() : nullptr;
       if (parent && parent->name() == "scf.if") {
         int ifId = loopOps[parent];
+        spillLiveRegsForControlFlow();
         bool thenRegion = !parent->getRegions().empty() && parent->getRegions()[0].get() == region;
         bool hasElse = parent->getRegions().size() > 1;
         if (thenRegion && hasElse) {
@@ -7408,12 +7769,15 @@ bool emitFunctionAssembly(Operation &func, const std::string &target, std::ostre
         } else {
           emitLabel(".Lendif_" + std::to_string(ifId) + ":");
         }
+        invalidateControlFlowJoinRegs();
         continue;
       }
       if (parent && parent->name() == "scf.while") {
         int loopId = loopOps[parent];
+        spillLiveRegsForControlFlow();
         os << "    " << (isArm ? "b" : "j") << " .Lwhile_cond_" << loopId << "\n";
         emitLabel(".Lwhile_end_" + std::to_string(loopId) + ":");
+        invalidateControlFlowJoinRegs();
         continue;
       }
       continue;
